@@ -6,12 +6,11 @@ from __future__ import annotations
 
 import copy
 import uuid
-from typing import Any, Dict
 
 from .errors import DocumentValidationError
 
 
-def normalize_document(doc: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_document(doc: dict[str, object]) -> dict[str, object]:
     """
     Ensure the document is JSON-serializable-ish and has an _id.
     """

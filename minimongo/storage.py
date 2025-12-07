@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, Tuple
+from collections.abc import Iterable, Iterator
 
 
 class AppendOnlyStorage:
@@ -15,7 +15,7 @@ class AppendOnlyStorage:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.sync_every_write = sync_every_write
 
-    def append(self, doc: Dict) -> int:
+    def append(self, doc: dict[str, object]) -> int:
         """
         Append a JSON document to disk and return the starting byte offset.
         """
@@ -38,14 +38,14 @@ class AppendOnlyStorage:
                     pass
         return offset
 
-    def read_all(self) -> Iterator[Tuple[int, Dict]]:
+    def read_all(self) -> Iterator[tuple[int, dict[str, object]]]:
         """
         Iterate over all documents on disk, yielding (offset, document).
         """
         if not self.path.exists():
             return iter(())
 
-        def _iter() -> Iterator[Tuple[int, Dict]]:
+        def _iter() -> Iterator[tuple[int, dict[str, object]]]:
             with self.path.open("rb") as fh:
                 while True:
                     offset = fh.tell()
