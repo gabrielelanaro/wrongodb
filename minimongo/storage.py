@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Iterable, Iterator
+from typing import Dict, Iterable, Iterator, Tuple
 
 
 class AppendOnlyStorage:
@@ -17,13 +17,43 @@ class AppendOnlyStorage:
 
     def append(self, doc: Dict) -> int:
         """
-        Append a JSON document to disk.
-        Returns the byte offset where the document starts.
+        Append a JSON document to disk and return the starting byte offset.
         """
-        raise NotImplementedError
+        payload = (json.dumps(doc, separators=(",", ":")) + "\n").encode("utf-8")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
 
-    def read_all(self) -> Iterator[Dict]:
+        with self.path.open("ab") as fh:
+            fh.seek(0, 2)  # ensure end of file
+            offset = fh.tell()
+            fh.write(payload)
+            fh.flush()
+            if self.sync_every_write:
+                fh.flush()
+                try:
+                    # Only available on real file objects.
+                    import os
+
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+        return offset
+
+    def read_all(self) -> Iterator[Tuple[int, Dict]]:
         """
-        Iterate over all documents from disk.
+        Iterate over all documents on disk, yielding (offset, document).
         """
-        raise NotImplementedError
+        if not self.path.exists():
+            return iter(())
+
+        def _iter() -> Iterator[Tuple[int, Dict]]:
+            with self.path.open("rb") as fh:
+                while True:
+                    offset = fh.tell()
+                    line = fh.readline()
+                    if not line:
+                        break
+                    if not line.strip():
+                        continue
+                    yield offset, json.loads(line)
+
+        return _iter()
