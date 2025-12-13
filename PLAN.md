@@ -1,6 +1,6 @@
 # WiredTiger‑like Storage Engine Roadmap (Option 2)
 
-Goal: evolve `wrongodb` from a JSONL append‑only toy into a simplified, **WiredTiger‑inspired** storage engine. We’re cloning *structure and core invariants*, not full fidelity. Constraints: single‑process, no networking, no compression initially, Python implementation.
+Goal: evolve `wrongodb` from a JSONL append‑only toy into a simplified, **WiredTiger‑inspired** storage engine. We’re cloning *structure and core invariants*, not full fidelity. Constraints: single‑process, no networking, no compression initially, Rust implementation.
 
 ## High‑level phases
 1. **Paged K/V substrate**

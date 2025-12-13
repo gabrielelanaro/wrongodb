@@ -1,6 +1,6 @@
 # WrongoDB
 
-A tiny, learning-oriented MongoDB-like store written in Python.
+A tiny, learning-oriented MongoDB-like store written in Rust.
 
 ### Thin-slice scope
 - Append-only log on disk (newline-delimited JSON).
@@ -11,15 +11,19 @@ A tiny, learning-oriented MongoDB-like store written in Python.
 This repo evolves step by step with small, focused commits to make the design easy to follow.
 
 ### Quickstart (current state)
-```python
-from wrongodb import WrongoDB
+```rust
+use serde_json::json;
+use wrongodb::WrongoDB;
 
-db = WrongoDB(path="data/db.log", index_fields=["name"])
-db.insert_one({"name": "alice", "age": 30})
-db.insert_one({"name": "bob", "age": 25})
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut db = WrongoDB::open("data/db.log", ["name"], false)?;
+    db.insert_one(json!({"name": "alice", "age": 30}))?;
+    db.insert_one(json!({"name": "bob", "age": 25}))?;
 
-print(db.find())               # all docs
-print(db.find({"name": "bob"}))  # equality on indexed field
+    println!("{:?}", db.find(None)?); // all docs
+    println!("{:?}", db.find(Some(json!({"name": "bob"})))?); // equality on indexed field
+    Ok(())
+}
 ```
 
-Backwards-compat: `from minimongo import MiniMongo` still works, but new code should use `wrongodb`.
+Run tests with `cargo test`.
