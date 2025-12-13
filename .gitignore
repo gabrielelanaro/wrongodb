@@ -1,19 +1,12 @@
-# Bytecode / cache
-__pycache__/
-*.py[cod]
-*.so
-
-# Virtual environments
-.venv/
-env/
-venv/
-
 # OS artifacts
 .DS_Store
 
 # Editor settings
 .idea/
 .vscode/
+
+# Rust
+target/
 
 # App data
 data/
