@@ -248,6 +248,20 @@ Hint: omit `--reuse` (default behavior) to recreate it as a block file format.",
         std::process::exit(2);
     }
 
+    if args.mode == Mode::Write {
+        let target_blocks = range.saturating_add(1);
+        loop {
+            let current = bf.num_blocks().unwrap_or(0);
+            if current >= target_blocks {
+                break;
+            }
+            let id = bf.allocate_block().unwrap();
+            // Initialize with a valid checksum so subsequent reads with --verify work even if
+            // a given block id isn't written during this run.
+            bf.write_block(id, &[]).unwrap();
+        }
+    }
+
     let max_payload = bf.page_size.saturating_sub(4);
     let payload_len = args.payload_len.unwrap_or(max_payload).min(max_payload);
     let mut payload = vec![0u8; payload_len];

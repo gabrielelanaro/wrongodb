@@ -13,14 +13,15 @@ const DEFAULT_PAGE_SIZE: usize = 4096;
 const MAGIC: [u8; 8] = *b"MMWT0001";
 const VERSION: u16 = 1;
 const HEADER_PAD_SIZE: usize = 64;
+const NONE_BLOCK_ID: u64 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
     pub magic: [u8; 8],
     pub version: u16,
     pub page_size: u32,
-    pub root_block_id: i64,
-    pub free_list_head: i64,
+    pub root_block_id: u64,
+    pub free_list_head: u64,
 }
 
 impl Default for FileHeader {
@@ -29,8 +30,8 @@ impl Default for FileHeader {
             magic: MAGIC,
             version: VERSION,
             page_size: DEFAULT_PAGE_SIZE as u32,
-            root_block_id: -1,
-            free_list_head: -1,
+            root_block_id: NONE_BLOCK_ID,
+            free_list_head: NONE_BLOCK_ID,
         }
     }
 }
@@ -41,8 +42,8 @@ impl FileHeader {
         buf.extend_from_slice(&self.magic);
         buf.write_u16::<LittleEndian>(self.version)?;
         buf.write_u32::<LittleEndian>(self.page_size)?;
-        buf.write_i64::<LittleEndian>(self.root_block_id)?;
-        buf.write_i64::<LittleEndian>(self.free_list_head)?;
+        buf.write_u64::<LittleEndian>(self.root_block_id)?;
+        buf.write_u64::<LittleEndian>(self.free_list_head)?;
         if buf.len() > HEADER_PAD_SIZE {
             return Err(StorageError("header struct too large".into()).into());
         }
@@ -62,8 +63,8 @@ impl FileHeader {
         rdr.read_exact(&mut magic)?;
         let version = rdr.read_u16::<LittleEndian>()?;
         let page_size = rdr.read_u32::<LittleEndian>()?;
-        let root_block_id = rdr.read_i64::<LittleEndian>()?;
-        let free_list_head = rdr.read_i64::<LittleEndian>()?;
+        let root_block_id = rdr.read_u64::<LittleEndian>()?;
+        let free_list_head = rdr.read_u64::<LittleEndian>()?;
         Ok(Self {
             magic,
             version,
@@ -167,6 +168,85 @@ impl BlockFile {
         })
     }
 
+    fn write_header(&mut self) -> Result<(), WrongoDBError> {
+        write_header_page(&mut self.file, &self.header, self.page_size)?;
+        Ok(())
+    }
+
+    pub fn allocate_block(&mut self) -> Result<u64, WrongoDBError> {
+        let head = self.header.free_list_head;
+        if head != NONE_BLOCK_ID {
+            let block_id: u64 = head;
+            let current_blocks = self.num_blocks()?;
+            if block_id == 0 || block_id >= current_blocks {
+                return Err(StorageError(format!(
+                    "corrupt free_list_head={block_id} (num_blocks={current_blocks})"
+                ))
+                .into());
+            }
+            let payload = self.read_block(block_id, true)?;
+            if payload.len() < 8 {
+                return Err(StorageError(format!(
+                    "free list block {block_id} too small for next pointer"
+                ))
+                .into());
+            }
+            let mut rdr = std::io::Cursor::new(&payload);
+            let next = rdr.read_u64::<LittleEndian>()?;
+            if next != NONE_BLOCK_ID {
+                let current_blocks = self.num_blocks()?;
+                if next == 0 || next >= current_blocks {
+                    return Err(StorageError(format!(
+                        "corrupt free list next={next} in block {block_id} (num_blocks={current_blocks})"
+                    ))
+                    .into());
+                }
+            }
+            self.header.free_list_head = next;
+            self.write_header()?;
+            return Ok(block_id);
+        }
+
+        let new_id = self.num_blocks()?;
+        let new_len = (new_id + 1)
+            .checked_mul(self.page_size as u64)
+            .ok_or_else(|| StorageError("file length overflow".into()))?;
+        self.file.set_len(new_len)?;
+        Ok(new_id)
+    }
+
+    pub fn write_new_block(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError> {
+        let block_id = self.allocate_block()?;
+        self.write_block(block_id, payload)?;
+        Ok(block_id)
+    }
+
+    pub fn free_block(&mut self, block_id: u64) -> Result<(), WrongoDBError> {
+        if block_id == 0 {
+            return Err(StorageError("block 0 is reserved for the header".into()).into());
+        }
+
+        let current_blocks = self.num_blocks()?;
+        if block_id >= current_blocks {
+            return Err(StorageError(format!(
+                "cannot free unallocated block {block_id} (num_blocks={current_blocks})"
+            ))
+            .into());
+        }
+
+        let next = self.header.free_list_head;
+        let mut payload = vec![0u8; 8];
+        {
+            let mut w = std::io::Cursor::new(&mut payload);
+            w.write_u64::<LittleEndian>(next)?;
+        }
+
+        self.write_block(block_id, &payload)?;
+        self.header.free_list_head = block_id;
+        self.write_header()?;
+        Ok(())
+    }
+
     pub fn close(self) -> Result<(), WrongoDBError> {
         self.file.sync_all()?;
         Ok(())
@@ -207,6 +287,14 @@ impl BlockFile {
     pub fn write_block(&mut self, block_id: u64, payload: &[u8]) -> Result<(), WrongoDBError> {
         if block_id == 0 {
             return Err(StorageError("block 0 is reserved for the header".into()).into());
+        }
+
+        let current_blocks = self.num_blocks()?;
+        if block_id >= current_blocks {
+            return Err(StorageError(format!(
+                "block {block_id} not allocated (num_blocks={current_blocks}); call allocate_block() first"
+            ))
+            .into());
         }
 
         let max_payload = self.page_size - CHECKSUM_SIZE;
