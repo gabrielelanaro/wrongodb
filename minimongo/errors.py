@@ -1,10 +1,2 @@
-class MiniMongoError(Exception):
-    """Base error for the project."""
+from wrongodb.errors import *  # noqa: F403
 
-
-class DocumentValidationError(MiniMongoError):
-    """Raised when input documents fail basic validation."""
-
-
-class StorageError(MiniMongoError):
-    """Raised for persistence-level issues."""

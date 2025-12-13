@@ -1,6 +1,6 @@
 # WiredTiger‑like Storage Engine Roadmap (Option 2)
 
-Goal: evolve `minimongo` from a JSONL append‑only toy into a simplified, **WiredTiger‑inspired** storage engine. We’re cloning *structure and core invariants*, not full fidelity. Constraints: single‑process, no networking, no compression initially, Python implementation.
+Goal: evolve `wrongodb` from a JSONL append‑only toy into a simplified, **WiredTiger‑inspired** storage engine. We’re cloning *structure and core invariants*, not full fidelity. Constraints: single‑process, no networking, no compression initially, Python implementation.
 
 ## High‑level phases
 1. **Paged K/V substrate**
@@ -53,7 +53,7 @@ Goal: evolve `minimongo` from a JSONL append‑only toy into a simplified, **Wir
 - Recursive insert + internal splits.
 - Ordered range scan.
 
-### Slice F: Plug B+tree into MiniMongo
+### Slice F: Plug B+tree into WrongoDB
 - Primary `_id` storage uses B+tree.
 - `find_one({_id: …})` hits primary; `find()` still scans.
 
@@ -68,4 +68,3 @@ Goal: evolve `minimongo` from a JSONL append‑only toy into a simplified, **Wir
 ### Slice I: MVCC / transactions
 - Txn ids/timestamps, per‑record version chains.
 - Snapshot reads + GC.
-

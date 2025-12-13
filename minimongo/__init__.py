@@ -1,7 +1,10 @@
 """
-Public API for MiniMongo.
+Compatibility layer for the old `minimongo` import path.
+
+New code should import from `wrongodb`.
 """
 
-from .engine import MiniMongo
+from wrongodb import MiniMongo, WrongoDB
 
-__all__ = ["MiniMongo"]
+__all__ = ["MiniMongo", "WrongoDB"]
+

@@ -1,4 +1,4 @@
-# MiniMongo
+# WrongoDB
 
 A tiny, learning-oriented MongoDB-like store written in Python.
 
@@ -12,12 +12,14 @@ This repo evolves step by step with small, focused commits to make the design ea
 
 ### Quickstart (current state)
 ```python
-from minimongo import MiniMongo
+from wrongodb import WrongoDB
 
-db = MiniMongo(path="data/db.log", index_fields=["name"])
+db = WrongoDB(path="data/db.log", index_fields=["name"])
 db.insert_one({"name": "alice", "age": 30})
 db.insert_one({"name": "bob", "age": 25})
 
 print(db.find())               # all docs
 print(db.find({"name": "bob"}))  # equality on indexed field
 ```
+
+Backwards-compat: `from minimongo import MiniMongo` still works, but new code should use `wrongodb`.

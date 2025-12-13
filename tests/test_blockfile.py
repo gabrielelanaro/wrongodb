@@ -3,13 +3,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from minimongo.blockfile import BlockFile, FileHeader
-from minimongo.errors import StorageError
+from wrongodb.blockfile import BlockFile, FileHeader
+from wrongodb.errors import StorageError
 
 
 class BlockFileTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmpdir = Path(tempfile.mkdtemp(prefix="minimongo-tests-"))
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="wrongodb-tests-"))
         self.path = self.tmpdir / "test.wt"
 
     def tearDown(self) -> None:
