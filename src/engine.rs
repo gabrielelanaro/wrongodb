@@ -10,13 +10,13 @@ use crate::{Document, WrongoDBError};
 
 #[derive(Debug, Clone)]
 struct Record {
-    offset: u64,
+    _offset: u64,
     doc: Document,
 }
 
 #[derive(Debug)]
 pub struct WrongoDB {
-    path: PathBuf,
+    _path: PathBuf,
     storage: AppendOnlyStorage,
     index: InMemoryIndex,
     docs: Vec<Record>,
@@ -37,7 +37,7 @@ impl WrongoDB {
         let path = path.as_ref().to_path_buf();
         let storage = AppendOnlyStorage::new(&path, sync_every_write);
         let mut db = Self {
-            path,
+            _path: path,
             storage,
             index: InMemoryIndex::new(index_fields),
             docs: Vec::new(),
@@ -54,7 +54,7 @@ impl WrongoDB {
         let offset = self.storage.append(&normalized)?;
         self.index.add(&normalized, offset);
         self.docs.push(Record {
-            offset,
+            _offset: offset,
             doc: normalized.clone(),
         });
         self.doc_by_offset.insert(offset, normalized.clone());
@@ -105,7 +105,7 @@ impl WrongoDB {
         let existing = self.storage.read_all()?;
         for (offset, doc) in existing {
             self.docs.push(Record {
-                offset,
+                _offset: offset,
                 doc: doc.clone(),
             });
             self.doc_by_offset.insert(offset, doc.clone());

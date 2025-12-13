@@ -172,6 +172,16 @@ impl BlockFile {
         Ok(())
     }
 
+    pub fn sync_all(&mut self) -> Result<(), WrongoDBError> {
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    pub fn sync_data(&mut self) -> Result<(), WrongoDBError> {
+        self.file.sync_data()?;
+        Ok(())
+    }
+
     pub fn read_block(&mut self, block_id: u64, verify: bool) -> Result<Vec<u8>, WrongoDBError> {
         let offset = (block_id as u64)
             .checked_mul(self.page_size as u64)
@@ -195,6 +205,10 @@ impl BlockFile {
     }
 
     pub fn write_block(&mut self, block_id: u64, payload: &[u8]) -> Result<(), WrongoDBError> {
+        if block_id == 0 {
+            return Err(StorageError("block 0 is reserved for the header".into()).into());
+        }
+
         let max_payload = self.page_size - CHECKSUM_SIZE;
         if payload.len() > max_payload {
             return Err(StorageError(format!(
