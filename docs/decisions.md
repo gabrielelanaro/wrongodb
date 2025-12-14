@@ -79,3 +79,54 @@ page 3 payload:
 **References**
 - WiredTiger Block Manager docs: https://source.wiredtiger.com/develop/arch-block.html
 - WiredTiger file growth tuning: https://source.wiredtiger.com/develop/tune_file_alloc.html
+
+## 2025-12-14: Slotted leaf-page format for in-page KV (Slice C)
+
+**Decision**
+- Implement the Slice C “single-page KV” as a **slotted leaf page** stored inside one `BlockFile` payload.
+- The page uses a small fixed header + a slot directory at the beginning and variable-size records packed from the end of the page.
+- Keys are ordered by the **slot directory order** (lexicographic byte ordering), enabling binary search.
+
+**Why**
+- Variable-sized K/V records need indirection; a slot directory allows inserts/deletes to mostly shift small fixed-size slot entries instead of moving record bytes on every change.
+- This matches the common “slotted page” pattern used by B-tree implementations and sets us up for later slices (splits, scans).
+
+**On-page layout**
+- All integers are little-endian.
+- Offsets/lengths are `u16`, so the page payload must be `<= 65535` bytes (true for the default 4KB pages).
+
+Header (`HEADER_SIZE = 8` bytes):
+```
+byte 0: page_type (u8) = 1 (leaf)
+byte 1: flags (u8)     = 0 (reserved)
+byte 2: slot_count (u16)
+byte 4: lower (u16)  = HEADER_SIZE + slot_count * SLOT_SIZE
+byte 6: upper (u16)  = start of packed record bytes (grows downward)
+```
+
+Slot (`SLOT_SIZE = 4` bytes), stored in sorted key order:
+```
+offset (u16): record start within the page payload
+len    (u16): record length in bytes
+```
+
+Record bytes, packed from the end of the page toward the front:
+```
+klen (u16)
+vlen (u16)
+key bytes (klen)
+value bytes (vlen)
+```
+
+**Free space / fragmentation**
+- Contiguous free space is `upper - lower`.
+- `delete(key)` removes the slot entry but leaves record bytes as unreachable garbage.
+- `put(key, value)` performs `compact()` automatically if `upper - lower` is insufficient; if still insufficient it returns `PageFull`.
+- `compact()` rewrites the page into a tightly packed form (no garbage), preserving slot order and updating offsets.
+
+**Notes**
+- This is intentionally a simplified page format for Slice C; later slices can add page ids, overflow handling, and internal pages.
+
+**References**
+- PostgreSQL storage page layout: https://www.postgresql.org/docs/current/storage-page-layout.html
+- SQLite database file format (B-tree pages): https://www.sqlite.org/fileformat2.html

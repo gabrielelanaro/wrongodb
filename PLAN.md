@@ -27,7 +27,7 @@ Goal: evolve `wrongodb` from a JSONL append‑only toy into a simplified, **Wire
 
 ## Thin slices
 
-### Slice A: File format + page I/O (current)
+### Slice A: File format + page I/O
 - Pick fixed page size (default 4KB).
 - Define file header (stored in block 0):
   - magic, version, page_size, root_block_id, free_list_head, reserved.
@@ -44,6 +44,10 @@ Goal: evolve `wrongodb` from a JSONL append‑only toy into a simplified, **Wire
 ### Slice C: Leaf‑page KV store (single page, no splits)
 - Leaf layout + slot directory.
 - In‑page `put/get/delete` until full, then raise `PageFull`.
+
+Status (2025-12-14)
+- Slice A/B/C are implemented.
+- Slice C lives in `src/leaf_page.rs` (slotted leaf page + `PageFull` + compaction-on-demand).
 
 ### Slice D: 2‑level B+tree
 - Root internal + leaf pages.
