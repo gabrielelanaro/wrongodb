@@ -175,3 +175,31 @@ child (u64 LE)       // block id of child_{i+1}
 
 **Notes**
 - Slice D intentionally does **not** split internal pages; if the root internal page runs out of space for more separators, inserts must fail with a “root full” error until Slice E adds height growth.
+
+## 2025-12-14: Slice E height growth (internal splits) + range scan API
+
+**Decision**
+- Implement Slice E B+tree height growth via **recursive insert** that can split both leaf and internal pages, with **root growth** when the current root splits.
+- Define internal split promotion using the existing Slice D separator semantics (“separator key is the minimum key of the child to its right”):
+  - When splitting an internal node, we choose a **promoted separator** `(k_promote, child_promote)`.
+  - The left internal page keeps the original `first_child` and all separator entries strictly **before** `k_promote`.
+  - The right internal page uses `first_child = child_promote` and keeps all separator entries strictly **after** `k_promote`.
+  - The parent inserts `k_promote` pointing to the **right internal page**.
+- Add a public ordered scan API: `BTree::range(start, end)` with `start` **inclusive** and `end` **exclusive**, returning keys in ascending lexicographic byte order.
+
+**Why**
+- Recursive splits + root growth are the standard B+tree mechanism that guarantees the tree stays height-balanced: only root growth increases depth, and it increases depth for **all** leaves equally.
+- Reusing the Slice D “min-of-right-child” separator invariant avoids redesigning routing semantics and keeps internal-page encoding stable.
+- `range(start, end)` with inclusive/exclusive bounds matches common database iterator conventions and is easy to compose (adjacent ranges don’t overlap).
+
+**Notes**
+- Slice E range scanning is implemented without leaf sibling pointers (no on-disk format change); the iterator finds the “next leaf” using a parent stack and in-order traversal.
+- A future slice may add leaf sibling pointers to make scans O(1) per leaf transition and more cache-friendly.
+
+## 2025-12-14: Export `NONE_BLOCK_ID` sentinel constant
+
+**Decision**
+- Expose `NONE_BLOCK_ID` as a public constant so code can avoid using raw `0` when representing “no block / null pointer”.
+
+**Why**
+- Eliminates “magic number” checks (`== 0`) around root pointers and free-list links, making intent explicit and reducing the chance of accidentally treating block `0` (the header page) as a data block.

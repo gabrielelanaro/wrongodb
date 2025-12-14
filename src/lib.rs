@@ -9,7 +9,7 @@ mod leaf_page;
 mod storage;
 
 pub use crate::btree::BTree;
-pub use crate::blockfile::{BlockFile, FileHeader};
+pub use crate::blockfile::{BlockFile, FileHeader, NONE_BLOCK_ID};
 pub use crate::engine::{MiniMongo, WrongoDB};
 pub use crate::errors::{DocumentValidationError, StorageError, WrongoDBError};
 pub use crate::index::{InMemoryIndex, ScalarKey};

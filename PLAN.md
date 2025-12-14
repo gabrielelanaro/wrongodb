@@ -56,6 +56,7 @@ Status (2025-12-14)
 ### Slice E: Full B+tree (arbitrary height)
 - Recursive insert + internal splits.
 - Ordered range scan.
+- Refactor: introduce a small `Pager` wrapper around `BlockFile` so `BTree` does not call `read_block/write_block/write_new_block/set_root_block_id` directly (no behavior change; keep `LeafPage`/`InternalPage` as pure “operate on bytes” types).
 
 ### Slice F: Plug B+tree into WrongoDB
 - Primary `_id` storage uses B+tree.
@@ -72,3 +73,7 @@ Status (2025-12-14)
 ### Slice I: MVCC / transactions
 - Txn ids/timestamps, per‑record version chains.
 - Snapshot reads + GC.
+
+## Performance notes / TODOs
+- B+tree splits currently choose a split point by rebuilding candidate left/right pages around the midpoint; OK for small pages but should be replaced with a single-pass “split-by-bytes” / one-build approach.
+- Range scans currently avoid leaf sibling pointers (no on-disk format change) and instead advance using a parent stack; consider adding leaf links for O(1) leaf-to-leaf transitions.

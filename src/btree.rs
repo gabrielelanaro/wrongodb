@@ -1,7 +1,10 @@
 use std::path::Path;
 
 use crate::errors::StorageError;
-use crate::{BlockFile, InternalPage, InternalPageError, LeafPage, LeafPageError, WrongoDBError};
+use crate::{
+    BlockFile, InternalPage, InternalPageError, LeafPage, LeafPageError, WrongoDBError,
+    NONE_BLOCK_ID,
+};
 
 const PAGE_TYPE_LEAF: u8 = 1;
 const PAGE_TYPE_INTERNAL: u8 = 2;
@@ -25,146 +28,212 @@ impl BTree {
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, WrongoDBError> {
-        let root = self.bf.header.root_block_id;
-        if root == 0 {
+        let mut node_id = self.bf.header.root_block_id;
+        if node_id == NONE_BLOCK_ID {
             return Ok(None);
         }
 
-        let root_payload = self.bf.read_block(root, true)?;
-        match page_type(&root_payload)? {
-            PageType::Leaf => {
-                let mut root_payload = root_payload;
-                let page = LeafPage::open(&mut root_payload)
-                    .map_err(|e| StorageError(format!("corrupt root leaf: {e}")))?;
-                Ok(page.get(key).map_err(map_leaf_err)?)
-            }
-            PageType::Internal => {
-                let mut root_payload = root_payload;
-                let internal = InternalPage::open(&mut root_payload)
-                    .map_err(|e| StorageError(format!("corrupt root internal: {e}")))?;
-                let child = internal
-                    .child_for_key(key)
-                    .map_err(|e| StorageError(format!("root routing failed: {e}")))?;
-                let mut leaf_payload = self.bf.read_block(child, true)?;
-                let leaf = LeafPage::open(&mut leaf_payload)
-                    .map_err(|e| StorageError(format!("corrupt leaf {child}: {e}")))?;
-                Ok(leaf.get(key).map_err(map_leaf_err)?)
+        loop {
+            let mut payload = self.bf.read_block(node_id, true)?;
+            match page_type(&payload)? {
+                PageType::Leaf => {
+                    let leaf = LeafPage::open(&mut payload)
+                        .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
+                    return Ok(leaf.get(key).map_err(map_leaf_err)?);
+                }
+                PageType::Internal => {
+                    let internal = InternalPage::open(&mut payload)
+                        .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
+                    node_id = internal
+                        .child_for_key(key)
+                        .map_err(|e| StorageError(format!("routing failed at {node_id}: {e}")))?;
+                }
             }
         }
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
         let root = self.bf.header.root_block_id;
-        if root == 0 {
+        if root == NONE_BLOCK_ID {
             return Err(StorageError("btree missing root".into()).into());
         }
 
-        let root_payload = self.bf.read_block(root, true)?;
-        match page_type(&root_payload)? {
-            PageType::Leaf => self.put_into_root_leaf(root, root_payload, key, value),
-            PageType::Internal => self.put_into_two_level(root, root_payload, key, value),
+        let split = self.insert_recursive(root, key, value)?;
+        if let Some(split) = split {
+            let payload_len = self.bf.page_size - 4;
+            let mut root_internal_bytes = vec![0u8; payload_len];
+            {
+                let mut internal = InternalPage::init(&mut root_internal_bytes, root)
+                    .map_err(|e| StorageError(format!("init new root internal failed: {e}")))?;
+                internal
+                    .put_separator(&split.sep_key, split.right_child)
+                    .map_err(map_internal_err)?;
+            }
+
+            let new_root_id = self.bf.write_new_block(&root_internal_bytes)?;
+            self.bf.set_root_block_id(new_root_id)?;
         }
+        Ok(())
     }
 
     pub fn sync_all(&mut self) -> Result<(), WrongoDBError> {
         self.bf.sync_all()
     }
 
-    fn put_into_root_leaf(
+    pub fn range(
         &mut self,
-        root_leaf_id: u64,
-        mut leaf_payload: Vec<u8>,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<(), WrongoDBError> {
-        {
-            let mut leaf = LeafPage::open(&mut leaf_payload)
-                .map_err(|e| StorageError(format!("corrupt root leaf: {e}")))?;
-            match leaf.put(key, value) {
-                Ok(()) => {
-                    self.bf.write_block(root_leaf_id, &leaf_payload)?;
-                    return Ok(());
-                }
-                Err(LeafPageError::PageFull) => { /* split below */ }
-                Err(e) => return Err(map_leaf_err(e)),
-            }
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<impl Iterator<Item = Result<(Vec<u8>, Vec<u8>), WrongoDBError>> + '_, WrongoDBError>
+    {
+        let root = self.bf.header.root_block_id;
+        if root == NONE_BLOCK_ID {
+            return Ok(BTreeRangeIter::empty());
         }
-
-        let payload_len = leaf_payload.len();
-        let mut entries = leaf_entries(&mut leaf_payload)?;
-        upsert_entry(&mut entries, key, value);
-        let (left_bytes, right_bytes, split_key) = split_leaf_entries(&entries, payload_len)?;
-
-        // Overwrite existing root leaf with the left page and allocate a new right leaf.
-        let right_leaf_id = self.bf.write_new_block(&right_bytes)?;
-        self.bf.write_block(root_leaf_id, &left_bytes)?;
-
-        // Create a new root internal page with two children.
-        let mut root_internal_bytes = vec![0u8; payload_len];
-        {
-            let mut internal = InternalPage::init(&mut root_internal_bytes, root_leaf_id)
-                .map_err(|e| StorageError(format!("init root internal failed: {e}")))?;
-            internal
-                .put_separator(&split_key, right_leaf_id)
-                .map_err(map_internal_err)?;
-        }
-
-        let new_root_id = self.bf.write_new_block(&root_internal_bytes)?;
-        self.bf.set_root_block_id(new_root_id)?;
-        Ok(())
+        Ok(BTreeRangeIter::new(&mut self.bf, root, start, end)?)
     }
 
-    fn put_into_two_level(
+    /// Insert into the subtree rooted at `node_id`.
+    ///
+    /// Returns:
+    /// - `Ok(None)` if the insert was fully absorbed by this subtree.
+    /// - `Ok(Some(split))` if this node split and the caller must insert a separator
+    ///   `(split.sep_key -> split.right_child)` into the parent.
+    ///
+    /// Separator invariant (Slice D/E):
+    /// - For any split producing left+right siblings, `sep_key` is the **minimum key** in the
+    ///   right sibling.
+    ///
+    /// Graphically:
+    /// ```text
+    /// parent inserts:  [ ... | sep_key -> right_child | ... ]
+    ///                      ^
+    ///                      min key of right sibling
+    /// ```
+    fn insert_recursive(
         &mut self,
-        root_internal_id: u64,
-        mut root_payload: Vec<u8>,
+        node_id: u64,
         key: &[u8],
         value: &[u8],
-    ) -> Result<(), WrongoDBError> {
-        let child_id = {
-            let root = InternalPage::open(&mut root_payload)
-                .map_err(|e| StorageError(format!("corrupt root internal: {e}")))?;
-            root.child_for_key(key)
-                .map_err(|e| StorageError(format!("root routing failed: {e}")))?
-        };
+    ) -> Result<Option<SplitInfo>, WrongoDBError> {
+        let payload = self.bf.read_block(node_id, true)?;
+        match page_type(&payload)? {
+            PageType::Leaf => self.insert_into_leaf(node_id, payload, key, value),
+            PageType::Internal => self.insert_into_internal(node_id, payload, key, value),
+        }
+    }
 
-        let mut leaf_payload = self.bf.read_block(child_id, true)?;
+    /// Insert into a leaf page, splitting if it overflows.
+    ///
+    /// Leaf split is done by rebuilding two leaf pages from the post-insert sorted entry list:
+    /// ```text
+    /// entries (sorted):  [ e0 e1 e2 e3 e4 e5 ]
+    ///                         ^
+    ///                      split_idx
+    /// left  = [ e0 .. e{split_idx-1} ]
+    /// right = [ e{split_idx} .. end ]
+    /// sep_key = first_key(right)
+    /// ```
+    fn insert_into_leaf(
+        &mut self,
+        node_id: u64,
+        mut payload: Vec<u8>,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<Option<SplitInfo>, WrongoDBError> {
         {
-            let mut leaf = LeafPage::open(&mut leaf_payload)
-                .map_err(|e| StorageError(format!("corrupt leaf {child_id}: {e}")))?;
+            let mut leaf = LeafPage::open(&mut payload)
+                .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
             match leaf.put(key, value) {
                 Ok(()) => {
-                    self.bf.write_block(child_id, &leaf_payload)?;
-                    return Ok(());
+                    self.bf.write_block(node_id, &payload)?;
+                    return Ok(None);
                 }
                 Err(LeafPageError::PageFull) => { /* split below */ }
                 Err(e) => return Err(map_leaf_err(e)),
             }
         }
 
-        // Split the overflowing leaf and update the root.
-        let payload_len = leaf_payload.len();
-        let mut entries = leaf_entries(&mut leaf_payload)?;
+        let payload_len = payload.len();
+        let mut entries = leaf_entries(&mut payload)?;
         upsert_entry(&mut entries, key, value);
         let (left_bytes, right_bytes, split_key) = split_leaf_entries(&entries, payload_len)?;
 
         let right_leaf_id = self.bf.write_new_block(&right_bytes)?;
-        self.bf.write_block(child_id, &left_bytes)?;
+        self.bf.write_block(node_id, &left_bytes)?;
+        Ok(Some(SplitInfo {
+            sep_key: split_key,
+            right_child: right_leaf_id,
+        }))
+    }
+
+    /// Insert into an internal page.
+    ///
+    /// Steps:
+    /// 1) Route to the appropriate child and recurse.
+    /// 2) If the child split, attempt to insert the child's separator into this internal page.
+    /// 3) If this internal page overflows, split it and return a promoted separator to the parent.
+    ///
+    /// Internal separator semantics:
+    /// - The page stores `(sep_key_i -> child_{i+1})` plus a `first_child = child_0`.
+    /// - `sep_key_i` is the **minimum key** of `child_{i+1}`.
+    fn insert_into_internal(
+        &mut self,
+        node_id: u64,
+        mut payload: Vec<u8>,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<Option<SplitInfo>, WrongoDBError> {
+        let child_id = {
+            let internal = InternalPage::open(&mut payload)
+                .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
+            internal
+                .child_for_key(key)
+                .map_err(|e| StorageError(format!("routing failed at {node_id}: {e}")))?
+        };
+
+        let split = self.insert_recursive(child_id, key, value)?;
+        let Some(split) = split else {
+            return Ok(None);
+        };
 
         {
-            let mut root = InternalPage::open(&mut root_payload)
-                .map_err(|e| StorageError(format!("corrupt root internal: {e}")))?;
-            match root.put_separator(&split_key, right_leaf_id) {
-                Ok(()) => {}
-                Err(InternalPageError::PageFull) => {
-                    return Err(StorageError("root internal page full (Slice E needed)".into()).into())
+            let mut internal = InternalPage::open(&mut payload)
+                .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
+            match internal.put_separator(&split.sep_key, split.right_child) {
+                Ok(()) => {
+                    self.bf.write_block(node_id, &payload)?;
+                    return Ok(None);
                 }
+                Err(InternalPageError::PageFull) => { /* split below */ }
                 Err(e) => return Err(map_internal_err(e)),
             }
         }
-        self.bf.write_block(root_internal_id, &root_payload)?;
-        Ok(())
+
+        let payload_len = payload.len();
+        let (first_child, mut entries) = internal_entries(&mut payload)?;
+        upsert_internal_entry(&mut entries, &split.sep_key, split.right_child);
+        let (left_bytes, right_bytes, promoted_key) =
+            split_internal_entries(first_child, &entries, payload_len)?;
+
+        let right_internal_id = self.bf.write_new_block(&right_bytes)?;
+        self.bf.write_block(node_id, &left_bytes)?;
+        Ok(Some(SplitInfo {
+            sep_key: promoted_key,
+            right_child: right_internal_id,
+        }))
     }
+}
+
+#[derive(Debug, Clone)]
+/// A split propagated upward during recursive insert.
+///
+/// The caller must insert `sep_key -> right_child` into its internal page.
+///
+/// `sep_key` is the minimum key in `right_child` (the new right sibling).
+struct SplitInfo {
+    sep_key: Vec<u8>,
+    right_child: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,7 +254,7 @@ fn page_type(payload: &[u8]) -> Result<PageType, WrongoDBError> {
 }
 
 fn init_root_if_missing(bf: &mut BlockFile) -> Result<(), WrongoDBError> {
-    if bf.header.root_block_id != 0 {
+    if bf.header.root_block_id != NONE_BLOCK_ID {
         return Ok(());
     }
     let payload_len = bf.page_size - 4;
@@ -221,6 +290,37 @@ fn upsert_entry(entries: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &[u8], value: &[u8])
     match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
         Ok(i) => entries[i].1 = value.to_vec(),
         Err(i) => entries.insert(i, (key.to_vec(), value.to_vec())),
+    }
+}
+
+fn internal_entries(buf: &mut [u8]) -> Result<(u64, Vec<(Vec<u8>, u64)>), WrongoDBError> {
+    let internal =
+        InternalPage::open(buf).map_err(|e| StorageError(format!("corrupt internal: {e}")))?;
+    let first_child = internal
+        .first_child()
+        .map_err(|e| StorageError(format!("corrupt internal: {e}")))?;
+    let n = internal
+        .slot_count()
+        .map_err(|e| StorageError(format!("corrupt internal: {e}")))?;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push((
+            internal
+                .key_at(i)
+                .map_err(|e| StorageError(format!("corrupt internal: {e}")))?
+                .to_vec(),
+            internal
+                .child_at(i)
+                .map_err(|e| StorageError(format!("corrupt internal: {e}")))?,
+        ));
+    }
+    Ok((first_child, out))
+}
+
+fn upsert_internal_entry(entries: &mut Vec<(Vec<u8>, u64)>, key: &[u8], child: u64) {
+    match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+        Ok(i) => entries[i].1 = child,
+        Err(i) => entries.insert(i, (key.to_vec(), child)),
     }
 }
 
@@ -274,3 +374,337 @@ fn build_leaf_page(
     Ok(bytes)
 }
 
+/// Split an internal node into (left_bytes, right_bytes, promoted_key).
+///
+/// We choose a separator entry at `promote_idx` to **promote** to the parent, and build left/right
+/// internal pages on either side:
+///
+/// ```text
+/// first_child = c0
+/// entries = [(k0->c1), (k1->c2), (k2->c3), (k3->c4)]
+///
+/// promote_idx = 2  (promote k2->c3)
+///
+/// LEFT:
+///   first_child = c0
+///   entries = [(k0->c1), (k1->c2)]
+///
+/// RIGHT:
+///   first_child = c3        (the promoted entry's child)
+///   entries = [(k3->c4)]
+///
+/// parent inserts: (k2 -> RIGHT_NODE_ID)
+/// ```
+///
+/// The implementation tries indices near the midpoint until both rebuilt pages fit in `payload_len`.
+fn split_internal_entries(
+    first_child: u64,
+    entries: &[(Vec<u8>, u64)],
+    payload_len: usize,
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), WrongoDBError> {
+    if entries.is_empty() {
+        return Err(StorageError("cannot split internal with 0 separators".into()).into());
+    }
+
+    let mid = entries.len() / 2;
+    let mut candidates = Vec::new();
+    for delta in 0..entries.len() {
+        let a = mid.saturating_sub(delta);
+        let b = mid + delta;
+        if a < entries.len() {
+            candidates.push(a);
+        }
+        if b < entries.len() && b != a {
+            candidates.push(b);
+        }
+    }
+    candidates.dedup();
+
+    for promote_idx in candidates {
+        let promoted_key = entries[promote_idx].0.clone();
+        let right_first_child = entries[promote_idx].1;
+        let left_entries = &entries[..promote_idx];
+        let right_entries = &entries[(promote_idx + 1)..];
+
+        let left = build_internal_page(first_child, left_entries, payload_len);
+        let right = build_internal_page(right_first_child, right_entries, payload_len);
+        if let (Ok(l), Ok(r)) = (left, right) {
+            return Ok((l, r, promoted_key));
+        }
+    }
+
+    Err(StorageError("internal split impossible (record too large?)".into()).into())
+}
+
+fn build_internal_page(
+    first_child: u64,
+    entries: &[(Vec<u8>, u64)],
+    payload_len: usize,
+) -> Result<Vec<u8>, WrongoDBError> {
+    let mut bytes = vec![0u8; payload_len];
+    let mut page = InternalPage::init(&mut bytes, first_child).map_err(map_internal_err)?;
+    for (k, child) in entries {
+        page.put_separator(k, *child).map_err(map_internal_err)?;
+    }
+    Ok(bytes)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CursorFrame {
+    internal_id: u64,
+    child_idx: usize,
+}
+
+/// Ordered range iterator over the B+tree (start inclusive, end exclusive).
+///
+/// Notes:
+/// - Leaves are not linked (no sibling pointers), so advancing to the next leaf uses a parent stack.
+///
+/// Graphically:
+/// ```text
+/// current leaf exhausted
+///   -> climb stack until a parent has a "next child"
+///   -> go to that next child subtree
+///   -> descend leftmost to the next leaf
+/// ```
+struct BTreeRangeIter<'a> {
+    bf: Option<&'a mut BlockFile>,
+    end: Option<Vec<u8>>,
+    stack: Vec<CursorFrame>,
+    leaf_id: u64,
+    leaf_payload: Vec<u8>,
+    slot_idx: usize,
+    done: bool,
+}
+
+impl<'a> BTreeRangeIter<'a> {
+    fn empty() -> Self {
+        Self {
+            bf: None,
+            end: None,
+            stack: Vec::new(),
+            leaf_id: 0,
+            leaf_payload: Vec::new(),
+            slot_idx: 0,
+            done: true,
+        }
+    }
+
+    fn new(
+        bf: &'a mut BlockFile,
+        root: u64,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Self, WrongoDBError> {
+        let mut it = Self {
+            bf: Some(bf),
+            end: end.map(|b| b.to_vec()),
+            stack: Vec::new(),
+            leaf_id: 0,
+            leaf_payload: Vec::new(),
+            slot_idx: 0,
+            done: false,
+        };
+        it.seek(root, start)?;
+        Ok(it)
+    }
+
+    fn bf_mut(&mut self) -> Result<&mut BlockFile, WrongoDBError> {
+        self.bf
+            .as_deref_mut()
+            .ok_or_else(|| StorageError("range iterator has no backing BlockFile".into()).into())
+    }
+
+    fn seek(&mut self, root: u64, start: Option<&[u8]>) -> Result<(), WrongoDBError> {
+        self.stack.clear();
+        let mut node_id = root;
+        loop {
+            let mut payload = self.bf_mut()?.read_block(node_id, true)?;
+            match page_type(&payload)? {
+                PageType::Leaf => {
+                    let leaf = LeafPage::open(&mut payload)
+                        .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
+                    let slot_idx = if let Some(start_key) = start {
+                        leaf_lower_bound(&leaf, start_key).map_err(map_leaf_err)?
+                    } else {
+                        0
+                    };
+                    self.leaf_id = node_id;
+                    self.leaf_payload = payload;
+                    self.slot_idx = slot_idx;
+                    return Ok(());
+                }
+                PageType::Internal => {
+                    let internal = InternalPage::open(&mut payload)
+                        .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
+                    let child_idx = if let Some(start_key) = start {
+                        internal_child_index_for_key(&internal, start_key).map_err(map_internal_err)?
+                    } else {
+                        0
+                    };
+                    let child_id = internal_child_at(&internal, child_idx).map_err(map_internal_err)?;
+                    self.stack.push(CursorFrame {
+                        internal_id: node_id,
+                        child_idx,
+                    });
+                    node_id = child_id;
+                }
+            }
+        }
+    }
+
+    fn advance_to_next_leaf(&mut self) -> Result<bool, WrongoDBError> {
+        while let Some(frame) = self.stack.pop() {
+            let mut payload = self.bf_mut()?.read_block(frame.internal_id, true)?;
+            let internal = InternalPage::open(&mut payload).map_err(|e| {
+                StorageError(format!("corrupt internal {}: {e}", frame.internal_id))
+            })?;
+
+            let slots = internal.slot_count().map_err(map_internal_err)?;
+            let children_count = slots + 1;
+            if frame.child_idx + 1 >= children_count {
+                continue;
+            }
+
+            let next_child_idx = frame.child_idx + 1;
+            let next_child_id =
+                internal_child_at(&internal, next_child_idx).map_err(map_internal_err)?;
+            self.stack.push(CursorFrame {
+                internal_id: frame.internal_id,
+                child_idx: next_child_idx,
+            });
+            self.descend_leftmost(next_child_id)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn descend_leftmost(&mut self, start_id: u64) -> Result<(), WrongoDBError> {
+        let mut node_id = start_id;
+        loop {
+            let payload = self.bf_mut()?.read_block(node_id, true)?;
+            match page_type(&payload)? {
+                PageType::Leaf => {
+                    self.leaf_id = node_id;
+                    self.leaf_payload = payload;
+                    self.slot_idx = 0;
+                    return Ok(());
+                }
+                PageType::Internal => {
+                    let mut payload = payload;
+                    let internal = InternalPage::open(&mut payload)
+                        .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
+                    let child_id = internal.first_child().map_err(map_internal_err)?;
+                    self.stack.push(CursorFrame {
+                        internal_id: node_id,
+                        child_idx: 0,
+                    });
+                    node_id = child_id;
+                }
+            }
+        }
+    }
+}
+
+impl<'a> Iterator for BTreeRangeIter<'a> {
+    type Item = Result<(Vec<u8>, Vec<u8>), WrongoDBError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+
+        loop {
+            let mut leaf_payload = std::mem::take(&mut self.leaf_payload);
+            let leaf = match LeafPage::open(&mut leaf_payload) {
+                Ok(v) => v,
+                Err(e) => return Some(Err(StorageError(format!("corrupt leaf {}: {e}", self.leaf_id)).into())),
+            };
+
+            let slot_count = match leaf.slot_count() {
+                Ok(v) => v,
+                Err(e) => return Some(Err(map_leaf_err(e))),
+            };
+
+            if self.slot_idx < slot_count {
+                let k = match leaf.key_at(self.slot_idx) {
+                    Ok(v) => v.to_vec(),
+                    Err(e) => return Some(Err(map_leaf_err(e))),
+                };
+                if let Some(end) = &self.end {
+                    if k.as_slice() >= end.as_slice() {
+                        self.done = true;
+                        self.leaf_payload = leaf_payload;
+                        return None;
+                    }
+                }
+                let v = match leaf.value_at(self.slot_idx) {
+                    Ok(v) => v.to_vec(),
+                    Err(e) => return Some(Err(map_leaf_err(e))),
+                };
+                self.slot_idx += 1;
+                self.leaf_payload = leaf_payload;
+                return Some(Ok((k, v)));
+            }
+
+            self.leaf_payload = leaf_payload;
+            match self.advance_to_next_leaf() {
+                Ok(true) => continue,
+                Ok(false) => {
+                    self.done = true;
+                    return None;
+                }
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
+}
+
+fn leaf_lower_bound(leaf: &LeafPage<'_>, key: &[u8]) -> Result<usize, LeafPageError> {
+    let n = leaf.slot_count()?;
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let mid_key = leaf.key_at(mid)?;
+        if mid_key < key {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+fn internal_child_index_for_key(
+    internal: &InternalPage<'_>,
+    key: &[u8],
+) -> Result<usize, InternalPageError> {
+    let n = internal.slot_count()?;
+    if n == 0 {
+        return Ok(0);
+    }
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let mid_key = internal.key_at(mid)?;
+        if mid_key <= key {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+fn internal_child_at(internal: &InternalPage<'_>, child_idx: usize) -> Result<u64, InternalPageError> {
+    if child_idx == 0 {
+        internal.first_child()
+    } else {
+        internal.child_at(child_idx - 1)
+    }
+}

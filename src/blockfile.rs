@@ -13,7 +13,7 @@ const DEFAULT_PAGE_SIZE: usize = 4096;
 const MAGIC: [u8; 8] = *b"MMWT0001";
 const VERSION: u16 = 1;
 const HEADER_PAD_SIZE: usize = 64;
-const NONE_BLOCK_ID: u64 = 0;
+pub const NONE_BLOCK_ID: u64 = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
