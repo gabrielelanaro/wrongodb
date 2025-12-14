@@ -526,7 +526,7 @@ mod tests {
 
         let mut bf = BlockFile::create(&path, 512).unwrap();
         let block = bf.allocate_block().unwrap();
-        let payload_len = bf.page_size - 4;
+        let payload_len = bf.page_payload_len();
         let mut page_bytes = vec![0u8; payload_len];
         {
             let mut page = LeafPage::init(&mut page_bytes).unwrap();

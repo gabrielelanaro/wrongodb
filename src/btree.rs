@@ -1,9 +1,11 @@
 use std::path::Path;
 
+mod pager;
+
 use crate::errors::StorageError;
+use self::pager::Pager;
 use crate::{
-    BlockFile, InternalPage, InternalPageError, LeafPage, LeafPageError, WrongoDBError,
-    NONE_BLOCK_ID,
+    InternalPage, InternalPageError, LeafPage, LeafPageError, WrongoDBError, NONE_BLOCK_ID,
 };
 
 const PAGE_TYPE_LEAF: u8 = 1;
@@ -11,30 +13,30 @@ const PAGE_TYPE_INTERNAL: u8 = 2;
 
 #[derive(Debug)]
 pub struct BTree {
-    bf: BlockFile,
+    pager: Pager,
 }
 
 impl BTree {
     pub fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
-        let mut bf = BlockFile::create(path, page_size)?;
-        init_root_if_missing(&mut bf)?;
-        Ok(Self { bf })
+        let mut pager = Pager::create(path, page_size)?;
+        init_root_if_missing(&mut pager)?;
+        Ok(Self { pager })
     }
 
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, WrongoDBError> {
-        let mut bf = BlockFile::open(path)?;
-        init_root_if_missing(&mut bf)?;
-        Ok(Self { bf })
+        let mut pager = Pager::open(path)?;
+        init_root_if_missing(&mut pager)?;
+        Ok(Self { pager })
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, WrongoDBError> {
-        let mut node_id = self.bf.header.root_block_id;
+        let mut node_id = self.pager.root_page_id();
         if node_id == NONE_BLOCK_ID {
             return Ok(None);
         }
 
         loop {
-            let mut payload = self.bf.read_block(node_id, true)?;
+            let mut payload = self.pager.read_page(node_id)?;
             match page_type(&payload)? {
                 PageType::Leaf => {
                     let leaf = LeafPage::open(&mut payload)
@@ -53,14 +55,14 @@ impl BTree {
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
-        let root = self.bf.header.root_block_id;
+        let root = self.pager.root_page_id();
         if root == NONE_BLOCK_ID {
             return Err(StorageError("btree missing root".into()).into());
         }
 
         let split = self.insert_recursive(root, key, value)?;
         if let Some(split) = split {
-            let payload_len = self.bf.page_size - 4;
+            let payload_len = self.pager.page_payload_len();
             let mut root_internal_bytes = vec![0u8; payload_len];
             {
                 let mut internal = InternalPage::init(&mut root_internal_bytes, root)
@@ -70,14 +72,14 @@ impl BTree {
                     .map_err(map_internal_err)?;
             }
 
-            let new_root_id = self.bf.write_new_block(&root_internal_bytes)?;
-            self.bf.set_root_block_id(new_root_id)?;
+            let new_root_id = self.pager.write_new_page(&root_internal_bytes)?;
+            self.pager.set_root_page_id(new_root_id)?;
         }
         Ok(())
     }
 
     pub fn sync_all(&mut self) -> Result<(), WrongoDBError> {
-        self.bf.sync_all()
+        self.pager.sync_all()
     }
 
     pub fn range(
@@ -86,11 +88,11 @@ impl BTree {
         end: Option<&[u8]>,
     ) -> Result<impl Iterator<Item = Result<(Vec<u8>, Vec<u8>), WrongoDBError>> + '_, WrongoDBError>
     {
-        let root = self.bf.header.root_block_id;
+        let root = self.pager.root_page_id();
         if root == NONE_BLOCK_ID {
             return Ok(BTreeRangeIter::empty());
         }
-        Ok(BTreeRangeIter::new(&mut self.bf, root, start, end)?)
+        Ok(BTreeRangeIter::new(&mut self.pager, root, start, end)?)
     }
 
     /// Insert into the subtree rooted at `node_id`.
@@ -116,7 +118,7 @@ impl BTree {
         key: &[u8],
         value: &[u8],
     ) -> Result<Option<SplitInfo>, WrongoDBError> {
-        let payload = self.bf.read_block(node_id, true)?;
+        let payload = self.pager.read_page(node_id)?;
         match page_type(&payload)? {
             PageType::Leaf => self.insert_into_leaf(node_id, payload, key, value),
             PageType::Internal => self.insert_into_internal(node_id, payload, key, value),
@@ -146,7 +148,7 @@ impl BTree {
                 .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
             match leaf.put(key, value) {
                 Ok(()) => {
-                    self.bf.write_block(node_id, &payload)?;
+                    self.pager.write_page(node_id, &payload)?;
                     return Ok(None);
                 }
                 Err(LeafPageError::PageFull) => { /* split below */ }
@@ -159,8 +161,8 @@ impl BTree {
         upsert_entry(&mut entries, key, value);
         let (left_bytes, right_bytes, split_key) = split_leaf_entries(&entries, payload_len)?;
 
-        let right_leaf_id = self.bf.write_new_block(&right_bytes)?;
-        self.bf.write_block(node_id, &left_bytes)?;
+        let right_leaf_id = self.pager.write_new_page(&right_bytes)?;
+        self.pager.write_page(node_id, &left_bytes)?;
         Ok(Some(SplitInfo {
             sep_key: split_key,
             right_child: right_leaf_id,
@@ -202,7 +204,7 @@ impl BTree {
                 .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
             match internal.put_separator(&split.sep_key, split.right_child) {
                 Ok(()) => {
-                    self.bf.write_block(node_id, &payload)?;
+                    self.pager.write_page(node_id, &payload)?;
                     return Ok(None);
                 }
                 Err(InternalPageError::PageFull) => { /* split below */ }
@@ -216,8 +218,8 @@ impl BTree {
         let (left_bytes, right_bytes, promoted_key) =
             split_internal_entries(first_child, &entries, payload_len)?;
 
-        let right_internal_id = self.bf.write_new_block(&right_bytes)?;
-        self.bf.write_block(node_id, &left_bytes)?;
+        let right_internal_id = self.pager.write_new_page(&right_bytes)?;
+        self.pager.write_page(node_id, &left_bytes)?;
         Ok(Some(SplitInfo {
             sep_key: promoted_key,
             right_child: right_internal_id,
@@ -253,15 +255,15 @@ fn page_type(payload: &[u8]) -> Result<PageType, WrongoDBError> {
     }
 }
 
-fn init_root_if_missing(bf: &mut BlockFile) -> Result<(), WrongoDBError> {
-    if bf.header.root_block_id != NONE_BLOCK_ID {
+fn init_root_if_missing(pager: &mut Pager) -> Result<(), WrongoDBError> {
+    if pager.root_page_id() != NONE_BLOCK_ID {
         return Ok(());
     }
-    let payload_len = bf.page_size - 4;
+    let payload_len = pager.page_payload_len();
     let mut leaf_bytes = vec![0u8; payload_len];
     LeafPage::init(&mut leaf_bytes).map_err(map_leaf_err)?;
-    let leaf_id = bf.write_new_block(&leaf_bytes)?;
-    bf.set_root_block_id(leaf_id)?;
+    let leaf_id = pager.write_new_page(&leaf_bytes)?;
+    pager.set_root_page_id(leaf_id)?;
     Ok(())
 }
 
@@ -468,7 +470,7 @@ struct CursorFrame {
 ///   -> descend leftmost to the next leaf
 /// ```
 struct BTreeRangeIter<'a> {
-    bf: Option<&'a mut BlockFile>,
+    pager: Option<&'a mut Pager>,
     end: Option<Vec<u8>>,
     stack: Vec<CursorFrame>,
     leaf_id: u64,
@@ -480,7 +482,7 @@ struct BTreeRangeIter<'a> {
 impl<'a> BTreeRangeIter<'a> {
     fn empty() -> Self {
         Self {
-            bf: None,
+            pager: None,
             end: None,
             stack: Vec::new(),
             leaf_id: 0,
@@ -491,13 +493,13 @@ impl<'a> BTreeRangeIter<'a> {
     }
 
     fn new(
-        bf: &'a mut BlockFile,
+        pager: &'a mut Pager,
         root: u64,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Self, WrongoDBError> {
         let mut it = Self {
-            bf: Some(bf),
+            pager: Some(pager),
             end: end.map(|b| b.to_vec()),
             stack: Vec::new(),
             leaf_id: 0,
@@ -509,17 +511,17 @@ impl<'a> BTreeRangeIter<'a> {
         Ok(it)
     }
 
-    fn bf_mut(&mut self) -> Result<&mut BlockFile, WrongoDBError> {
-        self.bf
+    fn pager_mut(&mut self) -> Result<&mut Pager, WrongoDBError> {
+        self.pager
             .as_deref_mut()
-            .ok_or_else(|| StorageError("range iterator has no backing BlockFile".into()).into())
+            .ok_or_else(|| StorageError("range iterator has no backing Pager".into()).into())
     }
 
     fn seek(&mut self, root: u64, start: Option<&[u8]>) -> Result<(), WrongoDBError> {
         self.stack.clear();
         let mut node_id = root;
         loop {
-            let mut payload = self.bf_mut()?.read_block(node_id, true)?;
+            let mut payload = self.pager_mut()?.read_page(node_id)?;
             match page_type(&payload)? {
                 PageType::Leaf => {
                     let leaf = LeafPage::open(&mut payload)
@@ -555,7 +557,7 @@ impl<'a> BTreeRangeIter<'a> {
 
     fn advance_to_next_leaf(&mut self) -> Result<bool, WrongoDBError> {
         while let Some(frame) = self.stack.pop() {
-            let mut payload = self.bf_mut()?.read_block(frame.internal_id, true)?;
+            let mut payload = self.pager_mut()?.read_page(frame.internal_id)?;
             let internal = InternalPage::open(&mut payload).map_err(|e| {
                 StorageError(format!("corrupt internal {}: {e}", frame.internal_id))
             })?;
@@ -582,7 +584,7 @@ impl<'a> BTreeRangeIter<'a> {
     fn descend_leftmost(&mut self, start_id: u64) -> Result<(), WrongoDBError> {
         let mut node_id = start_id;
         loop {
-            let payload = self.bf_mut()?.read_block(node_id, true)?;
+            let payload = self.pager_mut()?.read_page(node_id)?;
             match page_type(&payload)? {
                 PageType::Leaf => {
                     self.leaf_id = node_id;

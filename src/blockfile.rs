@@ -84,6 +84,10 @@ pub struct BlockFile {
 }
 
 impl BlockFile {
+    pub(crate) fn page_payload_len(&self) -> usize {
+        self.page_size - CHECKSUM_SIZE
+    }
+
     pub fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
