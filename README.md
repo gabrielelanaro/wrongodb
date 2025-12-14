@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="WrongoDB logo" width="280" />
+</p>
+
 # WrongoDB
 
 A tiny, learning-oriented MongoDB-like store written in Rust.
