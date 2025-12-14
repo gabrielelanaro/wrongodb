@@ -203,3 +203,68 @@ child (u64 LE)       // block id of child_{i+1}
 
 **Why**
 - Eliminates “magic number” checks (`== 0`) around root pointers and free-list links, making intent explicit and reducing the chance of accidentally treating block `0` (the header page) as a data block.
+
+## 2025-12-14: Use `RefCell<BTree>` for primary `_id` lookups (Slice F)
+
+**Decision**
+- Keep `WrongoDB::find_one(&self, ...)` as-is and wrap the primary B+tree handle in `RefCell<BTree>` so primary lookups can call `BTree::get(&mut self, ...)` without making read APIs `&mut self`.
+
+**Why**
+- `BTree::get` requires `&mut self` today because the pager ultimately uses `std::fs::File::seek`, and `seek` is `&mut File` in Rust (moving the file cursor is a mutation).
+- Slice F wants `_id` lookups to hit the primary index while keeping the existing engine API ergonomics (read operations should not require `mut db`).
+- This is the smallest change that preserves the current public API while we wire in a persistent primary index.
+
+**Tradeoffs**
+- **Pros**
+  - No public API break: callers keep using `find_one(&self, ...)`.
+  - Minimal code churn: no need to redesign `BlockFile`/`Pager` I/O yet.
+- **Cons**
+  - Borrowing rules move from compile-time to runtime for the primary tree:
+    - `RefCell` will panic on illegal re-entrant borrows (e.g., nested mutable borrows).
+    - We should keep `borrow_mut()` scopes tight (borrow, do the `get`, drop).
+  - Not thread-safe: if we ever want to share a `WrongoDB` across threads, we’ll need a `Mutex`/`RwLock` (or a different I/O model).
+
+**Alternatives considered**
+- Change read APIs to `&mut self` (e.g., `find_one(&mut self, ...)`): simplest mechanically, but breaks ergonomics and public API expectations.
+- Switch paging reads to positioned I/O (pread-style) or `mmap`: could allow `BTree::get(&self)`, but is a larger redesign and more platform-sensitive.
+- Wrap the pager/tree in `Mutex`/`RwLock`: thread-safe, but heavier and unnecessary for the current single-threaded design.
+
+**Mental model**
+```
+WrongoDB owns the BTree,
+but find_one(&self) only has a shared reference to WrongoDB.
+
+We need:  &mut BTree  (because File::seek mutates the cursor)
+We have:  &WrongoDB
+
+RefCell lets us do a runtime-checked temporary &mut to the BTree.
+```
+
+## 2025-12-14: Mongo-like `_id` defaults and uniqueness (Slice F)
+
+**Decision**
+- Default `_id` generation uses an **ObjectId-like** 24-hex string (12 bytes rendered as lower-case hex) instead of a UUID string.
+- Enforce `_id` uniqueness:
+  - `insert_one` returns an error if the `_id` already exists.
+  - `open()` fails if the append-only log contains duplicate `_id` values.
+- Primary-key encoding preserves embedded document key order (no key sorting) to better match MongoDB’s “field order matters” semantics.
+
+**Why**
+- MongoDB uses `_id` as the primary key with a unique index; duplicate inserts should fail.
+- MongoDB’s default `_id` is `ObjectId`, not UUID.
+- MongoDB’s comparison and equality semantics treat embedded-document field order as significant; key-sorting would incorrectly merge distinct `_id` values.
+
+**Tradeoffs**
+- We store documents as JSON, not BSON, so this is still a best-effort approximation:
+  - JSON number types don’t preserve BSON numeric types (int32/int64/double/decimal), so our “1 vs 1.0” normalization is heuristic.
+  - We represent ObjectId as a hex string (no dedicated ObjectId type in the document model yet).
+- Failing `open()` on duplicate `_id` is strict; it treats such logs as corrupted/invalid (matching MongoDB invariants).
+
+## 2025-12-14: Remove `MiniMongo` public alias
+
+**Decision**
+- Remove the public `MiniMongo` type alias and expose only `WrongoDB` as the engine entry point.
+
+**Why**
+- The crate and engine are named `wrongodb`; keeping a `MiniMongo` alias was confusing and no longer reflects the project naming.
+- Reduces API surface area and avoids “two names for the same thing” in examples and docs.

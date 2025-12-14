@@ -43,3 +43,26 @@ fn rebuilds_index_from_disk_on_open() {
     assert_eq!(bobs.len(), 1);
 }
 
+#[test]
+fn find_one_by_id_hits_primary_index() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("db.log");
+
+    let mut db = WrongoDB::open(&path, ["name"], false).unwrap();
+    let alice = db.insert_one(json!({"name": "alice"})).unwrap();
+    let bob = db.insert_one(json!({"name": "bob"})).unwrap();
+
+    let bob_id = bob.get("_id").unwrap().clone();
+    let got = db.find_one(Some(json!({"_id": bob_id}))).unwrap().unwrap();
+    assert_eq!(got.get("_id").unwrap(), bob.get("_id").unwrap());
+    assert_eq!(got.get("name").unwrap().as_str().unwrap(), "bob");
+
+    // Re-open and ensure the primary index is rebuilt from the append-only log.
+    drop(db);
+    let db2 = WrongoDB::open(&path, ["name"], false).unwrap();
+    let got2 = db2
+        .find_one(Some(json!({"_id": alice.get("_id").unwrap().clone()})))
+        .unwrap()
+        .unwrap();
+    assert_eq!(got2.get("name").unwrap().as_str().unwrap(), "alice");
+}
