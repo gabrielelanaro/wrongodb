@@ -1,5 +1,8 @@
 # WrongoDB: a tiny wrong database (on purpose)
 
+![WrongoDB Hero Image](images/wrongodb_hero.png)
+
+
 So. I’m building a small MongoDB-like store in Rust.
 
 Is it going to replace MongoDB? No.
@@ -27,6 +30,11 @@ WrongoDB starts with "store documents somewhere." Then it progresses, one thin s
 - **Pages** as a unit of IO,
 - A **B+tree** implementation,
 - And finally: **WAL (Write Ahead Log) + checkpoints**.
+
+![WrongoDB Architecture](images/wrongodb_architecture.png)
+
+Here’s the rough mental model I’m carrying right now. That diagram is deliberately “too neat”. Real designs loop back. They have background work. They have compaction, reconciliation, eviction, and all the machinery you only notice once you’re in trouble. But as a learning scaffold? It’s perfect.
+
 
 We need to get to the point where we have this structure with the WAL and the B-tree properly responding to the "storage engine questions":
 
