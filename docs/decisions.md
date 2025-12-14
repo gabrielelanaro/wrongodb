@@ -130,3 +130,48 @@ value bytes (vlen)
 **References**
 - PostgreSQL storage page layout: https://www.postgresql.org/docs/current/storage-page-layout.html
 - SQLite database file format (B-tree pages): https://www.sqlite.org/fileformat2.html
+
+## 2025-12-14: 2-level B+tree internal-root format + root persistence (Slice D)
+
+**Decision**
+- Introduce an **internal page** format (`page_type = 2`) for Slice D (root + leaf pages only).
+- Store the tree’s current root block id in the file header’s `root_block_id`, and persist updates via a new API: `BlockFile::set_root_block_id(u64)`.
+- Root can point at either a **leaf page** (`page_type = 1`) or an **internal page** (`page_type = 2`); on the first leaf split we *promote* the root to an internal page.
+
+**Why**
+- Slice D needs durable routing from root → leaf pages, so an on-disk internal node format is required.
+- Persisting `root_block_id` in the header provides a stable “entry point” for recovery and later slices (WAL/checkpoint will evolve this to root-swap patterns).
+- Keeping the initial tree as a single leaf until the first split keeps the bootstrapping simple.
+
+**Internal page semantics (separator keys)**
+- The internal page stores **separator keys** that represent the **minimum key** of each child *after the first*.
+- Header stores `first_child` (child pointer for keys smaller than the first separator).
+- Each slot stores `(sep_key_i, child_{i+1})` and applies for keys in `[sep_key_i, next_sep_key)` (or to the end for the last separator).
+- When a leaf splits into left+right, we insert a new separator key equal to the **first key of the new right leaf**, with `child = right_leaf_block_id`.
+
+**On-page layout**
+- Like leaf pages, the internal page uses a slotted layout: slot directory grows forward, records pack from the end.
+- Header (`HEADER_SIZE = 16` bytes):
+```
+byte 0: page_type (u8) = 2 (internal)
+byte 1: flags (u8)     = 0 (reserved)
+byte 2: slot_count (u16)
+byte 4: lower (u16)  = HEADER_SIZE + slot_count * SLOT_SIZE
+byte 6: upper (u16)  = start of packed record bytes (grows downward)
+byte 8: first_child (u64) - child pointer for keys < key_at(0)
+```
+- Slot (`SLOT_SIZE = 4` bytes), stored in sorted separator-key order:
+```
+offset (u16): record start within the page payload
+len    (u16): record length in bytes
+```
+- Record bytes:
+```
+klen (u16)
+vlen (u16) = 8
+key bytes (klen)     // separator key
+child (u64 LE)       // block id of child_{i+1}
+```
+
+**Notes**
+- Slice D intentionally does **not** split internal pages; if the root internal page runs out of space for more separators, inserts must fail with a “root full” error until Slice E adds height growth.

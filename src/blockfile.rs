@@ -173,6 +173,12 @@ impl BlockFile {
         Ok(())
     }
 
+    pub fn set_root_block_id(&mut self, root_block_id: u64) -> Result<(), WrongoDBError> {
+        self.header.root_block_id = root_block_id;
+        self.write_header()?;
+        Ok(())
+    }
+
     pub fn allocate_block(&mut self) -> Result<u64, WrongoDBError> {
         let head = self.header.free_list_head;
         if head != NONE_BLOCK_ID {
