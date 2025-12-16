@@ -1,0 +1,42 @@
+# cargo-deny configuration for WrongoDB
+# Checks for security vulnerabilities and license issues
+
+[advisories]
+# The lint level for crates.io published advisories
+yanked = "warn"
+ignore = []
+
+[licenses]
+# List of explicitly allowed licenses
+# https://spdx.org/licenses/
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+]
+# Deny crates which do not have a detectable license
+[licenses.private]
+ignore = false
+
+[bans]
+# Lint level for when multiple versions of the same package are detected
+multiple-versions = "warn"
+# Lint level for when a crate version requirement is `*`
+wildcards = "allow"
+highlight = "all"
+# The graph highlighting used when creating dotgraphs for crates
+workspace-default-features = "warn"
+external-default-features = "warn"
+
+[sources]
+# Lint level for what to happen when a crate from a crate registry that is
+# not in the allow list is encountered
+unknown-registry = "warn"
+# Lint level for what to happen when a crate from a git repository that is not
+# in the allow list is encountered
+unknown-git = "warn"

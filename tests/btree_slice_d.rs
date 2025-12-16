@@ -1,6 +1,6 @@
 use tempfile::tempdir;
 
-use wrongodb::{BlockFile, BTree, InternalPage};
+use wrongodb::{BTree, BlockFile, InternalPage};
 
 #[test]
 fn splits_root_leaf_into_internal_root() {
@@ -66,4 +66,3 @@ fn multiple_leaf_splits_update_root_separators() {
     assert!(slots >= 2);
     bf.close().unwrap();
 }
-

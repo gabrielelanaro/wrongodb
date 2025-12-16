@@ -27,6 +27,8 @@ A tiny, learning-oriented MongoDB-like store written in Rust.
 This repo evolves step by step. Check [PLAN.md](PLAN.md) to see where we are going (WiredTiger-inspired storage engine).
 
 ### Quickstart
+
+#### As a Library
 ```rust
 use serde_json::json;
 use wrongodb::WrongoDB;
@@ -41,6 +43,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+#### As a Server
+For interactive usage with mongosh, see [Server Documentation](docs/server.md).
 
 Run tests with `cargo test`.
 

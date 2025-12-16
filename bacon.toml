@@ -1,0 +1,21 @@
+# Bacon configuration for WrongoDB
+# Watches for file changes and runs just targets
+
+[jobs.check]
+command = ["just", "check"]
+need_stdout = false
+
+[jobs.test]
+command = ["just", "test"]
+need_stdout = false
+
+[jobs.clippy]
+command = ["just", "clippy"]
+need_stdout = false
+
+[jobs.fmt]
+command = ["just", "fmt"]
+need_stdout = false
+
+# Default job when running bacon
+default_job = "check"

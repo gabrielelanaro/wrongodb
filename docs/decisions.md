@@ -202,7 +202,7 @@ child (u64 LE)       // block id of child_{i+1}
 - Expose `NONE_BLOCK_ID` as a public constant so code can avoid using raw `0` when representing “no block / null pointer”.
 
 **Why**
-- Eliminates “magic number” checks (`== 0`) around root pointers and free-list links, making intent explicit and reducing the chance of accidentally treating block `0` (the header page) as a data block.
+- Eliminates "magic number" checks (`== 0`) around root pointers and free-list links, making intent explicit and reducing the chance of accidentally treating block `0` (the header page) as a data block.
 
 ## 2025-12-14: Use `RefCell<BTree>` for primary `_id` lookups (Slice F)
 
@@ -222,7 +222,7 @@ child (u64 LE)       // block id of child_{i+1}
   - Borrowing rules move from compile-time to runtime for the primary tree:
     - `RefCell` will panic on illegal re-entrant borrows (e.g., nested mutable borrows).
     - We should keep `borrow_mut()` scopes tight (borrow, do the `get`, drop).
-  - Not thread-safe: if we ever want to share a `WrongoDB` across threads, we’ll need a `Mutex`/`RwLock` (or a different I/O model).
+  - Not thread-safe: if we ever want to share a `WrongoDB` across threads, we'll need a `Mutex`/`RwLock` (or a different I/O model).
 
 **Alternatives considered**
 - Change read APIs to `&mut self` (e.g., `find_one(&mut self, ...)`): simplest mechanically, but breaks ergonomics and public API expectations.
@@ -247,16 +247,16 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - Enforce `_id` uniqueness:
   - `insert_one` returns an error if the `_id` already exists.
   - `open()` fails if the append-only log contains duplicate `_id` values.
-- Primary-key encoding preserves embedded document key order (no key sorting) to better match MongoDB’s “field order matters” semantics.
+- Primary-key encoding preserves embedded document key order (no key sorting) to better match MongoDB's "field order matters" semantics.
 
 **Why**
 - MongoDB uses `_id` as the primary key with a unique index; duplicate inserts should fail.
-- MongoDB’s default `_id` is `ObjectId`, not UUID.
-- MongoDB’s comparison and equality semantics treat embedded-document field order as significant; key-sorting would incorrectly merge distinct `_id` values.
+- MongoDB's default `_id` is `ObjectId`, not UUID.
+- MongoDB's comparison and equality semantics treat embedded-document field order as significant; key-sorting would incorrectly merge distinct `_id` values.
 
 **Tradeoffs**
 - We store documents as JSON, not BSON, so this is still a best-effort approximation:
-  - JSON number types don’t preserve BSON numeric types (int32/int64/double/decimal), so our “1 vs 1.0” normalization is heuristic.
+  - JSON number types don't preserve BSON numeric types (int32/int64/double/decimal), so our "1 vs 1.0" normalization is heuristic.
   - We represent ObjectId as a hex string (no dedicated ObjectId type in the document model yet).
 - Failing `open()` on duplicate `_id` is strict; it treats such logs as corrupted/invalid (matching MongoDB invariants).
 
@@ -267,4 +267,17 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 
 **Why**
 - The crate and engine are named `wrongodb`; keeping a `MiniMongo` alias was confusing and no longer reflects the project naming.
-- Reduces API surface area and avoids “two names for the same thing” in examples and docs.
+- Reduces API surface area and avoids "two names for the same thing" in examples and docs.
+
+## 2025-12-16: MongoDB wire protocol server with extensible command dispatch
+
+**Decision**
+- Implement MongoDB wire protocol (OP_MSG with document sequences, OP_QUERY/OP_REPLY for legacy) with a **Command trait + CommandRegistry** for O(1) dispatch.
+- Support multi-collection CRUD: `insert` (auto `_id`), `find` (filter/skip/limit), `update` (`$set`/`$unset`/`$inc`/`$push`/`$pull`), `delete`, plus `count`, `distinct`, and basic aggregation (`$match`/`$limit`/`$skip`/`$project`).
+- Command handlers in `src/commands/handlers/{connection,database,crud,index,cursor,aggregation}.rs`.
+
+**Why**
+- Enables mongosh and Rust driver connectivity with proper OP_MSG framing and `_id` materialization.
+- Trait-based dispatch replaces a monolithic if-else chain, making new commands easy to add.
+
+**Gaps** (future work): query operators (`$gt`/`$lt`/`$in`), sorting, projection, cursor batching, persistent indexes, transactions, auth.
