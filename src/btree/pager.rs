@@ -8,10 +8,7 @@ pub(super) struct Pager {
 }
 
 impl Pager {
-    pub(super) fn create<P: AsRef<Path>>(
-        path: P,
-        page_size: usize,
-    ) -> Result<Self, WrongoDBError> {
+    pub(super) fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
         Ok(Self {
             bf: BlockFile::create(path, page_size)?,
         })
@@ -31,10 +28,7 @@ impl Pager {
         self.bf.header.root_block_id
     }
 
-    pub(super) fn set_root_page_id(
-        &mut self,
-        root_page_id: u64,
-    ) -> Result<(), WrongoDBError> {
+    pub(super) fn set_root_page_id(&mut self, root_page_id: u64) -> Result<(), WrongoDBError> {
         self.bf.set_root_block_id(root_page_id)
     }
 
@@ -42,11 +36,7 @@ impl Pager {
         self.bf.read_block(page_id, true)
     }
 
-    pub(super) fn write_page(
-        &mut self,
-        page_id: u64,
-        payload: &[u8],
-    ) -> Result<(), WrongoDBError> {
+    pub(super) fn write_page(&mut self, page_id: u64, payload: &[u8]) -> Result<(), WrongoDBError> {
         self.bf.write_block(page_id, payload)
     }
 

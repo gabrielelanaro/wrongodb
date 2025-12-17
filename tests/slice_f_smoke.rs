@@ -42,11 +42,9 @@ fn slice_f_primary_id_smoke() {
 
     // 4) Embedded-doc field order matters for `_id` (Mongo-like):
     // `{a:1,b:2}` and `{b:2,a:1}` should be treated as distinct ids.
-    db
-        .insert_one(json!({"_id": {"a": 1, "b": 2}, "name": "order1"}))
+    db.insert_one(json!({"_id": {"a": 1, "b": 2}, "name": "order1"}))
         .unwrap();
-    db
-        .insert_one(json!({"_id": {"b": 2, "a": 1}, "name": "order2"}))
+    db.insert_one(json!({"_id": {"b": 2, "a": 1}, "name": "order2"}))
         .unwrap();
 
     let got_order1 = db

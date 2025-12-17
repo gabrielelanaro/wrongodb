@@ -72,7 +72,11 @@ fn checksum_mismatch_detected() {
     bf.close().unwrap();
 
     // Corrupt a byte in the payload of block 1 (known to be block_id==1).
-    let mut fh = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    let mut fh = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
     fh.seek(SeekFrom::Start(b1 * 512 + 4)).unwrap();
     let mut b = [0u8; 1];
     let _ = fh.read(&mut b).unwrap();

@@ -75,10 +75,25 @@ impl InMemoryIndex {
             .unwrap_or_default()
     }
 
+    pub fn remove(&mut self, doc: &serde_json::Map<String, Value>, offset: u64) {
+        for field in self.fields.iter() {
+            let Some(value) = doc.get(field) else {
+                continue;
+            };
+            let Some(key) = ScalarKey::from_value(value) else {
+                continue;
+            };
+            if let Some(field_index) = self.index.get_mut(field) {
+                if let Some(offsets) = field_index.get_mut(&key) {
+                    offsets.remove(&offset);
+                }
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
         for values in self.index.values_mut() {
             values.clear();
         }
     }
 }
-

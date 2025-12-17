@@ -13,6 +13,15 @@ pub enum WrongoDBError {
 
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("bson serialization error: {0}")]
+    Bson(#[from] bson::ser::Error),
+
+    #[error("bson deserialization error: {0}")]
+    BsonDe(#[from] bson::de::Error),
+
+    #[error("protocol error: {0}")]
+    Protocol(String),
 }
 
 #[derive(Debug, Error)]
@@ -22,4 +31,3 @@ pub struct DocumentValidationError(pub String);
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub struct StorageError(pub String);
-

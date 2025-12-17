@@ -2,8 +2,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::{Document, WrongoDBError};
 use crate::errors::StorageError;
+use crate::{Document, WrongoDBError};
 
 #[derive(Debug)]
 pub struct AppendOnlyStorage {
@@ -74,4 +74,3 @@ impl AppendOnlyStorage {
         Ok(results)
     }
 }
-

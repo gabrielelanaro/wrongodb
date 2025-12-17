@@ -1,6 +1,6 @@
 use tempfile::tempdir;
 
-use wrongodb::{BlockFile, BTree, InternalPage, NONE_BLOCK_ID};
+use wrongodb::{BTree, BlockFile, InternalPage, NONE_BLOCK_ID};
 
 fn internal_levels(path: &std::path::Path) -> usize {
     let mut bf = BlockFile::open(path).unwrap();

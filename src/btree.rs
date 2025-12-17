@@ -2,11 +2,40 @@ use std::path::Path;
 
 mod pager;
 
-use crate::errors::StorageError;
 use self::pager::Pager;
+use crate::errors::StorageError;
 use crate::{
     InternalPage, InternalPageError, LeafPage, LeafPageError, WrongoDBError, NONE_BLOCK_ID,
 };
+
+// Type aliases for B-tree operations to clarify intent and reduce complexity
+
+/// Represents a key in the B-tree (stored as bytes)
+type Key = Vec<u8>;
+
+/// Represents a value in the B-tree (stored as bytes)
+type Value = Vec<u8>;
+
+/// Represents serialized page data (stored as bytes)
+type PageData = Vec<u8>;
+
+/// A key-value pair for leaf node entries
+type KeyValuePair = (Key, Value);
+
+/// A key-child ID pair for internal node separators
+type KeyChildId = (Key, u64);
+
+/// Collection of key-value pairs from a leaf page
+type LeafEntries = Vec<KeyValuePair>;
+
+/// Internal page entries: (first_child_id, separators as key-child pairs)
+type InternalEntries = (u64, Vec<KeyChildId>);
+
+/// Result of splitting a page: (left_page_data, separator_key, right_page_data)
+type SplitResult = (PageData, Key, PageData);
+
+/// Iterator over key-value pairs, yielding results or errors
+type KeyValueIter<'a> = BTreeRangeIter<'a>;
 
 const PAGE_TYPE_LEAF: u8 = 1;
 const PAGE_TYPE_INTERNAL: u8 = 2;
@@ -41,7 +70,7 @@ impl BTree {
                 PageType::Leaf => {
                     let leaf = LeafPage::open(&mut payload)
                         .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
-                    return Ok(leaf.get(key).map_err(map_leaf_err)?);
+                    return leaf.get(key).map_err(map_leaf_err);
                 }
                 PageType::Internal => {
                     let internal = InternalPage::open(&mut payload)
@@ -86,13 +115,13 @@ impl BTree {
         &mut self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
-    ) -> Result<impl Iterator<Item = Result<(Vec<u8>, Vec<u8>), WrongoDBError>> + '_, WrongoDBError>
+    ) -> Result<KeyValueIter<'_>, WrongoDBError>
     {
         let root = self.pager.root_page_id();
         if root == NONE_BLOCK_ID {
             return Ok(BTreeRangeIter::empty());
         }
-        Ok(BTreeRangeIter::new(&mut self.pager, root, start, end)?)
+        BTreeRangeIter::new(&mut self.pager, root, start, end)
     }
 
     /// Insert into the subtree rooted at `node_id`.
@@ -275,7 +304,7 @@ fn map_internal_err(e: InternalPageError) -> WrongoDBError {
     StorageError(e.to_string()).into()
 }
 
-fn leaf_entries(buf: &mut [u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
+fn leaf_entries(buf: &mut [u8]) -> Result<LeafEntries, WrongoDBError> {
     let leaf = LeafPage::open(buf).map_err(|e| StorageError(format!("corrupt leaf: {e}")))?;
     let n = leaf.slot_count().map_err(map_leaf_err)?;
     let mut out = Vec::with_capacity(n);
@@ -295,7 +324,7 @@ fn upsert_entry(entries: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &[u8], value: &[u8])
     }
 }
 
-fn internal_entries(buf: &mut [u8]) -> Result<(u64, Vec<(Vec<u8>, u64)>), WrongoDBError> {
+fn internal_entries(buf: &mut [u8]) -> Result<InternalEntries, WrongoDBError> {
     let internal =
         InternalPage::open(buf).map_err(|e| StorageError(format!("corrupt internal: {e}")))?;
     let first_child = internal
@@ -329,7 +358,7 @@ fn upsert_internal_entry(entries: &mut Vec<(Vec<u8>, u64)>, key: &[u8], child: u
 fn split_leaf_entries(
     entries: &[(Vec<u8>, Vec<u8>)],
     payload_len: usize,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), WrongoDBError> {
+) -> Result<SplitResult, WrongoDBError> {
     if entries.len() < 2 {
         return Err(StorageError("cannot split leaf with <2 entries".into()).into());
     }
@@ -403,7 +432,7 @@ fn split_internal_entries(
     first_child: u64,
     entries: &[(Vec<u8>, u64)],
     payload_len: usize,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), WrongoDBError> {
+) -> Result<SplitResult, WrongoDBError> {
     if entries.is_empty() {
         return Err(StorageError("cannot split internal with 0 separators".into()).into());
     }
@@ -469,7 +498,7 @@ struct CursorFrame {
 ///   -> go to that next child subtree
 ///   -> descend leftmost to the next leaf
 /// ```
-struct BTreeRangeIter<'a> {
+pub struct BTreeRangeIter<'a> {
     pager: Option<&'a mut Pager>,
     end: Option<Vec<u8>>,
     stack: Vec<CursorFrame>,
@@ -540,11 +569,13 @@ impl<'a> BTreeRangeIter<'a> {
                     let internal = InternalPage::open(&mut payload)
                         .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
                     let child_idx = if let Some(start_key) = start {
-                        internal_child_index_for_key(&internal, start_key).map_err(map_internal_err)?
+                        internal_child_index_for_key(&internal, start_key)
+                            .map_err(map_internal_err)?
                     } else {
                         0
                     };
-                    let child_id = internal_child_at(&internal, child_idx).map_err(map_internal_err)?;
+                    let child_id =
+                        internal_child_at(&internal, child_idx).map_err(map_internal_err)?;
                     self.stack.push(CursorFrame {
                         internal_id: node_id,
                         child_idx,
@@ -620,7 +651,13 @@ impl<'a> Iterator for BTreeRangeIter<'a> {
             let mut leaf_payload = std::mem::take(&mut self.leaf_payload);
             let leaf = match LeafPage::open(&mut leaf_payload) {
                 Ok(v) => v,
-                Err(e) => return Some(Err(StorageError(format!("corrupt leaf {}: {e}", self.leaf_id)).into())),
+                Err(e) => {
+                    return Some(Err(StorageError(format!(
+                        "corrupt leaf {}: {e}",
+                        self.leaf_id
+                    ))
+                    .into()))
+                }
             };
 
             let slot_count = match leaf.slot_count() {
@@ -703,7 +740,10 @@ fn internal_child_index_for_key(
     Ok(lo)
 }
 
-fn internal_child_at(internal: &InternalPage<'_>, child_idx: usize) -> Result<u64, InternalPageError> {
+fn internal_child_at(
+    internal: &InternalPage<'_>,
+    child_idx: usize,
+) -> Result<u64, InternalPageError> {
     if child_idx == 0 {
         internal.first_child()
     } else {

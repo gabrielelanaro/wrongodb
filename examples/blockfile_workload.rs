@@ -215,22 +215,20 @@ fn main() {
     } else {
         match BlockFile::open(&args.path) {
             Ok(v) => v,
-            Err(e) => {
-                match args.mode {
-                    Mode::Write => {
-                        eprintln!(
-                            "failed to open existing file {:?} as a BlockFile: {e}\n\
+            Err(e) => match args.mode {
+                Mode::Write => {
+                    eprintln!(
+                        "failed to open existing file {:?} as a BlockFile: {e}\n\
 Hint: omit `--reuse` (default behavior) to recreate it as a block file format.",
-                            args.path
-                        );
-                        std::process::exit(2);
-                    }
-                    Mode::Read => {
-                        eprintln!("failed to open block file at {:?}: {e}", args.path);
-                        std::process::exit(2);
-                    }
+                        args.path
+                    );
+                    std::process::exit(2);
                 }
-            }
+                Mode::Read => {
+                    eprintln!("failed to open block file at {:?}: {e}", args.path);
+                    std::process::exit(2);
+                }
+            },
         }
     };
 
@@ -271,11 +269,10 @@ Hint: omit `--reuse` (default behavior) to recreate it as a block file format.",
     let mut traced = 0u64;
 
     for i in 0..args.ops {
-        let block_id = 1
-            + match args.pattern {
-                Pattern::Seq => i % range,
-                Pattern::Rand => xorshift64(&mut rng_state) % range,
-            };
+        let block_id = 1 + match args.pattern {
+            Pattern::Seq => i % range,
+            Pattern::Rand => xorshift64(&mut rng_state) % range,
+        };
         let offset = block_id.saturating_mul(bf.page_size as u64);
 
         if args.trace_every != 0 && (i % args.trace_every == 0) && traced < args.trace_limit {

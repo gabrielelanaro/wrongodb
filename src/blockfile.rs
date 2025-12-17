@@ -48,9 +48,7 @@ impl FileHeader {
             return Err(StorageError("header struct too large".into()).into());
         }
         buf.resize(HEADER_PAD_SIZE, 0);
-        Ok(buf
-            .try_into()
-            .expect("resized to exactly HEADER_PAD_SIZE"))
+        Ok(buf.try_into().expect("resized to exactly HEADER_PAD_SIZE"))
     }
 
     pub fn unpack(buf: &[u8]) -> Result<Self, WrongoDBError> {
@@ -273,7 +271,7 @@ impl BlockFile {
     }
 
     pub fn read_block(&mut self, block_id: u64, verify: bool) -> Result<Vec<u8>, WrongoDBError> {
-        let offset = (block_id as u64)
+        let offset = block_id
             .checked_mul(self.page_size as u64)
             .ok_or_else(|| StorageError("block offset overflow".into()))?;
 
@@ -315,7 +313,7 @@ impl BlockFile {
             .into());
         }
 
-        let offset = (block_id as u64)
+        let offset = block_id
             .checked_mul(self.page_size as u64)
             .ok_or_else(|| StorageError("block offset overflow".into()))?;
 

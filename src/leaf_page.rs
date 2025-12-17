@@ -131,7 +131,9 @@ impl<'a> LeafPage<'a> {
 
         let slot_count = self.slot_count()?;
         if idx > slot_count {
-            return Err(LeafPageError::Corrupt("insertion index out of bounds".into()));
+            return Err(LeafPageError::Corrupt(
+                "insertion index out of bounds".into(),
+            ));
         }
 
         // Shift slots right to make room for the new slot while preserving sorted-by-key order.
@@ -250,9 +252,7 @@ impl<'a> LeafPage<'a> {
         }
         let t = read_u8(self.buf, 0)?;
         if t != PAGE_TYPE_LEAF {
-            return Err(LeafPageError::Corrupt(format!(
-                "unexpected page type: {t}"
-            )));
+            return Err(LeafPageError::Corrupt(format!("unexpected page type: {t}")));
         }
         let slot_count = self.slot_count()?;
         let lower = self.lower()?;
@@ -317,7 +317,9 @@ impl<'a> LeafPage<'a> {
         let off = read_u16(self.buf, base)? as usize;
         let len = read_u16(self.buf, base + 2)? as usize;
         if off < HEADER_SIZE {
-            return Err(LeafPageError::Corrupt(format!("record offset too small: {off}")));
+            return Err(LeafPageError::Corrupt(format!(
+                "record offset too small: {off}"
+            )));
         }
         if off + len > self.buf.len() {
             return Err(LeafPageError::Corrupt(format!(
@@ -397,17 +399,13 @@ impl<'a> LeafPage<'a> {
     }
 
     fn write_record(&mut self, off: usize, key: &[u8], value: &[u8]) -> Result<(), LeafPageError> {
-        let klen_u16 = u16::try_from(key.len()).map_err(|_| {
-            LeafPageError::Corrupt(format!("key too large: {}", key.len()))
-        })?;
-        let vlen_u16 = u16::try_from(value.len()).map_err(|_| {
-            LeafPageError::Corrupt(format!("value too large: {}", value.len()))
-        })?;
+        let klen_u16 = u16::try_from(key.len())
+            .map_err(|_| LeafPageError::Corrupt(format!("key too large: {}", key.len())))?;
+        let vlen_u16 = u16::try_from(value.len())
+            .map_err(|_| LeafPageError::Corrupt(format!("value too large: {}", value.len())))?;
 
         if off + RECORD_HEADER_SIZE + key.len() + value.len() > self.buf.len() {
-            return Err(LeafPageError::Corrupt(
-                "write_record out of bounds".into(),
-            ));
+            return Err(LeafPageError::Corrupt("write_record out of bounds".into()));
         }
 
         {

@@ -114,7 +114,7 @@ impl<'a> InternalPage<'a> {
         // Each slot points to a record holding `(separator_key, child_pointer)`.
         let n = self.slot_count()?;
         if n == 0 {
-            return Ok(self.first_child()?);
+            return self.first_child();
         }
 
         // Find the first separator key > `key` (upper bound), then pick the previous child.
@@ -161,7 +161,9 @@ impl<'a> InternalPage<'a> {
 
         let slot_count = self.slot_count()?;
         if idx > slot_count {
-            return Err(InternalPageError::Corrupt("insertion index out of bounds".into()));
+            return Err(InternalPageError::Corrupt(
+                "insertion index out of bounds".into(),
+            ));
         }
 
         if idx < slot_count {
@@ -305,7 +307,9 @@ impl<'a> InternalPage<'a> {
         let off = read_u16(self.buf, base)? as usize;
         let len = read_u16(self.buf, base + 2)? as usize;
         if off < HEADER_SIZE {
-            return Err(InternalPageError::Corrupt(format!("record offset too small: {off}")));
+            return Err(InternalPageError::Corrupt(format!(
+                "record offset too small: {off}"
+            )));
         }
         if off + len > self.buf.len() {
             return Err(InternalPageError::Corrupt(format!(
@@ -361,7 +365,9 @@ impl<'a> InternalPage<'a> {
     fn delete_at(&mut self, index: usize) -> Result<(), InternalPageError> {
         let slot_count = self.slot_count()?;
         if index >= slot_count {
-            return Err(InternalPageError::Corrupt("delete index out of bounds".into()));
+            return Err(InternalPageError::Corrupt(
+                "delete index out of bounds".into(),
+            ));
         }
         if index + 1 < slot_count {
             let slots_start = HEADER_SIZE;
@@ -375,10 +381,14 @@ impl<'a> InternalPage<'a> {
         Ok(())
     }
 
-    fn write_record(&mut self, off: usize, key: &[u8], child: u64) -> Result<(), InternalPageError> {
-        let klen_u16 = u16::try_from(key.len()).map_err(|_| {
-            InternalPageError::Corrupt(format!("key too large: {}", key.len()))
-        })?;
+    fn write_record(
+        &mut self,
+        off: usize,
+        key: &[u8],
+        child: u64,
+    ) -> Result<(), InternalPageError> {
+        let klen_u16 = u16::try_from(key.len())
+            .map_err(|_| InternalPageError::Corrupt(format!("key too large: {}", key.len())))?;
         let vlen_u16: u16 = 8;
 
         if off + RECORD_HEADER_SIZE + key.len() + 8 > self.buf.len() {
@@ -418,9 +428,7 @@ fn read_u8(buf: &[u8], off: usize) -> Result<u8, InternalPageError> {
 
 fn write_u8(buf: &mut [u8], off: usize, v: u8) -> Result<(), InternalPageError> {
     let Some(b) = buf.get_mut(off) else {
-        return Err(InternalPageError::Corrupt(
-            "write_u8 out of bounds".into(),
-        ));
+        return Err(InternalPageError::Corrupt("write_u8 out of bounds".into()));
     };
     *b = v;
     Ok(())
@@ -428,9 +436,7 @@ fn write_u8(buf: &mut [u8], off: usize, v: u8) -> Result<(), InternalPageError> 
 
 fn read_u16(buf: &[u8], off: usize) -> Result<u16, InternalPageError> {
     if off + 2 > buf.len() {
-        return Err(InternalPageError::Corrupt(
-            "read_u16 out of bounds".into(),
-        ));
+        return Err(InternalPageError::Corrupt("read_u16 out of bounds".into()));
     }
     let mut rdr = std::io::Cursor::new(&buf[off..(off + 2)]);
     rdr.read_u16::<LittleEndian>()
@@ -439,9 +445,7 @@ fn read_u16(buf: &[u8], off: usize) -> Result<u16, InternalPageError> {
 
 fn write_u16(buf: &mut [u8], off: usize, v: u16) -> Result<(), InternalPageError> {
     if off + 2 > buf.len() {
-        return Err(InternalPageError::Corrupt(
-            "write_u16 out of bounds".into(),
-        ));
+        return Err(InternalPageError::Corrupt("write_u16 out of bounds".into()));
     }
     let mut w = std::io::Cursor::new(&mut buf[off..(off + 2)]);
     w.write_u16::<LittleEndian>(v)
@@ -450,9 +454,7 @@ fn write_u16(buf: &mut [u8], off: usize, v: u16) -> Result<(), InternalPageError
 
 fn read_u64(buf: &[u8], off: usize) -> Result<u64, InternalPageError> {
     if off + 8 > buf.len() {
-        return Err(InternalPageError::Corrupt(
-            "read_u64 out of bounds".into(),
-        ));
+        return Err(InternalPageError::Corrupt("read_u64 out of bounds".into()));
     }
     let mut rdr = std::io::Cursor::new(&buf[off..(off + 8)]);
     rdr.read_u64::<LittleEndian>()
@@ -461,9 +463,7 @@ fn read_u64(buf: &[u8], off: usize) -> Result<u64, InternalPageError> {
 
 fn write_u64(buf: &mut [u8], off: usize, v: u64) -> Result<(), InternalPageError> {
     if off + 8 > buf.len() {
-        return Err(InternalPageError::Corrupt(
-            "write_u64 out of bounds".into(),
-        ));
+        return Err(InternalPageError::Corrupt("write_u64 out of bounds".into()));
     }
     let mut w = std::io::Cursor::new(&mut buf[off..(off + 8)]);
     w.write_u64::<LittleEndian>(v)
