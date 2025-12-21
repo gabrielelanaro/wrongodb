@@ -281,3 +281,22 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - Trait-based dispatch replaces a monolithic if-else chain, making new commands easy to add.
 
 **Gaps** (future work): query operators (`$gt`/`$lt`/`$in`), sorting, projection, cursor batching, persistent indexes, transactions, auth.
+
+## 2025-12-21: Proposed checkpoint-first durability via copy-on-write (Option B)
+
+**Status**
+- Proposed in OpenSpec change `add-checkpoint-cow` (not yet approved).
+
+**Decision (proposed)**
+- Use copy-on-write for page updates and keep a stable on-disk root until checkpoint commit.
+- Persist checkpoints via an atomic root swap using dual header slots with generation + CRC.
+- Recovery uses the last completed checkpoint; no WAL in this phase.
+- Do not persist retired-block lists yet; space leaks on crash are acceptable for now.
+- Checkpoints are explicit API calls in this phase (no implicit checkpoint per write).
+- For metadata/turtle integration, keep the header root pointing at the primary B+tree for now; when metadata/turtle is added, repoint the header root to the metadata root and store the primary root in the metadata table.
+
+**Why**
+- Delivers crash-consistent snapshots without introducing WAL complexity at this stage.
+
+**Notes**
+- Requires a file format bump and new rules for reclaiming retired blocks.
