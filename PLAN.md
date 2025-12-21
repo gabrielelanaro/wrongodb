@@ -45,9 +45,12 @@ Goal: evolve `wrongodb` from a JSONL append‑only toy into a simplified, **Wire
 - Leaf layout + slot directory.
 - In‑page `put/get/delete` until full, then raise `PageFull`.
 
-Status (2025-12-14)
+Status (2025-12-21)
 - Slice A/B/C are implemented.
 - Slice C lives in `src/leaf_page.rs` (slotted leaf page + `PageFull` + compaction-on-demand).
+- Slice D is implemented (2-level B+tree root + leaf splits).
+- Slice E is implemented (full B+tree height growth + range scan).
+- Slice F is implemented (primary `_id` B+tree lookups).
 
 ### Slice D: 2‑level B+tree
 - Root internal + leaf pages.
