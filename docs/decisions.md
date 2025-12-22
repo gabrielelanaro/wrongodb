@@ -316,3 +316,15 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 
 **Why**
 - Per-slot CRCs + generation counters enable safe root selection and fallback during torn header writes.
+
+## 2025-12-22: Copy-on-write B+tree updates allocate new blocks
+
+**Decision**
+- B+tree mutations never overwrite existing pages: every modified leaf/internal page is written to a new block.
+- Each insert returns a new subtree root id; the tree’s header root pointer is updated on every write.
+- When a node splits, both left and right siblings are new blocks; the parent rewrites its own page to point at the new child ids.
+- Old blocks are left in place (no reuse) until checkpoint retirement is implemented.
+
+**Why**
+- Preserves the last durable checkpoint’s reachable pages while allowing in-progress mutations to proceed safely.
+- Establishes the invariant needed for later “stable vs working root” and checkpoint commits.

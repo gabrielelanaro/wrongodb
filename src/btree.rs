@@ -89,13 +89,14 @@ impl BTree {
             return Err(StorageError("btree missing root".into()).into());
         }
 
-        let split = self.insert_recursive(root, key, value)?;
-        if let Some(split) = split {
+        let result = self.insert_recursive(root, key, value)?;
+        if let Some(split) = result.split {
             let payload_len = self.pager.page_payload_len();
             let mut root_internal_bytes = vec![0u8; payload_len];
             {
-                let mut internal = InternalPage::init(&mut root_internal_bytes, root)
-                    .map_err(|e| StorageError(format!("init new root internal failed: {e}")))?;
+                let mut internal =
+                    InternalPage::init(&mut root_internal_bytes, result.new_node_id)
+                        .map_err(|e| StorageError(format!("init new root internal failed: {e}")))?;
                 internal
                     .put_separator(&split.sep_key, split.right_child)
                     .map_err(map_internal_err)?;
@@ -103,6 +104,8 @@ impl BTree {
 
             let new_root_id = self.pager.write_new_page(&root_internal_bytes)?;
             self.pager.set_root_page_id(new_root_id)?;
+        } else {
+            self.pager.set_root_page_id(result.new_node_id)?;
         }
         Ok(())
     }
@@ -127,9 +130,9 @@ impl BTree {
     /// Insert into the subtree rooted at `node_id`.
     ///
     /// Returns:
-    /// - `Ok(None)` if the insert was fully absorbed by this subtree.
-    /// - `Ok(Some(split))` if this node split and the caller must insert a separator
-    ///   `(split.sep_key -> split.right_child)` into the parent.
+    /// - `Ok(InsertResult)` with the new subtree root id and an optional split.
+    ///   If `split` is `Some`, the caller must insert `(split.sep_key -> split.right_child)`
+    ///   into its parent, and `new_node_id` is the left sibling's id.
     ///
     /// Separator invariant (Slice D/E):
     /// - For any split producing left+right siblings, `sep_key` is the **minimum key** in the
@@ -146,7 +149,7 @@ impl BTree {
         node_id: u64,
         key: &[u8],
         value: &[u8],
-    ) -> Result<Option<SplitInfo>, WrongoDBError> {
+    ) -> Result<InsertResult, WrongoDBError> {
         let payload = self.pager.read_page(node_id)?;
         match page_type(&payload)? {
             PageType::Leaf => self.insert_into_leaf(node_id, payload, key, value),
@@ -171,14 +174,17 @@ impl BTree {
         mut payload: Vec<u8>,
         key: &[u8],
         value: &[u8],
-    ) -> Result<Option<SplitInfo>, WrongoDBError> {
+    ) -> Result<InsertResult, WrongoDBError> {
         {
             let mut leaf = LeafPage::open(&mut payload)
                 .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
             match leaf.put(key, value) {
                 Ok(()) => {
-                    self.pager.write_page(node_id, &payload)?;
-                    return Ok(None);
+                    let new_leaf_id = self.pager.write_new_page(&payload)?;
+                    return Ok(InsertResult {
+                        new_node_id: new_leaf_id,
+                        split: None,
+                    });
                 }
                 Err(LeafPageError::PageFull) => { /* split below */ }
                 Err(e) => return Err(map_leaf_err(e)),
@@ -190,12 +196,15 @@ impl BTree {
         upsert_entry(&mut entries, key, value);
         let (left_bytes, right_bytes, split_key) = split_leaf_entries(&entries, payload_len)?;
 
+        let left_leaf_id = self.pager.write_new_page(&left_bytes)?;
         let right_leaf_id = self.pager.write_new_page(&right_bytes)?;
-        self.pager.write_page(node_id, &left_bytes)?;
-        Ok(Some(SplitInfo {
-            sep_key: split_key,
-            right_child: right_leaf_id,
-        }))
+        Ok(InsertResult {
+            new_node_id: left_leaf_id,
+            split: Some(SplitInfo {
+                sep_key: split_key,
+                right_child: right_leaf_id,
+            }),
+        })
     }
 
     /// Insert into an internal page.
@@ -210,49 +219,50 @@ impl BTree {
     /// - `sep_key_i` is the **minimum key** of `child_{i+1}`.
     fn insert_into_internal(
         &mut self,
-        node_id: u64,
+        _node_id: u64,
         mut payload: Vec<u8>,
         key: &[u8],
         value: &[u8],
-    ) -> Result<Option<SplitInfo>, WrongoDBError> {
-        let child_id = {
-            let internal = InternalPage::open(&mut payload)
-                .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
-            internal
-                .child_for_key(key)
-                .map_err(|e| StorageError(format!("routing failed at {node_id}: {e}")))?
+    ) -> Result<InsertResult, WrongoDBError> {
+        let payload_len = payload.len();
+        let (mut first_child, mut entries) = internal_entries(&mut payload)?;
+        let child_idx = child_index_for_key(&entries, key);
+        let child_id = if child_idx == 0 {
+            first_child
+        } else {
+            entries[child_idx - 1].1
         };
 
-        let split = self.insert_recursive(child_id, key, value)?;
-        let Some(split) = split else {
-            return Ok(None);
-        };
-
-        {
-            let mut internal = InternalPage::open(&mut payload)
-                .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
-            match internal.put_separator(&split.sep_key, split.right_child) {
-                Ok(()) => {
-                    self.pager.write_page(node_id, &payload)?;
-                    return Ok(None);
-                }
-                Err(InternalPageError::PageFull) => { /* split below */ }
-                Err(e) => return Err(map_internal_err(e)),
-            }
+        let child_result = self.insert_recursive(child_id, key, value)?;
+        if child_idx == 0 {
+            first_child = child_result.new_node_id;
+        } else {
+            entries[child_idx - 1].1 = child_result.new_node_id;
         }
 
-        let payload_len = payload.len();
-        let (first_child, mut entries) = internal_entries(&mut payload)?;
-        upsert_internal_entry(&mut entries, &split.sep_key, split.right_child);
+        if let Some(split) = child_result.split {
+            upsert_internal_entry(&mut entries, &split.sep_key, split.right_child);
+        }
+
+        if let Ok(bytes) = build_internal_page(first_child, &entries, payload_len) {
+            let new_internal_id = self.pager.write_new_page(&bytes)?;
+            return Ok(InsertResult {
+                new_node_id: new_internal_id,
+                split: None,
+            });
+        }
+
         let (left_bytes, right_bytes, promoted_key) =
             split_internal_entries(first_child, &entries, payload_len)?;
-
+        let left_internal_id = self.pager.write_new_page(&left_bytes)?;
         let right_internal_id = self.pager.write_new_page(&right_bytes)?;
-        self.pager.write_page(node_id, &left_bytes)?;
-        Ok(Some(SplitInfo {
-            sep_key: promoted_key,
-            right_child: right_internal_id,
-        }))
+        Ok(InsertResult {
+            new_node_id: left_internal_id,
+            split: Some(SplitInfo {
+                sep_key: promoted_key,
+                right_child: right_internal_id,
+            }),
+        })
     }
 }
 
@@ -265,6 +275,12 @@ impl BTree {
 struct SplitInfo {
     sep_key: Vec<u8>,
     right_child: u64,
+}
+
+#[derive(Debug, Clone)]
+struct InsertResult {
+    new_node_id: u64,
+    split: Option<SplitInfo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,6 +369,17 @@ fn upsert_internal_entry(entries: &mut Vec<(Vec<u8>, u64)>, key: &[u8], child: u
         Ok(i) => entries[i].1 = child,
         Err(i) => entries.insert(i, (key.to_vec(), child)),
     }
+}
+
+fn child_index_for_key(entries: &[(Vec<u8>, u64)], key: &[u8]) -> usize {
+    let mut idx = 0;
+    for (i, (sep_key, _)) in entries.iter().enumerate() {
+        if key < sep_key.as_slice() {
+            break;
+        }
+        idx = i + 1;
+    }
+    idx
 }
 
 fn split_leaf_entries(
