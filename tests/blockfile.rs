@@ -3,6 +3,8 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use tempfile::tempdir;
 
+use crc32fast::Hasher;
+
 use wrongodb::{BlockFile, FileHeader};
 
 #[test]
@@ -126,4 +128,73 @@ fn create_on_existing_file_raises() {
     let err = BlockFile::create(&path, 4096).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("file already exists"));
+}
+
+#[test]
+fn checkpoint_slots_rotate_and_select_latest_on_open() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("test.wt");
+
+    let mut bf = BlockFile::create(&path, 512).unwrap();
+    let b1 = bf.allocate_block().unwrap();
+    let b2 = bf.allocate_block().unwrap();
+    bf.set_root_block_id(b1).unwrap();
+    bf.close().unwrap();
+
+    let mut bf2 = BlockFile::open(&path).unwrap();
+    assert_eq!(bf2.root_block_id(), b1);
+    assert_eq!(bf2.header.checkpoint_slots[1].root_block_id, b1);
+    assert!(bf2.header.checkpoint_slots[1].generation > bf2.header.checkpoint_slots[0].generation);
+    bf2.set_root_block_id(b2).unwrap();
+    bf2.close().unwrap();
+
+    let bf3 = BlockFile::open(&path).unwrap();
+    assert_eq!(bf3.root_block_id(), b2);
+    assert!(bf3.header.checkpoint_slots[0].generation > bf3.header.checkpoint_slots[1].generation);
+    bf3.close().unwrap();
+}
+
+#[test]
+fn checkpoint_slot_invalid_falls_back_to_previous() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("test.wt");
+
+    let mut bf = BlockFile::create(&path, 512).unwrap();
+    let b1 = bf.allocate_block().unwrap();
+    let b2 = bf.allocate_block().unwrap();
+    bf.set_root_block_id(b1).unwrap();
+    bf.set_root_block_id(b2).unwrap();
+    bf.close().unwrap();
+
+    let bf2 = BlockFile::open(&path).unwrap();
+    let mut header = bf2.header.clone();
+    bf2.close().unwrap();
+
+    header.checkpoint_slots[0].crc32 ^= 0xFFFF_FFFF;
+
+    let packed = header.pack().unwrap();
+    let max_payload = header.page_size as usize - 4;
+    let mut padded = vec![0u8; max_payload];
+    padded[..packed.len()].copy_from_slice(&packed);
+    let checksum = crc32(&padded);
+
+    let mut fh = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    fh.seek(SeekFrom::Start(0)).unwrap();
+    fh.write_all(&checksum.to_le_bytes()).unwrap();
+    fh.write_all(&padded).unwrap();
+    fh.flush().unwrap();
+
+    let bf3 = BlockFile::open(&path).unwrap();
+    assert_eq!(bf3.root_block_id(), b1);
+    bf3.close().unwrap();
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut hasher = Hasher::new();
+    hasher.update(data);
+    hasher.finalize()
 }

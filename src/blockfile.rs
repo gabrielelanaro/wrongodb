@@ -130,9 +130,33 @@ pub struct BlockFile {
     file: File,
     pub header: FileHeader,
     pub page_size: usize,
+    active_checkpoint_slot: usize,
 }
 
 impl BlockFile {
+    fn select_checkpoint_slot(header: &FileHeader) -> Result<usize, WrongoDBError> {
+        let mut best_idx: Option<usize> = None;
+        let mut best_gen = 0u64;
+        for (idx, slot) in header.checkpoint_slots.iter().enumerate() {
+            if !slot.is_valid() {
+                continue;
+            }
+            match best_idx {
+                None => {
+                    best_idx = Some(idx);
+                    best_gen = slot.generation;
+                }
+                Some(_) if slot.generation > best_gen => {
+                    best_idx = Some(idx);
+                    best_gen = slot.generation;
+                }
+                _ => {}
+            }
+        }
+
+        best_idx.ok_or_else(|| StorageError("no valid checkpoint slots found".into()).into())
+    }
+
     pub(crate) fn page_payload_len(&self) -> usize {
         self.page_size - CHECKSUM_SIZE
     }
@@ -165,12 +189,14 @@ impl BlockFile {
 
         write_header_page(&mut file, &header, page_size)?;
         file.sync_all()?;
+        let active_checkpoint_slot = Self::select_checkpoint_slot(&header)?;
 
         Ok(Self {
             path,
             file,
             header,
             page_size,
+            active_checkpoint_slot,
         })
     }
 
@@ -213,11 +239,13 @@ impl BlockFile {
             return Err(StorageError("header checksum mismatch".into()).into());
         }
 
+        let active_checkpoint_slot = Self::select_checkpoint_slot(&header)?;
         Ok(Self {
             path,
             file,
             header,
             page_size,
+            active_checkpoint_slot,
         })
     }
 
@@ -227,17 +255,20 @@ impl BlockFile {
     }
 
     pub fn root_block_id(&self) -> u64 {
-        self.header.checkpoint_slots[0].root_block_id
+        self.header.checkpoint_slots[self.active_checkpoint_slot].root_block_id
     }
 
     pub fn set_root_block_id(&mut self, root_block_id: u64) -> Result<(), WrongoDBError> {
-        let slot = &mut self.header.checkpoint_slots[0];
-        let mut next_gen = slot.generation.wrapping_add(1);
+        let current_slot = self.active_checkpoint_slot;
+        let next_slot = (current_slot + 1) % CHECKPOINT_SLOT_COUNT;
+        let current_gen = self.header.checkpoint_slots[current_slot].generation;
+        let mut next_gen = current_gen.wrapping_add(1);
         if next_gen == 0 {
             next_gen = 1;
         }
-        slot.update(root_block_id, next_gen);
+        self.header.checkpoint_slots[next_slot].update(root_block_id, next_gen);
         self.write_header()?;
+        self.active_checkpoint_slot = next_slot;
         Ok(())
     }
 
