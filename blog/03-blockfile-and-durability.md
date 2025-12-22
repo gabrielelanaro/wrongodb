@@ -11,17 +11,7 @@ We need a way to map our tree onto the disk. This is the hierarchy of a storage 
 2.  **Pages:** The fixed-size byte arrays (e.g., 4KB) that serialize a node.
 3.  **Blocks:** The physical sections in a file where pages live.
 
-```text
-       [ Node A ]      [ Node B ]      <-- Logical Tree
-           |               |
-           v               v
-       [ Page 1 ]      [ Page 5 ]      <-- Serialized Bytes
-           |               |
-           v               v
-+--------+--------+--...--+--------+
-| Header | Block1 |  ...  | Block5 |   <-- Physical BlockFile
-+--------+--------+--...--+--------+
-```
+![Bplustree](images/bplustree.png)
 
 This post is about the **BlockFile**: the machinery that gives our B+Tree a physical place to live.
 
@@ -81,6 +71,14 @@ When the database starts:
 2. It deserializes the header.
 3. It finds `root_block_id`.
 4. It loads that block as the root of the B+Tree.
+
+```text
+[ Page 0: Header ]                         [ Page 42: Root Node ]
++---------------------+                    +--------------------+
+| magic: "MMWT..."    |      seek(42)      | [ "alice" ]        |
+| root_block_id: 42   | -----------------> | [ "bob"   ]        |
++---------------------+                    +--------------------+
+```
 
 Here is what the header structure looks like in Rust (from [`src/blockfile.rs`](https://github.com/gabrielelanaro/wrongodb/blob/main/src/blockfile.rs)):
 
