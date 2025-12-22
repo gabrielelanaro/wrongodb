@@ -11,27 +11,60 @@ use crate::WrongoDBError;
 const CHECKSUM_SIZE: usize = 4;
 const DEFAULT_PAGE_SIZE: usize = 4096;
 const MAGIC: [u8; 8] = *b"MMWT0001";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const HEADER_PAD_SIZE: usize = 64;
+const CHECKPOINT_SLOT_COUNT: usize = 2;
+const CHECKPOINT_SLOT_SIZE: usize = 8 + 8 + 4;
+const HEADER_MIN_SIZE: usize = 8 + 2 + 4 + 8 + (CHECKPOINT_SLOT_COUNT * CHECKPOINT_SLOT_SIZE);
 pub const NONE_BLOCK_ID: u64 = 0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointSlot {
+    pub root_block_id: u64,
+    pub generation: u64,
+    pub crc32: u32,
+}
+
+impl CheckpointSlot {
+    pub fn new(root_block_id: u64, generation: u64) -> Self {
+        let crc32 = checkpoint_slot_crc(root_block_id, generation);
+        Self {
+            root_block_id,
+            generation,
+            crc32,
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.crc32 == checkpoint_slot_crc(self.root_block_id, self.generation)
+    }
+
+    pub fn update(&mut self, root_block_id: u64, generation: u64) {
+        self.root_block_id = root_block_id;
+        self.generation = generation;
+        self.crc32 = checkpoint_slot_crc(root_block_id, generation);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
     pub magic: [u8; 8],
     pub version: u16,
     pub page_size: u32,
-    pub root_block_id: u64,
     pub free_list_head: u64,
+    pub checkpoint_slots: [CheckpointSlot; CHECKPOINT_SLOT_COUNT],
 }
 
 impl Default for FileHeader {
     fn default() -> Self {
+        let slot0 = CheckpointSlot::new(NONE_BLOCK_ID, 1);
+        let slot1 = CheckpointSlot::new(NONE_BLOCK_ID, 0);
         Self {
             magic: MAGIC,
             version: VERSION,
             page_size: DEFAULT_PAGE_SIZE as u32,
-            root_block_id: NONE_BLOCK_ID,
             free_list_head: NONE_BLOCK_ID,
+            checkpoint_slots: [slot0, slot1],
         }
     }
 }
@@ -42,8 +75,12 @@ impl FileHeader {
         buf.extend_from_slice(&self.magic);
         buf.write_u16::<LittleEndian>(self.version)?;
         buf.write_u32::<LittleEndian>(self.page_size)?;
-        buf.write_u64::<LittleEndian>(self.root_block_id)?;
         buf.write_u64::<LittleEndian>(self.free_list_head)?;
+        for slot in &self.checkpoint_slots {
+            buf.write_u64::<LittleEndian>(slot.root_block_id)?;
+            buf.write_u64::<LittleEndian>(slot.generation)?;
+            buf.write_u32::<LittleEndian>(slot.crc32)?;
+        }
         if buf.len() > HEADER_PAD_SIZE {
             return Err(StorageError("header struct too large".into()).into());
         }
@@ -52,7 +89,7 @@ impl FileHeader {
     }
 
     pub fn unpack(buf: &[u8]) -> Result<Self, WrongoDBError> {
-        if buf.len() < 8 + 2 + 4 + 8 + 8 {
+        if buf.len() < HEADER_MIN_SIZE {
             return Err(StorageError("header buffer too small".into()).into());
         }
 
@@ -61,14 +98,28 @@ impl FileHeader {
         rdr.read_exact(&mut magic)?;
         let version = rdr.read_u16::<LittleEndian>()?;
         let page_size = rdr.read_u32::<LittleEndian>()?;
-        let root_block_id = rdr.read_u64::<LittleEndian>()?;
         let free_list_head = rdr.read_u64::<LittleEndian>()?;
+        let mut checkpoint_slots = [CheckpointSlot {
+            root_block_id: NONE_BLOCK_ID,
+            generation: 0,
+            crc32: 0,
+        }; CHECKPOINT_SLOT_COUNT];
+        for slot in &mut checkpoint_slots {
+            let root_block_id = rdr.read_u64::<LittleEndian>()?;
+            let generation = rdr.read_u64::<LittleEndian>()?;
+            let crc32 = rdr.read_u32::<LittleEndian>()?;
+            *slot = CheckpointSlot {
+                root_block_id,
+                generation,
+                crc32,
+            };
+        }
         Ok(Self {
             magic,
             version,
             page_size,
-            root_block_id,
             free_list_head,
+            checkpoint_slots,
         })
     }
 }
@@ -175,8 +226,17 @@ impl BlockFile {
         Ok(())
     }
 
+    pub fn root_block_id(&self) -> u64 {
+        self.header.checkpoint_slots[0].root_block_id
+    }
+
     pub fn set_root_block_id(&mut self, root_block_id: u64) -> Result<(), WrongoDBError> {
-        self.header.root_block_id = root_block_id;
+        let slot = &mut self.header.checkpoint_slots[0];
+        let mut next_gen = slot.generation.wrapping_add(1);
+        if next_gen == 0 {
+            next_gen = 1;
+        }
+        slot.update(root_block_id, next_gen);
         self.write_header()?;
         Ok(())
     }
@@ -337,6 +397,13 @@ impl BlockFile {
 fn crc32(data: &[u8]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(data);
+    hasher.finalize()
+}
+
+fn checkpoint_slot_crc(root_block_id: u64, generation: u64) -> u32 {
+    let mut hasher = Hasher::new();
+    hasher.update(&root_block_id.to_le_bytes());
+    hasher.update(&generation.to_le_bytes());
     hasher.finalize()
 }
 

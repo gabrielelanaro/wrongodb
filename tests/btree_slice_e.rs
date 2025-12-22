@@ -4,7 +4,7 @@ use wrongodb::{BTree, BlockFile, InternalPage, NONE_BLOCK_ID};
 
 fn internal_levels(path: &std::path::Path) -> usize {
     let mut bf = BlockFile::open(path).unwrap();
-    let mut node_id = bf.header.root_block_id;
+    let mut node_id = bf.root_block_id();
     assert!(node_id != NONE_BLOCK_ID);
 
     let mut levels = 0usize;

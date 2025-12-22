@@ -17,7 +17,7 @@
 - On-disk header uses `u64` block pointers with `0` meaning “none” (block 0 is reserved for the header page).
 - Free space reuse is currently a persisted **singly-linked free list** of block IDs (simple Slice B mechanism).
 
-**Current on-disk layout (Slice A/B)**
+**Current on-disk layout (checkpoint metadata v2)**
 ```
 ====================== file ======================+
 | page 0 | page 1 | page 2 | page 3 | ... | page N|
@@ -30,8 +30,13 @@ page 0 (header page):
                        | magic[8]                      |
                        | version(u16)                  |
                        | page_size(u32)                |
-                       | root_block_id(u64)            |
                        | free_list_head(u64)           |
+                       | slot0.root_block_id(u64)      |
+                       | slot0.generation(u64)         |
+                       | slot0.crc32(u32)              |
+                       | slot1.root_block_id(u64)      |
+                       | slot1.generation(u64)         |
+                       | slot1.crc32(u32)              |
                        | ...zero padding...            |
                        +-------------------------------+
 
@@ -300,3 +305,14 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 
 **Notes**
 - Requires a file format bump and new rules for reclaiming retired blocks.
+
+## 2025-12-21: Header checkpoint slots (file format v2)
+
+**Decision**
+- Bump the blockfile header version to `2`.
+- Replace the single `root_block_id` header field with **two checkpoint slots**.
+- Each slot encodes `{root_block_id(u64), generation(u64), crc32(u32)}`; the slot CRC covers the little-endian bytes of `root_block_id` + `generation`.
+- Initialize slot 0 at generation `1` with `root_block_id = 0`, and slot 1 at generation `0` with `root_block_id = 0`.
+
+**Why**
+- Per-slot CRCs + generation counters enable safe root selection and fallback during torn header writes.

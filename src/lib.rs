@@ -10,7 +10,7 @@ mod leaf_page;
 mod server;
 mod storage;
 
-pub use crate::blockfile::{BlockFile, FileHeader, NONE_BLOCK_ID};
+pub use crate::blockfile::{BlockFile, CheckpointSlot, FileHeader, NONE_BLOCK_ID};
 pub use crate::btree::BTree;
 pub use crate::commands::CommandRegistry;
 pub use crate::engine::{DbStats, IndexInfo, UpdateResult, WrongoDB};

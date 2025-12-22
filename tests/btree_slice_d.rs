@@ -23,7 +23,7 @@ fn splits_root_leaf_into_internal_root() {
 
     // Root should now be internal.
     let mut bf = BlockFile::open(&path).unwrap();
-    let root = bf.header.root_block_id;
+    let root = bf.root_block_id();
     assert!(root != 0);
     let payload = bf.read_block(root, true).unwrap();
     assert_eq!(payload[0], 2);
@@ -57,7 +57,7 @@ fn multiple_leaf_splits_update_root_separators() {
     }
 
     let mut bf = BlockFile::open(&path).unwrap();
-    let root = bf.header.root_block_id;
+    let root = bf.root_block_id();
     let mut root_payload = bf.read_block(root, true).unwrap();
     assert_eq!(root_payload[0], 2);
 

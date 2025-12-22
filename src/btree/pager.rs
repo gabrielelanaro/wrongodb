@@ -25,7 +25,7 @@ impl Pager {
     }
 
     pub(super) fn root_page_id(&self) -> u64 {
-        self.bf.header.root_block_id
+        self.bf.root_block_id()
     }
 
     pub(super) fn set_root_page_id(&mut self, root_page_id: u64) -> Result<(), WrongoDBError> {
