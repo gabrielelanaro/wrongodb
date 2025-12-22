@@ -102,6 +102,16 @@ If Page 0 is the map, then pages 1 through N are the territory.
 Crucially, the **BlockFile doesn't know what’s inside them**.
 
 To the storage engine, page 42 is just a bag of bytes. It might contain:
+
+```text
+[ Page 42: Raw Bytes (BlockFile View) ]    [ Page 42: Leaf Node (B+Tree View) ]
++-----------------------------------+      +----------------------------------+
+| CRC32: 0xA1B2C3D4                 |      | Header: Leaf, 2 records          |
+| Payload: [ 00, 01, 4A, ... ]      | ---> | Record 1: { "id": 1, "a": 1 }    |
+| (4092 bytes of mystery data)      |      | Record 2: { "id": 5, "b": 2 }    |
++-----------------------------------+      +----------------------------------+
+```
+
 - A B+Tree **Leaf Node** (with actual user data).
 - A B+Tree **Internal Node** (with pointers to other nodes).
 - A **Free List** node (tracking empty space).
