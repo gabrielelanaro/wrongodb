@@ -26,6 +26,30 @@ Non-Goals:
 - Use a write-back policy: dirty pages are flushed on eviction and before checkpoint commit.
 - On first write to a page reachable from the last checkpoint, allocate a new block id and update the working tree to reference it; subsequent writes reuse that working block id until the next checkpoint.
 - Pinned pages are not eligible for eviction.
+- Use an LRU eviction policy based on a monotonic access counter; default cache capacity is 256 pages and is configurable via a cache config struct.
+
+## Cache entry shape
+Each cache entry tracks:
+- `page_id: u64` (the current working block id for this page)
+- `payload: Vec<u8>` (page payload bytes only, sized to `BlockFile::page_payload_len()`)
+- `dirty: bool` (payload differs from on-disk contents)
+- `pin_count: u32` (number of active pins)
+- `last_access: u64` (monotonic access counter for LRU selection)
+
+## Pager cache API
+The pager exposes a minimal, explicit pin/unpin API around the cache:
+- `pin_page(page_id) -> PinnedPage`: read-intent; loads from cache or disk, increments `pin_count`, updates `last_access`, returns a page handle with an owned payload buffer.
+- `pin_page_mut(page_id) -> PinnedPageMut`: write-intent; performs first-write COW if the page is still stable, ensures a cache entry exists for the working block id, marks it dirty, increments `pin_count`, returns a page handle with an owned payload buffer.
+- `unpin_page(PinnedPage)`: decrements `pin_count` for the cache entry.
+- `unpin_page_mut(PinnedPageMut)`: replaces the cache entry payload with the handle’s buffer (to capture edits) and decrements `pin_count` (entry stays dirty).
+- `flush_cache()`: writes all dirty cached pages to disk (via `BlockFile::write_block`) and marks them clean; used by eviction and before checkpoint commit.
+
+This design keeps pinned handles as owned buffers (no shared borrowing), which keeps call sites simple and avoids borrow checker complexity in the single-threaded engine.
+
+## Eviction + sizing
+- Capacity is a fixed number of cached pages (default 256).
+- Configuration is provided by `PageCacheConfig { capacity_pages, eviction_policy }`, with default values used by `Pager::create/open` and explicit override in `Pager::create_with_cache/open_with_cache` (and BTree wrappers if needed).
+- Eviction scans for the least-recently-used entry with `pin_count == 0`; if none exist, the cache returns an error (“all pages pinned”) rather than evicting a pinned page.
 
 ## Alternatives Considered
 - Write-through cache (simpler, but does not reduce write amplification).
@@ -42,6 +66,4 @@ Non-Goals:
 - Public APIs remain the same; internal pager/BTree APIs will change.
 
 ## Open Questions
-- Eviction policy choice (LRU vs clock) and default cache size.
-- Behavior when all pages are pinned (block, error, or grow cache temporarily).
 - Instrumentation for cache hit/evict/flush metrics.

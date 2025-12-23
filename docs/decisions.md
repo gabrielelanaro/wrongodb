@@ -376,3 +376,33 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 
 **Notes**
 - Eviction policy and cache sizing are finalized during implementation (LRU vs clock).
+
+## 2025-12-23: Page cache entry shape, API, and eviction policy
+
+**Decision**
+- Define cache entries as `{ page_id, payload, dirty, pin_count, last_access }`, where `payload` is the page payload buffer and `last_access` is a monotonic counter for LRU.
+- Pager cache API uses explicit pin/unpin calls:
+  - `pin_page(page_id) -> PinnedPage` (read intent)
+  - `pin_page_mut(page_id) -> PinnedPageMut` (write intent; marks dirty)
+  - `unpin_page(PinnedPage)` and `unpin_page_mut(PinnedPageMut)` to release pins and (for mutable pins) write back the updated payload into the cache entry.
+  - `flush_cache()` writes all dirty cached pages to disk and marks them clean.
+- Eviction policy is LRU among unpinned pages; if all pages are pinned at capacity, cache admission returns an error.
+- Cache sizing is fixed in pages with a default of 256; configuration is via `PageCacheConfig { capacity_pages, eviction_policy }`, with `Pager::create/open` using defaults and `Pager::create_with_cache/open_with_cache` enabling override.
+
+**Why**
+- Keeps cache bookkeeping straightforward and consistent with the single-threaded engine while meeting the spec’s pin/dirty/eviction requirements.
+- LRU with a simple access counter is easy to implement and adequate for the expected cache sizes in this phase.
+
+## 2025-12-23: Flush skips dirty pinned pages
+
+**Decision**
+- `Pager::flush_cache()` returns an error if it encounters a dirty cache entry with `pin_count > 0`.
+- Dirty pinned pages are not flushed or evicted; callers must unpin them before checkpoint or explicit flush.
+
+**Why**
+- The mutable pinned handle owns the latest payload until `unpin_page_mut` writes it back to the cache entry.
+- Flushing while a dirty page is pinned risks writing stale data and losing in-memory updates.
+
+**Notes**
+- Read-only pins remain flushable (they are not marked dirty).
+- Eviction already skips pinned pages; flush uses the same rule for dirty pages.
