@@ -25,3 +25,4 @@ Keep this managed block so 'openspec update' can refresh the instructions.
 
 ## Communication style
 - Use normal paragraph style for explanations and reviews unless asked otherwise.
+- If asked for explanations or reviews with structure, use short, meaningful section titles (not "Chunk N") and small sections; include ASCII diagrams where helpful.

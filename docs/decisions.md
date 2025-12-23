@@ -358,3 +358,21 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 
 **Ordering**
 - Checkpoint root metadata is synced before any retired blocks are added to the free list, so the on-disk stable root never points at reclaimed blocks.
+
+## 2025-12-23: Proposed in-memory page cache for COW coalescing
+
+**Status**
+- Proposed in OpenSpec change `add-page-cache` (not yet approved).
+
+**Decision (proposed)**
+- Add a bounded in-memory page cache between `Pager` and `BlockFile`.
+- Dirty pages are written back on eviction and before checkpoint commit.
+- The first mutation of a page reachable from the last checkpoint allocates a new block id; subsequent mutations reuse that working block id until the next checkpoint.
+- Cache supports pin/unpin so iterators and scans can prevent eviction.
+
+**Why**
+- Reduce write amplification and block churn by coalescing repeated updates to the same pages.
+- Provide a stable foundation for scan performance by keeping in-use pages resident.
+
+**Notes**
+- Eviction policy and cache sizing are finalized during implementation (LRU vs clock).
