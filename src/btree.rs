@@ -2,7 +2,7 @@ use std::path::Path;
 
 mod pager;
 
-use self::pager::Pager;
+use self::pager::{Pager, PinnedPage, PinnedPageMut};
 use crate::errors::StorageError;
 use crate::{
     InternalPage, InternalPageError, LeafPage, LeafPageError, WrongoDBError, NONE_BLOCK_ID,
@@ -66,19 +66,49 @@ impl BTree {
         }
 
         loop {
-            let mut payload = self.pager.read_page(node_id)?;
-            match page_type(&payload)? {
+            let mut page = self.pager.pin_page(node_id)?;
+            let page_id = page.page_id();
+            let page_type = match page_type(page.payload()) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.pager.unpin_page(page_id);
+                    return Err(e);
+                }
+            };
+            match page_type {
                 PageType::Leaf => {
-                    let leaf = LeafPage::open(&mut payload)
-                        .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
-                    return leaf.get(key).map_err(map_leaf_err);
+                    let leaf = match LeafPage::open(page.payload_mut()) {
+                        Ok(leaf) => leaf,
+                        Err(e) => {
+                            self.pager.unpin_page(page_id);
+                            return Err(StorageError(format!("corrupt leaf {node_id}: {e}")).into());
+                        }
+                    };
+                    let result = leaf.get(key).map_err(map_leaf_err);
+                    self.pager.unpin_page(page_id);
+                    return result;
                 }
                 PageType::Internal => {
-                    let internal = InternalPage::open(&mut payload)
-                        .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
-                    node_id = internal
+                    let internal = match InternalPage::open(page.payload_mut()) {
+                        Ok(internal) => internal,
+                        Err(e) => {
+                            self.pager.unpin_page(page_id);
+                            return Err(
+                                StorageError(format!("corrupt internal {node_id}: {e}")).into(),
+                            );
+                        }
+                    };
+                    node_id = match internal
                         .child_for_key(key)
-                        .map_err(|e| StorageError(format!("routing failed at {node_id}: {e}")))?;
+                        .map_err(|e| StorageError(format!("routing failed at {node_id}: {e}")))
+                    {
+                        Ok(id) => id,
+                        Err(e) => {
+                            self.pager.unpin_page(page_id);
+                            return Err(e.into());
+                        }
+                    };
+                    self.pager.unpin_page(page_id);
                 }
             }
         }
@@ -155,11 +185,21 @@ impl BTree {
         key: &[u8],
         value: &[u8],
     ) -> Result<InsertResult, WrongoDBError> {
-        let payload = self.pager.read_page(node_id)?;
-        match page_type(&payload)? {
-            PageType::Leaf => self.insert_into_leaf(node_id, payload, key, value),
-            PageType::Internal => self.insert_into_internal(node_id, payload, key, value),
-        }
+        let mut page = self.pager.pin_page_mut(node_id)?;
+        let page_id = page.page_id();
+        let page_type = match page_type(page.payload()) {
+            Ok(t) => t,
+            Err(e) => {
+                self.pager.unpin_page(page_id);
+                return Err(e);
+            }
+        };
+        let result = match page_type {
+            PageType::Leaf => self.insert_into_leaf(node_id, &mut page, key, value),
+            PageType::Internal => self.insert_into_internal(node_id, &mut page, key, value),
+        };
+        self.pager.unpin_page(page_id);
+        result
     }
 
     /// Insert into a leaf page, splitting if it overflows.
@@ -176,16 +216,17 @@ impl BTree {
     fn insert_into_leaf(
         &mut self,
         node_id: u64,
-        mut payload: Vec<u8>,
+        page: &mut PinnedPageMut,
         key: &[u8],
         value: &[u8],
     ) -> Result<InsertResult, WrongoDBError> {
+        let payload_len = page.payload().len();
         {
-            let mut leaf = LeafPage::open(&mut payload)
+            let mut leaf = LeafPage::open(page.payload_mut())
                 .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
             match leaf.put(key, value) {
                 Ok(()) => {
-                    let new_leaf_id = self.pager.write_new_page(&payload)?;
+                    let new_leaf_id = self.pager.write_new_page(page.payload())?;
                     self.pager.retire_page(node_id);
                     return Ok(InsertResult {
                         new_node_id: new_leaf_id,
@@ -197,8 +238,7 @@ impl BTree {
             }
         }
 
-        let payload_len = payload.len();
-        let mut entries = leaf_entries(&mut payload)?;
+        let mut entries = leaf_entries(page.payload_mut())?;
         upsert_entry(&mut entries, key, value);
         let (left_bytes, right_bytes, split_key) = split_leaf_entries(&entries, payload_len)?;
 
@@ -227,12 +267,12 @@ impl BTree {
     fn insert_into_internal(
         &mut self,
         node_id: u64,
-        mut payload: Vec<u8>,
+        page: &mut PinnedPageMut,
         key: &[u8],
         value: &[u8],
     ) -> Result<InsertResult, WrongoDBError> {
-        let payload_len = payload.len();
-        let (mut first_child, mut entries) = internal_entries(&mut payload)?;
+        let payload_len = page.payload().len();
+        let (mut first_child, mut entries) = internal_entries(page.payload_mut())?;
         let child_idx = child_index_for_key(&entries, key);
         let child_id = if child_idx == 0 {
             first_child
@@ -538,8 +578,7 @@ pub struct BTreeRangeIter<'a> {
     pager: Option<&'a mut Pager>,
     end: Option<Vec<u8>>,
     stack: Vec<CursorFrame>,
-    leaf_id: u64,
-    leaf_payload: Vec<u8>,
+    leaf: Option<PinnedPage>,
     slot_idx: usize,
     done: bool,
 }
@@ -550,8 +589,7 @@ impl<'a> BTreeRangeIter<'a> {
             pager: None,
             end: None,
             stack: Vec::new(),
-            leaf_id: 0,
-            leaf_payload: Vec::new(),
+            leaf: None,
             slot_idx: 0,
             done: true,
         }
@@ -567,8 +605,7 @@ impl<'a> BTreeRangeIter<'a> {
             pager: Some(pager),
             end: end.map(|b| b.to_vec()),
             stack: Vec::new(),
-            leaf_id: 0,
-            leaf_payload: Vec::new(),
+            leaf: None,
             slot_idx: 0,
             done: false,
         };
@@ -582,40 +619,86 @@ impl<'a> BTreeRangeIter<'a> {
             .ok_or_else(|| StorageError("range iterator has no backing Pager".into()).into())
     }
 
+    fn clear_leaf(&mut self) -> Result<(), WrongoDBError> {
+        if let Some(leaf) = self.leaf.take() {
+            self.pager_mut()?.unpin_page(leaf.page_id());
+        }
+        Ok(())
+    }
+
     fn seek(&mut self, root: u64, start: Option<&[u8]>) -> Result<(), WrongoDBError> {
+        self.clear_leaf()?;
         self.stack.clear();
         let mut node_id = root;
         loop {
-            let mut payload = self.pager_mut()?.read_page(node_id)?;
-            match page_type(&payload)? {
+            let mut page = self.pager_mut()?.pin_page(node_id)?;
+            let page_id = page.page_id();
+            let page_type = match page_type(page.payload()) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.pager_mut()?.unpin_page(page_id);
+                    return Err(e);
+                }
+            };
+            match page_type {
                 PageType::Leaf => {
-                    let leaf = LeafPage::open(&mut payload)
-                        .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
+                    let leaf = match LeafPage::open(page.payload_mut()) {
+                        Ok(leaf) => leaf,
+                        Err(e) => {
+                            self.pager_mut()?.unpin_page(page_id);
+                            return Err(StorageError(format!("corrupt leaf {node_id}: {e}")).into());
+                        }
+                    };
                     let slot_idx = if let Some(start_key) = start {
-                        leaf_lower_bound(&leaf, start_key).map_err(map_leaf_err)?
+                        match leaf_lower_bound(&leaf, start_key).map_err(map_leaf_err) {
+                            Ok(idx) => idx,
+                            Err(e) => {
+                                self.pager_mut()?.unpin_page(page_id);
+                                return Err(e);
+                            }
+                        }
                     } else {
                         0
                     };
-                    self.leaf_id = node_id;
-                    self.leaf_payload = payload;
+                    self.leaf = Some(page);
                     self.slot_idx = slot_idx;
                     return Ok(());
                 }
                 PageType::Internal => {
-                    let internal = InternalPage::open(&mut payload)
-                        .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
+                    let internal = match InternalPage::open(page.payload_mut()) {
+                        Ok(internal) => internal,
+                        Err(e) => {
+                            self.pager_mut()?.unpin_page(page_id);
+                            return Err(
+                                StorageError(format!("corrupt internal {node_id}: {e}")).into(),
+                            );
+                        }
+                    };
                     let child_idx = if let Some(start_key) = start {
-                        internal_child_index_for_key(&internal, start_key)
-                            .map_err(map_internal_err)?
+                        match internal_child_index_for_key(&internal, start_key)
+                            .map_err(map_internal_err)
+                        {
+                            Ok(idx) => idx,
+                            Err(e) => {
+                                self.pager_mut()?.unpin_page(page_id);
+                                return Err(e);
+                            }
+                        }
                     } else {
                         0
                     };
-                    let child_id =
-                        internal_child_at(&internal, child_idx).map_err(map_internal_err)?;
+                    let child_id = match internal_child_at(&internal, child_idx).map_err(map_internal_err) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            self.pager_mut()?.unpin_page(page_id);
+                            return Err(e);
+                        }
+                    };
                     self.stack.push(CursorFrame {
                         internal_id: node_id,
                         child_idx,
                     });
+                    self.pager_mut()?.unpin_page(page_id);
                     node_id = child_id;
                 }
             }
@@ -623,27 +706,41 @@ impl<'a> BTreeRangeIter<'a> {
     }
 
     fn advance_to_next_leaf(&mut self) -> Result<bool, WrongoDBError> {
+        self.clear_leaf()?;
         while let Some(frame) = self.stack.pop() {
-            let mut payload = self.pager_mut()?.read_page(frame.internal_id)?;
-            let internal = InternalPage::open(&mut payload).map_err(|e| {
-                StorageError(format!("corrupt internal {}: {e}", frame.internal_id))
-            })?;
+            let mut page = self.pager_mut()?.pin_page(frame.internal_id)?;
+            let page_id = page.page_id();
+            let next_child_id = match (|| {
+                let internal = InternalPage::open(page.payload_mut()).map_err(|e| {
+                    StorageError(format!("corrupt internal {}: {e}", frame.internal_id))
+                })?;
 
-            let slots = internal.slot_count().map_err(map_internal_err)?;
-            let children_count = slots + 1;
-            if frame.child_idx + 1 >= children_count {
-                continue;
+                let slots = internal.slot_count().map_err(map_internal_err)?;
+                let children_count = slots + 1;
+                if frame.child_idx + 1 >= children_count {
+                    Ok(None)
+                } else {
+                    let next_child_idx = frame.child_idx + 1;
+                    let next_child_id =
+                        internal_child_at(&internal, next_child_idx).map_err(map_internal_err)?;
+                    self.stack.push(CursorFrame {
+                        internal_id: frame.internal_id,
+                        child_idx: next_child_idx,
+                    });
+                    Ok(Some(next_child_id))
+                }
+            })() {
+                Ok(next) => next,
+                Err(e) => {
+                    self.pager_mut()?.unpin_page(page_id);
+                    return Err(e);
+                }
+            };
+            self.pager_mut()?.unpin_page(page_id);
+            if let Some(next_child_id) = next_child_id {
+                self.descend_leftmost(next_child_id)?;
+                return Ok(true);
             }
-
-            let next_child_idx = frame.child_idx + 1;
-            let next_child_id =
-                internal_child_at(&internal, next_child_idx).map_err(map_internal_err)?;
-            self.stack.push(CursorFrame {
-                internal_id: frame.internal_id,
-                child_idx: next_child_idx,
-            });
-            self.descend_leftmost(next_child_id)?;
-            return Ok(true);
         }
         Ok(false)
     }
@@ -651,23 +748,43 @@ impl<'a> BTreeRangeIter<'a> {
     fn descend_leftmost(&mut self, start_id: u64) -> Result<(), WrongoDBError> {
         let mut node_id = start_id;
         loop {
-            let payload = self.pager_mut()?.read_page(node_id)?;
-            match page_type(&payload)? {
+            let mut page = self.pager_mut()?.pin_page(node_id)?;
+            let page_id = page.page_id();
+            let page_type = match page_type(page.payload()) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.pager_mut()?.unpin_page(page_id);
+                    return Err(e);
+                }
+            };
+            match page_type {
                 PageType::Leaf => {
-                    self.leaf_id = node_id;
-                    self.leaf_payload = payload;
+                    self.leaf = Some(page);
                     self.slot_idx = 0;
                     return Ok(());
                 }
                 PageType::Internal => {
-                    let mut payload = payload;
-                    let internal = InternalPage::open(&mut payload)
-                        .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
-                    let child_id = internal.first_child().map_err(map_internal_err)?;
+                    let internal = match InternalPage::open(page.payload_mut()) {
+                        Ok(internal) => internal,
+                        Err(e) => {
+                            self.pager_mut()?.unpin_page(page_id);
+                            return Err(
+                                StorageError(format!("corrupt internal {node_id}: {e}")).into(),
+                            );
+                        }
+                    };
+                    let child_id = match internal.first_child().map_err(map_internal_err) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            self.pager_mut()?.unpin_page(page_id);
+                            return Err(e);
+                        }
+                    };
                     self.stack.push(CursorFrame {
                         internal_id: node_id,
                         child_idx: 0,
                     });
+                    self.pager_mut()?.unpin_page(page_id);
                     node_id = child_id;
                 }
             }
@@ -684,13 +801,19 @@ impl<'a> Iterator for BTreeRangeIter<'a> {
         }
 
         loop {
-            let mut leaf_payload = std::mem::take(&mut self.leaf_payload);
-            let leaf = match LeafPage::open(&mut leaf_payload) {
+            let Some(mut leaf_page) = self.leaf.take() else {
+                self.done = true;
+                return None;
+            };
+            let leaf_id = leaf_page.page_id();
+            let leaf = match LeafPage::open(leaf_page.payload_mut()) {
                 Ok(v) => v,
                 Err(e) => {
+                    self.done = true;
+                    let _ = self.pager_mut().map(|pager| pager.unpin_page(leaf_id));
                     return Some(Err(StorageError(format!(
                         "corrupt leaf {}: {e}",
-                        self.leaf_id
+                        leaf_id
                     ))
                     .into()))
                 }
@@ -698,31 +821,43 @@ impl<'a> Iterator for BTreeRangeIter<'a> {
 
             let slot_count = match leaf.slot_count() {
                 Ok(v) => v,
-                Err(e) => return Some(Err(map_leaf_err(e))),
+                Err(e) => {
+                    self.done = true;
+                    let _ = self.pager_mut().map(|pager| pager.unpin_page(leaf_id));
+                    return Some(Err(map_leaf_err(e)));
+                }
             };
 
             if self.slot_idx < slot_count {
                 let k = match leaf.key_at(self.slot_idx) {
                     Ok(v) => v.to_vec(),
-                    Err(e) => return Some(Err(map_leaf_err(e))),
+                    Err(e) => {
+                        self.done = true;
+                        let _ = self.pager_mut().map(|pager| pager.unpin_page(leaf_id));
+                        return Some(Err(map_leaf_err(e)));
+                    }
                 };
                 if let Some(end) = &self.end {
                     if k.as_slice() >= end.as_slice() {
                         self.done = true;
-                        self.leaf_payload = leaf_payload;
+                        let _ = self.pager_mut().map(|pager| pager.unpin_page(leaf_id));
                         return None;
                     }
                 }
                 let v = match leaf.value_at(self.slot_idx) {
                     Ok(v) => v.to_vec(),
-                    Err(e) => return Some(Err(map_leaf_err(e))),
+                    Err(e) => {
+                        self.done = true;
+                        let _ = self.pager_mut().map(|pager| pager.unpin_page(leaf_id));
+                        return Some(Err(map_leaf_err(e)));
+                    }
                 };
                 self.slot_idx += 1;
-                self.leaf_payload = leaf_payload;
+                self.leaf = Some(leaf_page);
                 return Some(Ok((k, v)));
             }
 
-            self.leaf_payload = leaf_payload;
+            self.leaf = Some(leaf_page);
             match self.advance_to_next_leaf() {
                 Ok(true) => continue,
                 Ok(false) => {
@@ -735,6 +870,12 @@ impl<'a> Iterator for BTreeRangeIter<'a> {
                 }
             }
         }
+    }
+}
+
+impl<'a> Drop for BTreeRangeIter<'a> {
+    fn drop(&mut self) {
+        let _ = self.clear_leaf();
     }
 }
 

@@ -10,6 +10,46 @@ pub(super) struct Pager {
     retired_blocks: HashSet<u64>,
 }
 
+#[derive(Debug)]
+pub(super) struct PinnedPage {
+    page_id: u64,
+    payload: Vec<u8>,
+}
+
+impl PinnedPage {
+    pub(super) fn page_id(&self) -> u64 {
+        self.page_id
+    }
+
+    pub(super) fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub(super) fn payload_mut(&mut self) -> &mut [u8] {
+        &mut self.payload
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct PinnedPageMut {
+    page_id: u64,
+    payload: Vec<u8>,
+}
+
+impl PinnedPageMut {
+    pub(super) fn page_id(&self) -> u64 {
+        self.page_id
+    }
+
+    pub(super) fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub(super) fn payload_mut(&mut self) -> &mut [u8] {
+        &mut self.payload
+    }
+}
+
 impl Pager {
     pub(super) fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
         let bf = BlockFile::create(path, page_size)?;
@@ -57,8 +97,18 @@ impl Pager {
         Ok(())
     }
 
-    pub(super) fn read_page(&mut self, page_id: u64) -> Result<Vec<u8>, WrongoDBError> {
-        self.bf.read_block(page_id, true)
+    pub(super) fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError> {
+        let payload = self.bf.read_block(page_id, true)?;
+        Ok(PinnedPage { page_id, payload })
+    }
+
+    pub(super) fn pin_page_mut(&mut self, page_id: u64) -> Result<PinnedPageMut, WrongoDBError> {
+        let payload = self.bf.read_block(page_id, true)?;
+        Ok(PinnedPageMut { page_id, payload })
+    }
+
+    pub(super) fn unpin_page(&mut self, _page_id: u64) {
+        // No-op until the page cache tracks pin counts.
     }
 
     pub(super) fn write_page(&mut self, page_id: u64, payload: &[u8]) -> Result<(), WrongoDBError> {
