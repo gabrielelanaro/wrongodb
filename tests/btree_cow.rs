@@ -18,15 +18,17 @@ fn cow_put_preserves_old_root_leaf() {
     tree.put(key, value).unwrap();
     assert_eq!(tree.get(key).unwrap().unwrap(), value);
 
+    let mut bf_before = BlockFile::open(&path).unwrap();
+    let mut old_payload = bf_before.read_block(old_root, true).unwrap();
+    let old_leaf = LeafPage::open(&mut old_payload).unwrap();
+    assert!(old_leaf.get(key).unwrap().is_none());
+    bf_before.close().unwrap();
+
     tree.checkpoint().unwrap();
 
     let mut bf2 = BlockFile::open(&path).unwrap();
     let new_root = bf2.root_block_id();
     assert_ne!(new_root, old_root);
-
-    let mut old_payload = bf2.read_block(old_root, true).unwrap();
-    let old_leaf = LeafPage::open(&mut old_payload).unwrap();
-    assert!(old_leaf.get(key).unwrap().is_none());
 
     let mut new_payload = bf2.read_block(new_root, true).unwrap();
     let new_leaf = LeafPage::open(&mut new_payload).unwrap();

@@ -3,5 +3,5 @@
 - [x] 1.2 Add root-slot selection on open; write-next-slot on checkpoint commit.
 - [x] 1.3 Add copy-on-write page writes for BTree mutations (new blocks for modified pages).
 - [x] 1.4 Introduce "stable root" vs "working root" and a `checkpoint()` API that swaps roots.
-- [ ] 1.5 Track retired blocks and only recycle them after successful checkpoint (initially allow leaks on crash).
-- [ ] 1.6 Tests: checkpoint commit selects new root; crash before commit uses old root; retired blocks not reused before checkpoint.
+- [x] 1.5 Track retired blocks and only recycle them after successful checkpoint (initially allow leaks on crash).
+- [x] 1.6 Tests: checkpoint commit selects new root; crash before commit uses old root; retired blocks not reused before checkpoint.

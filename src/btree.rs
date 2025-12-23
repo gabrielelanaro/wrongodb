@@ -186,6 +186,7 @@ impl BTree {
             match leaf.put(key, value) {
                 Ok(()) => {
                     let new_leaf_id = self.pager.write_new_page(&payload)?;
+                    self.pager.retire_page(node_id);
                     return Ok(InsertResult {
                         new_node_id: new_leaf_id,
                         split: None,
@@ -203,6 +204,7 @@ impl BTree {
 
         let left_leaf_id = self.pager.write_new_page(&left_bytes)?;
         let right_leaf_id = self.pager.write_new_page(&right_bytes)?;
+        self.pager.retire_page(node_id);
         Ok(InsertResult {
             new_node_id: left_leaf_id,
             split: Some(SplitInfo {
@@ -224,7 +226,7 @@ impl BTree {
     /// - `sep_key_i` is the **minimum key** of `child_{i+1}`.
     fn insert_into_internal(
         &mut self,
-        _node_id: u64,
+        node_id: u64,
         mut payload: Vec<u8>,
         key: &[u8],
         value: &[u8],
@@ -251,6 +253,7 @@ impl BTree {
 
         if let Ok(bytes) = build_internal_page(first_child, &entries, payload_len) {
             let new_internal_id = self.pager.write_new_page(&bytes)?;
+            self.pager.retire_page(node_id);
             return Ok(InsertResult {
                 new_node_id: new_internal_id,
                 split: None,
@@ -261,6 +264,7 @@ impl BTree {
             split_internal_entries(first_child, &entries, payload_len)?;
         let left_internal_id = self.pager.write_new_page(&left_bytes)?;
         let right_internal_id = self.pager.write_new_page(&right_bytes)?;
+        self.pager.retire_page(node_id);
         Ok(InsertResult {
             new_node_id: left_internal_id,
             split: Some(SplitInfo {

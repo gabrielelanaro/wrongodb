@@ -79,6 +79,7 @@ Status (2025-12-21)
 
 ## Page cache notes (future)
 - Add an in‑memory page cache between `Pager` and `BlockFile` so reads hit RAM and writes mark pages dirty.
+- Use the cache to coalesce many inserts into the same leaf/internal pages; write new blocks only on eviction or checkpoint (amortizes the current per‑key COW overhead).
 - Track per‑page state: clean/dirty, pinned/unpinned, last‑used (LRU or clock).
 - Reconcile dirty pages on eviction and on checkpoint; keep COW rules (never overwrite last‑checkpoint pages).
 - Define cache sizing, eviction policy, and a minimal pin/unpin API for iterators/scans.

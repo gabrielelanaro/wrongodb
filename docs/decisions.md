@@ -344,3 +344,17 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - Provides crash-consistent snapshots: the stable root always points to a valid tree state, while mutations proceed without risking corruption of the on-disk checkpoint.
 - Atomic root swap ensures that a crash during a checkpoint either sees the old checkpoint or the new checkpoint, never a partially-written state.
 - Separates durability boundaries (checkpoint) from write amplification (multiple mutations can be batched before a checkpoint).
+
+## 2025-12-23: Retired block recycling only after checkpoint
+
+**Decision**
+- Track retired (replaced) page block IDs in memory during copy-on-write updates.
+- Recycle retired blocks only after a successful checkpoint root swap.
+- Retired block lists are not persisted yet; crashes may leak space.
+
+**Why**
+- Prevents reuse of blocks still reachable from the last durable checkpoint.
+- Keeps the initial implementation simple while matching the "checkpoint-first" durability model.
+
+**Ordering**
+- Checkpoint root metadata is synced before any retired blocks are added to the free list, so the on-disk stable root never points at reclaimed blocks.
