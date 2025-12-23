@@ -9,7 +9,7 @@ fn internal_levels(path: &std::path::Path) -> usize {
 
     let mut levels = 0usize;
     loop {
-        let mut payload = bf.read_block(node_id, true).unwrap();
+        let mut payload = bf.read_block(node_id, false).unwrap();
         match payload[0] {
             1 => break,
             2 => {
@@ -41,6 +41,8 @@ fn grows_tree_height_past_two_levels_and_survives_reopen() {
         let got = tree.get(&k).unwrap().unwrap();
         assert_eq!(got, vec![b'v'; 24]);
     }
+
+    tree.checkpoint().unwrap();
 
     // Height > 2 implies at least two internal levels (root internal + one more).
     assert!(internal_levels(&path) >= 2);
@@ -86,6 +88,8 @@ fn ordered_range_scan_is_sorted_and_respects_bounds() {
     assert_eq!(slice.first().unwrap(), b"k0100");
     assert_eq!(slice.last().unwrap(), b"k0199");
     assert!(slice.windows(2).all(|w| w[0] < w[1]));
+
+    tree.checkpoint().unwrap();
 
     drop(tree);
 

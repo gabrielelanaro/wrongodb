@@ -18,6 +18,8 @@ fn cow_put_preserves_old_root_leaf() {
     tree.put(key, value).unwrap();
     assert_eq!(tree.get(key).unwrap().unwrap(), value);
 
+    tree.checkpoint().unwrap();
+
     let mut bf2 = BlockFile::open(&path).unwrap();
     let new_root = bf2.root_block_id();
     assert_ne!(new_root, old_root);

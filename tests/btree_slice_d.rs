@@ -21,11 +21,13 @@ fn splits_root_leaf_into_internal_root() {
         assert_eq!(got, vec![b'v'; 24]);
     }
 
+    tree.checkpoint().unwrap();
+
     // Root should now be internal.
     let mut bf = BlockFile::open(&path).unwrap();
     let root = bf.root_block_id();
     assert!(root != 0);
-    let payload = bf.read_block(root, true).unwrap();
+    let payload = bf.read_block(root, false).unwrap();
     assert_eq!(payload[0], 2);
     bf.close().unwrap();
 
@@ -56,9 +58,11 @@ fn multiple_leaf_splits_update_root_separators() {
         assert_eq!(got, vec![b'x'; 16]);
     }
 
+    tree.checkpoint().unwrap();
+
     let mut bf = BlockFile::open(&path).unwrap();
     let root = bf.root_block_id();
-    let mut root_payload = bf.read_block(root, true).unwrap();
+    let mut root_payload = bf.read_block(root, false).unwrap();
     assert_eq!(root_payload[0], 2);
 
     let root_page = InternalPage::open(&mut root_payload).unwrap();

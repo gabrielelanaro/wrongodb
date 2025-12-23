@@ -49,6 +49,7 @@ impl BTree {
     pub fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
         let mut pager = Pager::create(path, page_size)?;
         init_root_if_missing(&mut pager)?;
+        pager.checkpoint()?;
         Ok(Self { pager })
     }
 
@@ -112,6 +113,10 @@ impl BTree {
 
     pub fn sync_all(&mut self) -> Result<(), WrongoDBError> {
         self.pager.sync_all()
+    }
+
+    pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
+        self.pager.checkpoint()
     }
 
     pub fn range(

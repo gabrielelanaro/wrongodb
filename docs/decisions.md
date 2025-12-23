@@ -328,3 +328,19 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 **Why**
 - Preserves the last durable checkpoint’s reachable pages while allowing in-progress mutations to proceed safely.
 - Establishes the invariant needed for later “stable vs working root” and checkpoint commits.
+
+## 2025-12-23: Stable root vs working root with checkpoint API
+
+**Decision**
+- Introduce two root pointers in `Pager`:
+  - **stable root**: root stored in the active checkpoint slot on disk (last completed checkpoint).
+  - **working root**: in-memory root used for ongoing mutations (advances with each write).
+- `BTree::create()` now writes an initial checkpoint after creating the first leaf root.
+- Add `BTree::checkpoint()` API that atomically swaps roots by calling `BlockFile::set_root_block_id()` and syncing.
+- Mutations update the working root in memory but do not affect the stable root until `checkpoint()` is called.
+- On `BTree::open()`, the working root is initialized from the stable root on disk.
+
+**Why**
+- Provides crash-consistent snapshots: the stable root always points to a valid tree state, while mutations proceed without risking corruption of the on-disk checkpoint.
+- Atomic root swap ensures that a crash during a checkpoint either sees the old checkpoint or the new checkpoint, never a partially-written state.
+- Separates durability boundaries (checkpoint) from write amplification (multiple mutations can be batched before a checkpoint).
