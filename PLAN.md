@@ -77,6 +77,13 @@ Status (2025-12-21)
 - Txn ids/timestamps, per‑record version chains.
 - Snapshot reads + GC.
 
+## Page cache notes (future)
+- Add an in‑memory page cache between `Pager` and `BlockFile` so reads hit RAM and writes mark pages dirty.
+- Track per‑page state: clean/dirty, pinned/unpinned, last‑used (LRU or clock).
+- Reconcile dirty pages on eviction and on checkpoint; keep COW rules (never overwrite last‑checkpoint pages).
+- Define cache sizing, eviction policy, and a minimal pin/unpin API for iterators/scans.
+- Integrate with free‑list/retired blocks so freed pages aren’t reused until checkpoint commit.
+
 ## Performance notes / TODOs
 - B+tree splits currently choose a split point by rebuilding candidate left/right pages around the midpoint; OK for small pages but should be replaced with a single-pass “split-by-bytes” / one-build approach.
 - Range scans currently avoid leaf sibling pointers (no on-disk format change) and instead advance using a parent stack; consider adding leaf links for O(1) leaf-to-leaf transitions.
