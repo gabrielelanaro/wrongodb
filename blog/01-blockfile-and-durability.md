@@ -11,6 +11,8 @@ We need a way to map our tree onto the disk. This is the hierarchy of a storage 
 2.  **Pages:** The fixed-size byte arrays (e.g., 4KB) that serialize a node.
 3.  **Blocks:** The physical sections in a file where pages live.
 
+![Node Pointer](images/node_pointer.png)
+
 ![Bplustree](images/bplustree.png)
 
 This post is about the **BlockFile**: the machinery that gives our B+Tree a physical place to live.
@@ -18,6 +20,8 @@ This post is about the **BlockFile**: the machinery that gives our B+Tree a phys
 ## The BlockFile mental model
 
 The goal is to treat a file like an array of 4KB pages. Page `0` is the header, and pages `1..N` are the payload.
+
+![Blockfile](images/blockfile.png)
 
 ASCII time:
 
