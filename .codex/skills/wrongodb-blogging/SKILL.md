@@ -86,8 +86,9 @@ Produce a tight, publish-ready plan for a single new post (5–10 minute read) t
 ## Output format
 Return a plan with the following sections, in order:
 
-### 1) Title + One-line hook
+### 1) Title + Subtitle + One-line hook
 - Proposed title
+- A meaningful subtitle that sharpens the focus (not a generic label)
 - A single-sentence hook that sounds like the existing voice
 
 ### 2) Thin-slice scope
@@ -174,6 +175,7 @@ Produce a complete markdown post that follows the plan exactly, in the establish
 ## Output format
 Return a single markdown document with:
 1) `# Title`
+2) `## Subtitle`
 2) Optional hero image (if the plan calls for it)
 3) Body sections in a natural flow (no numbered headings required)
 4) “What’s next” as a bullet list
@@ -187,6 +189,8 @@ Return a single markdown document with:
 ## Post template (skeleton)
 
 # <Title>
+
+## <Subtitle>
 
 ![<Hero Alt>](images/<hero_filename>.png)
 
