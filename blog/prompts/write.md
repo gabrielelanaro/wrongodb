@@ -31,7 +31,7 @@ Produce a complete markdown post that follows the plan exactly, in the establish
 - Include 2–4 inline images as markdown: `![Alt](images/<filename>.png)`.
 - Generate images by running `python blog/generate_image.py "<prompt>" --out blog/images/<filename>.png`.
 - If an image looks generic or confusing, revise the prompt to emphasize **purpose + narrative structure** and regenerate.
-- If you revise the hook, re-check the next 2–3 paragraphs for flow.
+- After any significant change anywhere, re-check flow.
 - Introduce new concepts inline before jargon appears; keep definitions direct (no metaphors).
 - If the plan includes an ASCII diagram, include it in a fenced code block.
 - If a fact is uncertain, mark it inline as **TO VERIFY** and keep going.

@@ -28,7 +28,7 @@ Create blog post plans and drafts for the WrongoDB series without re-reading or 
   - Specify labels and icons that reinforce the story (e.g., crash bolt, shield, timeline bands).
   - After generation, validate files are real images (`file blog/images/*.png`); if invalid or dull, revise prompts and regenerate.
 - Story/structure lessons:
-  - If you change the hook, re-check that the next 2–3 paragraphs still flow as a coherent arc.
+  - After any significant change anywhere, re-check that the arc still flows.
   - Introduce new concepts inline before using jargon; keep definitions direct (no metaphors).
   - Use sections for readability; include explicit transitions or “lightbulb” moments where they help.
   - Diagrams must be narrated in the text and placed near the concept they illustrate.
