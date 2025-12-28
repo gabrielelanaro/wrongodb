@@ -20,9 +20,6 @@ Produce a tight, publish-ready plan for a single new post (5–10 minute read) t
 - Include **one** concrete artifact to anchor the explanation (code, struct, layout, file header, algorithm step, etc.).
 - Prefer examples that can be verified against the repo if needed.
 - If details are uncertain, mark as **TO VERIFY** (do not invent).
-- After any significant change anywhere, sanity-check flow and coherence.
-- Plan to introduce any new concepts inline, before jargon appears (direct definitions, no metaphors).
-- Use short section titles in the plan if it helps readability in the final post.
 
 ## Output format
 Return a plan with the following sections, in order:
@@ -54,10 +51,7 @@ Use exactly these beats:
 - Bullet list of the 2–4 elements you will show or explain
 
 ### 6) Images
-- 2–4 image prompts (short, literal) and each must include:
-  - The **purpose** of the image (what it teaches or clarifies)
-  - Any required labels or visual metaphors (e.g., crash bolt, shield, before/after split)
-  - A hint about structure (timeline, mapping, split panel) if important
+- 2–4 image prompts (short, literal)
 
 ### 7) Verification checklist
 - 3–6 bullets of facts to verify against code/notes
