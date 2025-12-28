@@ -27,6 +27,13 @@ Create blog post plans and drafts for the WrongoDB series without re-reading or 
   - Prefer narrative structures (before/after, timelines, mappings) over generic box-and-arrow diagrams.
   - Specify labels and icons that reinforce the story (e.g., crash bolt, shield, timeline bands).
   - After generation, validate files are real images (`file blog/images/*.png`); if invalid or dull, revise prompts and regenerate.
+- Story/structure lessons:
+  - If you change the hook, re-check that the next 2–3 paragraphs still flow as a coherent arc.
+  - Introduce new concepts inline before using jargon; keep definitions direct (no metaphors).
+  - Use sections for readability; include explicit transitions or “lightbulb” moments where they help.
+  - Diagrams must be narrated in the text and placed near the concept they illustrate.
+  - Include a brief “how I ran the tool” line in the post when a tool is central; mention other options you did not use.
+  - Keep series continuity: add a short recap/link to the previous post when relevant; ensure numbering/order is updated.
 
 ### 2) Writing a post
 - Open `blog/prompts/write.md` and follow it exactly.
