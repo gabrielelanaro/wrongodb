@@ -39,9 +39,14 @@ def _require_api_key() -> None:
     sys.exit(2)
 
 
-def _default_out_path() -> Path:
+def _default_out_path(post_dir: str | None) -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return Path("blog/images") / f"generated_{stamp}.png"
+    if not post_dir:
+        raise ValueError("post_dir is required for default output path")
+    post_path = Path(post_dir)
+    if post_path.parts and post_path.parts[0] != "blog":
+        post_path = Path("blog") / post_path
+    return post_path / "images" / f"generated_{stamp}.png"
 
 
 def _extract_image_data(response) -> tuple[bytes, str | None] | None:
@@ -102,7 +107,12 @@ def main() -> int:
     parser.add_argument(
         "--out",
         default=None,
-        help="Output path (default: blog/images/generated_<timestamp>.png)",
+        help="Output path (default: blog/<post-dir>/images/generated_<timestamp>.png when --post is set)",
+    )
+    parser.add_argument(
+        "--post",
+        default=None,
+        help="Post directory (e.g., 02-watching-the-os-write or blog/02-watching-the-os-write)",
     )
     parser.add_argument(
         "--model",
@@ -135,7 +145,13 @@ def main() -> int:
         )
         return 3
 
-    out_path = Path(args.out) if args.out else _default_out_path()
+    if args.out:
+        out_path = Path(args.out)
+    else:
+        if not args.post:
+            print("Missing output location. Provide --out or --post.", file=sys.stderr)
+            return 2
+        out_path = _default_out_path(args.post)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     image_config = types.ImageConfig(

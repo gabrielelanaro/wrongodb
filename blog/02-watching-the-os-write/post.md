@@ -37,7 +37,7 @@ Durable boundary
 
 This is the same model as a picture, so you can keep the layers straight in your head:
 
-![Write path pipeline](images/write-path-pipeline.png)
+![Write path pipeline](images/01-write-path-pipeline.png)
 
 Keep the two words separate: "written" means the kernel accepted my bytes. "durable" means they will survive a crash. Those are different events separated by time, queues, and sometimes wishful thinking.
 
@@ -67,7 +67,7 @@ I remember asking very dumb questions out loud: what is `B`? why does it say `F=
 
 That one block of output turned into an actual story: my code writes 4KiB, the kernel buffers it, the filesystem decides how to flush it, and only a sync call draws the line that says "this is safe now".
 
-![fs_usage annotated](images/fs-usage-annotated.png)
+![fs_usage annotated](images/02-fs-usage-annotated.png)
 
 The other weird thing I noticed is that trace lines are not always ordered the way your brain wants. Sometimes the `FULLFSYNC` line looks like it arrives before the writes. The actual reason is simpler: I was running this in a loop, so the sync you see belongs to the previous write and the next write is already queued. Facepalm.
 
@@ -81,7 +81,7 @@ Once I had the trace, I realized I was mixing these up. This whole exercise taug
 
 That separation is the durability story.
 
-![Durability boundary](images/durability-boundary.png)
+![Durability boundary](images/03-durability-boundary.png)
 
 ## What’s next
 - B+trees?

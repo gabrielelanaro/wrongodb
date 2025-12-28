@@ -1,6 +1,6 @@
 # WrongoDB: a tiny wrong database (on purpose)
 
-![WrongoDB Hero Image](images/wrongodb_hero.png)
+![WrongoDB Hero Image](images/01-wrongodb_hero.png)
 
 
 So. I’m building a small MongoDB-like store in Rust.
@@ -31,7 +31,7 @@ WrongoDB starts with "store documents somewhere." Then it progresses, one thin s
 - A **B+tree** implementation,
 - And finally: **WAL (Write Ahead Log) + checkpoints**.
 
-![WrongoDB Architecture](images/wrongodb_architecture.png)
+![WrongoDB Architecture](images/02-wrongodb_architecture.png)
 
 Here’s the rough mental model I’m carrying right now. That diagram is deliberately “too neat”. Real designs loop back. They have background work. They have compaction, reconciliation, eviction, and all the machinery you only notice once you’re in trouble. But as a learning scaffold? It’s perfect.
 

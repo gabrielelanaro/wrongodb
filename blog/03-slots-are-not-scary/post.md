@@ -35,7 +35,7 @@ The mental model:
 - the **record bytes** grow from the back
 - free space is the middle
 
-![Leaf Pointer](images/leaf_pointer.png)
+![Leaf Pointer](images/01-leaf_pointer.png)
 
 ```
 byte offsets: 0                                                 page_end

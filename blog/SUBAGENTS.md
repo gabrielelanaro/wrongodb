@@ -1,6 +1,6 @@
 # Sub-agent prompts (Codex CLI)
 
-If I want Codex to draft a post without touching the repo, I run it in read-only mode and write the output to `/tmp`, then copy the text into `blog/*.md` manually.
+If I want Codex to draft a post without touching the repo, I run it in read-only mode and write the output to `/tmp`, then copy the text into `blog/<post-dir>/post.md` manually.
 
 Examples (copy/paste):
 
@@ -50,4 +50,3 @@ Content:
 - End with **Editing notes** bullets.
 PROMPT
 ```
-

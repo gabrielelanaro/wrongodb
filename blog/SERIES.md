@@ -16,20 +16,20 @@ The narrative thread:
 ## Proposed posts
 
 ### 00 — Introduction
-File: `blog/00-introduction.md`
+File: `blog/00-introduction/post.md`
 Goal: set expectations, define “learning-first”, explain AI-as-pair approach.
 
 ### 01 — BlockFile + durability anxiety
-File: `blog/01-blockfile-and-durability.md`
+File: `blog/01-blockfile-and-durability/post.md`
 Goal: fixed-size pages, sparse files, explicit allocation, CRC as a sanity alarm.
 
-### 02 — Slotted pages (leaf KV)
-File: `blog/02-slots-are-not-scary.md`
-Goal: slotted layout, deletes, compaction, `PageFull` as a boundary.
-
-### 03 — Watching the OS write
-Status: draft later
+### 02 — Watching the OS write
+File: `blog/02-watching-the-os-write/post.md`
 Goal: `fs_usage`, `FULLFSYNC`, the difference between “written” and “durable”.
+
+### 03 — Slotted pages (leaf KV)
+File: `blog/03-slots-are-not-scary/post.md`
+Goal: slotted layout, deletes, compaction, `PageFull` as a boundary.
 
 ### 04 — The first B+tree
 Status: draft later
