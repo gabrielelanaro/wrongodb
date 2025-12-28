@@ -27,14 +27,14 @@ Goal: fixed-size pages, sparse files, explicit allocation, CRC as a sanity alarm
 File: `blog/02-slots-are-not-scary.md`
 Goal: slotted layout, deletes, compaction, `PageFull` as a boundary.
 
-### 03 — The first B+tree
+### 03 — Watching the OS write
+Status: draft later
+Goal: `fs_usage`, `FULLFSYNC`, the difference between “written” and “durable”.
+
+### 04 — The first B+tree
 Status: draft later
 Goal: root+leaves, splits, separator keys, “height ≤ 2” as a deliberate slice.
 Note: another agent is actively working in the repo on Slice D; treat the code as moving.
-
-### 04 — Watching the OS write
-Status: draft later
-Goal: `fs_usage`, `FULLFSYNC`, the difference between “written” and “durable”.
 
 ### 05 — What “WAL + checkpoints” will mean here
 Status: outline later
@@ -49,4 +49,3 @@ Suggested structure (not mandatory):
 4) What broke / what I learned
 5) What’s next
 6) Editing notes
-
