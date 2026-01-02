@@ -1,5 +1,21 @@
 # Decisions
 
+## 2026-01-02: Commit/abort semantics for mutable pinned pages
+
+**Decision**
+- Introduce commit/abort semantics for mutable page pins:
+  - `pin_page_mut` records the original (stable) page id when first-write COW happens.
+  - `unpin_page_mut_commit` writes the updated payload into the cache and retires the original page.
+  - `unpin_page_mut_abort` discards the working page and keeps the original page reachable.
+
+**Why**
+- Avoid retiring blocks that are still reachable from the stable root when a mutation fails.
+- Make COW safe under error paths while preserving the “coalesce writes until checkpoint” behavior.
+
+**Notes**
+- Only first-write COW paths carry an `original_page_id`; subsequent writes to the same working page commit without retiring anything.
+- The stable root pointer remains unchanged until checkpoint, so aborting a mutation must never invalidate stable pages.
+
 ## 2025-12-13: `BlockFile::write_block` does not auto-allocate
 
 **Decision**
