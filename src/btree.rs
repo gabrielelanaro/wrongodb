@@ -186,11 +186,12 @@ impl BTree {
         value: &[u8],
     ) -> Result<InsertResult, WrongoDBError> {
         let mut page = self.pager.pin_page_mut(node_id)?;
-        let page_id = page.page_id();
         let page_type = match page_type(page.payload()) {
             Ok(t) => t,
             Err(e) => {
-                self.pager.unpin_page(page_id);
+                if let Err(unpin_err) = self.pager.unpin_page_mut_abort(page) {
+                    return Err(unpin_err);
+                }
                 return Err(e);
             }
         };
@@ -198,8 +199,18 @@ impl BTree {
             PageType::Leaf => self.insert_into_leaf(node_id, &mut page, key, value),
             PageType::Internal => self.insert_into_internal(node_id, &mut page, key, value),
         };
-        self.pager.unpin_page(page_id);
-        result
+        match result {
+            Ok(ok) => {
+                self.pager.unpin_page_mut_commit(page)?;
+                Ok(ok)
+            }
+            Err(err) => {
+                if let Err(unpin_err) = self.pager.unpin_page_mut_abort(page) {
+                    return Err(unpin_err);
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Insert into a leaf page, splitting if it overflows.
@@ -221,15 +232,14 @@ impl BTree {
         value: &[u8],
     ) -> Result<InsertResult, WrongoDBError> {
         let payload_len = page.payload().len();
+        let page_id = page.page_id();
         {
             let mut leaf = LeafPage::open(page.payload_mut())
                 .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
             match leaf.put(key, value) {
                 Ok(()) => {
-                    let new_leaf_id = self.pager.write_new_page(page.payload())?;
-                    self.pager.retire_page(node_id);
                     return Ok(InsertResult {
-                        new_node_id: new_leaf_id,
+                        new_node_id: page_id,
                         split: None,
                     });
                 }
@@ -242,11 +252,10 @@ impl BTree {
         upsert_entry(&mut entries, key, value);
         let (left_bytes, right_bytes, split_key) = split_leaf_entries(&entries, payload_len)?;
 
-        let left_leaf_id = self.pager.write_new_page(&left_bytes)?;
         let right_leaf_id = self.pager.write_new_page(&right_bytes)?;
-        self.pager.retire_page(node_id);
+        page.payload_mut().copy_from_slice(&left_bytes);
         Ok(InsertResult {
-            new_node_id: left_leaf_id,
+            new_node_id: page_id,
             split: Some(SplitInfo {
                 sep_key: split_key,
                 right_child: right_leaf_id,
@@ -266,12 +275,13 @@ impl BTree {
     /// - `sep_key_i` is the **minimum key** of `child_{i+1}`.
     fn insert_into_internal(
         &mut self,
-        node_id: u64,
+        _node_id: u64,
         page: &mut PinnedPageMut,
         key: &[u8],
         value: &[u8],
     ) -> Result<InsertResult, WrongoDBError> {
         let payload_len = page.payload().len();
+        let page_id = page.page_id();
         let (mut first_child, mut entries) = internal_entries(page.payload_mut())?;
         let child_idx = child_index_for_key(&entries, key);
         let child_id = if child_idx == 0 {
@@ -292,21 +302,19 @@ impl BTree {
         }
 
         if let Ok(bytes) = build_internal_page(first_child, &entries, payload_len) {
-            let new_internal_id = self.pager.write_new_page(&bytes)?;
-            self.pager.retire_page(node_id);
+            page.payload_mut().copy_from_slice(&bytes);
             return Ok(InsertResult {
-                new_node_id: new_internal_id,
+                new_node_id: page_id,
                 split: None,
             });
         }
 
         let (left_bytes, right_bytes, promoted_key) =
             split_internal_entries(first_child, &entries, payload_len)?;
-        let left_internal_id = self.pager.write_new_page(&left_bytes)?;
         let right_internal_id = self.pager.write_new_page(&right_bytes)?;
-        self.pager.retire_page(node_id);
+        page.payload_mut().copy_from_slice(&left_bytes);
         Ok(InsertResult {
-            new_node_id: left_internal_id,
+            new_node_id: page_id,
             split: Some(SplitInfo {
                 sep_key: promoted_key,
                 right_child: right_internal_id,

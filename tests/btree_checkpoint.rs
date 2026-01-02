@@ -73,5 +73,30 @@ fn retired_blocks_not_reused_before_checkpoint() {
     bf2.close().unwrap();
 
     assert_eq!(free_head_after_second, NONE_BLOCK_ID);
-    assert!(blocks_after_second > blocks_after_first);
+    assert!(blocks_after_second >= blocks_after_first);
+}
+
+#[test]
+fn coalesces_updates_between_checkpoints() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("btree_coalesce.wt");
+
+    let mut tree = BTree::create(&path, 512).unwrap();
+
+    let mut bf = BlockFile::open(&path).unwrap();
+    let blocks_before = bf.num_blocks().unwrap();
+    bf.close().unwrap();
+
+    tree.put(b"k1", b"v1").unwrap();
+    let mut bf = BlockFile::open(&path).unwrap();
+    let blocks_after_first = bf.num_blocks().unwrap();
+    bf.close().unwrap();
+
+    tree.put(b"k2", b"v2").unwrap();
+    let mut bf = BlockFile::open(&path).unwrap();
+    let blocks_after_second = bf.num_blocks().unwrap();
+    bf.close().unwrap();
+
+    assert!(blocks_after_first > blocks_before);
+    assert_eq!(blocks_after_second, blocks_after_first);
 }

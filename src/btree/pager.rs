@@ -182,6 +182,7 @@ impl PageCache {
 pub(super) struct Pager {
     bf: BlockFile,
     working_root: u64,
+    working_pages: HashSet<u64>,
     retired_blocks: HashSet<u64>,
     #[allow(dead_code)]
     cache: PageCache,
@@ -211,6 +212,7 @@ impl PinnedPage {
 pub(super) struct PinnedPageMut {
     page_id: u64,
     payload: Vec<u8>,
+    original_page_id: Option<u64>,
 }
 
 impl PinnedPageMut {
@@ -234,6 +236,7 @@ impl Pager {
         Ok(Self {
             bf,
             working_root,
+            working_pages: HashSet::new(),
             retired_blocks: HashSet::new(),
             cache: PageCache::new(PageCacheConfig::default()),
         })
@@ -245,6 +248,7 @@ impl Pager {
         Ok(Self {
             bf,
             working_root,
+            working_pages: HashSet::new(),
             retired_blocks: HashSet::new(),
             cache: PageCache::new(PageCacheConfig::default()),
         })
@@ -264,6 +268,7 @@ impl Pager {
     }
 
     pub(super) fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
+        self.flush_cache()?;
         self.bf.set_root_block_id(self.working_root)?;
         // Ensure the new checkpoint root is durable before reclaiming blocks.
         self.bf.sync_all()?;
@@ -273,21 +278,94 @@ impl Pager {
             // is durable, but crashes before this point may still leak space.
             self.bf.sync_all()?;
         }
+        self.working_pages.clear();
         Ok(())
     }
 
     pub(super) fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError> {
-        let payload = self.bf.read_block(page_id, true)?;
+        let payload = self.load_page_for_pin(page_id)?;
         Ok(PinnedPage { page_id, payload })
     }
 
     pub(super) fn pin_page_mut(&mut self, page_id: u64) -> Result<PinnedPageMut, WrongoDBError> {
-        let payload = self.bf.read_block(page_id, true)?;
-        Ok(PinnedPageMut { page_id, payload })
+        if self.working_pages.contains(&page_id) {
+            let payload = self.load_page_for_pin(page_id)?;
+            return Ok(PinnedPageMut {
+                page_id,
+                payload,
+                original_page_id: None,
+            });
+        }
+
+        let payload = self.read_payload_for_cow(page_id)?;
+        self.evict_cache_if_full()?;
+        let new_page_id = self.allocate_page()?;
+        let entry = self.cache.insert(new_page_id, payload.clone());
+        entry.pin_count = 1;
+        self.working_pages.insert(new_page_id);
+        Ok(PinnedPageMut {
+            page_id: new_page_id,
+            payload,
+            original_page_id: Some(page_id),
+        })
     }
 
     pub(super) fn unpin_page(&mut self, _page_id: u64) {
-        // No-op until the page cache tracks pin counts.
+        if let Err(err) = self.cache.unpin(_page_id) {
+            debug_assert!(false, "{err}");
+        }
+    }
+
+    pub(super) fn unpin_page_mut_commit(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError> {
+        let PinnedPageMut {
+            page_id,
+            payload,
+            original_page_id,
+        } = page;
+        let entry = self
+            .cache
+            .get_mut(page_id)
+            .ok_or_else(|| StorageError(format!("page cache miss for {page_id}")))?;
+        if entry.pin_count == 0 {
+            return Err(StorageError(format!("page cache pin underflow for {page_id}")).into());
+        }
+        entry.payload = payload;
+        entry.dirty = true;
+        entry.pin_count -= 1;
+        if let Some(old_page_id) = original_page_id {
+            self.retire_page(old_page_id);
+        }
+        Ok(())
+    }
+
+    pub(super) fn unpin_page_mut_abort(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError> {
+        let PinnedPageMut {
+            page_id,
+            original_page_id,
+            ..
+        } = page;
+        let mut remove_entry = false;
+        {
+            let entry = self
+                .cache
+                .get_mut(page_id)
+                .ok_or_else(|| StorageError(format!("page cache miss for {page_id}")))?;
+            if entry.pin_count == 0 {
+                return Err(StorageError(format!("page cache pin underflow for {page_id}")).into());
+            }
+            entry.pin_count -= 1;
+            if original_page_id.is_some() && entry.pin_count == 0 {
+                remove_entry = true;
+            }
+        }
+        if original_page_id.is_some() {
+            self.working_pages.remove(&page_id);
+            if remove_entry {
+                self.cache.remove(page_id);
+            }
+            self.retire_page(page_id);
+        }
+        Ok(())
     }
 
     pub(super) fn write_page(&mut self, page_id: u64, payload: &[u8]) -> Result<(), WrongoDBError> {
@@ -300,6 +378,7 @@ impl Pager {
 
     pub(super) fn write_new_page(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError> {
         let page_id = self.allocate_page()?;
+        self.working_pages.insert(page_id);
         self.write_page(page_id, payload)?;
         Ok(page_id)
     }
@@ -325,6 +404,32 @@ impl Pager {
 
     pub(super) fn sync_all(&mut self) -> Result<(), WrongoDBError> {
         self.bf.sync_all()
+    }
+
+    fn load_page_for_pin(&mut self, page_id: u64) -> Result<Vec<u8>, WrongoDBError> {
+        if self.cache.contains(page_id) {
+            self.cache.pin(page_id)?;
+            let payload = self
+                .cache
+                .get(page_id)
+                .expect("page cache entry just pinned")
+                .payload
+                .clone();
+            return Ok(payload);
+        }
+
+        self.evict_cache_if_full()?;
+        let payload = self.bf.read_block(page_id, true)?;
+        let entry = self.cache.insert(page_id, payload.clone());
+        entry.pin_count = 1;
+        Ok(payload)
+    }
+
+    fn read_payload_for_cow(&mut self, page_id: u64) -> Result<Vec<u8>, WrongoDBError> {
+        if let Some(entry) = self.cache.get_mut(page_id) {
+            return Ok(entry.payload.clone());
+        }
+        self.bf.read_block(page_id, true)
     }
 
     #[allow(dead_code)]
@@ -439,5 +544,39 @@ mod tests {
         assert!(err
             .to_string()
             .contains("cannot flush dirty pinned page"));
+    }
+
+    #[test]
+    fn pin_blocks_eviction_until_unpinned() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("pager-cache-pin.db");
+        let mut pager = Pager::create(&path, 256).unwrap();
+        let payload_len = pager.page_payload_len();
+
+        let page1 = pager.write_new_page(&vec![1u8; payload_len]).unwrap();
+        let page2 = pager.write_new_page(&vec![2u8; payload_len]).unwrap();
+
+        pager.cache = PageCache::new(PageCacheConfig {
+            capacity_pages: 1,
+            eviction_policy: EvictionPolicy::Lru,
+        });
+
+        let pinned = pager.pin_page(page1).unwrap();
+        assert!(pager.cache.contains(page1));
+
+        let err = pager.pin_page(page2).unwrap_err();
+        assert!(matches!(err, WrongoDBError::Storage(_)));
+
+        pager.unpin_page(pinned.page_id());
+
+        let pinned2 = pager.pin_page(page2).unwrap();
+        assert!(pager.cache.contains(page2));
+        assert!(!pager.cache.contains(page1));
+
+        pager.unpin_page(pinned2.page_id());
+
+        let pinned2_again = pager.pin_page(page2).unwrap();
+        assert!(pager.cache.contains(page2));
+        pager.unpin_page(pinned2_again.page_id());
     }
 }
