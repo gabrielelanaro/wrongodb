@@ -13,15 +13,15 @@
 - [x] 2.3 Implement dirty tracking and write-back on eviction/checkpoint.
 
 ## 3. Copy-on-write integration
-- [ ] 3.1 Implement first-write COW for pages reachable from the stable root.
-- [ ] 3.2 Ensure parent links update to new block ids on first-write COW.
-- [ ] 3.3 Integrate cache updates with retired-block tracking and reuse rules.
+- [x] 3.1 Implement first-write COW for pages reachable from the stable root.
+- [x] 3.2 Ensure parent links update to new block ids on first-write COW.
+- [x] 3.3 Integrate cache updates with retired-block tracking and reuse rules.
 
 ## 4. Checkpoint integration
-- [ ] 4.1 Flush dirty cached pages before persisting the checkpoint root.
-- [ ] 4.2 Reset cache/retired state after a successful checkpoint.
+- [x] 4.1 Flush dirty cached pages before persisting the checkpoint root.
+- [x] 4.2 Reset cache/retired state after a successful checkpoint.
 
 ## 5. Tests
-- [ ] 5.1 Cache hit/eviction tests (including pinned pages).
-- [ ] 5.2 Multiple updates coalesce to a single working block id between checkpoints.
-- [ ] 5.3 Crash-safety test: stable root remains readable after uncheckpointed writes.
+- [x] 5.1 Cache hit/eviction tests (including pinned pages).
+- [x] 5.2 Multiple updates coalesce to a single working block id between checkpoints.
+- [x] 5.3 Crash-safety test: stable root remains readable after uncheckpointed writes.
