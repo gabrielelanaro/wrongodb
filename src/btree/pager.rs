@@ -283,13 +283,13 @@ impl Pager {
     }
 
     pub(super) fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError> {
-        let payload = self.load_page_for_pin(page_id)?;
+        let payload = self.load_page_and_pin(page_id)?;
         Ok(PinnedPage { page_id, payload })
     }
 
     pub(super) fn pin_page_mut(&mut self, page_id: u64) -> Result<PinnedPageMut, WrongoDBError> {
         if self.working_pages.contains(&page_id) {
-            let payload = self.load_page_for_pin(page_id)?;
+            let payload = self.load_page_and_pin(page_id)?;
             return Ok(PinnedPageMut {
                 page_id,
                 payload,
@@ -297,7 +297,7 @@ impl Pager {
             });
         }
 
-        let payload = self.read_payload_for_cow(page_id)?;
+        let payload = self.load_cow_payload(page_id)?;
         self.evict_cache_if_full()?;
         let new_page_id = self.allocate_page()?;
         let entry = self.cache.insert(new_page_id, payload.clone());
@@ -406,7 +406,7 @@ impl Pager {
         self.bf.sync_all()
     }
 
-    fn load_page_for_pin(&mut self, page_id: u64) -> Result<Vec<u8>, WrongoDBError> {
+    fn load_page_and_pin(&mut self, page_id: u64) -> Result<Vec<u8>, WrongoDBError> {
         if self.cache.contains(page_id) {
             self.cache.pin(page_id)?;
             let payload = self
@@ -425,7 +425,7 @@ impl Pager {
         Ok(payload)
     }
 
-    fn read_payload_for_cow(&mut self, page_id: u64) -> Result<Vec<u8>, WrongoDBError> {
+    fn load_cow_payload(&mut self, page_id: u64) -> Result<Vec<u8>, WrongoDBError> {
         if let Some(entry) = self.cache.get_mut(page_id) {
             return Ok(entry.payload.clone());
         }
