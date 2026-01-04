@@ -27,6 +27,9 @@ Create blog post plans and drafts for the WrongoDB series without re-reading or 
   - Add a one-sentence definition for the core concept (e.g., “A B+tree is…”).
   - Deepen the “Why” beyond the immediate symptom (e.g., not just “page full,” but why the structure is a standard DB building block).
   - Keep each beat short and explanation-forward (one or two sentences max).
+- Aha-moment mining (when planning or revising posts):
+  - Scan `~/.codex/sessions` and `~/.codex/history.jsonl` for the exact questions/confusions you had (e.g., “what the hell is a slot,” “when do we compact?”).
+  - Extract 2–4 of those questions and answer them in the post as short, teachable inserts.
 - Image planning lessons:
   - Each image prompt must state the **story purpose** (e.g., “show the durability boundary” or “map trace lines to meaning”), not just the subject.
   - Prefer narrative structures (before/after, timelines, mappings) over generic box-and-arrow diagrams.
