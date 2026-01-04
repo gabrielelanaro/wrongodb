@@ -22,6 +22,11 @@ Create blog post plans and drafts for the WrongoDB series without re-reading or 
 - Do not reread or re-discover prior posts; the prompt already encodes the structure and voice.
 - Produce a plan with the required sections (Title + hook, scope, 7 beats, decisions, artifact, images/ASCII, verification).
 - If details are uncertain, tag as **TO VERIFY**.
+- Outline clarity guidelines (apply when the user asks for simpler language or stronger pedagogy):
+  - Reduce jargon and define any unavoidable terms in plain language.
+  - Add a one-sentence definition for the core concept (e.g., “A B+tree is…”).
+  - Deepen the “Why” beyond the immediate symptom (e.g., not just “page full,” but why the structure is a standard DB building block).
+  - Keep each beat short and explanation-forward (one or two sentences max).
 - Image planning lessons:
   - Each image prompt must state the **story purpose** (e.g., “show the durability boundary” or “map trace lines to meaning”), not just the subject.
   - Prefer narrative structures (before/after, timelines, mappings) over generic box-and-arrow diagrams.
@@ -33,7 +38,7 @@ Create blog post plans and drafts for the WrongoDB series without re-reading or 
   - Use sections for readability; include explicit transitions or “lightbulb” moments where they help.
   - Diagrams must be narrated in the text and placed near the concept they illustrate.
   - Include a brief “how I ran the tool” line in the post when a tool is central; mention other options you did not use.
-  - Keep series continuity: add a short recap/link to the previous post when relevant; ensure numbering/order is updated.
+- Keep series continuity: add a short recap/link to the previous post when relevant; ensure numbering/order is updated.
 
 ### 2) Writing a post
 - Read the "Writing prompt (canonical)" section below and follow it exactly.
@@ -125,6 +130,8 @@ Use exactly these beats:
 
 ## Style constraints for the plan
 - Keep each section short; avoid narrative prose.
+- Prefer plain language; avoid jargon unless defined.
+- If the topic is concept-heavy, include a one-sentence definition in the plan.
 
 ## Example: acceptable brevity (mini)
 - “Key decision: explicit allocation vs implicit append; trade-off: clarity vs convenience.”
