@@ -8,7 +8,9 @@ At some point I literally asked:
 
 Here is the answer I wish I had then:
 
-A slotted page is a fixed-size page where small slots point to record bytes, so inserts and deletes don’t force you to rewrite the whole page.
+A slotted page is a fixed-size page where **record bytes live at the back** and a **tiny index lives at the front**. The index stores where each record starts and how long it is, so records can move without changing their ID. That tiny index entry is what I call a *slot*.
+
+![Slot points to record bytes](images/01-leaf_pointer.png)
 
 This post is the smallest version of that idea. It is not a B+tree yet. It is the in-page layout that makes a B+tree possible.
 
@@ -30,20 +32,9 @@ A slotted page is the boring, reliable answer to that.
 
 You split the page into three regions:
 
-- a small header + slot directory at the front
+- a small header + index of record locations at the front (slot directory)
 - record bytes packed from the back
 - free space in the middle
-
-![Leaf Pointer](images/01-leaf_pointer.png)
-
-```text
-byte offsets: 0                                                 page_end
-             +------------------+-------------------+------------------+
-             | header + slots   |   free space      |  record bytes    |
-             +------------------+-------------------+------------------+
-                                 ^                 ^
-                               lower              upper
-```
 
 Yes. Slots grow forward from the front. Record bytes grow backward from the end. The free space is the gap between them.
 
@@ -105,6 +96,8 @@ Now insert `c -> ...`.
 
 With a flat array you would shift every record after `a`. With slots:
 
+![Sorted slots shift, bytes don't](images/02-slot-shift.png)
+
 - append the new record bytes near the end (move `upper` down)
 - insert one slot in sorted order (shift slots, not records)
 
@@ -121,6 +114,8 @@ That means the page accumulates garbage. Eventually, you need compaction:
 
 - rebuild the page with only live records
 - rewrite slot offsets to point to the new locations
+
+![Compaction packs bytes again](images/03-compaction.png)
 
 We compact *only when we need space* and a delete left garbage behind. If a new insert doesn’t fit, we compact and try again. If it still doesn’t fit, we return `PageFull`.
 
@@ -146,12 +141,4 @@ Once that exists, a B+tree is “just” a way to connect many pages together.
 
 ## What’s next
 
-- Split pages when `PageFull` happens.
-- Add a tiny root page that routes lookups.
-- Start turning one page into a real tree.
-
-## Editing notes
-
-- Add a worked example with actual byte offsets (one page, 3 inserts, 1 delete).
-- Consider a second diagram that shows slots moving while bytes stay put.
-- Decide if I want a short paragraph on fragmentation and why it appears immediately.
+- B+tree, for real this time

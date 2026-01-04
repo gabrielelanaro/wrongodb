@@ -20,7 +20,7 @@ Create blog post plans and drafts for the WrongoDB series without re-reading or 
   - Cross-check `PLAN.md`, `docs/decisions.md`, `blog/SERIES.md`
   - Codex session logs for narrative hooks: `~/.codex/sessions` and `~/.codex/history.jsonl` (use `rg` for keywords like `blockfile`, `fs_usage`, `BTree`, `checkpoint`)
 - Do not reread or re-discover prior posts; the prompt already encodes the structure and voice.
-- Produce a plan with the required sections (Title + hook, scope, 7 beats, decisions, artifact, images/ASCII, verification).
+- Produce a plan with the required sections (Title + hook, scope, 7 beats, decisions, artifact, images, verification).
 - If details are uncertain, tag as **TO VERIFY**.
 - Outline clarity guidelines (apply when the user asks for simpler language or stronger pedagogy):
   - Reduce jargon and define any unavoidable terms in plain language.
@@ -81,7 +81,7 @@ Produce a tight, publish-ready plan for a single new post (5–10 minute read) t
 - Voice: candid, playful, learning-first
 - Structure rhythm: hook → context → mental model → one key decision → concrete artifact → why it matters → what’s next.
 - Teaching moves: rhetorical questions, crisp definitions, zoom from concept to bytes, explicit layer separation.
-- Visual rhythm: 2–4 images per post + optional ASCII diagrams.
+- Visual rhythm: 2–4 images per post
 - Scope: one slice only, no roadmap dumps.
 
 ## Planning rules
@@ -157,7 +157,7 @@ You will be given a plan that follows the 7-beat outline and includes:
 - Outline beats
 - Key decisions
 - Concrete artifact
-- Images & ASCII
+- Images
 - Verification checklist
 
 ## Goal
@@ -167,7 +167,7 @@ Produce a complete markdown post that follows the plan exactly, in the establish
 - Voice: candid, playful, learning-first, “wrong on purpose.”
 - Structure rhythm: hook → context → mental model → one key decision → concrete artifact → why it matters → what’s next.
 - Teaching moves: rhetorical questions, crisp definitions, zoom from concept to bytes, explicit layer separation.
-- Visual rhythm: 2–4 images per post + optional ASCII diagrams.
+- Visual rhythm: 2–4 images per post.
 - Scope: one slice only, no roadmap dumps.
 
 ## Writing rules
@@ -176,10 +176,8 @@ Produce a complete markdown post that follows the plan exactly, in the establish
 - Include 2–4 inline images as markdown: `![Alt](images/<NN-filename>.png)`.
 - Image filenames must be prefixed in order of appearance: `01-`, `02-`, `03-`, ...
 - Generate images by running `python blog/generate_image.py "<prompt>" --post <post-dir> --out blog/<post-dir>/images/<NN-short-name>.png`.
-- If the plan includes an ASCII diagram, include it in a fenced code block.
 - If a fact is uncertain, mark it inline as **TO VERIFY** and keep going.
 - Do not invent code details; only reference file paths or structs if the plan says they exist.
-- Use plain ASCII only.
 - Avoid markdown links unless the plan explicitly provides them.
 
 ## Output format
@@ -208,7 +206,7 @@ Return a single markdown document with:
 
 <Context / why this exists>
 
-<Mental model + image + optional ASCII>
+<Mental model + image>
 
 <Key decision + trade-off>
 
