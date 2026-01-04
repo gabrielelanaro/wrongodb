@@ -1,43 +1,42 @@
-# What the hell is a slot? Slotted pages, deletes, and the first real data structure
+# Slots are not scary
+
+## How a page stores variable-size records without chaos
 
 At some point I literally asked:
 
 > what the hell is a slot
 
-Which is funny, because the answer is: a slot is just… a tiny pointer.
+Here is the answer I wish I had then:
 
-But slotted pages are one of those ideas that don’t click until you see them drawn and then implemented once.
+A slotted page is a fixed-size page where small slots point to record bytes, so inserts and deletes don’t force you to rewrite the whole page.
 
-This post is about the slotted page layout I’m using for a “leaf page” key/value store: the thing that turns “I have pages” into “I can store variable-sized records and delete them without rewriting the world”.
+This post is the smallest version of that idea. It is not a B+tree yet. It is the in-page layout that makes a B+tree possible.
 
-## The problem: variable-sized records on a fixed-sized page
+## Why this exists (the real problem)
 
-If keys and values were fixed size, life would be easy:
+Databases store data in fixed-size pages because disks and caches move data in pages. But our records are not fixed-size. Documents are definitely not fixed-size.
 
-- record `i` starts at offset `i * RECORD_SIZE`
-- done
+So the real problem is: **how do you fit variable-sized records into a fixed-size page and still support search, inserts, and deletes?**
 
-But keys and values are not fixed. Documents are definitely not fixed.
+You need three things at once:
 
-So you need a layout that supports:
+- Insert without shifting half the page.
+- Delete without leaving the page unusable.
+- Keep keys in sorted order so you can search.
 
-- inserts that don’t rewrite half the page
-- deletes that don’t require shifting all bytes
-- an ordering by key so you can binary search
+A slotted page is the boring, reliable answer to that.
 
-Enter: the slotted page.
+## The mental model (draw it, always)
 
-## The slotted page layout (draw it, always)
+You split the page into three regions:
 
-The mental model:
-
-- the **slot directory** grows from the front
-- the **record bytes** grow from the back
-- free space is the middle
+- a small header + slot directory at the front
+- record bytes packed from the back
+- free space in the middle
 
 ![Leaf Pointer](images/01-leaf_pointer.png)
 
-```
+```text
 byte offsets: 0                                                 page_end
              +------------------+-------------------+------------------+
              | header + slots   |   free space      |  record bytes    |
@@ -46,20 +45,45 @@ byte offsets: 0                                                 page_end
                                lower              upper
 ```
 
-Each slot is tiny. Conceptually it’s:
+Yes. Slots grow forward from the front. Record bytes grow backward from the end. The free space is the gap between them.
 
-- `offset` (where the record lives)
-- `len` (how many bytes it occupies)
+## The tiny header (what those fields are for)
 
-That’s it.
+```text
+Header (fixed bytes):
+- page_type (u8)
+- slot_count (u16)
+- lower (u16) = end of slot directory
+- upper (u16) = start of record bytes
+```
 
-The “index” for the page is the slot array, and you can keep it **sorted by key**. That’s the trick: shifting 4-byte slots is cheap compared to moving whole records.
+Why header size != buffer size when there are no slots?
+
+- The header is fixed and small. The buffer is the whole page (e.g., 4096 bytes).
+- `lower` starts right after the header, `upper` starts at the end of the page.
+
+`lower` and `upper` are the page’s free-space accounting. They let us answer two questions fast:
+
+- “Do we have room for this insert?”
+- “Where should the next record bytes go?”
+
+## The key decision: slots are sorted, records are not
+
+The thing that makes this work is: **slots stay sorted by key**, even if record bytes do not.
+
+That one rule lets you:
+
+- binary-search slots (fast lookup)
+- insert by shifting small slot entries (cheap)
+- avoid moving big record bytes around (also cheap)
+
+The bytes can be messy. The slots are the truth.
 
 ## A concrete record format (small enough to fit in your head)
 
 Inside the record bytes, I use a simple encoding:
 
-```
+```text
 record:
   klen (u16)
   vlen (u16)
@@ -67,101 +91,67 @@ record:
   value bytes (vlen)
 ```
 
-So the “header” inside a record is 4 bytes, then the bytes.
+The record header is 4 bytes: klen (2) + vlen (2). So when I say “key starts at offset +4”, that is why.
 
-This is enough to parse a record given a slot `(off, len)` and to extract the key without knowing anything else.
+## The “oh” moment: insert without rewriting the world
 
-## The “why does this help?” moment
-
-Let’s say the page currently has three keys:
+Say the page has three keys:
 
 - `a -> ...`
 - `m -> ...`
 - `z -> ...`
 
-Now I insert `c -> ...`.
+Now insert `c -> ...`.
 
-If I stored records in a flat array, I’d have to shift everything after `a` to make room.
+With a flat array you would shift every record after `a`. With slots:
 
-With slots:
+- append the new record bytes near the end (move `upper` down)
+- insert one slot in sorted order (shift slots, not records)
 
-- I append the new record bytes near the end (moving `upper` down)
-- I insert one slot in sorted position (shifting *slots*, not record bytes)
+We still shift things, but we shift *slots*, not record bytes. A slot is 4 bytes. A record might be hundreds of bytes. Shifting the small thing is the whole point.
 
-The record bytes don’t have to stay in key order. The *slots* define the order.
+## Deletes and compaction (the part nobody loves)
 
-That is the “oh” moment.
+Deletes are a two-step story:
 
-## Deletes and why compaction exists
+1. Remove the slot entry.
+2. Leave the old record bytes where they are.
 
-Now delete `m`.
+That means the page accumulates garbage. Eventually, you need compaction:
 
-What do I do?
+- rebuild the page with only live records
+- rewrite slot offsets to point to the new locations
 
-The simplest approach (and the one I used in this thin slice) is:
+We compact *only when we need space* and a delete left garbage behind. If a new insert doesn’t fit, we compact and try again. If it still doesn’t fit, we return `PageFull`.
 
-- remove the slot entry for `m`
-- leave the record bytes where they are
+It is not glamorous, but it is the first time the system starts acting like a storage engine: validate, rewrite, and preserve invariants.
 
-That means the page accumulates “dead” record bytes over time.
+## PageFull is a feature, not a bug
 
-So we need compaction: rebuild the page by copying only live records into a new packed layout, updating slot offsets along the way.
+A page that cannot fit the next record is not a failure. It is a boundary.
 
-Compaction is not glamorous. But it’s the first time the code starts to feel like storage-engine code:
+It tells you: “this page is full, time to split and build a tree.”
 
-- validate invariants
-- rewrite bytes
-- update pointers
-- return `PageFull` when you can’t make it work
+That is the handoff to the next post.
 
-## `PageFull` is a feature, not an error
+## Why it matters
 
-When a page is full, two things are true:
+A slotted page is a **local index**. It is the smallest piece of a real database:
 
-- I can’t fit this record in this page.
-- I now have a reason to implement the next slice.
+- it supports variable-size records
+- it keeps keys ordered
+- it has a clear full/empty boundary
 
-In other words, `PageFull` is the hand-off between:
+Once that exists, a B+tree is “just” a way to connect many pages together.
 
-- “single page KV store”
-- “B+tree node that can split”
+## What’s next
 
-If you don’t have a hard “page full” boundary, you end up doing ad-hoc growth and it gets messy fast.
-
-## Tiny snippet: the header fields that make the whole thing work
-
-I’m not going to paste the full implementation here, but the key header fields are small:
-
-```rust
-// conceptual (not exact code)
-page_type:  u8
-slot_count: u16
-lower:      u16 // end of slot directory
-upper:      u16 // start of packed record bytes
-```
-
-That’s the whole free-space accounting model.
-
-Once you have those, every other operation becomes “adjust lower/upper, validate, maybe compact”.
-
-## The thing I learned: slots are the per-page index
-
-I kept thinking of slots as an annoying indirection.
-
-But it’s better to think of them as: “a tiny, local index inside the page”.
-
-If the slots are sorted by key, you can:
-
-- binary search within the page
-- implement range scans later (iterate slots in order)
-- split by slot index (not by physical byte region)
-
-It’s a small idea with a lot of leverage.
+- Split pages when `PageFull` happens.
+- Add a tiny root page that routes lookups.
+- Start turning one page into a real tree.
 
 ## Editing notes
 
 - Add a worked example with actual byte offsets (one page, 3 inserts, 1 delete).
-- Decide whether to include a compact() pseudocode block (it’s a nice story).
-- Mention how this relates to “real” systems (Postgres/SQLite style slotted pages) without turning it into a survey.
-- Add one paragraph on fragmentation and why it shows up immediately when you support deletes.
-
+- Consider a second diagram that shows slots moving while bytes stay put.
+- Decide if I want a short paragraph on fragmentation and why it appears immediately.
