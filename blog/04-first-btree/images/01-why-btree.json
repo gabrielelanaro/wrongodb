@@ -1,0 +1,54 @@
+{
+  "seed_prompt": "Diagram: why B+trees are used for on-disk data. Story: page-sized nodes make a wide, shallow tree with few page reads; split produces a separator key and routing. Include a simple before/after split and a tiny routing box.",
+  "draft_prompt": "Infographic diagram titled 'B+Trees: Optimized for On-Disk Data Storage'. The top section, 'The Why: Matching Disk Physics', shows a stylized hard drive icon connected via a thick arrow labeled 'Slow Page I/O' to a large rectangular container labeled 'Disk Page (Block) = B+Tree Node (e.g., 16KB)'. Inside this node are many smaller data slots [Key|Ptr, Key|Ptr... Key|Ptr]. Below this is a wide, three-level tree structure labeled 'Shallow Hierarchy'. The root node has many branches pointing to a wide layer of middle nodes, which point to a massive bottom layer of 'Leaf Nodes (Actual Data)'. A caption reads: 'Wide Nodes = Fewer Levels = Minimizes Expensive Disk Reads to Find Data'. The bottom section, titled 'The Mechanism: Node Split & Routing', shows a 'BEFORE: Full Leaf Node' containing sorted keys [40, 42, 45, 48] with a 'FULL' indicator. A large orange arrow labeled 'Insert Key 47 -> Triggers Split' points to the 'AFTER' state. The parent node above now contains a tiny, highlighted orange rectangular 'Routing Box / Separator Key [45]', with pointers directing traffic down to two new, half-full leaf nodes: Left Node [40, 42] and Right Node [45, 47, 48]. The overall style is clean technical illustration with a blue, teal, and orange color palette, clean lines, and sans-serif typography.",
+  "draft_payload": {
+    "draft_prompt": "Infographic diagram titled 'B+Trees: Optimized for On-Disk Data Storage'. The top section, 'The Why: Matching Disk Physics', shows a stylized hard drive icon connected via a thick arrow labeled 'Slow Page I/O' to a large rectangular container labeled 'Disk Page (Block) = B+Tree Node (e.g., 16KB)'. Inside this node are many smaller data slots [Key|Ptr, Key|Ptr... Key|Ptr]. Below this is a wide, three-level tree structure labeled 'Shallow Hierarchy'. The root node has many branches pointing to a wide layer of middle nodes, which point to a massive bottom layer of 'Leaf Nodes (Actual Data)'. A caption reads: 'Wide Nodes = Fewer Levels = Minimizes Expensive Disk Reads to Find Data'. The bottom section, titled 'The Mechanism: Node Split & Routing', shows a 'BEFORE: Full Leaf Node' containing sorted keys [40, 42, 45, 48] with a 'FULL' indicator. A large orange arrow labeled 'Insert Key 47 -> Triggers Split' points to the 'AFTER' state. The parent node above now contains a tiny, highlighted orange rectangular 'Routing Box / Separator Key [45]', with pointers directing traffic down to two new, half-full leaf nodes: Left Node [40, 42] and Right Node [45, 47, 48]. The overall style is clean technical illustration with a blue, teal, and orange color palette, clean lines, and sans-serif typography.",
+    "story_purpose": "To visually explain that B+Trees are designed for spinning disks by sizing nodes to match disk pages, creating a shallow structure that minimizes slow I/O operations. It also demonstrates how a node split handles overflow by promoting a 'separator' key for future routing.",
+    "key_elements": [
+      "Large rectangular container equating 'Disk Page' with 'B+Tree Node'",
+      "Wide, shallow tree structure visualizing few levels",
+      "Before/After sequence showing a full node splitting",
+      "Prominent, tiny 'Routing Box/Separator Key' created during the split in the parent node",
+      "Visual contrast between 'Slow Page I/O' and efficient internal node navigation"
+    ],
+    "labels_icons": [
+      "Hard Drive Icon",
+      "Label: 'Disk Page (Block) = B+Tree Node'",
+      "Label: 'Shallow Hierarchy'",
+      "Caption: 'Minimizes Expensive Disk Reads'",
+      "Label: 'BEFORE: Full Leaf Node'",
+      "Action Arrow: 'Insert Key -> Triggers Split'",
+      "Highlighted Label: 'Routing Box / Separator Key'",
+      "Label: 'AFTER: Two Half-Full Nodes'"
+    ],
+    "style_notes": "Clean digital illustration style. Palette: Cool blues and teals for the stable tree structure and disk elements; warm oranges/yellows to highlight actions, changes (splits), and the routing key. Line weight: Medium weight for structural outlines, slightly thinner for internal slot dividers. Typography: Clear, legible sans-serif font suitable for technical documentation."
+  },
+  "final_prompt": "Infographic diagram titled 'B+Trees: Optimized for On-Disk Data Storage'. The top section, 'The Why: Matching Disk Physics', shows a stylized hard drive icon connected via a thick arrow labeled 'Slow Page I/O' to a large rectangular container labeled 'Disk Page (Block) = B+Tree Node (e.g., 16KB)'. Inside this node are many smaller data slots [Key|Ptr, Key|Ptr... Key|Ptr]. Below this is a wide, three-level tree structure labeled 'Shallow Hierarchy'. The root node has many branches pointing to a wide layer of middle nodes, which point to a massive bottom layer of 'Leaf Nodes (Actual Data)'. A caption reads: 'Wide Nodes = Fewer Levels = Minimizes Expensive Disk Reads to Find Data'. The bottom section, titled 'The Mechanism: Node Split & Routing', shows a 'BEFORE: Full Leaf Node' containing sorted keys [40, 42, 45, 48] with a 'FULL' indicator. A large orange arrow labeled 'Insert Key 47 -> Triggers Split' points to the 'AFTER' state. The parent node above now contains a tiny, highlighted orange rectangular 'Routing Box / Separator Key [45]', with pointers directing traffic down to two new, half-full leaf nodes: Left Node [40, 42] and Right Node [45, 47, 48]. The overall style is clean technical illustration with a blue, teal, and orange color palette, clean lines, and sans-serif typography.",
+  "model": "gemini-3-pro-image-preview",
+  "aspect": "4:3",
+  "size": "1K",
+  "iterations_requested": 2,
+  "iterations_used": 1,
+  "critiques": [
+    {
+      "pass": true,
+      "story_effectiveness": {
+        "pass": true,
+        "notes": "The diagram is highly effective. It brilliantly uses a two-part structure to first explain the 'why' (matching disk physics to wide nodes) and then the 'how' (a clear, step-by-step node split example). The visual flow is logical and the story is easy to follow."
+      },
+      "visual_consistency": {
+        "pass": true,
+        "notes": "The layout, color palette (blues for structure, orange for action), typography, and icon style are perfectly consistent throughout the entire infographic."
+      },
+      "pleasing": {
+        "pass": true,
+        "notes": "Aesthetically, it's excellent. The design is clean, professional, and well-organized. Despite containing a lot of information, it does not feel cluttered due to the clear sectioning and good use of white space."
+      },
+      "revision_prompt": "A clean technical infographic titled 'B+Trees: Optimized for On-Disk Data Storage', split into two main sections with a blue, teal, and orange color palette. The top section, 'The Why: Matching Disk Physics', connects a hard drive icon via a 'Slow Page I/O' arrow to a large 'Disk Page (Block) = B+Tree Node' container filled with many '[Key|Ptr]' slots. Below it, a wide 'Shallow Hierarchy' tree illustrates that 'Wide Nodes = Fewer Levels = Minimizes Expensive Disk Reads'. The bottom section, 'The Mechanism: Node Split & Routing', uses orange highlights to show a 'BEFORE: Full Leaf Node' [40, 42, 45, 48] splitting after 'Insert Key 47'. An 'AFTER' diagram shows a parent node with a new orange 'Routing Box / Separator Key [45]' pointing to two new half-full leaf nodes [40, 42] and [45, 47, 48], with a caption explaining the data redistribution.",
+      "iteration": 1,
+      "prompt": "Infographic diagram titled 'B+Trees: Optimized for On-Disk Data Storage'. The top section, 'The Why: Matching Disk Physics', shows a stylized hard drive icon connected via a thick arrow labeled 'Slow Page I/O' to a large rectangular container labeled 'Disk Page (Block) = B+Tree Node (e.g., 16KB)'. Inside this node are many smaller data slots [Key|Ptr, Key|Ptr... Key|Ptr]. Below this is a wide, three-level tree structure labeled 'Shallow Hierarchy'. The root node has many branches pointing to a wide layer of middle nodes, which point to a massive bottom layer of 'Leaf Nodes (Actual Data)'. A caption reads: 'Wide Nodes = Fewer Levels = Minimizes Expensive Disk Reads to Find Data'. The bottom section, titled 'The Mechanism: Node Split & Routing', shows a 'BEFORE: Full Leaf Node' containing sorted keys [40, 42, 45, 48] with a 'FULL' indicator. A large orange arrow labeled 'Insert Key 47 -> Triggers Split' points to the 'AFTER' state. The parent node above now contains a tiny, highlighted orange rectangular 'Routing Box / Separator Key [45]', with pointers directing traffic down to two new, half-full leaf nodes: Left Node [40, 42] and Right Node [45, 47, 48]. The overall style is clean technical illustration with a blue, teal, and orange color palette, clean lines, and sans-serif typography.",
+      "image_mime": "image/jpeg"
+    }
+  ],
+  "passed": true
+}

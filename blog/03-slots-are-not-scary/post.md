@@ -1,20 +1,20 @@
-# Slots are not scary
+# Where the Records Go
 
-## How a page stores variable-size records without chaos
+## A simple page layout for variable-size key/value data
 
 At some point I literally asked:
 
 > what the hell is a slot
 
-Here is the answer I wish I had then:
+I asked because I hit a basic storage-engine wall: pages are fixed size, records are not.
 
-A slotted page is a fixed-size page where **record bytes live at the back** and a **tiny index lives at the front**. The index stores where each record starts and how long it is, so records can move without changing their ID. That tiny index entry is what I call a *slot*.
+A slotted page is the smallest answer to that wall. It is a fixed-size page where **record bytes live at the back** and a **tiny index lives at the front**. The index stores where each record starts and how long it is, so records can move without changing their ID. That tiny index entry is what I call a *slot*.
 
 ![Slot points to record bytes](images/01-leaf_pointer.png)
 
 This post is the smallest version of that idea. It is not a B+tree yet. It is the in-page layout that makes a B+tree possible.
 
-## Why this exists (the real problem)
+## The real problem (fixed pages, variable records)
 
 Databases store data in fixed-size pages because disks and caches move data in pages. But our records are not fixed-size. Documents are definitely not fixed-size.
 
@@ -28,7 +28,9 @@ You need three things at once:
 
 A slotted page is the boring, reliable answer to that.
 
-## The mental model (draw it, always)
+The only way this makes sense is if you can picture the page. So let’s start with the shape.
+
+## The shape of the page
 
 You split the page into three regions:
 
@@ -36,31 +38,13 @@ You split the page into three regions:
 - record bytes packed from the back
 - free space in the middle
 
-Yes. Slots grow forward from the front. Record bytes grow backward from the end. The free space is the gap between them.
+Slots grow forward from the front. Record bytes grow backward from the end. The free space is the gap between them.
 
-## The tiny header (what those fields are for)
+Now we have a shape, but not a way to search.
 
-```text
-Header (fixed bytes):
-- page_type (u8)
-- slot_count (u16)
-- lower (u16) = end of slot directory
-- upper (u16) = start of record bytes
-```
+## The rule that makes it searchable
 
-Why header size != buffer size when there are no slots?
-
-- The header is fixed and small. The buffer is the whole page (e.g., 4096 bytes).
-- `lower` starts right after the header, `upper` starts at the end of the page.
-
-`lower` and `upper` are the page’s free-space accounting. They let us answer two questions fast:
-
-- “Do we have room for this insert?”
-- “Where should the next record bytes go?”
-
-## The key decision: slots are sorted, records are not
-
-The thing that makes this work is: **slots stay sorted by key**, even if record bytes do not.
+Slots stay **sorted by key**, even if record bytes do not.
 
 That one rule lets you:
 
@@ -70,19 +54,7 @@ That one rule lets you:
 
 The bytes can be messy. The slots are the truth.
 
-## A concrete record format (small enough to fit in your head)
-
-Inside the record bytes, I use a simple encoding:
-
-```text
-record:
-  klen (u16)
-  vlen (u16)
-  key bytes (klen)
-  value bytes (vlen)
-```
-
-The record header is 4 bytes: klen (2) + vlen (2). So when I say “key starts at offset +4”, that is why.
+With that rule in place, inserts become “move the small thing.”
 
 ## The “oh” moment: insert without rewriting the world
 
@@ -120,6 +92,39 @@ That means the page accumulates garbage. Eventually, you need compaction:
 We compact *only when we need space* and a delete left garbage behind. If a new insert doesn’t fit, we compact and try again. If it still doesn’t fit, we return `PageFull`.
 
 It is not glamorous, but it is the first time the system starts acting like a storage engine: validate, rewrite, and preserve invariants.
+
+## The concrete bytes (if you want them)
+
+If you want the exact layout in this repo, it is tiny.
+
+```text
+Header (fixed bytes):
+- page_type (u8)
+- slot_count (u16)
+- lower (u16) = end of slot directory
+- upper (u16) = start of record bytes
+```
+
+The header is fixed and small. The buffer is the whole page (e.g., 4096 bytes). `lower` starts right after the header, `upper` starts at the end of the page.
+
+`lower` and `upper` are the page’s free-space accounting. They let us answer two questions fast:
+
+- “Do we have room for this insert?”
+- “Where should the next record bytes go?”
+
+Inside the record bytes, I use a simple encoding:
+
+```text
+record:
+  klen (u16)
+  vlen (u16)
+  key bytes (klen)
+  value bytes (vlen)
+```
+
+The record header is 4 bytes: klen (2) + vlen (2). So when I say “key starts at offset +4”, that is why.
+
+When `lower` meets `upper`, the page is done. That is the boundary.
 
 ## PageFull is a feature, not a bug
 

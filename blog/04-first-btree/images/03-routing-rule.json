@@ -1,0 +1,51 @@
+{
+  "seed_prompt": "Diagram: separator key routing rule. Story: separator is the first key in the right leaf. Show left/right leaf key lists, highlight separator in right leaf, and show routing: key < sep goes left, key >= sep goes right.",
+  "draft_prompt": "Technical illustration diagram in a clean, modern data visualization style. The layout is hierarchical, featuring a top 'Parent Routing Node' connected by prominent arrows to two lower rectangular containers labeled 'Left Leaf Node' and 'Right Leaf Node'. The Left Leaf Node contains a horizontal array of sorted data blocks: '[ 10 | 25 | 33 ]'. The Right Leaf Node contains: '[ *42* | 50 | 67 ]'. The first data block in the Right Leaf, '42', is visually emphasized with a bright orange highlight, a thicker border, and a tag element pointing to it labeled 'SEPARATOR KEY (First value in Right Leaf)'. Above within the Parent Routing Node, a flowchart element shows an 'Incoming Search Key (K)' icon pointing to a decision junction. From this junction, a thick orange arrow path labeled 'If K < 42' points down to the Left Leaf Node. Another thick orange arrow path labeled 'If K \u2265 42' points down to the Right Leaf Node. The background is a clean white with a subtle digital grid pattern. The overall palette uses cool grays and blues for structure, with distinct orange for the separator, routing paths, and active logic. Typography is a blend of technical monospace for data blocks and clean sans-serif for titles and logic labels.",
+  "draft_payload": {
+    "draft_prompt": "Technical illustration diagram in a clean, modern data visualization style. The layout is hierarchical, featuring a top 'Parent Routing Node' connected by prominent arrows to two lower rectangular containers labeled 'Left Leaf Node' and 'Right Leaf Node'. The Left Leaf Node contains a horizontal array of sorted data blocks: '[ 10 | 25 | 33 ]'. The Right Leaf Node contains: '[ *42* | 50 | 67 ]'. The first data block in the Right Leaf, '42', is visually emphasized with a bright orange highlight, a thicker border, and a tag element pointing to it labeled 'SEPARATOR KEY (First value in Right Leaf)'. Above within the Parent Routing Node, a flowchart element shows an 'Incoming Search Key (K)' icon pointing to a decision junction. From this junction, a thick orange arrow path labeled 'If K < 42' points down to the Left Leaf Node. Another thick orange arrow path labeled 'If K \u2265 42' points down to the Right Leaf Node. The background is a clean white with a subtle digital grid pattern. The overall palette uses cool grays and blues for structure, with distinct orange for the separator, routing paths, and active logic. Typography is a blend of technical monospace for data blocks and clean sans-serif for titles and logic labels.",
+    "story_purpose": "To visually explain that the routing decision value (separator) between two database nodes is derived specifically from the first key value contained within the right-hand child node, dictating that smaller values go left and greater-or-equal values go right.",
+    "key_elements": [
+      "Parent Routing Node (Top)",
+      "Left Leaf Node containing sorted example keys (e.g., 10, 25, 33)",
+      "Right Leaf Node containing sorted example keys (e.g., 42, 50, 67)",
+      "Highly visible highlighting of the first key in the Right Leaf as the 'Separator'",
+      "Explicit conditional routing paths (arrows) originating from the parent based on comparison to the separator value."
+    ],
+    "labels_icons": [
+      "Label: 'SEPARATOR KEY' with pointer to right leaf's first entry",
+      "Label: 'Incoming Search Key (K)'",
+      "Logic Label: 'If K < [Separator Value]'",
+      "Logic Label: 'If K \u2265 [Separator Value]'",
+      "Icons: Math comparison operators (<, \u2265) prominently displayed on routing paths."
+    ],
+    "style_notes": "Palette: Cool slate blues, light grays, and clean white background. Accent color: Vibrant orange for the separator element and the active routing logic paths. Line Weight: Medium weight for structural boxes, heavier weight for routing arrows. Typography: Monospace font for numerical data to feel technical, clear sans-serif for instructional labels."
+  },
+  "final_prompt": "Technical illustration diagram in a clean, modern data visualization style. The layout is hierarchical, featuring a top 'Parent Routing Node' connected by prominent arrows to two lower rectangular containers labeled 'Left Leaf Node' and 'Right Leaf Node'. The Left Leaf Node contains a horizontal array of sorted data blocks: '[ 10 | 25 | 33 ]'. The Right Leaf Node contains: '[ *42* | 50 | 67 ]'. The first data block in the Right Leaf, '42', is visually emphasized with a bright orange highlight, a thicker border, and a tag element pointing to it labeled 'SEPARATOR KEY (First value in Right Leaf)'. Above within the Parent Routing Node, a flowchart element shows an 'Incoming Search Key (K)' icon pointing to a decision junction. From this junction, a thick orange arrow path labeled 'If K < 42' points down to the Left Leaf Node. Another thick orange arrow path labeled 'If K \u2265 42' points down to the Right Leaf Node. The background is a clean white with a subtle digital grid pattern. The overall palette uses cool grays and blues for structure, with distinct orange for the separator, routing paths, and active logic. Typography is a blend of technical monospace for data blocks and clean sans-serif for titles and logic labels.",
+  "model": "gemini-3-pro-image-preview",
+  "aspect": "4:3",
+  "size": "1K",
+  "iterations_requested": 2,
+  "iterations_used": 1,
+  "critiques": [
+    {
+      "pass": true,
+      "story_effectiveness": {
+        "pass": true,
+        "notes": "Excellent. The diagram clearly illustrates the routing logic based on a separator key. The visual link between the routing condition '42' and the first value in the Right Leaf Node is established effectively through highlighting and a specific label."
+      },
+      "visual_consistency": {
+        "pass": true,
+        "notes": "High consistency. The color palette (cool blues for structure, orange for active elements/keys) is used uniformly. Typography, container styles, and arrow designs are coherent throughout the diagram."
+      },
+      "pleasing": {
+        "pass": true,
+        "notes": "Aesthetically pleasing. The clean, modern style with a subtle grid background works well. The layout is balanced, and the use of glows and gradients is polished without being cluttered."
+      },
+      "revision_prompt": "Technical illustration diagram in a clean, modern data visualization style. A top 'Parent Routing Node' container is connected by prominent orange routing arrows to two lower containers: 'Left Leaf Node' and 'Right Leaf Node'. The Left Leaf Node contains sorted data blocks '[ 10 | 25 | 33 ]'. The Right Leaf Node contains '[ *42* | 50 | 67 ]', where the '*42*' block is highlighted in bright orange with a tag labeling it 'SEPARATOR KEY (First value in Right Leaf)'. Inside the Parent Routing Node, an 'Incoming Search Key (K)' icon points to a decision diamond. An orange path labeled 'If K < 42' leads to the Left Leaf, and another orange path labeled 'If K \u2265 42' leads to the Right Leaf. The background is a clean white with a subtle digital grid. The palette uses cool blues and grays for structure and distinct orange for the separator, paths, and logic.",
+      "iteration": 1,
+      "prompt": "Technical illustration diagram in a clean, modern data visualization style. The layout is hierarchical, featuring a top 'Parent Routing Node' connected by prominent arrows to two lower rectangular containers labeled 'Left Leaf Node' and 'Right Leaf Node'. The Left Leaf Node contains a horizontal array of sorted data blocks: '[ 10 | 25 | 33 ]'. The Right Leaf Node contains: '[ *42* | 50 | 67 ]'. The first data block in the Right Leaf, '42', is visually emphasized with a bright orange highlight, a thicker border, and a tag element pointing to it labeled 'SEPARATOR KEY (First value in Right Leaf)'. Above within the Parent Routing Node, a flowchart element shows an 'Incoming Search Key (K)' icon pointing to a decision junction. From this junction, a thick orange arrow path labeled 'If K < 42' points down to the Left Leaf Node. Another thick orange arrow path labeled 'If K \u2265 42' points down to the Right Leaf Node. The background is a clean white with a subtle digital grid pattern. The overall palette uses cool grays and blues for structure, with distinct orange for the separator, routing paths, and active logic. Typography is a blend of technical monospace for data blocks and clean sans-serif for titles and logic labels.",
+      "image_mime": "image/jpeg"
+    }
+  ],
+  "passed": true
+}

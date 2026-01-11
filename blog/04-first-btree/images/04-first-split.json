@@ -1,0 +1,55 @@
+{
+  "seed_prompt": "Diagram: first split example. Story: insert 9 into keys 3,7,12,18,21; sorted list splits into left [3,7,9] and right [12,18,21]; separator = 12 becomes root entry. Show before list, after two leaves, and root with separator.",
+  "draft_prompt": "Technical blog diagram illustrating a data structure node split operation, presented as a top-down progression with a clean, digital aesthetic. At the top, a rectangular node containing ordered integers [3, 7, 12, 18, 21] is labeled 'BEFORE: Initial Sorted Node (Full)'. An arrow labeled 'Insert Key: 9' points into this node, with the number '9' highlighted in orange. Below this, a large downward transition arrow is labeled 'Overflow & Split'. The bottom section is labeled 'AFTER: Root and Two Leaves'. It features a central upper node labeled 'New Root (Promoted Separator)' containing the integer [12], which is highlighted in orange. Two thick connecting lines extend downwards from the root node to two separate lower rectangular nodes. The bottom left node, labeled 'Left Leaf', contains [3, 7, 9], with the '9' still highlighted. The bottom right node, labeled 'Right Leaf', contains [12, 18, 21]. The background is a clean white with subtle grid lines. The overall color palette uses technical blues for node borders and connectors, dark gray text, and orange for highlighting active elements (insertion and promotion). Line weights are medium and precise. Typography is a modern sans-serif font throughout.",
+  "draft_payload": {
+    "draft_prompt": "Technical blog diagram illustrating a data structure node split operation, presented as a top-down progression with a clean, digital aesthetic. At the top, a rectangular node containing ordered integers [3, 7, 12, 18, 21] is labeled 'BEFORE: Initial Sorted Node (Full)'. An arrow labeled 'Insert Key: 9' points into this node, with the number '9' highlighted in orange. Below this, a large downward transition arrow is labeled 'Overflow & Split'. The bottom section is labeled 'AFTER: Root and Two Leaves'. It features a central upper node labeled 'New Root (Promoted Separator)' containing the integer [12], which is highlighted in orange. Two thick connecting lines extend downwards from the root node to two separate lower rectangular nodes. The bottom left node, labeled 'Left Leaf', contains [3, 7, 9], with the '9' still highlighted. The bottom right node, labeled 'Right Leaf', contains [12, 18, 21]. The background is a clean white with subtle grid lines. The overall color palette uses technical blues for node borders and connectors, dark gray text, and orange for highlighting active elements (insertion and promotion). Line weights are medium and precise. Typography is a modern sans-serif font throughout.",
+    "story_purpose": "To visually explain the mechanism of a node split in a sorted data structure (like a B-tree or B+ tree) when an insertion causes an overflow, showing how a median key is promoted to become a new root separator while the remaining keys are divided into left and right child nodes.",
+    "key_elements": [
+      "Top-down progressive layout showing 'Before' and 'After' states.",
+      "Initial single node state with data [3, 7, 12, 18, 21].",
+      "Visual cue for insertion of key '9'.",
+      "Final three-node structure: one Root, one Left Leaf, one Right Leaf.",
+      "Correct data distribution in final state: Root [12], Left [3, 7, 9], Right [12, 18, 21].",
+      "Connecting lines showing parent-child relationships."
+    ],
+    "labels_icons": [
+      "BEFORE: Initial Sorted Node (Full)",
+      "Insert Key: 9",
+      "Overflow & Split (Transition Arrow)",
+      "AFTER: Root and Two Leaves",
+      "New Root (Promoted Separator)",
+      "Left Leaf",
+      "Right Leaf",
+      "Highlighting (Orange color) on keys 9 and 12 to track their movement."
+    ],
+    "style_notes": "Clean technical blog aesthetic. Palette: Blueprint blues, greys, white background, with distinct orange highlights for active data. Line weight: Medium, clean digital lines. Typography: Modern sans-serif (e.g., Roboto or Open Sans). No hand-drawn elements."
+  },
+  "final_prompt": "Technical blog diagram illustrating a data structure node split operation, presented as a top-down progression with a clean, digital aesthetic. At the top, a rectangular node containing ordered integers [3, 7, 12, 18, 21] is labeled 'BEFORE: Initial Sorted Node (Full)'. An arrow labeled 'Insert Key: 9' points into this node, with the number '9' highlighted in orange. Below this, a large downward transition arrow is labeled 'Overflow & Split'. The bottom section is labeled 'AFTER: Root and Two Leaves'. It features a central upper node labeled 'New Root (Promoted Separator)' containing the integer [12], which is highlighted in orange. Two thick connecting lines extend downwards from the root node to two separate lower rectangular nodes. The bottom left node, labeled 'Left Leaf', contains [3, 7, 9], with the '9' still highlighted. The bottom right node, labeled 'Right Leaf', contains [12, 18, 21]. The background is a clean white with subtle grid lines. The overall color palette uses technical blues for node borders and connectors, dark gray text, and orange for highlighting active elements (insertion and promotion). Line weights are medium and precise. Typography is a modern sans-serif font throughout.",
+  "model": "gemini-3-pro-image-preview",
+  "aspect": "4:3",
+  "size": "1K",
+  "iterations_requested": 2,
+  "iterations_used": 1,
+  "critiques": [
+    {
+      "pass": true,
+      "story_effectiveness": {
+        "pass": true,
+        "notes": "The diagram perfectly illustrates the data structure node split. The progression from a full sorted node to a new root with two leaves is clear. The insertion of '9' and the promotion of '12' are highlighted effectively, telling the technical story accurately and intuitively."
+      },
+      "visual_consistency": {
+        "pass": true,
+        "notes": "The visual style is highly consistent. The clean digital aesthetic, color palette (technical blues, dark gray, orange highlights), typography, and line weights are uniform throughout. The layout is well-structured and follows a clear top-down progression."
+      },
+      "pleasing": {
+        "pass": true,
+        "notes": "The diagram is aesthetically pleasing, clean, and uncluttered. The use of white space, the subtle grid background, and the balanced layout make it easy to read and understand. The colors are professional and the highlights draw the eye to the key actions without being overwhelming."
+      },
+      "revision_prompt": "Technical blog diagram illustrating a data structure node split operation, presented as a clean top-down progression. At the top, a blue-bordered rectangular node labeled 'BEFORE: Initial Sorted Node (Full)' contains '[3, 7, 12, 18, 21]'. A blue arrow labeled 'Insert Key: 9' points into this node, with the '9' highlighted in orange. Below, a large downward blue transition arrow is labeled 'Overflow & Split'. The bottom section, labeled 'AFTER: Root and Two Leaves', shows a central upper node 'New Root (Promoted Separator)' containing '[12]' in orange. Thick blue lines connect it down to two lower nodes: 'Left Leaf' with '[3, 7, 9]' (9 in orange) and 'Right Leaf' with '[12, 18, 21]'. The background is a clean white with a subtle grid. The style is modern, digital, and uses blue for structure, dark gray for text, and orange for highlights.",
+      "iteration": 1,
+      "prompt": "Technical blog diagram illustrating a data structure node split operation, presented as a top-down progression with a clean, digital aesthetic. At the top, a rectangular node containing ordered integers [3, 7, 12, 18, 21] is labeled 'BEFORE: Initial Sorted Node (Full)'. An arrow labeled 'Insert Key: 9' points into this node, with the number '9' highlighted in orange. Below this, a large downward transition arrow is labeled 'Overflow & Split'. The bottom section is labeled 'AFTER: Root and Two Leaves'. It features a central upper node labeled 'New Root (Promoted Separator)' containing the integer [12], which is highlighted in orange. Two thick connecting lines extend downwards from the root node to two separate lower rectangular nodes. The bottom left node, labeled 'Left Leaf', contains [3, 7, 9], with the '9' still highlighted. The bottom right node, labeled 'Right Leaf', contains [12, 18, 21]. The background is a clean white with subtle grid lines. The overall color palette uses technical blues for node borders and connectors, dark gray text, and orange for highlighting active elements (insertion and promotion). Line weights are medium and precise. Typography is a modern sans-serif font throughout.",
+      "image_mime": "image/jpeg"
+    }
+  ],
+  "passed": true
+}

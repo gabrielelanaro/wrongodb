@@ -31,12 +31,19 @@ Create blog post plans and drafts for the WrongoDB series without re-reading or 
   - Scan `~/.codex/sessions` and `~/.codex/history.jsonl` for the exact questions/confusions you had (e.g., “what the hell is a slot,” “when do we compact?”).
   - Extract 2–4 of those questions and answer them in the post as short, teachable inserts.
 - Image planning lessons:
+  - Diagram refinement loop (use for diagrams, not photos):
+    1) Why: state the diagram’s purpose in one sentence.
+    2) Story: spell out the specific point the diagram must teach.
+    3) Draft: list visual elements, color roles, connections, icons, and style choices.
+    4) Refine: improve hierarchy, notation consistency, aesthetics, and remove extra complexity.
+    5) Verify: check the diagram matches the intended concept and is correct.
   - Each image prompt must state the **story purpose** (e.g., “show the durability boundary” or “map trace lines to meaning”), not just the subject.
   - Prefer narrative structures (before/after, timelines, mappings) over generic box-and-arrow diagrams.
   - Specify labels and icons that reinforce the story (e.g., crash bolt, shield, timeline bands).
   - After generation, validate files are real images (`file blog/<post-dir>/images/*.png`); if invalid or dull, revise prompts and regenerate.
 - Story/structure lessons:
   - After any significant change anywhere, re-check that the arc still flows.
+  - Prefer a narrative arc that moves from problem → shape/mental model → key rule/decision → operations (insert/delete) → concrete bytes → boundary/implication → why it matters.
   - Introduce new concepts inline before using jargon; keep definitions direct (no metaphors).
   - Use sections for readability; include explicit transitions or “lightbulb” moments where they help.
   - Diagrams must be narrated in the text and placed near the concept they illustrate.
@@ -53,11 +60,14 @@ Create blog post plans and drafts for the WrongoDB series without re-reading or 
 ### 3) Generating images
 - For each image prompt, run:
   `python blog/generate_image.py "<prompt>" --post <post-dir> --out blog/<post-dir>/images/<NN-short-name>.png`
+- Prefer agentic mode for diagrams (draft → generate → critique → revise):
+  `python blog/generate_image.py "<prompt>" --post <post-dir> --out blog/<post-dir>/images/<NN-short-name>.png --agentic --iterations 2`
 - Prefer sizes/aspects by intent:
   - Hero: `--aspect 16:9 --size 2K`
   - Diagrams: `--aspect 4:3 --size 1K` or `--aspect 1:1 --size 1K`
 - Filenames must be prefixed with the order they appear in the post: `01-`, `02-`, `03-`, ...
 - If an image prompt is unclear, revise the prompt text first (do not guess).
+- Agentic mode writes a sidecar JSON file next to the image with draft/final prompts and critique summaries; use it to judge story effectiveness, visual consistency, and pleasing aesthetics.
 
 ## QA checklist
 - Keep **TO VERIFY** tags until verified against code or notes.

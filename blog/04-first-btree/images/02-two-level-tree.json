@@ -1,0 +1,54 @@
+{
+  "seed_prompt": "Diagram: smallest useful B+tree. Story: root routes to two leaf pages using a single separator key D. Show root with key D, arrows to left/right leaves, and routing rule: key < D -> left, key >= D -> right.",
+  "draft_prompt": "A clean, modern technical diagram schematic illustrating the smallest useful B+tree. At the top center is a rectangular node labeled 'ROOT NODE (Internal)'. Inside this root node is a central highlighted block containing the bold character 'D', labeled below as 'Separator Key'. To the immediate left and right of 'D' are smaller pointer blocks. A thick, arcing arrow originates from the left pointer block, curving down to a rectangular node on the lower left labeled 'LEAF PAGE 1 (Data < D)'. Along this left arrow, a text annotation reads 'Routing Rule: key < D'. Another thick, arcing arrow originates from the right pointer block, curving down to a rectangular node on the lower right labeled 'LEAF PAGE 2 (Data \u2265 D)'. Along this right arrow, an annotation reads 'Routing Rule: key \u2265 D'. The left leaf page contains example placeholder data blocks '[A] [B] [C]'. The right leaf page contains example placeholder data blocks '[D] [E] [F]'. The background is pure white. The color palette uses cool blues for node outlines, light grey fill for node interiors, and a striking orange color for the 'D' key, the routing arrows, and the routing rule text to emphasize the flow and decision points. Typography is a clean sans-serif for headers and labels, and a monospace font for keys and data entries.",
+  "draft_payload": {
+    "draft_prompt": "A clean, modern technical diagram schematic illustrating the smallest useful B+tree. At the top center is a rectangular node labeled 'ROOT NODE (Internal)'. Inside this root node is a central highlighted block containing the bold character 'D', labeled below as 'Separator Key'. To the immediate left and right of 'D' are smaller pointer blocks. A thick, arcing arrow originates from the left pointer block, curving down to a rectangular node on the lower left labeled 'LEAF PAGE 1 (Data < D)'. Along this left arrow, a text annotation reads 'Routing Rule: key < D'. Another thick, arcing arrow originates from the right pointer block, curving down to a rectangular node on the lower right labeled 'LEAF PAGE 2 (Data \u2265 D)'. Along this right arrow, an annotation reads 'Routing Rule: key \u2265 D'. The left leaf page contains example placeholder data blocks '[A] [B] [C]'. The right leaf page contains example placeholder data blocks '[D] [E] [F]'. The background is pure white. The color palette uses cool blues for node outlines, light grey fill for node interiors, and a striking orange color for the 'D' key, the routing arrows, and the routing rule text to emphasize the flow and decision points. Typography is a clean sans-serif for headers and labels, and a monospace font for keys and data entries.",
+    "story_purpose": "To visually explain the fundamental routing mechanism of a B+tree, demonstrating how a single internal separator key in the root determines which leaf page is accessed for data retrieval based on specific comparison rules.",
+    "key_elements": [
+      "Top-down hierarchical layout",
+      "Root Node (Internal) with one separator key 'D' and two pointers",
+      "Two Leaf Pages (Data) at the bottom level",
+      "Prominent directional arrows showing the search path",
+      "Explicit routing rule annotations placed along the path arrows",
+      "Example data within leaf pages to validate the rules (e.g., A,B,C on left; D,E,F on right)"
+    ],
+    "labels_icons": [
+      "Label: 'ROOT NODE (Internal)'",
+      "Label: 'Separator Key: D'",
+      "Label: 'LEAF PAGE 1 (Data < D)'",
+      "Label: 'LEAF PAGE 2 (Data \u2265 D)'",
+      "Annotation: 'Routing Rule: key < D'",
+      "Annotation: 'Routing Rule: key \u2265 D'",
+      "Icon style: Simple rectangular blocks for nodes, bold arrows for flow"
+    ],
+    "style_notes": "Technical blog aesthetic. Palette: Clean blues and greys for structure, highlighted with orange for active elements (keys, arrows, rules). Line weight: Medium weight for boxes, heavier weight for routing arrows. Typography: Sans-serif for labels, Monospace for data/keys."
+  },
+  "final_prompt": "A clean, modern technical diagram schematic illustrating the smallest useful B+tree. At the top center is a rectangular node labeled 'ROOT NODE (Internal)'. Inside this root node is a central highlighted block containing the bold character 'D', labeled below as 'Separator Key'. To the immediate left and right of 'D' are smaller pointer blocks. A thick, arcing arrow originates from the left pointer block, curving down to a rectangular node on the lower left labeled 'LEAF PAGE 1 (Data < D)'. Along this left arrow, a text annotation reads 'Routing Rule: key < D'. Another thick, arcing arrow originates from the right pointer block, curving down to a rectangular node on the lower right labeled 'LEAF PAGE 2 (Data \u2265 D)'. Along this right arrow, an annotation reads 'Routing Rule: key \u2265 D'. The left leaf page contains example placeholder data blocks '[A] [B] [C]'. The right leaf page contains example placeholder data blocks '[D] [E] [F]'. The background is pure white. The color palette uses cool blues for node outlines, light grey fill for node interiors, and a striking orange color for the 'D' key, the routing arrows, and the routing rule text to emphasize the flow and decision points. Typography is a clean sans-serif for headers and labels, and a monospace font for keys and data entries.",
+  "model": "gemini-3-pro-image-preview",
+  "aspect": "4:3",
+  "size": "1K",
+  "iterations_requested": 2,
+  "iterations_used": 1,
+  "critiques": [
+    {
+      "pass": true,
+      "story_effectiveness": {
+        "pass": true,
+        "notes": "The diagram perfectly captures the 'smallest useful B+tree' concept. The single root separator, the two leaf pages, and the clear routing rules (< D, \u2265 D) effectively teach how a B+tree organizes data."
+      },
+      "visual_consistency": {
+        "pass": true,
+        "notes": "Excellent consistency. The color coding (blue outlines, grey fill, orange highlights) is uniform. The sans-serif and monospace typography is correctly applied to labels and keys/data, respectively. The layout is symmetrical and balanced."
+      },
+      "pleasing": {
+        "pass": true,
+        "notes": "The diagram is clean, modern, and uncluttered. The use of white space, clear lines, and the striking orange highlight for the flow makes it visually appealing and easy to digest."
+      },
+      "revision_prompt": "A clean, modern technical schematic of a minimal B+tree. A top center blue-outlined 'ROOT NODE (Internal)' contains an orange-filled block with a bold 'D', labeled below as 'Separator Key', flanked by grey pointer blocks. An orange arcing arrow from the left pointer with text 'Routing Rule: key < D' points to a lower-left blue-outlined 'LEAF PAGE 1 (Data < D)' containing grey blocks '[A] [B] [C]'. A similar right orange arrow with 'Routing Rule: key \u2265 D' points to a lower-right blue-outlined 'LEAF PAGE 2 (Data \u2265 D)' containing grey blocks '[D] [E] [F]'. The background is white. Typography uses sans-serif for labels and monospace for data keys.",
+      "iteration": 1,
+      "prompt": "A clean, modern technical diagram schematic illustrating the smallest useful B+tree. At the top center is a rectangular node labeled 'ROOT NODE (Internal)'. Inside this root node is a central highlighted block containing the bold character 'D', labeled below as 'Separator Key'. To the immediate left and right of 'D' are smaller pointer blocks. A thick, arcing arrow originates from the left pointer block, curving down to a rectangular node on the lower left labeled 'LEAF PAGE 1 (Data < D)'. Along this left arrow, a text annotation reads 'Routing Rule: key < D'. Another thick, arcing arrow originates from the right pointer block, curving down to a rectangular node on the lower right labeled 'LEAF PAGE 2 (Data \u2265 D)'. Along this right arrow, an annotation reads 'Routing Rule: key \u2265 D'. The left leaf page contains example placeholder data blocks '[A] [B] [C]'. The right leaf page contains example placeholder data blocks '[D] [E] [F]'. The background is pure white. The color palette uses cool blues for node outlines, light grey fill for node interiors, and a striking orange color for the 'D' key, the routing arrows, and the routing rule text to emphasize the flow and decision points. Typography is a clean sans-serif for headers and labels, and a monospace font for keys and data entries.",
+      "image_mime": "image/jpeg"
+    }
+  ],
+  "passed": true
+}

@@ -1,5 +1,19 @@
 # Decisions
 
+## 2026-01-11: Agentic image generation loop for blog diagrams
+
+**Decision**
+- Add an opt-in agentic loop to `blog/generate_image.py` that drafts prompts, critiques images, and iterates with a cap.
+- Use `gemini-3-pro-image-preview` for draft, critique, and image generation steps.
+- Emit a sidecar JSON file next to the output image in agentic mode with prompts and critique summaries.
+
+**Why**
+- Improve story effectiveness, visual consistency, and overall aesthetic quality for diagrams.
+- Preserve iteration context for later tuning without manual logging.
+
+**Notes**
+- Default single-shot behavior remains unchanged when `--agentic` is not used.
+
 ## 2026-01-02: Commit/abort semantics for mutable pinned pages
 
 **Decision**

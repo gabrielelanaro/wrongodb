@@ -1,28 +1,33 @@
-# From one page to a tree
+# From one page to a B+Tree (Part 1)
 
-## My first B+tree split
+## Page-shaped divide and conquer
 
 Enough scans, enough hand-waving. B+trees, finally.
 
-Last time I built a single-page key/value store with slots and compaction. It was the first time the bytes felt real. It also ended with a hard boundary: `PageFull`. That boundary is the handoff to a real index.
+Last time I built a single-page key/value store with slots and compaction. It's only 4KB, what do we do now? How do we start splitting and combining those pages? Both the data and the index should be on-disk.
 
-Here is the one-sentence definition that finally made this click for me:
+We need to have a **page-shaped divide and conquer**. Every time a page fills up, we split it into two sorted halves and we save the "separator" key (the first key in the right half) in another page, which we call the "internal routing page".
 
-A B+tree is a sorted collection of fixed-size pages, plus a few tiny index pages that point to the right data page.
+In other words: A B+tree. In this post we introduce how we go from one page to a two-level B+tree. In the next post we'll add multi-level to the mix based on this foundation.
 
-That is the whole trick. Pages stay sorted, and a small top page tells you which page to read.
+## Why B+trees exist at all
 
-## Why B+trees exist at all (not just because my page filled up)
+If you build a database, you need lookups that stay fast even when the file is big. You want the cost to be predictable when the file is 50x larger, and on disk.
 
-If you build a database, you need lookups that stay fast even when the data is big. Not "fast on my laptop today", but "predictable when the file is 50x larger". B+trees are the default answer because they match how storage actually works:
+Storage gives you **pages**, so the real cost is "how many pages do I read?" A B+tree makes that cost small and stable by turning each split into a routing entry:
+
+- When a page fills, you split it into two sorted halves.
+- You keep one separator key (the first key in the right half).
+- That separator becomes a routing entry in another internal page.
+- Every internal page is a divide-and-conquer step over *pages*, not over individual records.
+
+B+trees are the boring, reliable workhorse for on-disk data because they match how storage actually works:
 
 - Disk and OS caches move data in pages, so the tree stores one page per node.
-- Each page can hold many keys, so the tree is wide and short.
+- Each page can hold many keys, so the tree has few levels (wide and short).
 - A wide, short tree means only a few page reads per lookup.
 - Keys stay sorted, so ranges are natural (later).
 - Inserts do not break the structure; they split pages and keep the tree balanced.
-
-There are other index structures, but B+trees are the boring, reliable workhorse for on-disk data. This post is my smallest slice of that idea.
 
 ![Why B+trees are everywhere](images/01-why-btree.png)
 
@@ -31,27 +36,9 @@ There are other index structures, but B+trees are the boring, reliable workhorse
 I am not building the full thing yet. The thin slice here is a two-level tree:
 
 - **leaf pages** hold the actual key/value records
-- **one internal page (the root)** holds a few separator keys and child pointers
+- **one internal page** holds a few separator keys and child pointers
 
-No multi-level growth. No range scans. Just enough structure to stop scanning the world.
-
-Conceptually it looks like this:
-
-```text
-           [root]
- key < D -> left leaf
- key >=D -> right leaf
-```
-
-That is the entire routing rule. The root is just a small routing table.
-
-## The key decision: what is the separator key?
-
-I chose the simplest rule that stays consistent across splits:
-
-**The separator key is the first key in the right leaf.**
-
-That sounds small, but it matters. It gives one clean rule for routing:
+The key decision is the separator rule: **the separator key is the first key in the right leaf.** That single choice gives a stable routing rule:
 
 - If key < separator, go left.
 - If key >= separator, go right.
@@ -62,13 +49,21 @@ So the internal page can use an upper-bound search, and the tree stays correct n
 
 ## The split sequence (the moment the tree is born)
 
-The split starts the second a leaf says "PageFull". I rebuild the page into two leaves and then create a tiny root to point at them. At a high level the sequence is:
+The split starts the second a leaf says “PageFull”. I rebuild the page into two leaves and then create a tiny root to point at them. At a high level the sequence is:
 
 1. Read the leaf entries and insert the new key into that sorted list.
 2. Split the list into left and right halves.
 3. Pick the divider key: the first key in the right half.
 4. Write two leaf pages (left and right) to disk.
 5. Create a new root internal page that points at them.
+
+Here is a tiny example with six keys:
+
+- existing keys: 3, 7, 12, 18, 21
+- insert: 9
+- sorted list: 3, 7, 9, 12, 18, 21
+- split: left = 3, 7, 9 | right = 12, 18, 21
+- separator = 12 (first key in the right half)
 
 Pseudocode, not exact code:
 
@@ -86,9 +81,24 @@ set_root(root)
 
 That is the smallest B+tree. Two leaves and a tiny root with one separator key.
 
-![The first split](images/02-first-split.png)
+![The first split (concrete keys)](images/04-first-split.png)
 
-## Concrete artifact: what I actually built
+## How internal pages fill up
+
+Internal pages fill up the same way leaves do: **every time a child splits, you insert a new separator key into the parent**.
+
+Here’s the shape of that:
+
+1. A leaf splits and produces a separator key.
+2. The parent internal page inserts that separator and a pointer to the new right child.
+3. The parent’s slots grow, and its free space shrinks.
+4. If the parent runs out of space, the parent splits too (not in this post yet).
+
+So the root starts tiny, then accumulates separator keys as more leaf pages split. It is just a compact index of “where the boundaries are” between child pages.
+
+![Internal page fills as leaves split](images/06-internal-fill.png)
+
+## Show me the code, boi
 
 Two pieces of code matter here:
 
@@ -111,27 +121,22 @@ Each slot stores:
 separator_key -> child_pointer
 ```
 
+![Internal page layout: header, slots, child pointers](images/05-internal-page-layout.png)
+
 2) **Root creation on split** (`src/btree.rs`)
 
-When a leaf split happens at the root, I allocate a new internal page and store a single separator key. That is the moment the tree stops being a single page and becomes a two-level index.
+When a leaf split happens at the root, I allocate a new internal page and store a single separator key. That is the moment you "grow" the tree.
 
-## Why this matters (beyond "I stopped scanning")
+## Why this matters
 
 This is the first time the system has **predictable lookup cost**. Even if the data doubles, the lookup path is still just a few page reads. The tree is still short, because each page holds many keys.
 
 It is also the first time the system has a clean growth story. A split does not destroy old data; it creates new pages and rewires the root. That is the exact shape I need for more advanced features later (range scans, checkpoints, and eventually multi-level growth).
 
-This is why B+trees show up in so many databases. They are a clean, boring, scalable answer to "how do I find things on disk?"
+This is why B+trees show up in so many databases. They are a clean, boring, scalable answer to “how do I find things on disk?”
 
 ## What is next
 
 - Let the tree grow past one root page (full-height splits).
 - Add a range scan that walks keys in order.
-- Wire `_id` lookups to hit this tree instead of scanning.
 
-## Editing notes
-
-- Add a concrete toy example with 6 keys and a split diagram that shows real key values.
-- Decide whether to include the one-line `child_for_key` rule from `InternalPage`.
-- Generate the three diagrams for the mental model and split sequence.
-- Consider a short "why not hash index" paragraph, but only if it stays short.
