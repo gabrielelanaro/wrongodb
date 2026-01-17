@@ -588,6 +588,36 @@ impl WrongoDB {
         }
     }
 
+    /// Checkpoint all primary indexes to durable storage.
+    ///
+    /// This flushes all dirty pages to disk and atomically swaps the root.
+    /// After this returns, all previous mutations are durable.
+    ///
+    /// # Durability semantics
+    /// - `checkpoint()` = durability boundary
+    /// - Unflushed pages may be lost on crash
+    /// - Call after important writes to ensure they survive crashes
+    pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
+        for coll in self.collections.values_mut() {
+            if let Some(primary) = &mut coll.primary_index {
+                primary.checkpoint()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Request automatic checkpointing after N updates on the primary index.
+    ///
+    /// Once the threshold is reached, `put()` operations will automatically
+    /// call `checkpoint()` after the operation completes.
+    pub fn request_checkpoint_after_updates(&mut self, count: usize) {
+        for coll in self.collections.values_mut() {
+            if let Some(primary) = &mut coll.primary_index {
+                primary.request_checkpoint_after_updates(count);
+            }
+        }
+    }
+
     pub fn stats(&self) -> DbStats {
         let doc_count: usize = self
             .collections

@@ -51,8 +51,9 @@ Status (2026-01-17)
 - Slice D is implemented (2-level B+tree root + leaf splits).
 - Slice E is implemented (full B+tree height growth + range scan).
 - Slice F is implemented (primary `_id` B+tree lookups).
-- Slice G0 is implemented (basic page cache + checkpoint).
-- Slice G1 is implemented (cache/checkpoint hardening).
+- Slice G0 is implemented (basic page cache + checkpoint infrastructure).
+- Slice G1a is implemented (cache/checkpoint hardening infrastructure).
+- Slice G1b is implemented (wire checkpointing into database operations).
 
 ### Slice D: 2‑level B+tree
 - Root internal + leaf pages.
@@ -75,17 +76,30 @@ Status (2026-01-17)
 - Basic checkpoint: flush dirty pages, atomic root swap (checkpoint slots), retired block reuse.
 - Tests: pin blocks eviction, dirty pages written back, checkpoint commit selects new root on reopen, crash-before-checkpoint uses old root.
 
-### Slice G1: Cache/checkpoint hardening (pre-WAL)
+### Slice G1a: Cache/checkpoint hardening (infrastructure only)
 - **Pinning semantics**: Document pin lifetime for point ops vs range scans.
 - **Cache as source of truth**: Audit BTree paths to ensure no direct BlockFile access; `write_new_page()` should go through cache.
 - **Checkpoint stages**: Make prepare → flush data → commit explicit (currently monolithic).
 - **Iterator safety**: Document pin strategy (current: leaf-only pinning); add eviction-during-iteration tests.
 - **Checkpoint scheduling**: Helper to request checkpoint after N updates; optional interval-based trigger.
 - **Hardening tests**: Dirty pinned pages, all-pinned-at-capacity, concurrent access patterns.
+- **Deliverable**: Infrastructure is solid, but checkpointing is NOT yet wired into database operations.
+
+### Slice G1b: Wire checkpointing into database operations
+- **Automatic checkpoint scheduling**: Configure `checkpoint_after_updates` threshold in Pager; call `checkpoint()` when threshold reached.
+- **Explicit checkpoint API**: Expose `BTree::checkpoint()` publicly; call from `WrongoDB::sync_all()`.
+- **Durability semantics**: Document that `sync_all()` = checkpoint = durability boundary; unflushed pages may be lost on crash.
+- **Test coverage**:
+  - Insert N records, crash before checkpoint → verify old root is recovered
+  - Insert N records, checkpoint, crash → verify new root is recovered
+  - Verify dirty pages are actually flushed to disk during checkpoint
+  - Verify retired blocks are reclaimed after checkpoint
+- **Deliverable**: Checkpointing actually happens during normal database operations; WAL can rely on this working.
 
 ### Slice G2: WAL + recovery
 - Append log records with LSNs.
 - Startup replay to last durable state.
+- **Prerequisite**: Slice G1b must be complete (checkpointing is wired and tested).
 
 ### Slice H: Checkpoint + WAL integration
 - WAL truncation after checkpoint (log records before last checkpoint LSN can be discarded).
