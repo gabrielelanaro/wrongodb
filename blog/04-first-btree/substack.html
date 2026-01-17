@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+</head>
+<body>
+
+<h1>From one page to a B+Tree (Part 1)</h1>
+<p><em>Page-shaped divide and conquer</em></p>
+
+<hr>
+
+<p>Enough scans, enough hand-waving. B+trees, finally.</p>
+
+<p>Last time I built a single-page key/value store with slots and compaction. It's only 4KB, what do we do now? How do we start splitting and combining those pages? Both the data and the index should be on-disk.</p>
+
+<p>We need to have a <strong>page-shaped divide and conquer</strong>. Every time a page fills up, we split it into two sorted halves and we save the "separator" key (the first key in the right half) in another page, which we call the "internal routing page".</p>
+
+<p>In other words: A B+tree. In this post we introduce how we go from one page to a two-level B+tree. In the next post we'll add multi-level to the mix based on this foundation.</p>
+
+<h2>Why B+trees exist at all</h2>
+
+<p>If you build a database, you need lookups that stay fast even when the file is big. You want the cost to be predictable when the file is 50x larger, and on disk.</p>
+
+<p>Storage gives you <strong>pages</strong>, so the real cost is "how many pages do I read?" A B+tree makes that cost small and stable by turning each split into a routing entry:</p>
+
+<ul>
+<li>When a page fills, you split it into two sorted halves.</li>
+<li>You keep one separator key (the first key in the right half).</li>
+<li>That separator becomes a routing entry in another internal page.</li>
+<li>Every internal page is a divide-and-conquer step over <em>pages</em>, not over individual records.</li>
+</ul>
+
+<p>B+trees are the boring, reliable workhorse for on-disk data because they match how storage actually works:</p>
+
+<ul>
+<li>Disk and OS caches move data in pages, so the tree stores one page per node.</li>
+<li>Each page can hold many keys, so the tree has few levels (wide and short).</li>
+<li>A wide, short tree means only a few page reads per lookup.</li>
+<li>Keys stay sorted, so ranges are natural (later).</li>
+<li>Inserts do not break the structure; they split pages and keep the tree balanced.</li>
+</ul>
+
+<p><strong>[IMAGE 1: Upload blog/04-first-btree/images/01-why-btree.png here - Caption: Why B+trees are everywhere]</strong></p>
+
+<h2>The smallest useful tree</h2>
+
+<p>I am not building the full thing yet. The thin slice here is a two-level tree:</p>
+
+<ul>
+<li><strong>leaf pages</strong> hold the actual key/value records</li>
+<li><strong>one internal page</strong> holds a few separator keys and child pointers</li>
+</ul>
+
+<p>The key decision is the separator rule: <strong>the separator key is the first key in the right leaf.</strong> That single choice gives a stable routing rule:</p>
+
+<ul>
+<li>If key &lt; separator, go left.</li>
+<li>If key &gt;= separator, go right.</li>
+</ul>
+
+<p>So the internal page can use an upper-bound search, and the tree stays correct no matter how many inserts come later.</p>
+
+<p><strong>[IMAGE 2: Upload blog/04-first-btree/images/03-routing-rule.png here - Caption: Routing rule: separator key]</strong></p>
+
+<h2>The split sequence (the moment the tree is born)</h2>
+
+<p>The split starts the second a leaf says "PageFull". I rebuild the page into two leaves and then create a tiny root to point at them. At a high level the sequence is:</p>
+
+<ol>
+<li>Read the leaf entries and insert the new key into that sorted list.</li>
+<li>Split the list into left and right halves.</li>
+<li>Pick the divider key: the first key in the right half.</li>
+<li>Write two leaf pages (left and right) to disk.</li>
+<li>Create a new root internal page that points at them.</li>
+</ol>
+
+<p>Here is a tiny example with six keys:</p>
+
+<ul>
+<li>existing keys: 3, 7, 12, 18, 21</li>
+<li>insert: 9</li>
+<li>sorted list: 3, 7, 9, 12, 18, 21</li>
+<li>split: left = 3, 7, 9 | right = 12, 18, 21</li>
+<li>separator = 12 (first key in the right half)</li>
+</ul>
+
+<p>Pseudocode, not exact code:</p>
+
+<pre><code>entries = read_leaf()
+entries.insert(new_kv)
+left, right = split(entries)
+sep = first_key(right)
+left_id  = write_page(left)
+right_id = write_page(right)
+root = new_internal(first_child=left_id)
+root.put_separator(sep, right_id)
+set_root(root)
+</code></pre>
+
+<p>That is the smallest B+tree. Two leaves and a tiny root with one separator key.</p>
+
+<p><strong>[IMAGE 3: Upload blog/04-first-btree/images/04-first-split.png here - Caption: The first split (concrete keys)]</strong></p>
+
+<h2>How internal pages fill up</h2>
+
+<p>Internal pages fill up the same way leaves do: <strong>every time a child splits, you insert a new separator key into the parent</strong>.</p>
+
+<p>Here's the shape of that:</p>
+
+<ol>
+<li>A leaf splits and produces a separator key.</li>
+<li>The parent internal page inserts that separator and a pointer to the new right child.</li>
+<li>The parent's slots grow, and its free space shrinks.</li>
+<li>If the parent runs out of space, the parent splits too (not in this post yet).</li>
+</ol>
+
+<p>So the root starts tiny, then accumulates separator keys as more leaf pages split. It is just a compact index of "where the boundaries are" between child pages.</p>
+
+<p><strong>[IMAGE 4: Upload blog/04-first-btree/images/06-internal-fill.png here - Caption: Internal page fills as leaves split]</strong></p>
+
+<h2>Show me the code, boi</h2>
+
+<p>Two pieces of code matter here:</p>
+
+<p><strong>1) Internal page layout</strong> (<code>src/internal_page.rs</code>)</p>
+
+<p>The internal page has the same slotted layout as a leaf, but the record value is a child pointer instead of a user value. The header includes a <code>first_child</code> pointer for keys smaller than the first separator key.</p>
+
+<p>In plain terms, the header is:</p>
+
+<pre><code>page_type  (internal)
+slot_count
+lower / upper
+first_child
+</code></pre>
+
+<p>Each slot stores:</p>
+
+<pre><code>separator_key -> child_pointer
+</code></pre>
+
+<p><strong>[IMAGE 5: Upload blog/04-first-btree/images/05-internal-page-layout.png here - Caption: Internal page layout: header, slots, child pointers]</strong></p>
+
+<p><strong>2) Root creation on split</strong> (<code>src/btree.rs</code>)</p>
+
+<p>When a leaf split happens at the root, I allocate a new internal page and store a single separator key. That is the moment you "grow" the tree.</p>
+
+<h2>Why this matters</h2>
+
+<p>This is the first time the system has <strong>predictable lookup cost</strong>. Even if the data doubles, the lookup path is still just a few page reads. The tree is still short, because each page holds many keys.</p>
+
+<p>It is also the first time the system has a clean growth story. A split does not destroy old data; it creates new pages and rewires the root. That is the exact shape I need for more advanced features later (range scans, checkpoints, and eventually multi-level growth).</p>
+
+<p>This is why B+trees show up in so many databases. They are a clean, boring, scalable answer to "how do I find things on disk?"</p>
+
+<h2>What is next</h2>
+
+<ul>
+<li>Let the tree grow past one root page (full-height splits).</li>
+<li>Add a range scan that walks keys in order.</li>
+</ul>
+
+</body>
+</html>
