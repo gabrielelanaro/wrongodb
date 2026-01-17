@@ -328,9 +328,6 @@ impl Pager {
     ///
     /// Once the configured number of updates is reached, `checkpoint_requested()` returns true.
     /// The caller is responsible for actually calling `checkpoint()`.
-    ///
-    /// TODO: Wire up in Slice G2 (WAL) for automatic checkpoint triggering.
-    #[allow(dead_code)]
     pub(super) fn request_checkpoint_after_updates(&mut self, count: usize) {
         self.checkpoint_after_updates = Some(count);
     }
@@ -338,9 +335,6 @@ impl Pager {
     /// Check if a checkpoint has been requested based on update count.
     ///
     /// Returns true if `checkpoint_after_updates` is set and the update threshold has been reached.
-    ///
-    /// TODO: Wire up in Slice G2 (WAL) for automatic checkpoint triggering.
-    #[allow(dead_code)]
     pub(super) fn checkpoint_requested(&self) -> bool {
         if let Some(threshold) = self.checkpoint_after_updates {
             return self.updates_since_checkpoint >= threshold;
