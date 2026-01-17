@@ -436,3 +436,33 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 **Notes**
 - Read-only pins remain flushable (they are not marked dirty).
 - Eviction already skips pinned pages; flush uses the same rule for dirty pages.
+
+## 2026-01-17: Pinning semantics for page cache (Slice G1)
+
+**Decision**
+- Define pin lifetime invariants for the page cache:
+  - **Pinned pages cannot be evicted**: Pages with `pin_count > 0` are never selected for eviction by the LRU policy.
+  - **Dirty pinned pages cannot be flushed**: `flush_cache()` returns an error if it encounters a dirty page with `pin_count > 0`.
+  - **Pin/unpin must be balanced**: Every `pin_page()` or `pin_page_mut()` must have a corresponding `unpin_page()` or `unpin_page_mut_*()` call.
+- Pin lifetimes:
+  - **Point operations** (get/put): Pin is held only for the duration of the single page access. Unpin immediately after read/modify.
+  - **Range scans/iterators**: Pin current leaf page during iteration, unpin when advancing to next leaf. Parent pages are unpinned after routing to child (safe to re-read with COW).
+  - **Tree modifications**: `pin_page_mut()` holds pin until `unpin_page_mut_commit()` or `unpin_page_mut_abort()` is called.
+
+**Why**
+- Prevents use-after-free bugs where pages are evicted while still being accessed.
+- Ensures flush/writeback doesn't race with in-memory modifications.
+- Provides clear rules for iterator safety and concurrent access patterns.
+
+**Iterator safety (current leaf-only pinning)**
+- `BTreeRangeIter` pins only the current leaf page during iteration.
+- Parent pages are unpinned after navigating down to the leaf (they may be re-read safely due to COW semantics).
+- This is safe because:
+  - Internal pages are immutable from the stable root perspective.
+  - If a parent is evicted and re-read, the same stable page content is retrieved.
+  - The iterator only needs stable access to the current leaf; mutations create new working pages that don't affect the in-memory pinned leaf.
+
+**Tradeoffs**
+- **Leaf-only pinning** minimizes pin count but may re-read parent pages during iteration if they're evicted.
+- **Full-path pinning** would keep the entire path from root to leaf pinned, preventing any re-reads but consuming more cache capacity.
+- Current implementation uses leaf-only pinning for simplicity; full-path pinning can be added later if needed for performance.

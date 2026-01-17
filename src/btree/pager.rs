@@ -186,6 +186,12 @@ pub(super) struct Pager {
     retired_blocks: HashSet<u64>,
     #[allow(dead_code)]
     cache: PageCache,
+    /// Number of updates since last checkpoint. Used for checkpoint scheduling.
+    updates_since_checkpoint: usize,
+    /// If set, checkpoint will be requested after this many updates.
+    /// TODO: Wire up in Slice G2 (WAL) for automatic checkpoint triggering.
+    #[allow(dead_code)]
+    checkpoint_after_updates: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -239,6 +245,8 @@ impl Pager {
             working_pages: HashSet::new(),
             retired_blocks: HashSet::new(),
             cache: PageCache::new(PageCacheConfig::default()),
+            updates_since_checkpoint: 0,
+            checkpoint_after_updates: None,
         })
     }
 
@@ -251,6 +259,8 @@ impl Pager {
             working_pages: HashSet::new(),
             retired_blocks: HashSet::new(),
             cache: PageCache::new(PageCacheConfig::default()),
+            updates_since_checkpoint: 0,
+            checkpoint_after_updates: None,
         })
     }
 
@@ -267,9 +277,32 @@ impl Pager {
         Ok(())
     }
 
-    pub(super) fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
-        self.flush_cache()?;
-        self.bf.set_root_block_id(self.working_root)?;
+    /// Prepare for checkpoint by capturing the current working root.
+    ///
+    /// This freezes the root that will be persisted; subsequent mutations
+    /// will update a new working root.
+    pub(super) fn checkpoint_prepare(&self) -> u64 {
+        self.working_root
+    }
+
+    /// Flush all dirty cached pages to disk.
+    ///
+    /// This is the data files stage of checkpoint. Dirty pages are written
+    /// to their working block locations. Dirty pinned pages will cause an error.
+    pub(super) fn checkpoint_flush_data(&mut self) -> Result<(), WrongoDBError> {
+        self.flush_cache()
+    }
+
+    /// Commit the checkpoint by atomically swapping the root and reclaiming retired blocks.
+    ///
+    /// Steps:
+    /// 1. Write the new root to the checkpoint slot.
+    /// 2. Sync to ensure the new root is durable.
+    /// 3. Release retired blocks to the free list (after root is durable).
+    /// 4. Sync again to make free list updates durable.
+    /// 5. Clear working_pages (all pages are now stable).
+    pub(super) fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError> {
+        self.bf.set_root_block_id(new_root)?;
         // Ensure the new checkpoint root is durable before reclaiming blocks.
         self.bf.sync_all()?;
         if !self.retired_blocks.is_empty() {
@@ -280,6 +313,44 @@ impl Pager {
         }
         self.working_pages.clear();
         Ok(())
+    }
+
+    pub(super) fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
+        let root = self.checkpoint_prepare();
+        self.checkpoint_flush_data()?;
+        self.checkpoint_commit(root)?;
+        // Reset update counter after successful checkpoint
+        self.updates_since_checkpoint = 0;
+        Ok(())
+    }
+
+    /// Request a checkpoint after the specified number of updates.
+    ///
+    /// Once the configured number of updates is reached, `checkpoint_requested()` returns true.
+    /// The caller is responsible for actually calling `checkpoint()`.
+    ///
+    /// TODO: Wire up in Slice G2 (WAL) for automatic checkpoint triggering.
+    #[allow(dead_code)]
+    pub(super) fn request_checkpoint_after_updates(&mut self, count: usize) {
+        self.checkpoint_after_updates = Some(count);
+    }
+
+    /// Check if a checkpoint has been requested based on update count.
+    ///
+    /// Returns true if `checkpoint_after_updates` is set and the update threshold has been reached.
+    ///
+    /// TODO: Wire up in Slice G2 (WAL) for automatic checkpoint triggering.
+    #[allow(dead_code)]
+    pub(super) fn checkpoint_requested(&self) -> bool {
+        if let Some(threshold) = self.checkpoint_after_updates {
+            return self.updates_since_checkpoint >= threshold;
+        }
+        false
+    }
+
+    /// Increment the update counter (to be called after each mutation).
+    fn track_update(&mut self) {
+        self.updates_since_checkpoint = self.updates_since_checkpoint.saturating_add(1);
     }
 
     pub(super) fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError> {
@@ -335,6 +406,8 @@ impl Pager {
         if let Some(old_page_id) = original_page_id {
             self.retire_page(old_page_id);
         }
+        // Track this mutation for checkpoint scheduling
+        self.track_update();
         Ok(())
     }
 
@@ -432,7 +505,6 @@ impl Pager {
         self.bf.read_block(page_id, true)
     }
 
-    #[allow(dead_code)]
     fn evict_cache_if_full(&mut self) -> Result<(), WrongoDBError> {
         if !self.cache.is_full() {
             return Ok(());
@@ -450,13 +522,18 @@ impl Pager {
         Ok(())
     }
 
-    #[allow(dead_code)]
     fn flush_cache(&mut self) -> Result<(), WrongoDBError> {
         let (bf, cache) = (&mut self.bf, &mut self.cache);
         for entry in cache.entries.values_mut() {
             if !entry.dirty {
                 continue;
             }
+            // NOTE: Defensive programming - this check shouldn't be hit in the current
+            // single-threaded design because:
+            // 1. Pages are marked dirty only in unpin_page_mut_commit(), which also decrements pin_count
+            // 2. No concurrent operations (no background threads yet)
+            //
+            // This check becomes important when adding concurrent eviction/checkpoint (Slice G2+).
             if entry.pin_count > 0 {
                 return Err(
                     StorageError(format!("cannot flush dirty pinned page {}", entry.page_id)).into(),

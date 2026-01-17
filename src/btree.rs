@@ -575,6 +575,21 @@ struct CursorFrame {
 /// Notes:
 /// - Leaves are not linked (no sibling pointers), so advancing to the next leaf uses a parent stack.
 ///
+/// ## Iterator Pinning Strategy
+///
+/// This iterator uses **leaf-only pinning** for memory efficiency:
+/// - Only the current leaf page is pinned during iteration.
+/// - Parent internal pages are unpinned after routing down to the leaf.
+/// - When advancing to the next leaf, the current leaf is unpinned before climbing the stack.
+///
+/// This is safe because:
+/// - Internal pages are immutable from the stable root perspective (COW semantics).
+/// - If a parent page is evicted and re-read, it returns the same stable content.
+/// - The iterator only needs stable access to the current leaf; mutations create new working pages.
+///
+/// Tradeoff: Parent pages may be re-read if evicted during iteration, but this is acceptable
+/// for the current single-threaded design. Full-path pinning could be added later if needed.
+///
 /// Graphically:
 /// ```text
 /// current leaf exhausted
