@@ -51,6 +51,7 @@ Status (2025-12-21)
 - Slice D is implemented (2-level B+tree root + leaf splits).
 - Slice E is implemented (full B+tree height growth + range scan).
 - Slice F is implemented (primary `_id` B+tree lookups).
+- Slice G0 is implemented (basic page cache + checkpoint).
 
 ### Slice D: 2‑level B+tree
 - Root internal + leaf pages.
@@ -65,25 +66,39 @@ Status (2025-12-21)
 - Primary `_id` storage uses B+tree.
 - `find_one({_id: …})` hits primary; `find()` still scans.
 
-### Slice G: WAL + recovery
+### Slice G0: Page cache + basic checkpoint
+- Add in-memory page cache between `Pager` and `BlockFile` with LRU eviction.
+- Pin/unpin API for iterators and scans.
+- Copy-on-write updates with working root vs stable root.
+- Dirty page tracking and writeback on eviction/checkpoint.
+- Basic checkpoint: flush dirty pages, atomic root swap (checkpoint slots), retired block reuse.
+- Tests: pin blocks eviction, dirty pages written back, checkpoint commit selects new root on reopen, crash-before-checkpoint uses old root.
+
+### Slice G1: Cache/checkpoint hardening (pre-WAL)
+- **Pinning semantics**: Document pin lifetime for point ops vs range scans.
+- **Cache as source of truth**: Audit BTree paths to ensure no direct BlockFile access; `write_new_page()` should go through cache.
+- **Checkpoint stages**: Make prepare → flush data → commit explicit (currently monolithic).
+- **Iterator safety**: Document pin strategy (current: leaf-only pinning); add eviction-during-iteration tests.
+- **Checkpoint scheduling**: Helper to request checkpoint after N updates; optional interval-based trigger.
+- **Hardening tests**: Dirty pinned pages, all-pinned-at-capacity, concurrent access patterns.
+
+### Slice G2: WAL + recovery
 - Append log records with LSNs.
 - Startup replay to last durable state.
 
-### Slice H: Checkpoints
-- Flush dirty pages to new blocks.
-- Atomic metadata update + WAL truncation.
+### Slice H: Checkpoint + WAL integration
+- WAL truncation after checkpoint (log records before last checkpoint LSN can be discarded).
+- Checkpoint scheduling integration with WAL (periodic checkpoints to bound WAL size).
+- Note: checkpoints are the explicit durability boundary (eviction is opportunistic and only happens when the cache is under pressure).
 
 ### Slice I: MVCC / transactions
 - Txn ids/timestamps, per‑record version chains.
 - Snapshot reads + GC.
 
-## Page cache notes (future)
-- Add an in‑memory page cache between `Pager` and `BlockFile` so reads hit RAM and writes mark pages dirty.
-- Use the cache to coalesce many inserts into the same leaf/internal pages; write new blocks only on eviction or checkpoint (amortizes the current per‑key COW overhead).
-- Track per‑page state: clean/dirty, pinned/unpinned, last‑used (LRU or clock).
-- Reconcile dirty pages on eviction and on checkpoint; keep COW rules (never overwrite last‑checkpoint pages).
-- Define cache sizing, eviction policy, and a minimal pin/unpin API for iterators/scans.
-- Integrate with free‑list/retired blocks so freed pages aren’t reused until checkpoint commit.
+## WiredTiger alignment notes
+- Eviction is opportunistic (memory pressure) vs checkpoint as explicit durability boundary.
+- Checkpoint staging in WT: prepare → data files → history store → flush → metadata; we use a simpler stable-root vs working-root model without generations.
+- Checkpoint scheduling: periodic or on-demand; added in Slice G1.
 
 ## Performance notes / TODOs
 - B+tree splits currently choose a split point by rebuilding candidate left/right pages around the midpoint; OK for small pages but should be replaced with a single-pass “split-by-bytes” / one-build approach.
