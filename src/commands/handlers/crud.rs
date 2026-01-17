@@ -266,3 +266,33 @@ impl Command for DeleteCommand {
         })
     }
 }
+
+// ============================================================================
+// DeleteMany Command (mongosh helper)
+// ============================================================================
+
+pub struct DeleteManyCommand;
+
+impl Command for DeleteManyCommand {
+    fn names(&self) -> &[&str] {
+        &["deleteMany"]
+    }
+
+    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+        // deleteMany format: {deleteMany: "collection", deletes: [{q: filter, limit: 1}]}
+        let coll_name = doc.get_str("deleteMany").unwrap_or("test");
+        let filter = doc.get_document("filter").ok();
+
+        let count = if let Some(filter_doc) = filter {
+            let filter_json = bson_to_value(&filter_doc);
+            db.delete_many_in(coll_name, Some(filter_json))?
+        } else {
+            db.delete_many_in(coll_name, None)?
+        };
+
+        Ok(doc! {
+            "acknowledged": Bson::Boolean(true),
+            "deletedCount": Bson::Int32(count as i32),
+        })
+    }
+}

@@ -52,6 +52,7 @@ impl CommandRegistry {
         self.register(Box::new(handlers::FindCommand));
         self.register(Box::new(handlers::UpdateCommand));
         self.register(Box::new(handlers::DeleteCommand));
+        self.register(Box::new(handlers::DeleteManyCommand));
         self.register(Box::new(handlers::ListIndexesCommand));
         self.register(Box::new(handlers::CreateIndexesCommand));
         self.register(Box::new(handlers::GetMoreCommand));
