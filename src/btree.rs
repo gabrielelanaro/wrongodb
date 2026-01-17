@@ -155,7 +155,7 @@ impl BTree {
     ///
     /// # Example
     /// ```no_run
-    /// # use minimongo::BTree;
+    /// # use wrongodb::BTree;
     /// # let mut tree = BTree::create("/tmp/db", 4096).unwrap();
     /// tree.request_checkpoint_after_updates(100);  // Auto-checkpoint every 100 puts
     /// ```
