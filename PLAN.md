@@ -101,6 +101,12 @@ Status (2026-01-17)
 - Startup replay to last durable state.
 - **Prerequisite**: Slice G1b must be complete (checkpointing is wired and tested).
 
+**Design decision (2026-01-18)**: Using **change vector logging** (WiredTiger-style) instead of full-page logging.
+- Logs operations (insert, split) not page images
+- ~100x smaller WAL: ~30 bytes per operation vs 4KB full page
+- More complex recovery (must replay operations) but matches production WiredTiger architecture
+- Trade-off: implementation complexity vs space efficiency
+
 ### Slice H: Checkpoint + WAL integration
 - WAL truncation after checkpoint (log records before last checkpoint LSN can be discarded).
 - Checkpoint scheduling integration with WAL (periodic checkpoints to bound WAL size).
