@@ -1,6 +1,7 @@
 use std::path::Path;
 
 mod pager;
+pub mod wal;
 
 use self::pager::{Pager, PinnedPage, PinnedPageMut};
 use crate::errors::StorageError;
