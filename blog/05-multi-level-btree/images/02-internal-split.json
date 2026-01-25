@@ -1,0 +1,6 @@
+{
+  "prompt": "Technical diagram of an internal page split in a B+tree. Show an internal node with separators [(10->c1),(20->c2),(30->c3),(40->c4)], highlight the promoted separator 30 in orange, then show the resulting left and right internal pages: left keeps 10,20 with first_child c0; right keeps 40 with first_child c3. Show the parent receiving '30 -> right'. Clean blueprint style, light grid background, blue/grey structure, orange highlight for the promoted key, minimal labels: 'promote', 'left', 'right', 'parent insert'.",
+  "model": "gemini-3-pro-image-preview",
+  "aspect": "16:9",
+  "size": "1K"
+}

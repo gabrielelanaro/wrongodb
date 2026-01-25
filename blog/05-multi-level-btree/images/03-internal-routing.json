@@ -1,0 +1,6 @@
+{
+  "prompt": "Technical diagram showing B+tree internal page routing. Draw one internal node box labeled 'INTERNAL PAGE' with a field 'first_child: c0' in the header and two separator entries: '10 -> c1' and '20 -> c2'. Below it, show three child page boxes labeled c0, c1, c2. Add arrows from the internal node to each child. Add range labels next to the arrows: 'keys < 10' goes to c0, '10 <= keys < 20' goes to c1, 'keys >= 20' goes to c2. Highlight 10 and 20 in orange. Clean technical blog style: light grid background, blueprint blues/greys for structure, orange highlight for separator keys and range arrows. Simple, readable labels.",
+  "model": "gemini-3-pro-image-preview",
+  "aspect": "16:9",
+  "size": "1K"
+}

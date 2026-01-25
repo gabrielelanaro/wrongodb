@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>From two levels to a real B+tree (Part 2)</title>
+</head>
+<body>
+<article>
+<h1 id="from-two-levels-to-a-real-btree-part-2">From two levels to a real B+tree (Part 2)</h1>
+<p>Last time I stopped at a two-level tree. This quick post finishes the job. Splits propagate upward, internal pages can split, and the root can grow. The tree can grow beyond two levels and still route keys correctly.</p>
+<h2 id="the-rule-that-keeps-routing-correct">The rule that keeps routing correct</h2>
+<p>Part 1 ended with a root and a small set of leaf pages. The root was an internal page. It stored separator keys and child pointers. A leaf split produced two leaf pages. I copied one key into the parent. That key came from the split.</p>
+<p>Example: the left leaf holds <code>3, 7, 9</code>, the right leaf holds <code>12, 18, 21</code>, and the parent stores <code>12</code>.</p>
+<p>That key is a separator. The rule is simple.</p>
+<p><strong>A separator key is the minimum key in the right child.</strong></p>
+<p>Every key in the left child is smaller than <code>sep</code>. Every key in the right child is <code>sep</code> or larger. An internal page can say:</p>
+<ul>
+<li>If <code>key &lt; sep</code>, go left.</li>
+<li>If <code>key &gt;= sep</code>, go right.</li>
+</ul>
+<p>Here is the routing rule as a picture.</p>
+<p><img alt="Internal page routing rule" src="images/03-internal-routing.png"></p>
+<h2 id="split-propagation">Split propagation</h2>
+<p>An insert starts as a write to one leaf page. If the leaf has space, the change stays inside that page. If it overflows, the leaf splits and the split moves upward.</p>
+<p>This is the core loop. It shows how a split from a child turns into a new separator in the parent. It also shows how the split can keep moving upward.</p>
+<pre><code class="language-rust">fn insert_into_internal(
+    mut node: InternalNode,
+    key: &amp;[u8],
+    value: &amp;[u8],
+) -&gt; (InternalNode, Option&lt;Split&gt;) {
+    // Route to the child that should receive this key.
+    let i = node.child_index_for_key(key);
+
+    // Recurse into that child.
+    let (new_child, child_split) = insert(node.child(i), key, value);
+
+    // Update the parent to point at the updated child subtree.
+    node.set_child(i, new_child.id());
+
+    // If the child split, insert the new separator into this internal node.
+    if let Some(split) = child_split {
+        node.insert_separator(split.sep_key, split.right_child);
+    }
+
+    // If this internal node still fits, stop here.
+    if node.fits_in_page() {
+        return (node, None);
+    }
+
+    // Overflow: split this internal node and return a promoted separator upward.
+    let (left, promoted_sep, right) = node.split();
+    (left, Some(Split { sep_key: promoted_sep, right_child: right.id() }))
+}
+</code></pre>
+<p>Here is the full process of creating a new root as a sequence of splits.</p>
+<p><img alt="Split propagation through the tree" src="images/01-split-propagation-ai.png"></p>
+<h2 id="splitting-internal-pages">Splitting internal pages</h2>
+<p>An internal split promotes one separator to the parent. The promoted key is removed from both children and becomes the new separator in the parent.</p>
+<p>Conceptually:</p>
+<pre><code class="language-text">internal entries: [ (10-&gt;c1), (20-&gt;c2), (30-&gt;c3), (40-&gt;c4) ]
+
+promote 30
+left  keeps: 10, 20 (first_child stays c0)
+right keeps: 40     (first_child becomes c3)
+parent inserts: 30 -&gt; right_node
+</code></pre>
+<p>The right node's first_child is the promoted key's child. That maintains the separator rule.</p>
+<h2 id="root-growth">Root growth</h2>
+<p>If a split reaches the root, create a new root that points at the two children and stores the promoted separator. The tree height increases by one. The same split rule keeps working as the tree grows.</p>
+<h2 id="a-tiny-walkthrough">A tiny walkthrough</h2>
+<p>Say the root routes between three leaf pages. We insert a key, the target leaf overflows, and returns <code>sep = 17</code>.</p>
+<ul>
+<li>Root inserts <code>17 -&gt; new_right_leaf</code>.</li>
+<li>Root is now full, so it splits.</li>
+<li>The split promotes a separator up.</li>
+<li>A new root is created.</li>
+</ul>
+<p>The same split logic applies at each level. Leaves and internal pages follow the same pattern.</p>
+<h2 id="what-i-shipped">What I shipped</h2>
+<ul>
+<li>Recursive insert that returns <code>(new_node_id, optional_split)</code> upward.</li>
+<li>Internal page splits with a promoted separator.</li>
+<li>Root growth when the split reaches the top.</li>
+</ul>
+<p>That is enough for the tree to grow arbitrarily and stay balanced.</p>
+<h2 id="what-i-skipped">What I skipped</h2>
+<ul>
+<li>Deletes or merges.</li>
+<li>Leaf sibling links.</li>
+<li>How to handle uplicate keys.</li>
+<li>Range scan.</li>
+</ul>
+<p>I'll tackle those another time.</p>
+</article>
+</body>
+</html>
