@@ -20,8 +20,8 @@ struct Record {
 struct Collection {
     _name: String,
     storage: AppendOnlyStorage,
-    index: InMemoryIndex,
-    primary_index: Option<BTree>,
+    secondary_indexes: InMemoryIndex,
+    id_index: Option<BTree>,
     docs: Vec<Record>,
     doc_by_offset: HashMap<u64, usize>,
 }
@@ -34,12 +34,12 @@ impl Collection {
         sync_every_write: bool,
     ) -> Result<Self, WrongoDBError> {
         let storage = AppendOnlyStorage::new(path, sync_every_write);
-        let primary_path = PathBuf::from(format!("{}.primary.wt", path.display()));
-        let primary_index = if name == "test" {
-            if primary_path.exists() {
-                Some(BTree::open(&primary_path)?)
+        let id_index_path = PathBuf::from(format!("{}.id_index.wt", path.display()));
+        let id_index = if name == "test" {
+            if id_index_path.exists() {
+                Some(BTree::open(&id_index_path)?)
             } else {
-                Some(BTree::create(&primary_path, 4096)?)
+                Some(BTree::create(&id_index_path, 4096)?)
             }
         } else {
             None
@@ -47,8 +47,8 @@ impl Collection {
         let mut coll = Self {
             _name: name.to_string(),
             storage,
-            index: InMemoryIndex::new(index_fields.iter().cloned()),
-            primary_index,
+            secondary_indexes: InMemoryIndex::new(index_fields.iter().cloned()),
+            id_index,
             docs: Vec::new(),
             doc_by_offset: HashMap::new(),
         };
@@ -66,12 +66,12 @@ impl Collection {
                 deleted: false,
             });
             self.doc_by_offset.insert(offset, idx);
-            self.index.add(&doc, offset);
-            if let Some(primary) = &mut self.primary_index {
+            self.secondary_indexes.add(&doc, offset);
+            if let Some(id_idx) = &mut self.id_index {
                 if let Some(id) = doc.get("_id") {
                     let key = serde_json::to_string(id).unwrap().into_bytes();
                     let value = offset.to_le_bytes().to_vec();
-                    primary.put(&key, &value)?;
+                    id_idx.put(&key, &value)?;
                 }
             }
         }
@@ -90,18 +90,18 @@ impl Collection {
             deleted: false,
         });
         self.doc_by_offset.insert(offset, idx);
-        self.index.add(&normalized, offset);
-        if let Some(primary) = &mut self.primary_index {
+        self.secondary_indexes.add(&normalized, offset);
+        if let Some(id_idx) = &mut self.id_index {
             if let Some(id) = normalized.get("_id") {
                 let key = serde_json::to_string(id).unwrap().into_bytes();
-                if primary.get(&key)?.is_some() {
+                if id_idx.get(&key)?.is_some() {
                     return Err(crate::errors::DocumentValidationError(
                         "duplicate key error".into(),
                     )
                     .into());
                 }
                 let value = offset.to_le_bytes().to_vec();
-                primary.put(&key, &value)?;
+                id_idx.put(&key, &value)?;
             }
         }
         Ok(normalized)
@@ -127,13 +127,13 @@ impl Collection {
 
         let indexed_field = filter_doc
             .keys()
-            .find(|k| self.index.fields.contains(*k))
+            .find(|k| self.secondary_indexes.fields.contains(*k))
             .cloned();
 
         let candidates: Box<dyn Iterator<Item = &Record> + '_> = if let Some(field) = indexed_field
         {
             let value = filter_doc.get(&field).unwrap();
-            let offsets = self.index.lookup(&field, value);
+            let offsets = self.secondary_indexes.lookup(&field, value);
             Box::new(
                 offsets
                     .into_iter()
@@ -200,9 +200,9 @@ impl Collection {
 
         for rec in &mut self.docs {
             if !rec.deleted && rec.doc.get("_id") == id.as_ref() {
-                self.index.remove(&rec.doc, rec.offset);
+                self.secondary_indexes.remove(&rec.doc, rec.offset);
                 rec.doc = updated_doc.clone();
-                self.index.add(&rec.doc, rec.offset);
+                self.secondary_indexes.add(&rec.doc, rec.offset);
                 return Ok(UpdateResult {
                     matched: 1,
                     modified: 1,
@@ -238,9 +238,9 @@ impl Collection {
             }
             if let Some(rec_id) = rec.doc.get("_id") {
                 if ids.contains(rec_id) {
-                    self.index.remove(&rec.doc, rec.offset);
+                    self.secondary_indexes.remove(&rec.doc, rec.offset);
                     rec.doc = apply_update(&rec.doc, &update)?;
-                    self.index.add(&rec.doc, rec.offset);
+                    self.secondary_indexes.add(&rec.doc, rec.offset);
                     modified += 1;
                 }
             }
@@ -263,7 +263,7 @@ impl Collection {
         for rec in &mut self.docs {
             if !rec.deleted && rec.doc.get("_id") == id.as_ref() {
                 rec.deleted = true;
-                self.index.remove(&rec.doc, rec.offset);
+                self.secondary_indexes.remove(&rec.doc, rec.offset);
                 return Ok(1);
             }
         }
@@ -294,7 +294,7 @@ impl Collection {
                 let id_str = serde_json::to_string(rec_id).unwrap_or_default();
                 if ids.contains(&id_str) {
                     rec.deleted = true;
-                    self.index.remove(&rec.doc, rec.offset);
+                    self.secondary_indexes.remove(&rec.doc, rec.offset);
                     deleted += 1;
                 }
             }
@@ -567,7 +567,7 @@ impl WrongoDB {
     pub fn list_indexes(&self, collection: &str) -> Vec<IndexInfo> {
         match self.collections.get(collection) {
             Some(coll) => coll
-                .index
+                .secondary_indexes
                 .fields
                 .iter()
                 .map(|f| IndexInfo { field: f.clone() })
@@ -578,17 +578,17 @@ impl WrongoDB {
 
     pub fn create_index(&mut self, collection: &str, field: &str) {
         if let Ok(coll) = self.get_or_create_collection(collection) {
-            if coll.index.fields.insert(field.to_string()) {
+            if coll.secondary_indexes.fields.insert(field.to_string()) {
                 for rec in &coll.docs {
                     if !rec.deleted {
-                        coll.index.add(&rec.doc, rec.offset);
+                        coll.secondary_indexes.add(&rec.doc, rec.offset);
                     }
                 }
             }
         }
     }
 
-    /// Checkpoint all primary indexes to durable storage.
+    /// Checkpoint all id indexes to durable storage.
     ///
     /// This flushes all dirty pages to disk and atomically swaps the root.
     /// After this returns, all previous mutations are durable.
@@ -599,21 +599,21 @@ impl WrongoDB {
     /// - Call after important writes to ensure they survive crashes
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         for coll in self.collections.values_mut() {
-            if let Some(primary) = &mut coll.primary_index {
-                primary.checkpoint()?;
+            if let Some(id_idx) = &mut coll.id_index {
+                id_idx.checkpoint()?;
             }
         }
         Ok(())
     }
 
-    /// Request automatic checkpointing after N updates on the primary index.
+    /// Request automatic checkpointing after N updates on the id index.
     ///
     /// Once the threshold is reached, `put()` operations will automatically
     /// call `checkpoint()` after the operation completes.
     pub fn request_checkpoint_after_updates(&mut self, count: usize) {
         for coll in self.collections.values_mut() {
-            if let Some(primary) = &mut coll.primary_index {
-                primary.request_checkpoint_after_updates(count);
+            if let Some(id_idx) = &mut coll.id_index {
+                id_idx.request_checkpoint_after_updates(count);
             }
         }
     }
@@ -627,7 +627,7 @@ impl WrongoDB {
         let index_count: usize = self
             .collections
             .values()
-            .map(|c| c.index.fields.len())
+            .map(|c| c.secondary_indexes.fields.len())
             .sum();
 
         DbStats {

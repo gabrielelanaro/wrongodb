@@ -44,7 +44,7 @@ fn rebuilds_index_from_disk_on_open() {
 }
 
 #[test]
-fn find_one_by_id_hits_primary_index() {
+fn find_one_by_id_hits_id_index() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("db.log");
 
@@ -57,7 +57,7 @@ fn find_one_by_id_hits_primary_index() {
     assert_eq!(got.get("_id").unwrap(), bob.get("_id").unwrap());
     assert_eq!(got.get("name").unwrap().as_str().unwrap(), "bob");
 
-    // Re-open and ensure the primary index is rebuilt from the append-only log.
+    // Re-open and ensure the id index is rebuilt from the append-only log.
     drop(db);
     let db2 = WrongoDB::open(&path, ["name"], false).unwrap();
     let got2 = db2

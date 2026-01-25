@@ -26,8 +26,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let docs = db.find_in("test", None)?;
     println!("📊 Found {} documents in collection\n", docs.len());
 
-    // Find by _id (uses primary BTree index)
-    println!("🔍 Testing primary index lookup by _id...");
+    // Find by _id (uses id BTree index)
+    println!("🔍 Testing id index lookup by _id...");
     let filter = json!({ "_id": 5 });
     if let Some(doc) = db.find_one_in("test", Some(filter))? {
         println!("   ✅ Found: {}\n", serde_json::to_string_pretty(&doc)?);
@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("✅ All operations completed successfully!");
     println!("\n💡 The checkpoint infrastructure is working internally:");
-    println!("   - BTree primary index is being used for _id lookups");
+    println!("   - BTree id index is being used for _id lookups");
     println!("   - Auto-checkpointing can be configured with request_checkpoint_after_updates()");
     println!("   - Explicit checkpoint() flushes dirty pages to disk");
 

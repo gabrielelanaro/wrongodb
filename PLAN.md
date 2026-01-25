@@ -121,6 +121,40 @@ Status (2026-01-17)
 - Checkpoint staging in WT: prepare → data files → history store → flush → metadata; we use a simpler stable-root vs working-root model without generations.
 - Checkpoint scheduling: periodic or on-demand; added in Slice G1.
 
+### Architectural divergence from MongoDB/WiredTiger (2026-01-25)
+
+**Current minimongo architecture:**
+- `AppendOnlyStorage`: JSONL append-only log (actual document storage)
+- `id_index` (renamed from `primary_index`): B+Tree mapping `_id` → offset
+- `secondary_indexes` (renamed from `index`): In-memory HashMap mapping `field` → offsets
+
+**MongoDB/WiredTiger architecture:**
+- Table is a B+Tree with `_id` as key: `_id` → full_document
+- All indexes (including `_id`) are separate B+Trees: `indexed_field` → `_id`
+- Indexes store primary keys, not storage offsets
+
+**Key differences:**
+1. minimongo uses an append-only log + offset-based indexes
+2. MongoDB/WiredTiger uses a primary B+Tree table + primary-key-based indexes
+3. In minimongo, the log is the "source of truth"; in MongoDB, the B+Tree table is
+
+**Re-alignment needed (future work):**
+To align with MongoDB/WiredTiger, we would need to:
+- Make the main collection a B+Tree keyed by `_id` (not append-only log)
+- Store `_id` values in indexes, not log offsets
+- Remove the append-only log architecture
+- Handle in-place updates vs append-only model
+
+**Why not yet:**
+- The append-only log + offset model is simpler and works well for the current scope
+- Would be a major rewrite of the storage layer
+- Better to defer until after WAL, recovery, and transactions are solid
+
+**Naming convention update (2026-01-25):**
+- Renamed `primary_index` → `id_index` (clearer that it's specifically for `_id`)
+- Renamed `index` → `secondary_indexes` (clearer that it's for non-`_id` fields)
+- This makes the distinction clearer while keeping the current architecture
+
 ## Performance notes / TODOs
 - B+tree splits currently choose a split point by rebuilding candidate left/right pages around the midpoint; OK for small pages but should be replaced with a single-pass “split-by-bytes” / one-build approach.
 - Range scans currently avoid leaf sibling pointers (no on-disk format change) and instead advance using a parent stack; consider adding leaf links for O(1) leaf-to-leaf transitions.
