@@ -202,7 +202,7 @@ async fn handle_op_query(
     }
 
     let filter_json = bson_to_value(&query_doc);
-    let db_lock = db.lock().await;
+    let mut db_lock = db.lock().await;
     let results = db_lock.find(Some(filter_json))?;
     let results_bson: Vec<Bson> = results
         .into_iter()

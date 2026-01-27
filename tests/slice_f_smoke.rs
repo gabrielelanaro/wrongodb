@@ -61,7 +61,7 @@ fn slice_f_primary_id_smoke() {
 
     // 5) Re-open and verify primary lookups still work (index rebuild on open).
     drop(db);
-    let db2 = WrongoDB::open(&log_path, ["name"], false).unwrap();
+    let mut db2 = WrongoDB::open(&log_path, ["name"], false).unwrap();
     let got = db2
         .find_one(Some(json!({"_id": {"b": 2, "a": 1}})))
         .unwrap()

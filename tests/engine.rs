@@ -38,7 +38,7 @@ fn rebuilds_index_from_disk_on_open() {
         db.insert_one(json!({"name": "bob"})).unwrap();
     }
 
-    let db2 = WrongoDB::open(&path, ["name"], false).unwrap();
+    let mut db2 = WrongoDB::open(&path, ["name"], false).unwrap();
     let bobs = db2.find(Some(json!({"name": "bob"}))).unwrap();
     assert_eq!(bobs.len(), 1);
 }
@@ -59,7 +59,7 @@ fn find_one_by_id_hits_id_index() {
 
     // Re-open and ensure the id index is rebuilt from the append-only log.
     drop(db);
-    let db2 = WrongoDB::open(&path, ["name"], false).unwrap();
+    let mut db2 = WrongoDB::open(&path, ["name"], false).unwrap();
     let got2 = db2
         .find_one(Some(json!({"_id": alice.get("_id").unwrap().clone()})))
         .unwrap()

@@ -65,7 +65,7 @@ impl Command for CreateIndexesCommand {
                 if let Bson::Document(spec) = index_spec {
                     if let Ok(key_doc) = spec.get_document("key") {
                         for (field, _) in key_doc {
-                            db.create_index(coll_name, field);
+                            let _ = db.create_index(coll_name, field);
                             created += 1;
                         }
                     }

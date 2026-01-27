@@ -1,7 +1,261 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::index_key::{encode_index_key, encode_range_bounds};
+use crate::{BTree, Document, WrongoDBError};
+
+/// A persistent secondary index backed by a B+tree.
+///
+/// The index stores composite keys in the format:
+///   [scalar_type: 1 byte][scalar_value: variable][record_offset: 8 bytes LE]
+///
+/// The value stored is always empty since the offset is embedded in the key.
+/// This allows duplicate values (different offsets = different keys).
+#[derive(Debug)]
+pub struct PersistentIndex {
+    #[allow(dead_code)]
+    pub field: String,
+    pub btree: BTree,
+}
+
+impl PersistentIndex {
+    /// Open an existing index BTree or create a new one if it doesn't exist.
+    fn open_or_create(
+        path: &Path,
+        field: &str,
+        wal_enabled: bool,
+    ) -> Result<Self, WrongoDBError> {
+        let btree = if path.exists() {
+            BTree::open(path, wal_enabled)?
+        } else {
+            BTree::create(path, 4096, wal_enabled)?
+        };
+
+        Ok(Self {
+            field: field.to_string(),
+            btree,
+        })
+    }
+
+    /// Insert a document's field value into the index.
+    fn insert(&mut self, value: &Value, offset: u64) -> Result<(), WrongoDBError> {
+        if let Some(key) = encode_index_key(value, offset) {
+            // Value is empty since offset is embedded in key
+            self.btree.put(&key, &[])?;
+        }
+        Ok(())
+    }
+
+    /// Remove a document's field value from the index.
+    fn remove(&mut self, value: &Value, offset: u64) -> Result<(), WrongoDBError> {
+        if let Some(key) = encode_index_key(value, offset) {
+            let _ = self.btree.delete(&key)?;
+        }
+        Ok(())
+    }
+
+    /// Lookup all offsets matching a scalar value using range scan.
+    fn lookup(&mut self, value: &Value) -> Result<Vec<u64>, WrongoDBError> {
+        let Some((start_key, end_key)) = encode_range_bounds(value) else {
+            return Ok(Vec::new());
+        };
+
+        let mut offsets = Vec::new();
+        let iter = self.btree.range(Some(&start_key), Some(&end_key))?;
+
+        for result in iter {
+            let (key, _) = result?;
+            // Extract offset from the last 8 bytes of the key
+            if key.len() >= 8 {
+                let offset = u64::from_le_bytes([
+                    key[key.len() - 8],
+                    key[key.len() - 7],
+                    key[key.len() - 6],
+                    key[key.len() - 5],
+                    key[key.len() - 4],
+                    key[key.len() - 3],
+                    key[key.len() - 2],
+                    key[key.len() - 1],
+                ]);
+                offsets.push(offset);
+            }
+        }
+
+        Ok(offsets)
+    }
+
+    /// Checkpoint the index to durable storage.
+    fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
+        self.btree.checkpoint()
+    }
+}
+
+/// Manages persistent secondary indexes for a collection.
+///
+/// Each indexed field has its own B+tree stored in a separate file:
+///   {collection_path}.{field_name}.idx.wt
+#[derive(Debug)]
+pub struct SecondaryIndexManager {
+    pub fields: HashSet<String>,
+    persistent: HashMap<String, PersistentIndex>,
+    collection_path: PathBuf,
+    wal_enabled: bool,
+}
+
+impl SecondaryIndexManager {
+    /// Open existing indexes or create and build new ones from existing documents.
+    ///
+    /// For each field in `fields`:
+    /// - If `{collection_path}.{field}.idx.wt` exists, open it
+    /// - Otherwise, create it and build from all non-deleted documents
+    pub fn open_or_rebuild<P, I, S>(
+        collection_path: P,
+        fields: I,
+        wal_enabled: bool,
+        documents: &[(u64, Document)],
+    ) -> Result<Self, WrongoDBError>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let collection_path = collection_path.as_ref().to_path_buf();
+        let field_set: HashSet<String> = fields.into_iter().map(Into::into).collect();
+        let mut persistent = HashMap::new();
+
+        for field in &field_set {
+            let index_path = Self::index_path(&collection_path, field);
+
+            // Check if index exists BEFORE creating/opening
+            let index_exists = index_path.exists();
+
+            let mut index = PersistentIndex::open_or_create(&index_path, field, wal_enabled)?;
+
+            // If the index file was just created, build it from existing documents
+            if !index_exists {
+                for (offset, doc) in documents {
+                    if let Some(value) = doc.get(field) {
+                        index.insert(value, *offset)?;
+                    }
+                }
+            }
+
+            persistent.insert(field.clone(), index);
+        }
+
+        Ok(Self {
+            fields: field_set,
+            persistent,
+            collection_path,
+            wal_enabled,
+        })
+    }
+
+    /// Create an empty manager with no indexes (for new collections).
+    pub fn empty<P: AsRef<Path>>(collection_path: P, wal_enabled: bool) -> Self {
+        Self {
+            fields: HashSet::new(),
+            persistent: HashMap::new(),
+            collection_path: collection_path.as_ref().to_path_buf(),
+            wal_enabled,
+        }
+    }
+
+    /// Get the file path for a field's index.
+    fn index_path(collection_path: &Path, field: &str) -> PathBuf {
+        PathBuf::from(format!("{}.{field}.idx.wt", collection_path.display()))
+    }
+
+    /// Insert a document into all indexes.
+    pub fn add(&mut self, doc: &Document, offset: u64) -> Result<(), WrongoDBError> {
+        for field in self.fields.iter() {
+            if let Some(value) = doc.get(field) {
+                if let Some(index) = self.persistent.get_mut(field) {
+                    index.insert(value, offset)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove a document from all indexes.
+    pub fn remove(&mut self, doc: &Document, offset: u64) -> Result<(), WrongoDBError> {
+        for field in self.fields.iter() {
+            if let Some(value) = doc.get(field) {
+                if let Some(index) = self.persistent.get_mut(field) {
+                    index.remove(value, offset)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Lookup offsets for a specific field and value.
+    pub fn lookup(&mut self, field: &str, value: &Value) -> Result<Vec<u64>, WrongoDBError> {
+        match self.persistent.get_mut(field) {
+            Some(index) => index.lookup(value),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Add a new index field and build it from existing documents.
+    ///
+    /// Creates a new BTree index file and populates it from all documents.
+    pub fn add_field(
+        &mut self,
+        field: &str,
+        existing_docs: &[(u64, Document)],
+    ) -> Result<(), WrongoDBError> {
+        if self.fields.contains(field) {
+            return Ok(()); // Already indexed
+        }
+
+        let index_path = Self::index_path(&self.collection_path, field);
+        let mut index = PersistentIndex::open_or_create(&index_path, field, self.wal_enabled)?;
+
+        // Build index from existing documents
+        for (offset, doc) in existing_docs {
+            if let Some(value) = doc.get(field) {
+                index.insert(value, *offset)?;
+            }
+        }
+
+        self.fields.insert(field.to_string());
+        self.persistent.insert(field.to_string(), index);
+
+        Ok(())
+    }
+
+    /// Checkpoint all indexes to durable storage.
+    pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
+        for index in self.persistent.values_mut() {
+            index.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// Get the paths of all index files (for cleanup/verification).
+    pub fn index_paths(&self) -> Vec<PathBuf> {
+        self.fields
+            .iter()
+            .map(|f| Self::index_path(&self.collection_path, f))
+            .collect()
+    }
+}
+
+/// Legacy in-memory index for backward compatibility during migration.
+///
+/// This is kept temporarily for any code that might reference it,
+/// but new code should use SecondaryIndexManager instead.
+#[derive(Debug, Clone)]
+pub struct InMemoryIndex {
+    pub fields: HashSet<String>,
+    index: HashMap<String, HashMap<ScalarKey, HashSet<u64>>>,
+}
+
+/// A scalar value that can be used as an index key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ScalarKey {
     Null,
@@ -20,12 +274,6 @@ impl ScalarKey {
             Value::Array(_) | Value::Object(_) => None,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct InMemoryIndex {
-    pub fields: HashSet<String>,
-    index: HashMap<String, HashMap<ScalarKey, HashSet<u64>>>,
 }
 
 impl InMemoryIndex {
@@ -95,5 +343,126 @@ impl InMemoryIndex {
         for values in self.index.values_mut() {
             values.clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    #[test]
+    fn persistent_index_insert_and_lookup() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("test.idx.wt");
+
+        let mut index = PersistentIndex::open_or_create(&path, "name", false).unwrap();
+
+        // Insert some values
+        index.insert(&json!("alice"), 100).unwrap();
+        index.insert(&json!("bob"), 200).unwrap();
+        index.insert(&json!("alice"), 300).unwrap(); // Duplicate value
+
+        // Lookup
+        let alice_offsets = index.lookup(&json!("alice")).unwrap();
+        assert_eq!(alice_offsets.len(), 2);
+        assert!(alice_offsets.contains(&100));
+        assert!(alice_offsets.contains(&300));
+
+        let bob_offsets = index.lookup(&json!("bob")).unwrap();
+        assert_eq!(bob_offsets.len(), 1);
+        assert!(bob_offsets.contains(&200));
+
+        let carol_offsets = index.lookup(&json!("carol")).unwrap();
+        assert!(carol_offsets.is_empty());
+    }
+
+    #[test]
+    fn persistent_index_remove() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("test.idx.wt");
+
+        let mut index = PersistentIndex::open_or_create(&path, "name", false).unwrap();
+
+        index.insert(&json!("alice"), 100).unwrap();
+        index.insert(&json!("alice"), 200).unwrap();
+
+        // Remove one
+        index.remove(&json!("alice"), 100).unwrap();
+
+        let offsets = index.lookup(&json!("alice")).unwrap();
+        assert_eq!(offsets.len(), 1);
+        assert!(offsets.contains(&200));
+    }
+
+    #[test]
+    fn persistent_index_checkpoint_and_reopen() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("test.idx.wt");
+
+        // Create and populate index
+        {
+            let mut index = PersistentIndex::open_or_create(&path, "name", false).unwrap();
+            index.insert(&json!("alice"), 100).unwrap();
+            index.insert(&json!("bob"), 200).unwrap();
+            index.checkpoint().unwrap();
+        }
+
+        // Reopen and verify
+        {
+            let mut index = PersistentIndex::open_or_create(&path, "name", false).unwrap();
+            let alice_offsets = index.lookup(&json!("alice")).unwrap();
+            assert_eq!(alice_offsets.len(), 1);
+            assert!(alice_offsets.contains(&100));
+        }
+    }
+
+    #[test]
+    fn secondary_index_manager_open_or_rebuild() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("collection.db");
+
+        // Simulate existing documents
+        let docs: Vec<(u64, Document)> = vec![
+            (100, serde_json::from_value(json!({"name": "alice", "age": 30})).unwrap()),
+            (200, serde_json::from_value(json!({"name": "bob", "age": 25})).unwrap()),
+            (300, serde_json::from_value(json!({"name": "alice", "age": 35})).unwrap()),
+        ];
+
+        let mut manager =
+            SecondaryIndexManager::open_or_rebuild(&path, ["name", "age"], false, &docs).unwrap();
+
+        // Test lookups
+        let name_offsets = manager.lookup("name", &json!("alice")).unwrap();
+        assert_eq!(name_offsets.len(), 2);
+        assert!(name_offsets.contains(&100));
+        assert!(name_offsets.contains(&300));
+
+        let age_offsets = manager.lookup("age", &json!(25)).unwrap();
+        assert_eq!(age_offsets.len(), 1);
+        assert!(age_offsets.contains(&200));
+    }
+
+    #[test]
+    fn secondary_index_manager_add_field() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("collection.db");
+
+        let docs: Vec<(u64, Document)> = vec![
+            (100, serde_json::from_value(json!({"name": "alice", "city": "nyc"})).unwrap()),
+            (200, serde_json::from_value(json!({"name": "bob", "city": "la"})).unwrap()),
+        ];
+
+        // Start with just name index
+        let mut manager = SecondaryIndexManager::open_or_rebuild(&path, ["name"], false, &docs).unwrap();
+
+        // Add city index
+        manager.add_field("city", &docs).unwrap();
+
+        // Verify city index works
+        let city_offsets = manager.lookup("city", &json!("nyc")).unwrap();
+        assert_eq!(city_offsets.len(), 1);
+        assert!(city_offsets.contains(&100));
     }
 }

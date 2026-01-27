@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::document::{normalize_document, validate_is_object};
-use crate::index::InMemoryIndex;
+use crate::index::SecondaryIndexManager;
 use crate::storage::AppendOnlyStorage;
 use crate::{BTree, Document, WrongoDBError};
 
@@ -20,10 +20,11 @@ struct Record {
 struct Collection {
     _name: String,
     storage: AppendOnlyStorage,
-    secondary_indexes: InMemoryIndex,
+    secondary_indexes: SecondaryIndexManager,
     id_index: Option<BTree>,
     docs: Vec<Record>,
     doc_by_offset: HashMap<u64, usize>,
+    wal_enabled: bool,
 }
 
 impl Collection {
@@ -33,40 +34,54 @@ impl Collection {
         index_fields: &HashSet<String>,
         sync_every_write: bool,
     ) -> Result<Self, WrongoDBError> {
+        let wal_enabled = true; // Enable WAL for durability
         let storage = AppendOnlyStorage::new(path, sync_every_write);
         let id_index_path = PathBuf::from(format!("{}.id_index.wt", path.display()));
         let id_index = if name == "test" {
             if id_index_path.exists() {
-                Some(BTree::open(&id_index_path, true)?)
+                Some(BTree::open(&id_index_path, wal_enabled)?)
             } else {
-                Some(BTree::create(&id_index_path, 4096, true)?)
+                Some(BTree::create(&id_index_path, 4096, wal_enabled)?)
             }
         } else {
             None
         };
+
+        // Start with empty manager - indexes will be created in load_existing after reading docs
+        let secondary_indexes = SecondaryIndexManager::empty(path, wal_enabled);
+
         let mut coll = Self {
             _name: name.to_string(),
             storage,
-            secondary_indexes: InMemoryIndex::new(index_fields.iter().cloned()),
+            secondary_indexes,
             id_index,
             docs: Vec::new(),
             doc_by_offset: HashMap::new(),
+            wal_enabled,
         };
-        coll.load_existing()?;
+        coll.load_existing(path, index_fields)?;
         Ok(coll)
     }
 
-    fn load_existing(&mut self) -> Result<(), WrongoDBError> {
+    fn load_existing(
+        &mut self,
+        path: &Path,
+        index_fields: &HashSet<String>,
+    ) -> Result<(), WrongoDBError> {
         let existing = self.storage.read_all()?;
-        for (offset, doc) in existing {
+
+        // First, collect all documents
+        let mut docs_for_index: Vec<(u64, Document)> = Vec::new();
+        for (offset, doc) in &existing {
             let idx = self.docs.len();
             self.docs.push(Record {
-                offset,
+                offset: *offset,
                 doc: doc.clone(),
                 deleted: false,
             });
-            self.doc_by_offset.insert(offset, idx);
-            self.secondary_indexes.add(&doc, offset);
+            self.doc_by_offset.insert(*offset, idx);
+            docs_for_index.push((*offset, doc.clone()));
+
             if let Some(id_idx) = &mut self.id_index {
                 if let Some(id) = doc.get("_id") {
                     let key = serde_json::to_string(id).unwrap().into_bytes();
@@ -75,6 +90,12 @@ impl Collection {
                 }
             }
         }
+
+        // Now rebuild secondary indexes with all documents
+        // This handles the case where index files don't exist yet
+        self.secondary_indexes =
+            SecondaryIndexManager::open_or_rebuild(path, index_fields.iter().cloned(), self.wal_enabled, &docs_for_index)?;
+
         Ok(())
     }
 
@@ -90,7 +111,7 @@ impl Collection {
             deleted: false,
         });
         self.doc_by_offset.insert(offset, idx);
-        self.secondary_indexes.add(&normalized, offset);
+        self.secondary_indexes.add(&normalized, offset)?;
         if let Some(id_idx) = &mut self.id_index {
             if let Some(id) = normalized.get("_id") {
                 let key = serde_json::to_string(id).unwrap().into_bytes();
@@ -107,7 +128,7 @@ impl Collection {
         Ok(normalized)
     }
 
-    fn find(&self, filter: Option<Value>) -> Result<Vec<Document>, WrongoDBError> {
+    fn find(&mut self, filter: Option<Value>) -> Result<Vec<Document>, WrongoDBError> {
         let filter_doc = match filter {
             None => Document::new(),
             Some(v) => {
@@ -133,7 +154,7 @@ impl Collection {
         let candidates: Box<dyn Iterator<Item = &Record> + '_> = if let Some(field) = indexed_field
         {
             let value = filter_doc.get(&field).unwrap();
-            let offsets = self.secondary_indexes.lookup(&field, value);
+            let offsets = self.secondary_indexes.lookup(&field, value)?;
             Box::new(
                 offsets
                     .into_iter()
@@ -160,11 +181,11 @@ impl Collection {
             .collect())
     }
 
-    fn count(&self, filter: Option<Value>) -> Result<usize, WrongoDBError> {
+    fn count(&mut self, filter: Option<Value>) -> Result<usize, WrongoDBError> {
         Ok(self.find(filter)?.len())
     }
 
-    fn distinct(&self, key: &str, filter: Option<Value>) -> Result<Vec<Value>, WrongoDBError> {
+    fn distinct(&mut self, key: &str, filter: Option<Value>) -> Result<Vec<Value>, WrongoDBError> {
         let docs = self.find(filter)?;
         let mut seen = HashSet::new();
         let mut values = Vec::new();
@@ -200,9 +221,9 @@ impl Collection {
 
         for rec in &mut self.docs {
             if !rec.deleted && rec.doc.get("_id") == id.as_ref() {
-                self.secondary_indexes.remove(&rec.doc, rec.offset);
+                self.secondary_indexes.remove(&rec.doc, rec.offset)?;
                 rec.doc = updated_doc.clone();
-                self.secondary_indexes.add(&rec.doc, rec.offset);
+                self.secondary_indexes.add(&rec.doc, rec.offset)?;
                 return Ok(UpdateResult {
                     matched: 1,
                     modified: 1,
@@ -238,9 +259,9 @@ impl Collection {
             }
             if let Some(rec_id) = rec.doc.get("_id") {
                 if ids.contains(rec_id) {
-                    self.secondary_indexes.remove(&rec.doc, rec.offset);
+                    self.secondary_indexes.remove(&rec.doc, rec.offset)?;
                     rec.doc = apply_update(&rec.doc, &update)?;
-                    self.secondary_indexes.add(&rec.doc, rec.offset);
+                    self.secondary_indexes.add(&rec.doc, rec.offset)?;
                     modified += 1;
                 }
             }
@@ -263,7 +284,7 @@ impl Collection {
         for rec in &mut self.docs {
             if !rec.deleted && rec.doc.get("_id") == id.as_ref() {
                 rec.deleted = true;
-                self.secondary_indexes.remove(&rec.doc, rec.offset);
+                self.secondary_indexes.remove(&rec.doc, rec.offset)?;
                 return Ok(1);
             }
         }
@@ -294,7 +315,7 @@ impl Collection {
                 let id_str = serde_json::to_string(rec_id).unwrap_or_default();
                 if ids.contains(&id_str) {
                     rec.deleted = true;
-                    self.secondary_indexes.remove(&rec.doc, rec.offset);
+                    self.secondary_indexes.remove(&rec.doc, rec.offset)?;
                     deleted += 1;
                 }
             }
@@ -459,11 +480,11 @@ impl WrongoDB {
         self.insert_one_into("test", doc)
     }
 
-    pub fn find(&self, filter: Option<Value>) -> Result<Vec<Document>, WrongoDBError> {
+    pub fn find(&mut self, filter: Option<Value>) -> Result<Vec<Document>, WrongoDBError> {
         self.find_in("test", filter)
     }
 
-    pub fn find_one(&self, filter: Option<Value>) -> Result<Option<Document>, WrongoDBError> {
+    pub fn find_one(&mut self, filter: Option<Value>) -> Result<Option<Document>, WrongoDBError> {
         Ok(self.find(filter)?.into_iter().next())
     }
 
@@ -481,18 +502,18 @@ impl WrongoDB {
     }
 
     pub fn find_in(
-        &self,
+        &mut self,
         collection: &str,
         filter: Option<Value>,
     ) -> Result<Vec<Document>, WrongoDBError> {
-        match self.collections.get(collection) {
+        match self.collections.get_mut(collection) {
             Some(coll) => coll.find(filter),
             None => Ok(vec![]),
         }
     }
 
     pub fn find_one_in(
-        &self,
+        &mut self,
         collection: &str,
         filter: Option<Value>,
     ) -> Result<Option<Document>, WrongoDBError> {
@@ -537,20 +558,20 @@ impl WrongoDB {
         coll.delete_many(filter)
     }
 
-    pub fn count(&self, collection: &str, filter: Option<Value>) -> Result<usize, WrongoDBError> {
-        match self.collections.get(collection) {
+    pub fn count(&mut self, collection: &str, filter: Option<Value>) -> Result<usize, WrongoDBError> {
+        match self.collections.get_mut(collection) {
             Some(coll) => coll.count(filter),
             None => Ok(0),
         }
     }
 
     pub fn distinct(
-        &self,
+        &mut self,
         collection: &str,
         key: &str,
         filter: Option<Value>,
     ) -> Result<Vec<Value>, WrongoDBError> {
-        match self.collections.get(collection) {
+        match self.collections.get_mut(collection) {
             Some(coll) => coll.distinct(key, filter),
             None => Ok(vec![]),
         }
@@ -576,16 +597,21 @@ impl WrongoDB {
         }
     }
 
-    pub fn create_index(&mut self, collection: &str, field: &str) {
-        if let Ok(coll) = self.get_or_create_collection(collection) {
-            if coll.secondary_indexes.fields.insert(field.to_string()) {
-                for rec in &coll.docs {
-                    if !rec.deleted {
-                        coll.secondary_indexes.add(&rec.doc, rec.offset);
-                    }
-                }
-            }
-        }
+    pub fn create_index(&mut self, collection: &str, field: &str) -> Result<(), WrongoDBError> {
+        let coll = self.get_or_create_collection(collection)?;
+
+        // Prepare existing documents for index building
+        let existing_docs: Vec<(u64, Document)> = coll
+            .docs
+            .iter()
+            .filter(|r| !r.deleted)
+            .map(|r| (r.offset, r.doc.clone()))
+            .collect();
+
+        // Add the field to the index manager (creates BTree and builds from existing docs)
+        coll.secondary_indexes.add_field(field, &existing_docs)?;
+
+        Ok(())
     }
 
     /// Checkpoint all id indexes to durable storage.
@@ -602,6 +628,7 @@ impl WrongoDB {
             if let Some(id_idx) = &mut coll.id_index {
                 id_idx.checkpoint()?;
             }
+            coll.secondary_indexes.checkpoint()?;
         }
         Ok(())
     }
