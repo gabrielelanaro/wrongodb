@@ -101,7 +101,7 @@ fn checkpoint_logs_wal_record() {
     let wal_path = path.with_extension("wt.wal");
     assert!(wal_path.exists());
 
-    // TODO: In Phase 4, verify checkpoint record exists by reading WAL
+    // Note: Checkpoint record verification is done in recovery tests
 }
 
 #[test]

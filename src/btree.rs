@@ -19,9 +19,6 @@ type Key = Vec<u8>;
 /// Represents a value in the B-tree (stored as bytes)
 type Value = Vec<u8>;
 
-/// Represents serialized page data (stored as bytes)
-type PageData = Vec<u8>;
-
 /// A key-value pair for leaf node entries
 type KeyValuePair = (Key, Value);
 
@@ -33,9 +30,6 @@ type LeafEntries = Vec<KeyValuePair>;
 
 /// Internal page entries: (first_child_id, separators as key-child pairs)
 type InternalEntries = (u64, Vec<KeyChildId>);
-
-/// Result of splitting a page: (left_page_data, separator_key, right_page_data)
-type SplitResult = (PageData, Key, PageData);
 
 /// Iterator over key-value pairs, yielding results or errors
 type KeyValueIter<'a> = BTreeRangeIter<'a>;

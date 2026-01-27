@@ -20,8 +20,6 @@ const WAL_HEADER_SIZE: usize = 512;
 /// Format: record_type(1) + flags(1) + payload_len(2) + reserved(2) + lsn(12) + prev_lsn(12) + crc32(4) = 34 bytes
 /// But we'll use 32 bytes for simplicity, with lsn/prev_lsn using just offset (8 bytes each)
 const RECORD_HEADER_SIZE: usize = 32;
-/// Minimum WAL record size (for alignment)
-const MIN_RECORD_SIZE: usize = 128;
 
 /// Log Sequence Number - uniquely identifies a position in the WAL.
 ///
@@ -418,6 +416,7 @@ impl WalRecordHeader {
 /// Change vector logging: operations are logged as compact descriptions,
 /// not full page images. This matches WiredTiger's production architecture.
 #[derive(Debug)]
+#[allow(dead_code)]  // TODO: Remove when Slice H (WAL truncation) is implemented
 pub struct WalFile {
     path: PathBuf,
     file: File,
@@ -427,6 +426,7 @@ pub struct WalFile {
     last_lsn: Lsn,
 }
 
+#[allow(dead_code)]  // TODO: Remove when Slice H (WAL truncation) is implemented
 impl WalFile {
     /// Buffer capacity for WAL writes (64KB)
     const DEFAULT_BUFFER_CAPACITY: usize = 64 * 1024;
@@ -851,13 +851,6 @@ impl WalReader {
     pub fn checkpoint_lsn(&self) -> Lsn {
         self.header.checkpoint_lsn
     }
-
-    /// Check if we've reached the end of the WAL file.
-    pub fn is_eof(&mut self) -> Result<bool, RecoveryError> {
-        let current_pos = self.file.seek(SeekFrom::Current(0))?;
-        let file_len = self.file.metadata()?.len();
-        Ok(current_pos >= file_len)
-    }
 }
 
 #[cfg(test)]
@@ -1003,8 +996,7 @@ mod tests {
         wal.sync().unwrap();
         drop(wal);
 
-        // TODO: Add record reading functionality in Phase 4
-        // For now, just verify the file was written
+        // Verify the file was written
         assert!(path.exists());
     }
 

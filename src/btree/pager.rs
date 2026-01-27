@@ -234,10 +234,6 @@ impl PinnedPageMut {
         self.page_id
     }
 
-    pub(super) fn original_page_id(&self) -> Option<u64> {
-        self.original_page_id
-    }
-
     pub(super) fn payload(&self) -> &[u8] {
         &self.payload
     }
