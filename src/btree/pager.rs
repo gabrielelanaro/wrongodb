@@ -199,6 +199,7 @@ pub(super) struct Pager {
     wal_enabled: bool,
     wal_sync_threshold: Option<usize>,
     wal_operations_since_sync: usize,
+
 }
 
 #[derive(Debug)]
@@ -231,6 +232,10 @@ pub(super) struct PinnedPageMut {
 impl PinnedPageMut {
     pub(super) fn page_id(&self) -> u64 {
         self.page_id
+    }
+
+    pub(super) fn original_page_id(&self) -> Option<u64> {
+        self.original_page_id
     }
 
     pub(super) fn payload(&self) -> &[u8] {
@@ -399,6 +404,16 @@ impl Pager {
             .ok_or_else(|| StorageError("WAL not enabled".into()).into())
     }
 
+    /// Temporarily remove the WAL handle (used to disable logging during recovery).
+    pub(super) fn take_wal(&mut self) -> Option<WalFile> {
+        self.wal.take()
+    }
+
+    /// Restore the WAL handle after recovery.
+    pub(super) fn restore_wal(&mut self, wal: Option<WalFile>) {
+        self.wal = wal;
+    }
+
     /// Configure WAL batch sync threshold (sync every N operations)
     pub(super) fn set_wal_sync_threshold(&mut self, threshold: usize) {
         self.wal_sync_threshold = Some(threshold);
@@ -442,6 +457,11 @@ impl Pager {
     #[cfg(test)]
     pub(super) fn enable_wal(&mut self) {
         self.wal_enabled = true;
+    }
+
+    /// Get access to the underlying block file (for recovery)
+    pub(super) fn blockfile(&mut self) -> &mut BlockFile {
+        &mut self.bf
     }
 
     pub(super) fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError> {

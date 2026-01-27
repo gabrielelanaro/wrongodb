@@ -8,7 +8,7 @@ fn btree_creates_with_wal_enabled() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test.wt");
 
-    let tree = BTree::create(&path, 512, true).unwrap();
+    let _tree = BTree::create(&path, 512, true).unwrap();
 
     // Verify WAL file exists
     let wal_path = path.with_extension("wt.wal");
@@ -20,7 +20,7 @@ fn btree_creates_without_wal() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test.wt");
 
-    let tree = BTree::create(&path, 512, false).unwrap();
+    let _tree = BTree::create(&path, 512, false).unwrap();
 
     // Verify WAL file does NOT exist
     let wal_path = path.with_extension("wt.wal");
@@ -44,14 +44,14 @@ fn leaf_insert_logs_wal_record() {
 }
 
 #[test]
-fn leaf_split_logs_wal_record() {
+fn multiple_inserts_log_wal_records() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test_split.wt");
 
-    // Use small page size to force splits
+    // Use small page size to create multiple updates
     let mut tree = BTree::create(&path, 256, true).unwrap();
 
-    // Insert many keys to cause split
+    // Insert many keys to generate multiple WAL records
     for i in 0..20 {
         let key = format!("key{:05}", i);
         let value = vec![i as u8; 100];

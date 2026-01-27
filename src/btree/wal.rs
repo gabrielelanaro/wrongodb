@@ -3,7 +3,7 @@
 //! Uses change vector logging (WiredTiger-style): operations are logged,
 //! not full page images. This provides ~100x smaller WAL size.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use crc32fast::Hasher;
@@ -13,7 +13,7 @@ use crate::{StorageError, WrongoDBError};
 /// WAL file magic bytes (8 bytes)
 const WAL_MAGIC: &[u8; 8] = b"WAL0001\0";
 /// WAL file format version
-const WAL_VERSION: u16 = 1;
+const WAL_VERSION: u16 = 2;
 /// WAL file header size (512 bytes)
 const WAL_HEADER_SIZE: usize = 512;
 /// WAL record header size (32 bytes)
@@ -46,11 +46,9 @@ impl Lsn {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WalRecordType {
-    LeafInsert = 1,
-    LeafSplit = 2,
-    InternalSplit = 3,
-    InternalInsertSep = 4,
-    Checkpoint = 5,
+    Put = 1,
+    Delete = 2,
+    Checkpoint = 3,
 }
 
 impl TryFrom<u8> for WalRecordType {
@@ -58,11 +56,9 @@ impl TryFrom<u8> for WalRecordType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            1 => Ok(Self::LeafInsert),
-            2 => Ok(Self::LeafSplit),
-            3 => Ok(Self::InternalSplit),
-            4 => Ok(Self::InternalInsertSep),
-            5 => Ok(Self::Checkpoint),
+            1 => Ok(Self::Put),
+            2 => Ok(Self::Delete),
+            3 => Ok(Self::Checkpoint),
             _ => Err(StorageError(format!("invalid WAL record type: {}", value)).into()),
         }
     }
@@ -73,29 +69,12 @@ impl TryFrom<u8> for WalRecordType {
 /// Uses change vectors: compact descriptions of operations, not full pages.
 #[derive(Debug, Clone, PartialEq)]
 pub enum WalRecord {
-    LeafInsert {
-        page_id: u64,
+    Put {
         key: Vec<u8>,
         value: Vec<u8>,
     },
-    LeafSplit {
-        left_page_id: u64,
-        right_page_id: u64,
-        split_key: Vec<u8>,
-        left_entries: Vec<(Vec<u8>, Vec<u8>)>,
-        right_entries: Vec<(Vec<u8>, Vec<u8>)>,
-    },
-    InternalSplit {
-        left_page_id: u64,
-        right_page_id: u64,
-        split_key: Vec<u8>,
-        first_child: u64,
-        separators: Vec<(Vec<u8>, u64)>,
-    },
-    InternalInsertSep {
-        page_id: u64,
+    Delete {
         key: Vec<u8>,
-        child: u64,
     },
     Checkpoint {
         root_block_id: u64,
@@ -107,10 +86,8 @@ impl WalRecord {
     /// Get the record type for this WAL record.
     pub fn record_type(&self) -> WalRecordType {
         match self {
-            WalRecord::LeafInsert { .. } => WalRecordType::LeafInsert,
-            WalRecord::LeafSplit { .. } => WalRecordType::LeafSplit,
-            WalRecord::InternalSplit { .. } => WalRecordType::InternalSplit,
-            WalRecord::InternalInsertSep { .. } => WalRecordType::InternalInsertSep,
+            WalRecord::Put { .. } => WalRecordType::Put,
+            WalRecord::Delete { .. } => WalRecordType::Delete,
             WalRecord::Checkpoint { .. } => WalRecordType::Checkpoint,
         }
     }
@@ -120,9 +97,7 @@ impl WalRecord {
         let mut buf = Vec::new();
 
         match self {
-            WalRecord::LeafInsert { page_id, key, value } => {
-                // page_id (8 bytes)
-                buf.extend_from_slice(&page_id.to_le_bytes());
+            WalRecord::Put { key, value } => {
                 // key_len (4 bytes) + key
                 buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
                 buf.extend_from_slice(key);
@@ -131,71 +106,10 @@ impl WalRecord {
                 buf.extend_from_slice(value);
             }
 
-            WalRecord::LeafSplit {
-                left_page_id,
-                right_page_id,
-                split_key,
-                left_entries,
-                right_entries,
-            } => {
-                // left_page_id (8 bytes)
-                buf.extend_from_slice(&left_page_id.to_le_bytes());
-                // right_page_id (8 bytes)
-                buf.extend_from_slice(&right_page_id.to_le_bytes());
-                // split_key_len (4 bytes) + split_key
-                buf.extend_from_slice(&(split_key.len() as u32).to_le_bytes());
-                buf.extend_from_slice(split_key);
-                // left_entries count (4 bytes)
-                buf.extend_from_slice(&(left_entries.len() as u32).to_le_bytes());
-                for (k, v) in left_entries {
-                    buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(k);
-                    buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(v);
-                }
-                // right_entries count (4 bytes)
-                buf.extend_from_slice(&(right_entries.len() as u32).to_le_bytes());
-                for (k, v) in right_entries {
-                    buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(k);
-                    buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(v);
-                }
-            }
-
-            WalRecord::InternalSplit {
-                left_page_id,
-                right_page_id,
-                split_key,
-                first_child,
-                separators,
-            } => {
-                // left_page_id (8 bytes)
-                buf.extend_from_slice(&left_page_id.to_le_bytes());
-                // right_page_id (8 bytes)
-                buf.extend_from_slice(&right_page_id.to_le_bytes());
-                // split_key_len (4 bytes) + split_key
-                buf.extend_from_slice(&(split_key.len() as u32).to_le_bytes());
-                buf.extend_from_slice(split_key);
-                // first_child (8 bytes)
-                buf.extend_from_slice(&first_child.to_le_bytes());
-                // separators count (4 bytes)
-                buf.extend_from_slice(&(separators.len() as u32).to_le_bytes());
-                for (k, child) in separators {
-                    buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(k);
-                    buf.extend_from_slice(&child.to_le_bytes());
-                }
-            }
-
-            WalRecord::InternalInsertSep { page_id, key, child } => {
-                // page_id (8 bytes)
-                buf.extend_from_slice(&page_id.to_le_bytes());
+            WalRecord::Delete { key } => {
                 // key_len (4 bytes) + key
                 buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
                 buf.extend_from_slice(key);
-                // child (8 bytes)
-                buf.extend_from_slice(&child.to_le_bytes());
             }
 
             WalRecord::Checkpoint {
@@ -247,88 +161,20 @@ impl WalRecord {
         };
 
         match record_type {
-            WalRecordType::LeafInsert => {
-                let page_id = read_u64(data, &mut cursor)?;
+            WalRecordType::Put => {
                 let key_len = read_u32(data, &mut cursor)? as usize;
                 let key = read_bytes(data, &mut cursor, key_len)?;
                 let value_len = read_u32(data, &mut cursor)? as usize;
                 let value = read_bytes(data, &mut cursor, value_len)?;
 
-                Ok(WalRecord::LeafInsert {
-                    page_id,
-                    key,
-                    value,
-                })
+                Ok(WalRecord::Put { key, value })
             }
 
-            WalRecordType::LeafSplit => {
-                let left_page_id = read_u64(data, &mut cursor)?;
-                let right_page_id = read_u64(data, &mut cursor)?;
-                let split_key_len = read_u32(data, &mut cursor)? as usize;
-                let split_key = read_bytes(data, &mut cursor, split_key_len)?;
-                let left_count = read_u32(data, &mut cursor)? as usize;
-                let mut left_entries = Vec::with_capacity(left_count);
-                for _ in 0..left_count {
-                    let k_len = read_u32(data, &mut cursor)? as usize;
-                    let k = read_bytes(data, &mut cursor, k_len)?;
-                    let v_len = read_u32(data, &mut cursor)? as usize;
-                    let v = read_bytes(data, &mut cursor, v_len)?;
-                    left_entries.push((k, v));
-                }
-                let right_count = read_u32(data, &mut cursor)? as usize;
-                let mut right_entries = Vec::with_capacity(right_count);
-                for _ in 0..right_count {
-                    let k_len = read_u32(data, &mut cursor)? as usize;
-                    let k = read_bytes(data, &mut cursor, k_len)?;
-                    let v_len = read_u32(data, &mut cursor)? as usize;
-                    let v = read_bytes(data, &mut cursor, v_len)?;
-                    right_entries.push((k, v));
-                }
-
-                Ok(WalRecord::LeafSplit {
-                    left_page_id,
-                    right_page_id,
-                    split_key,
-                    left_entries,
-                    right_entries,
-                })
-            }
-
-            WalRecordType::InternalSplit => {
-                let left_page_id = read_u64(data, &mut cursor)?;
-                let right_page_id = read_u64(data, &mut cursor)?;
-                let split_key_len = read_u32(data, &mut cursor)? as usize;
-                let split_key = read_bytes(data, &mut cursor, split_key_len)?;
-                let first_child = read_u64(data, &mut cursor)?;
-                let sep_count = read_u32(data, &mut cursor)? as usize;
-                let mut separators = Vec::with_capacity(sep_count);
-                for _ in 0..sep_count {
-                    let k_len = read_u32(data, &mut cursor)? as usize;
-                    let k = read_bytes(data, &mut cursor, k_len)?;
-                    let child = read_u64(data, &mut cursor)?;
-                    separators.push((k, child));
-                }
-
-                Ok(WalRecord::InternalSplit {
-                    left_page_id,
-                    right_page_id,
-                    split_key,
-                    first_child,
-                    separators,
-                })
-            }
-
-            WalRecordType::InternalInsertSep => {
-                let page_id = read_u64(data, &mut cursor)?;
+            WalRecordType::Delete => {
                 let key_len = read_u32(data, &mut cursor)? as usize;
                 let key = read_bytes(data, &mut cursor, key_len)?;
-                let child = read_u64(data, &mut cursor)?;
 
-                Ok(WalRecord::InternalInsertSep {
-                    page_id,
-                    key,
-                    child,
-                })
+                Ok(WalRecord::Delete { key })
             }
 
             WalRecordType::Checkpoint => {
@@ -361,7 +207,7 @@ impl WalFileHeader {
             magic: *WAL_MAGIC,
             version: WAL_VERSION,
             page_size,
-            last_lsn: Lsn::new(0, WAL_HEADER_SIZE as u64),
+            last_lsn: Lsn::new(0, 0),  // Invalid LSN initially (no records written)
             checkpoint_lsn: Lsn::new(0, 0),
             crc32: 0,
         };
@@ -433,6 +279,9 @@ impl WalFileHeader {
 
         // Version
         let version = u16::from_le_bytes(data[cursor..cursor + 2].try_into().unwrap());
+        if version != WAL_VERSION {
+            return Err(StorageError(format!("unsupported WAL version: {}", version)).into());
+        }
         cursor += 4; // Skip reserved
 
         // Page size
@@ -487,13 +336,13 @@ impl WalFileHeader {
 
 /// WAL record header - precedes each record in the WAL.
 #[derive(Debug, Clone)]
-struct WalRecordHeader {
-    record_type: u8,
-    flags: u8,
-    payload_len: u16,
-    lsn: Lsn,
-    prev_lsn: Lsn,
-    crc32: u32,
+pub struct WalRecordHeader {
+    pub record_type: u8,
+    pub flags: u8,
+    pub payload_len: u16,
+    pub lsn: Lsn,
+    pub prev_lsn: Lsn,
+    pub crc32: u32,
 }
 
 impl WalRecordHeader {
@@ -588,7 +437,6 @@ impl WalFile {
         let mut file = File::create(path)?;
 
         let header = WalFileHeader::new(page_size);
-        let last_lsn = header.last_lsn;
         let header_bytes = header.serialize();
         file.write_all(&header_bytes)?;
         file.sync_all()?;
@@ -599,14 +447,14 @@ impl WalFile {
             header,
             write_buffer: Vec::with_capacity(Self::DEFAULT_BUFFER_CAPACITY),
             buffer_capacity: Self::DEFAULT_BUFFER_CAPACITY,
-            last_lsn,
+            last_lsn: Lsn::new(0, WAL_HEADER_SIZE as u64),  // Next write position
         })
     }
 
     /// Open an existing WAL file.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, WrongoDBError> {
         let path = path.as_ref();
-        let mut file = File::open(path)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
 
         // Read and validate header
         let mut header_bytes = vec![0u8; WAL_HEADER_SIZE];
@@ -617,7 +465,9 @@ impl WalFile {
             return Err(StorageError("WAL header CRC32 mismatch".into()).into());
         }
 
-        let last_lsn = header.last_lsn;
+        let file_len = file.metadata()?.len();
+        let last_lsn = Lsn::new(0, file_len);
+        file.seek(SeekFrom::Start(last_lsn.offset))?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -638,6 +488,9 @@ impl WalFile {
     pub fn set_checkpoint_lsn(&mut self, lsn: Lsn) -> Result<(), WrongoDBError> {
         self.header.checkpoint_lsn = lsn;
 
+        // Recompute CRC32 after modifying the header
+        self.header.crc32 = self.header.compute_crc32();
+
         // Rewrite header to disk
         let header_bytes = self.header.serialize();
         self.file.seek(SeekFrom::Start(0))?;
@@ -654,71 +507,18 @@ impl WalFile {
         Ok(())
     }
 
-    /// Log a leaf insert operation.
-    pub fn log_leaf_insert(
-        &mut self,
-        page_id: u64,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<Lsn, WrongoDBError> {
-        let record = WalRecord::LeafInsert {
-            page_id,
+    /// Log a logical put (upsert) operation.
+    pub fn log_put(&mut self, key: &[u8], value: &[u8]) -> Result<Lsn, WrongoDBError> {
+        let record = WalRecord::Put {
             key: key.to_vec(),
             value: value.to_vec(),
         };
         self.append_record(record)
     }
 
-    /// Log a leaf split operation.
-    pub fn log_leaf_split(
-        &mut self,
-        left_page_id: u64,
-        right_page_id: u64,
-        split_key: &[u8],
-        left_entries: &[(Vec<u8>, Vec<u8>)],
-        right_entries: &[(Vec<u8>, Vec<u8>)],
-    ) -> Result<Lsn, WrongoDBError> {
-        let record = WalRecord::LeafSplit {
-            left_page_id,
-            right_page_id,
-            split_key: split_key.to_vec(),
-            left_entries: left_entries.to_vec(),
-            right_entries: right_entries.to_vec(),
-        };
-        self.append_record(record)
-    }
-
-    /// Log an internal split operation.
-    pub fn log_internal_split(
-        &mut self,
-        left_page_id: u64,
-        right_page_id: u64,
-        split_key: &[u8],
-        first_child: u64,
-        separators: &[(Vec<u8>, u64)],
-    ) -> Result<Lsn, WrongoDBError> {
-        let record = WalRecord::InternalSplit {
-            left_page_id,
-            right_page_id,
-            split_key: split_key.to_vec(),
-            first_child,
-            separators: separators.to_vec(),
-        };
-        self.append_record(record)
-    }
-
-    /// Log an internal insert separator operation.
-    pub fn log_internal_insert_sep(
-        &mut self,
-        page_id: u64,
-        key: &[u8],
-        child: u64,
-    ) -> Result<Lsn, WrongoDBError> {
-        let record = WalRecord::InternalInsertSep {
-            page_id,
-            key: key.to_vec(),
-            child,
-        };
+    /// Log a logical delete operation.
+    pub fn log_delete(&mut self, key: &[u8]) -> Result<Lsn, WrongoDBError> {
+        let record = WalRecord::Delete { key: key.to_vec() };
         self.append_record(record)
     }
 
@@ -728,7 +528,11 @@ impl WalFile {
             root_block_id,
             generation,
         };
-        self.append_record(record)
+        self.append_record(record)?;
+
+        // Return the LSN AFTER the checkpoint record
+        // Recovery should start reading from here, skipping the checkpoint record itself
+        Ok(self.last_lsn)
     }
 
     /// Append a WAL record to the log.
@@ -776,7 +580,8 @@ impl WalFile {
             self.last_lsn.file_id,
             self.last_lsn.offset + record_size as u64,
         );
-        self.header.last_lsn = self.last_lsn;
+        // Update header.last_lsn to point to this record (the last written record)
+        self.header.last_lsn = lsn;
 
         Ok(lsn)
     }
@@ -832,6 +637,229 @@ pub fn wal_path_from_data_path(data_path: &Path) -> PathBuf {
     PathBuf::from(wal_path)
 }
 
+/// Recovery-specific error type for WAL operations.
+#[derive(Debug)]
+pub enum RecoveryError {
+    /// Checksum mismatch in WAL record
+    ChecksumMismatch {
+        offset: u64,
+        expected: u32,
+        actual: u32,
+    },
+    /// Broken LSN chain (gap in sequence)
+    BrokenLsnChain {
+        current_lsn: Lsn,
+        expected_prev: Lsn,
+        actual_prev: Lsn,
+    },
+    /// Corrupt record header
+    CorruptRecordHeader {
+        offset: u64,
+        details: String,
+    },
+    /// Corrupt record payload
+    CorruptRecordPayload {
+        record_type: WalRecordType,
+        offset: u64,
+        details: String,
+    },
+    /// Invalid WAL file
+    InvalidWalFile(String),
+    /// IO error during recovery
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for RecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecoveryError::ChecksumMismatch { offset, expected, actual } => {
+                write!(f, "WAL checksum mismatch at offset {}: expected {:08x}, got {:08x}",
+                       offset, expected, actual)
+            }
+            RecoveryError::BrokenLsnChain { current_lsn, expected_prev, actual_prev } => {
+                write!(f, "WAL LSN chain broken at LSN {:?}: expected prev LSN {:?}, got {:?}",
+                       current_lsn, expected_prev, actual_prev)
+            }
+            RecoveryError::CorruptRecordHeader { offset, details } => {
+                write!(f, "WAL corrupt record header at offset {}: {}", offset, details)
+            }
+            RecoveryError::CorruptRecordPayload { record_type, offset, details } => {
+                write!(f, "WAL corrupt payload for record type {:?} at offset {}: {}",
+                       record_type, offset, details)
+            }
+            RecoveryError::InvalidWalFile(msg) => {
+                write!(f, "Invalid WAL file: {}", msg)
+            }
+            RecoveryError::Io(err) => {
+                write!(f, "WAL IO error: {}", err)
+            }
+        }
+    }
+}
+
+impl std::error::Error for RecoveryError {}
+
+impl From<std::io::Error> for RecoveryError {
+    fn from(err: std::io::Error) -> Self {
+        RecoveryError::Io(err)
+    }
+}
+
+/// WAL reader for sequential reading during recovery.
+///
+/// Reads WAL records from the checkpoint LSN to the end of the file.
+/// Validates checksums and LSN chains.
+pub struct WalReader {
+    file: File,
+    header: WalFileHeader,
+    current_offset: u64,
+    last_valid_lsn: Lsn,
+}
+
+impl WalReader {
+    /// Open a WAL file for reading.
+    ///
+    /// Returns an error if the WAL file doesn't exist or has an invalid header.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, RecoveryError> {
+        let path = path.as_ref();
+
+        if !path.exists() {
+            return Err(RecoveryError::InvalidWalFile(
+                format!("WAL file does not exist: {}", path.display())
+            ));
+        }
+
+        let mut file = File::open(path)?;
+
+        // Read and validate header
+        let mut header_bytes = vec![0u8; WAL_HEADER_SIZE];
+        file.read_exact(&mut header_bytes)?;
+        let header = WalFileHeader::deserialize(&header_bytes)
+            .map_err(|e| RecoveryError::InvalidWalFile(format!("invalid header: {}", e)))?;
+
+        if !header.validate_crc() {
+            return Err(RecoveryError::InvalidWalFile(
+                "WAL header CRC32 mismatch".to_string()
+            ));
+        }
+
+        // Start reading from checkpoint LSN (or beginning if 0)
+        let current_offset = if header.checkpoint_lsn.is_valid() {
+            header.checkpoint_lsn.offset
+        } else {
+            WAL_HEADER_SIZE as u64
+        };
+
+        Ok(Self {
+            file,
+            header,
+            current_offset,
+            last_valid_lsn: Lsn::new(0, 0),
+        })
+    }
+
+    /// Read the next WAL record from the log.
+    ///
+    /// Returns `Ok(None)` when reaching the end of the file or a partial record.
+    /// Returns `Ok(Some((header, record)))` for successfully read records.
+    /// Returns `Err` for unrecoverable errors (corruption).
+    pub fn read_record(&mut self) -> Result<Option<(WalRecordHeader, WalRecord)>, RecoveryError> {
+        // Seek to current offset
+        self.file.seek(SeekFrom::Start(self.current_offset))?;
+
+        // Try to read record header
+        let mut header_bytes = vec![0u8; RECORD_HEADER_SIZE];
+        let bytes_read = self.file.read(&mut header_bytes)?;
+
+        // EOF check
+        if bytes_read == 0 {
+            return Ok(None);
+        }
+
+        // Partial header at EOF
+        if bytes_read < RECORD_HEADER_SIZE {
+            return Ok(None);
+        }
+
+        // Deserialize header
+        let header = WalRecordHeader::deserialize(&header_bytes)
+            .map_err(|e| RecoveryError::CorruptRecordHeader {
+                offset: self.current_offset,
+                details: e.to_string(),
+            })?;
+
+        // Read payload
+        let payload_len = header.payload_len as usize;
+        let mut payload = vec![0u8; payload_len];
+        let payload_bytes_read = self.file.read(&mut payload)?;
+
+        // Partial payload at EOF
+        if payload_bytes_read < payload_len {
+            return Ok(None);
+        }
+
+        // Validate checksum
+        // Header format for CRC (same as during write):
+        // - record_type (1) + flags (1) + payload_len (2) + reserved (2) = 6 bytes
+        // - lsn_offset (8) + prev_lsn_offset (8) = 16 bytes
+        // Total = 22 bytes (not including CRC itself or padding)
+        let crc_header_len = 1 + 1 + 2 + 2 + 8 + 8; // 22 bytes
+        let mut hasher = Hasher::new();
+        hasher.update(&header_bytes[0..crc_header_len]);
+        hasher.update(&payload);
+        let computed_crc = hasher.finalize();
+
+        if computed_crc != header.crc32 {
+            return Err(RecoveryError::ChecksumMismatch {
+                offset: self.current_offset,
+                expected: header.crc32,
+                actual: computed_crc,
+            });
+        }
+
+        // Validate LSN chain
+        if self.last_valid_lsn.is_valid() && header.prev_lsn != self.last_valid_lsn {
+            return Err(RecoveryError::BrokenLsnChain {
+                current_lsn: header.lsn,
+                expected_prev: self.last_valid_lsn,
+                actual_prev: header.prev_lsn,
+            });
+        }
+
+        // Deserialize payload
+        let record_type = WalRecordType::try_from(header.record_type)
+            .map_err(|_| RecoveryError::CorruptRecordHeader {
+                offset: self.current_offset,
+                details: format!("invalid record type: {}", header.record_type),
+            })?;
+
+        let record = WalRecord::deserialize_payload(record_type, &payload)
+            .map_err(|e| RecoveryError::CorruptRecordPayload {
+                record_type,
+                offset: self.current_offset + RECORD_HEADER_SIZE as u64,
+                details: e.to_string(),
+            })?;
+
+        // Update state
+        self.last_valid_lsn = header.lsn;
+        self.current_offset += (RECORD_HEADER_SIZE + payload_len) as u64;
+
+        Ok(Some((header, record)))
+    }
+
+    /// Get the checkpoint LSN from the WAL header.
+    pub fn checkpoint_lsn(&self) -> Lsn {
+        self.header.checkpoint_lsn
+    }
+
+    /// Check if we've reached the end of the WAL file.
+    pub fn is_eof(&mut self) -> Result<bool, RecoveryError> {
+        let current_pos = self.file.seek(SeekFrom::Current(0))?;
+        let file_len = self.file.metadata()?.len();
+        Ok(current_pos >= file_len)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -860,7 +888,7 @@ mod tests {
     fn wal_header_round_trip() {
         let header = WalFileHeader {
             magic: *WAL_MAGIC,
-            version: 1,
+            version: WAL_VERSION,
             page_size: 4096,
             last_lsn: Lsn::new(0, 512),
             checkpoint_lsn: Lsn::new(0, 0),
@@ -919,65 +947,28 @@ mod tests {
     }
 
     #[test]
-    fn wal_record_serialize_leaf_insert() {
-        let record = WalRecord::LeafInsert {
-            page_id: 42,
+    fn wal_record_serialize_put() {
+        let record = WalRecord::Put {
             key: b"test_key".to_vec(),
             value: b"test_value".to_vec(),
         };
 
         let payload = record.serialize_payload();
         let deserialized =
-            WalRecord::deserialize_payload(WalRecordType::LeafInsert, &payload).unwrap();
+            WalRecord::deserialize_payload(WalRecordType::Put, &payload).unwrap();
 
         assert_eq!(record, deserialized);
     }
 
     #[test]
-    fn wal_record_serialize_leaf_split() {
-        let record = WalRecord::LeafSplit {
-            left_page_id: 10,
-            right_page_id: 20,
-            split_key: b"mid".to_vec(),
-            left_entries: vec![(b"a".to_vec(), b"1".to_vec()), (b"b".to_vec(), b"2".to_vec())],
-            right_entries: vec![(b"c".to_vec(), b"3".to_vec()), (b"d".to_vec(), b"4".to_vec())],
+    fn wal_record_serialize_delete() {
+        let record = WalRecord::Delete {
+            key: b"test_key".to_vec(),
         };
 
         let payload = record.serialize_payload();
         let deserialized =
-            WalRecord::deserialize_payload(WalRecordType::LeafSplit, &payload).unwrap();
-
-        assert_eq!(record, deserialized);
-    }
-
-    #[test]
-    fn wal_record_serialize_internal_split() {
-        let record = WalRecord::InternalSplit {
-            left_page_id: 5,
-            right_page_id: 15,
-            split_key: b"separator".to_vec(),
-            first_child: 100,
-            separators: vec![(b"a".to_vec(), 101), (b"b".to_vec(), 102)],
-        };
-
-        let payload = record.serialize_payload();
-        let deserialized =
-            WalRecord::deserialize_payload(WalRecordType::InternalSplit, &payload).unwrap();
-
-        assert_eq!(record, deserialized);
-    }
-
-    #[test]
-    fn wal_record_serialize_internal_insert_sep() {
-        let record = WalRecord::InternalInsertSep {
-            page_id: 7,
-            key: b"sep_key".to_vec(),
-            child: 99,
-        };
-
-        let payload = record.serialize_payload();
-        let deserialized =
-            WalRecord::deserialize_payload(WalRecordType::InternalInsertSep, &payload).unwrap();
+            WalRecord::deserialize_payload(WalRecordType::Delete, &payload).unwrap();
 
         assert_eq!(record, deserialized);
     }
@@ -997,16 +988,14 @@ mod tests {
     }
 
     #[test]
-    fn wal_file_log_and_read_leaf_insert() {
+    fn wal_file_log_and_read_put() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("test.wal");
 
         let mut wal = WalFile::create(&path, 4096).unwrap();
 
-        // Log a leaf insert
-        let lsn = wal
-            .log_leaf_insert(42, b"my_key", b"my_value")
-            .unwrap();
+        // Log a put
+        let lsn = wal.log_put(b"my_key", b"my_value").unwrap();
 
         assert_eq!(lsn.offset, WAL_HEADER_SIZE as u64);
 
@@ -1027,9 +1016,9 @@ mod tests {
         let mut wal = WalFile::create(&path, 4096).unwrap();
 
         // Write multiple records - should buffer
-        wal.log_leaf_insert(1, b"key1", b"value1").unwrap();
-        wal.log_leaf_insert(2, b"key2", b"value2").unwrap();
-        wal.log_leaf_insert(3, b"key3", b"value3").unwrap();
+        wal.log_put(b"key1", b"value1").unwrap();
+        wal.log_put(b"key2", b"value2").unwrap();
+        wal.log_put(b"key3", b"value3").unwrap();
 
         // Now sync - should flush buffer
         wal.sync().unwrap();
@@ -1045,9 +1034,9 @@ mod tests {
 
         let mut wal = WalFile::create(&path, 4096).unwrap();
 
-        let lsn1 = wal.log_leaf_insert(1, b"key1", b"value1").unwrap();
-        let lsn2 = wal.log_leaf_insert(2, b"key2", b"value2").unwrap();
-        let lsn3 = wal.log_leaf_insert(3, b"key3", b"value3").unwrap();
+        let lsn1 = wal.log_put(b"key1", b"value1").unwrap();
+        let lsn2 = wal.log_put(b"key2", b"value2").unwrap();
+        let lsn3 = wal.log_put(b"key3", b"value3").unwrap();
 
         // LSNs should be sequential
         assert!(lsn1.offset < lsn2.offset);

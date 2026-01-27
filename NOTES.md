@@ -22,3 +22,17 @@ you do a range scan over the prefix `(tenant_id = X, *)` and read each record id
 ## Posting lists alternative (not chosen here)
 An alternative is to store a single key and point it at a posting list of record ids. We explicitly avoided this for now
 in favor of the composite-key approach above.
+
+# Notes: WiredTiger WAL recovery (logical replay)
+
+## Evidence from the WiredTiger reference code
+- WAL logs logical row/column operations (put/remove/modify) using file ids + keys/recnos, not page ids.
+  - `wiredtiger/src/txn/txn_log.c`
+- Recovery replays log records by opening cursors with overwrite and calling normal insert/remove paths.
+  - `wiredtiger/src/txn/txn_recover.c`
+- Recovery is bounded by checkpoint LSNs and skips missing files; not-found removes are tolerated.
+  - `wiredtiger/src/txn/txn_recover.c`
+
+## Implications for minimongo
+- Prefer logical WAL records and replay via BTree writes to avoid page-id mapping and split logging.
+- Make replay idempotent (put as upsert, delete missing keys ok).

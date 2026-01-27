@@ -57,9 +57,18 @@ impl BTree {
     }
 
     pub fn open<P: AsRef<Path>>(path: P, wal_enabled: bool) -> Result<Self, WrongoDBError> {
-        let mut pager = Pager::open(path, wal_enabled)?;
-        init_root_if_missing(&mut pager)?;
-        Ok(Self { pager })
+        let pager = Pager::open(path, wal_enabled)?;
+        let mut tree = Self { pager };
+        init_root_if_missing(&mut tree.pager)?;
+
+        if wal_enabled {
+            if let Err(e) = tree.recover_from_wal() {
+                eprintln!("WAL recovery failed: {}. Database may be inconsistent.", e);
+                // Continue anyway - corrupted WAL shouldn't prevent database open
+            }
+        }
+
+        Ok(tree)
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, WrongoDBError> {
@@ -142,12 +151,32 @@ impl BTree {
             self.pager.set_root_page_id(result.new_node_id)?;
         }
 
+        self.log_wal_if_enabled(|w| w.log_put(key, value))?;
+
         // Auto-checkpoint if threshold reached
         if self.pager.checkpoint_requested() {
             self.checkpoint()?;
         }
 
         Ok(())
+    }
+
+    pub fn delete(&mut self, key: &[u8]) -> Result<bool, WrongoDBError> {
+        let root = self.pager.root_page_id();
+        if root == NONE_BLOCK_ID {
+            return Ok(false);
+        }
+
+        let result = self.delete_recursive(root, key)?;
+        self.pager.set_root_page_id(result.new_node_id)?;
+
+        self.log_wal_if_enabled(|w| w.log_delete(key))?;
+
+        if self.pager.checkpoint_requested() {
+            self.checkpoint()?;
+        }
+
+        Ok(result.deleted)
     }
 
     /// Request automatic checkpointing after N updates.
@@ -188,7 +217,10 @@ impl BTree {
                 let generation = 0;
 
                 // Log checkpoint record
-                wal.log_checkpoint(root, generation)?;
+                let checkpoint_lsn = wal.log_checkpoint(root, generation)?;
+
+                // Update checkpoint_lsn in WAL header so recovery knows where to start
+                wal.set_checkpoint_lsn(checkpoint_lsn)?;
 
                 // Sync WAL to ensure checkpoint record is durable
                 wal.sync()?;
@@ -224,6 +256,71 @@ impl BTree {
         self.pager.sync_wal()
     }
 
+    /// Recover from WAL after a crash.
+    ///
+    /// This is called automatically during BTree::open() if WAL is enabled.
+    /// It replays all WAL records from the checkpoint LSN via logical BTree operations.
+    fn recover_from_wal(&mut self) -> Result<(), WrongoDBError> {
+        // Get the data file path from the blockfile
+        let data_path = &self.pager.blockfile().path;
+
+        let wal_path = crate::btree::wal::wal_path_from_data_path(data_path);
+
+        if !wal_path.exists() {
+            // No WAL file - nothing to recover
+            return Ok(());
+        }
+
+        // Open WAL reader
+        let mut wal_reader = crate::btree::wal::WalReader::open(&wal_path)
+            .map_err(|e| StorageError(format!("Failed to open WAL for recovery: {}", e)))?;
+
+        let checkpoint_lsn = wal_reader.checkpoint_lsn();
+
+        if checkpoint_lsn.is_valid() {
+            eprintln!("Starting WAL recovery from checkpoint LSN: {:?}", checkpoint_lsn);
+        } else {
+            eprintln!("Starting WAL recovery from beginning");
+        }
+
+        let saved_wal = self.pager.take_wal();
+
+        let result = (|| {
+            let mut stats = RecoveryStats::default();
+
+            // Replay all records
+            while let Some((_header, record)) = wal_reader
+                .read_record()
+                .map_err(|e| StorageError(format!("Failed to read WAL record: {}", e)))?
+            {
+                match record {
+                    crate::btree::wal::WalRecord::Put { key, value } => {
+                        self.put(&key, &value)?;
+                        stats.puts += 1;
+                    }
+                    crate::btree::wal::WalRecord::Delete { key } => {
+                        let _ = self.delete(&key)?;
+                        stats.deletes += 1;
+                    }
+                    crate::btree::wal::WalRecord::Checkpoint { .. } => {
+                        stats.checkpoints += 1;
+                    }
+                }
+                stats.operations_replayed += 1;
+            }
+
+            eprintln!(
+                "WAL recovery complete: {} operations replayed (puts={}, deletes={}, checkpoints={})",
+                stats.operations_replayed, stats.puts, stats.deletes, stats.checkpoints
+            );
+
+            Ok(())
+        })();
+
+        self.pager.restore_wal(saved_wal);
+        result
+    }
+
     pub fn range(
         &mut self,
         start: Option<&[u8]>,
@@ -235,6 +332,90 @@ impl BTree {
             return Ok(BTreeRangeIter::empty());
         }
         BTreeRangeIter::new(&mut self.pager, root, start, end)
+    }
+
+    /// Delete a key from the subtree rooted at `node_id`.
+    ///
+    /// Returns:
+    /// - `Ok(DeleteResult)` with the new subtree root id and a flag indicating deletion.
+    ///   No merge/borrow is performed; empty pages may remain.
+    fn delete_recursive(&mut self, node_id: u64, key: &[u8]) -> Result<DeleteResult, WrongoDBError> {
+        let mut page = self.pager.pin_page_mut(node_id)?;
+        let page_type = match page_type(page.payload()) {
+            Ok(t) => t,
+            Err(e) => {
+                if let Err(unpin_err) = self.pager.unpin_page_mut_abort(page) {
+                    return Err(unpin_err);
+                }
+                return Err(e);
+            }
+        };
+        let result = match page_type {
+            PageType::Leaf => self.delete_from_leaf(node_id, &mut page, key),
+            PageType::Internal => self.delete_from_internal(&mut page, key),
+        };
+        match result {
+            Ok(ok) => {
+                self.pager.unpin_page_mut_commit(page)?;
+                Ok(ok)
+            }
+            Err(err) => {
+                if let Err(unpin_err) = self.pager.unpin_page_mut_abort(page) {
+                    return Err(unpin_err);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn delete_from_leaf(
+        &mut self,
+        _node_id: u64,
+        page: &mut PinnedPageMut,
+        key: &[u8],
+    ) -> Result<DeleteResult, WrongoDBError> {
+        let page_id = page.page_id();
+        let deleted = {
+            let mut leaf = LeafPage::open(page.payload_mut())
+                .map_err(|e| StorageError(format!("corrupt leaf {page_id}: {e}")))?;
+            leaf.delete(key).map_err(map_leaf_err)?
+        };
+
+        Ok(DeleteResult {
+            new_node_id: page_id,
+            deleted,
+        })
+    }
+
+    fn delete_from_internal(
+        &mut self,
+        page: &mut PinnedPageMut,
+        key: &[u8],
+    ) -> Result<DeleteResult, WrongoDBError> {
+        let payload_len = page.payload().len();
+        let page_id = page.page_id();
+        let (mut first_child, mut entries) = internal_entries(page.payload_mut())?;
+        let child_idx = child_index_for_key(&entries, key);
+        let child_id = if child_idx == 0 {
+            first_child
+        } else {
+            entries[child_idx - 1].1
+        };
+
+        let child_result = self.delete_recursive(child_id, key)?;
+        if child_idx == 0 {
+            first_child = child_result.new_node_id;
+        } else {
+            entries[child_idx - 1].1 = child_result.new_node_id;
+        }
+
+        let bytes = build_internal_page(first_child, &entries, payload_len)?;
+        page.payload_mut().copy_from_slice(&bytes);
+
+        Ok(DeleteResult {
+            new_node_id: page_id,
+            deleted: child_result.deleted,
+        })
     }
 
     /// Insert into the subtree rooted at `node_id`.
@@ -330,7 +511,6 @@ impl BTree {
                 .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
             match leaf.put(key, value) {
                 Ok(()) => {
-                    self.log_wal_if_enabled(|w| w.log_leaf_insert(page_id, key, value))?;
                     return Ok(InsertResult {
                         new_node_id: page_id,
                         split: None,
@@ -343,17 +523,10 @@ impl BTree {
 
         let mut entries = leaf_entries(page.payload_mut())?;
         upsert_entry(&mut entries, key, value);
-        let (left_bytes, right_bytes, split_key, split_idx) = split_leaf_entries(&entries, payload_len)?;
+        let (left_bytes, right_bytes, split_key, _split_idx) = split_leaf_entries(&entries, payload_len)?;
 
-        // Allocate right sibling first (need page_id for WAL)
+        // Allocate right sibling first
         let right_leaf_id = self.pager.write_new_page(&right_bytes)?;
-
-        // Log WAL record for the split
-        let left_entries = entries[..split_idx].to_vec();
-        let right_entries = entries[split_idx..].to_vec();
-        self.log_wal_if_enabled(|w| {
-            w.log_leaf_split(page_id, right_leaf_id, &split_key, &left_entries, &right_entries)
-        })?;
 
         page.payload_mut().copy_from_slice(&left_bytes);
         Ok(InsertResult {
@@ -400,11 +573,6 @@ impl BTree {
         }
 
         if let Some(split) = child_result.split {
-            // Log WAL record for separator insertion
-            self.log_wal_if_enabled(|w| {
-                w.log_internal_insert_sep(page_id, &split.sep_key, split.right_child)
-            })?;
-
             upsert_internal_entry(&mut entries, &split.sep_key, split.right_child);
         }
 
@@ -416,22 +584,11 @@ impl BTree {
             });
         }
 
-        let (left_bytes, right_bytes, promoted_key, left_first_child, left_separators, _promote_idx) =
+        let (left_bytes, right_bytes, promoted_key, _left_first_child, _left_separators, _promote_idx) =
             split_internal_entries(first_child, &entries, payload_len)?;
 
         // Allocate right sibling first
         let right_internal_id = self.pager.write_new_page(&right_bytes)?;
-
-        // Log WAL record for internal split
-        self.log_wal_if_enabled(|w| {
-            w.log_internal_split(
-                page_id,
-                right_internal_id,
-                &promoted_key,
-                left_first_child,
-                &left_separators,
-            )
-        })?;
 
         page.payload_mut().copy_from_slice(&left_bytes);
         Ok(InsertResult {
@@ -459,6 +616,20 @@ struct SplitInfo {
 struct InsertResult {
     new_node_id: u64,
     split: Option<SplitInfo>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RecoveryStats {
+    operations_replayed: usize,
+    puts: usize,
+    deletes: usize,
+    checkpoints: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DeleteResult {
+    new_node_id: u64,
+    deleted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

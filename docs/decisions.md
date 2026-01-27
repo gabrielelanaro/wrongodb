@@ -1,5 +1,20 @@
 # Decisions
 
+## 2026-01-27: Logical WAL replay (WiredTiger-style)
+
+**Decision**
+- Replace page-level WAL records with logical put/delete records.
+- Recovery replays logical ops through BTree writes with WAL disabled.
+- Bump WAL format version; incompatible WAL is rejected during recovery (open continues with warning). No migration/backwards compatibility.
+- Recovery does not auto-checkpoint; WAL is retained until an explicit checkpoint.
+
+**Why**
+- Avoid COW page-id drift and split ordering failures during recovery.
+- Align with WiredTiger's logical WAL approach (key-based logging, normal B-tree replay).
+
+**Notes**
+- Replay is idempotent: put is upsert; delete missing keys is OK.
+
 ## 2026-01-11: Agentic image generation loop for blog diagrams
 
 **Decision**
