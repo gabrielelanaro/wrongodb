@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::{BlockFile, StorageError, WrongoDBError, NONE_BLOCK_ID};
+use crate::btree::wal::{WalFile, wal_path_from_data_path};
 
 #[allow(dead_code)]
 const DEFAULT_CACHE_CAPACITY_PAGES: usize = 256;
@@ -192,6 +193,12 @@ pub(super) struct Pager {
     /// TODO: Wire up in Slice G2 (WAL) for automatic checkpoint triggering.
     #[allow(dead_code)]
     checkpoint_after_updates: Option<usize>,
+
+    // WAL fields
+    wal: Option<WalFile>,
+    wal_enabled: bool,
+    wal_sync_threshold: Option<usize>,
+    wal_operations_since_sync: usize,
 }
 
 #[derive(Debug)]
@@ -236,9 +243,18 @@ impl PinnedPageMut {
 }
 
 impl Pager {
-    pub(super) fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
-        let bf = BlockFile::create(path, page_size)?;
+    pub(super) fn create<P: AsRef<Path>>(path: P, page_size: usize, wal_enabled: bool) -> Result<Self, WrongoDBError> {
+        let bf = BlockFile::create(&path, page_size)?;
         let working_root = bf.root_block_id();
+
+        // Create WAL file if enabled
+        let wal = if wal_enabled {
+            let wal_path = wal_path_from_data_path(path.as_ref());
+            Some(WalFile::create(&wal_path, page_size as u32)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             bf,
             working_root,
@@ -247,12 +263,29 @@ impl Pager {
             cache: PageCache::new(PageCacheConfig::default()),
             updates_since_checkpoint: 0,
             checkpoint_after_updates: None,
+            wal,
+            wal_enabled,
+            wal_sync_threshold: None,
+            wal_operations_since_sync: 0,
         })
     }
 
-    pub(super) fn open<P: AsRef<Path>>(path: P) -> Result<Self, WrongoDBError> {
-        let bf = BlockFile::open(path)?;
+    pub(super) fn open<P: AsRef<Path>>(path: P, wal_enabled: bool) -> Result<Self, WrongoDBError> {
+        let bf = BlockFile::open(&path)?;
         let working_root = bf.root_block_id();
+
+        // Open WAL file if enabled
+        let wal = if wal_enabled {
+            let wal_path = wal_path_from_data_path(path.as_ref());
+            if wal_path.exists() {
+                Some(WalFile::open(&wal_path)?)
+            } else {
+                Some(WalFile::create(&wal_path, bf.page_size as u32)?)
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             bf,
             working_root,
@@ -261,6 +294,10 @@ impl Pager {
             cache: PageCache::new(PageCacheConfig::default()),
             updates_since_checkpoint: 0,
             checkpoint_after_updates: None,
+            wal,
+            wal_enabled,
+            wal_sync_threshold: None,
+            wal_operations_since_sync: 0,
         })
     }
 
@@ -296,12 +333,16 @@ impl Pager {
     /// Commit the checkpoint by atomically swapping the root and reclaiming retired blocks.
     ///
     /// Steps:
-    /// 1. Write the new root to the checkpoint slot.
-    /// 2. Sync to ensure the new root is durable.
-    /// 3. Release retired blocks to the free list (after root is durable).
-    /// 4. Sync again to make free list updates durable.
-    /// 5. Clear working_pages (all pages are now stable).
+    /// 1. Sync WAL to ensure checkpoint record is durable.
+    /// 2. Write the new root to the checkpoint slot.
+    /// 3. Sync to ensure the new root is durable.
+    /// 4. Release retired blocks to the free list (after root is durable).
+    /// 5. Sync again to make free list updates durable.
+    /// 6. Clear working_pages (all pages are now stable).
     pub(super) fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError> {
+        // Sync WAL before committing checkpoint (write-ahead logging)
+        self.sync_wal()?;
+
         self.bf.set_root_block_id(new_root)?;
         // Ensure the new checkpoint root is durable before reclaiming blocks.
         self.bf.sync_all()?;
@@ -345,6 +386,62 @@ impl Pager {
     /// Increment the update counter (to be called after each mutation).
     fn track_update(&mut self) {
         self.updates_since_checkpoint = self.updates_since_checkpoint.saturating_add(1);
+    }
+
+    // WAL accessor methods
+
+    pub(super) fn wal(&mut self) -> Option<&mut WalFile> {
+        self.wal.as_mut()
+    }
+
+    pub(super) fn wal_mut(&mut self) -> Result<&mut WalFile, WrongoDBError> {
+        self.wal.as_mut()
+            .ok_or_else(|| StorageError("WAL not enabled".into()).into())
+    }
+
+    /// Configure WAL batch sync threshold (sync every N operations)
+    pub(super) fn set_wal_sync_threshold(&mut self, threshold: usize) {
+        self.wal_sync_threshold = Some(threshold);
+    }
+
+    /// Sync WAL to disk (with batching logic)
+    pub(super) fn sync_wal(&mut self) -> Result<(), WrongoDBError> {
+        if let Some(wal) = self.wal.as_mut() {
+            wal.sync()?;
+            self.wal_operations_since_sync = 0;
+        }
+        Ok(())
+    }
+
+    /// Log a WAL operation and conditionally sync based on threshold
+    pub(super) fn log_wal_operation(&mut self) -> Result<bool, WrongoDBError> {
+        if !self.wal_enabled {
+            return Ok(false);
+        }
+
+        self.wal_operations_since_sync += 1;
+
+        // Check if we should sync
+        if let Some(threshold) = self.wal_sync_threshold {
+            if self.wal_operations_since_sync >= threshold {
+                self.sync_wal()?;
+                return Ok(true);  // Synced
+            }
+        }
+
+        Ok(false)  // Not synced
+    }
+
+    /// Disable WAL (for testing)
+    #[cfg(test)]
+    pub(super) fn disable_wal(&mut self) {
+        self.wal_enabled = false;
+    }
+
+    /// Enable WAL
+    #[cfg(test)]
+    pub(super) fn enable_wal(&mut self) {
+        self.wal_enabled = true;
     }
 
     pub(super) fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError> {
@@ -579,7 +676,7 @@ mod tests {
     fn eviction_writes_back_dirty_page() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("pager-cache.db");
-        let mut pager = Pager::create(&path, 256).unwrap();
+        let mut pager = Pager::create(&path, 256, false).unwrap();
         let payload_len = pager.page_payload_len();
         let page_id = pager.write_new_page(&vec![0u8; payload_len]).unwrap();
 
@@ -603,7 +700,7 @@ mod tests {
     fn flush_rejects_dirty_pinned_page() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("pager-cache-flush.db");
-        let mut pager = Pager::create(&path, 256).unwrap();
+        let mut pager = Pager::create(&path, 256, false).unwrap();
         let payload_len = pager.page_payload_len();
         let page_id = pager.write_new_page(&vec![0u8; payload_len]).unwrap();
 
@@ -621,7 +718,7 @@ mod tests {
     fn pin_blocks_eviction_until_unpinned() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("pager-cache-pin.db");
-        let mut pager = Pager::create(&path, 256).unwrap();
+        let mut pager = Pager::create(&path, 256, false).unwrap();
         let payload_len = pager.page_payload_len();
 
         let page1 = pager.write_new_page(&vec![1u8; payload_len]).unwrap();

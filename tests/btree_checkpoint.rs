@@ -7,7 +7,7 @@ fn checkpoint_commit_selects_new_root_on_reopen() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("btree_checkpoint_root.wt");
 
-    let mut tree = BTree::create(&path, 512).unwrap();
+    let mut tree = BTree::create(&path, 512, false).unwrap();
 
     let bf = BlockFile::open(&path).unwrap();
     let old_root = bf.root_block_id();
@@ -23,7 +23,7 @@ fn checkpoint_commit_selects_new_root_on_reopen() {
 
     assert_ne!(new_root, old_root);
 
-    let mut tree2 = BTree::open(&path).unwrap();
+    let mut tree2 = BTree::open(&path, false).unwrap();
     assert_eq!(tree2.get(b"alpha").unwrap(), Some(b"value".to_vec()));
 }
 
@@ -32,7 +32,7 @@ fn crash_before_checkpoint_uses_old_root() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("btree_checkpoint_crash.wt");
 
-    let mut tree = BTree::create(&path, 512).unwrap();
+    let mut tree = BTree::create(&path, 512, false).unwrap();
 
     let bf = BlockFile::open(&path).unwrap();
     let stable_root = bf.root_block_id();
@@ -47,7 +47,7 @@ fn crash_before_checkpoint_uses_old_root() {
 
     assert_eq!(reopened_root, stable_root);
 
-    let mut tree2 = BTree::open(&path).unwrap();
+    let mut tree2 = BTree::open(&path, false).unwrap();
     assert_eq!(tree2.get(b"beta").unwrap(), None);
 }
 
@@ -56,7 +56,7 @@ fn retired_blocks_not_reused_before_checkpoint() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("btree_checkpoint_retired.wt");
 
-    let mut tree = BTree::create(&path, 512).unwrap();
+    let mut tree = BTree::create(&path, 512, false).unwrap();
 
     tree.put(b"k1", b"v1").unwrap();
     let mut bf = BlockFile::open(&path).unwrap();
@@ -81,7 +81,7 @@ fn coalesces_updates_between_checkpoints() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("btree_coalesce.wt");
 
-    let mut tree = BTree::create(&path, 512).unwrap();
+    let mut tree = BTree::create(&path, 512, false).unwrap();
 
     let mut bf = BlockFile::open(&path).unwrap();
     let blocks_before = bf.num_blocks().unwrap();
@@ -110,7 +110,7 @@ fn auto_checkpoint_after_n_updates() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("btree_auto_checkpoint.wt");
 
-    let mut tree = BTree::create(&path, 512).unwrap();
+    let mut tree = BTree::create(&path, 512, false).unwrap();
     tree.request_checkpoint_after_updates(3);
 
     // Insert 2 records - no checkpoint yet
@@ -121,7 +121,7 @@ fn auto_checkpoint_after_n_updates() {
     drop(tree);
 
     // Reopen and verify - data should be lost
-    let mut tree2 = BTree::open(&path).unwrap();
+    let mut tree2 = BTree::open(&path, false).unwrap();
     assert_eq!(tree2.get(b"k1").unwrap(), None);
     assert_eq!(tree2.get(b"k2").unwrap(), None);
 
@@ -136,7 +136,7 @@ fn auto_checkpoint_after_n_updates() {
     drop(tree2);
 
     // Reopen and verify - k3, k4, k5 should be durable
-    let mut tree3 = BTree::open(&path).unwrap();
+    let mut tree3 = BTree::open(&path, false).unwrap();
     assert_eq!(tree3.get(b"k3").unwrap(), Some(b"v3".to_vec()));
     assert_eq!(tree3.get(b"k4").unwrap(), Some(b"v4".to_vec()));
     assert_eq!(tree3.get(b"k5").unwrap(), Some(b"v5".to_vec()));
@@ -147,7 +147,7 @@ fn checkpoint_then_crash_recovers_new_root() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("btree_checkpoint_crash_recovery.wt");
 
-    let mut tree = BTree::create(&path, 512).unwrap();
+    let mut tree = BTree::create(&path, 512, false).unwrap();
 
     // Insert records and checkpoint
     for i in 0..10 {
@@ -179,7 +179,7 @@ fn checkpoint_then_crash_recovers_new_root() {
     bf2.close().unwrap();
 
     // Verify only checkpointed data is recovered
-    let mut tree2 = BTree::open(&path).unwrap();
+    let mut tree2 = BTree::open(&path, false).unwrap();
     for i in 0..10 {
         let key = format!("key{}", i);
         let value = format!("value{}", i);
@@ -200,7 +200,7 @@ fn retired_blocks_reclaimed_after_checkpoint() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("btree_checkpoint_reclaim.wt");
 
-    let mut tree = BTree::create(&path, 512).unwrap();
+    let mut tree = BTree::create(&path, 512, false).unwrap();
 
     // Insert enough records to cause splits
     for i in 0..20 {
@@ -223,7 +223,7 @@ fn dirty_pages_flushed_on_checkpoint() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("btree_checkpoint_flush.wt");
 
-    let mut tree = BTree::create(&path, 512).unwrap();
+    let mut tree = BTree::create(&path, 512, false).unwrap();
 
     // Insert records that modify dirty pages
     tree.put(b"key1", b"value1").unwrap();
@@ -237,7 +237,7 @@ fn dirty_pages_flushed_on_checkpoint() {
     drop(tree);
 
     // Reopen and verify all data is durable
-    let mut tree2 = BTree::open(&path).unwrap();
+    let mut tree2 = BTree::open(&path, false).unwrap();
     assert_eq!(tree2.get(b"key1").unwrap(), Some(b"value1".to_vec()));
     assert_eq!(tree2.get(b"key2").unwrap(), Some(b"value2".to_vec()));
     assert_eq!(tree2.get(b"key3").unwrap(), Some(b"value3".to_vec()));

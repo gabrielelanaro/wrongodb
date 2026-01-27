@@ -4,7 +4,7 @@
 //! not full page images. This provides ~100x smaller WAL size.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Write, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use crc32fast::Hasher;
 
@@ -568,6 +568,7 @@ impl WalRecordHeader {
 ///
 /// Change vector logging: operations are logged as compact descriptions,
 /// not full page images. This matches WiredTiger's production architecture.
+#[derive(Debug)]
 pub struct WalFile {
     path: PathBuf,
     file: File,
@@ -631,6 +632,19 @@ impl WalFile {
     /// Get the checkpoint LSN - recovery should replay from this point.
     pub fn checkpoint_lsn(&self) -> Lsn {
         self.header.checkpoint_lsn
+    }
+
+    /// Update the checkpoint LSN in the WAL header.
+    pub fn set_checkpoint_lsn(&mut self, lsn: Lsn) -> Result<(), WrongoDBError> {
+        self.header.checkpoint_lsn = lsn;
+
+        // Rewrite header to disk
+        let header_bytes = self.header.serialize();
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(&header_bytes)?;
+        self.file.sync_all()?;
+
+        Ok(())
     }
 
     /// Sync the WAL file to disk.

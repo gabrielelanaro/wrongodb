@@ -3,6 +3,8 @@ use std::path::Path;
 mod pager;
 pub mod wal;
 
+use self::wal::WalFile;
+
 use self::pager::{Pager, PinnedPage, PinnedPageMut};
 use crate::errors::StorageError;
 use crate::{
@@ -47,15 +49,15 @@ pub struct BTree {
 }
 
 impl BTree {
-    pub fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
-        let mut pager = Pager::create(path, page_size)?;
+    pub fn create<P: AsRef<Path>>(path: P, page_size: usize, wal_enabled: bool) -> Result<Self, WrongoDBError> {
+        let mut pager = Pager::create(path, page_size, wal_enabled)?;
         init_root_if_missing(&mut pager)?;
         pager.checkpoint()?;
         Ok(Self { pager })
     }
 
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, WrongoDBError> {
-        let mut pager = Pager::open(path)?;
+    pub fn open<P: AsRef<Path>>(path: P, wal_enabled: bool) -> Result<Self, WrongoDBError> {
+        let mut pager = Pager::open(path, wal_enabled)?;
         init_root_if_missing(&mut pager)?;
         Ok(Self { pager })
     }
@@ -157,7 +159,7 @@ impl BTree {
     /// # Example
     /// ```no_run
     /// # use wrongodb::BTree;
-    /// # let mut tree = BTree::create("/tmp/db", 4096).unwrap();
+    /// # let mut tree = BTree::create("/tmp/db", 4096, false).unwrap();
     /// tree.request_checkpoint_after_updates(100);  // Auto-checkpoint every 100 puts
     /// ```
     pub fn request_checkpoint_after_updates(&mut self, count: usize) {
@@ -176,7 +178,50 @@ impl BTree {
     /// Note: This is called automatically if `request_checkpoint_after_updates`
     /// is configured and the threshold is reached.
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
-        self.pager.checkpoint()
+        // Log checkpoint record BEFORE preparing checkpoint (if WAL is enabled)
+        let root = self.pager.checkpoint_prepare();
+
+        // Only log checkpoint if WAL is enabled
+        if self.pager.wal().is_some() {
+            if let Ok(wal) = self.pager.wal_mut() {
+                // Get current generation (simplified - using 0 for now)
+                let generation = 0;
+
+                // Log checkpoint record
+                wal.log_checkpoint(root, generation)?;
+
+                // Sync WAL to ensure checkpoint record is durable
+                wal.sync()?;
+            }
+        }
+
+        self.pager.checkpoint_flush_data()?;
+        self.pager.checkpoint_commit(root)?;
+        Ok(())
+    }
+
+    /// Configure WAL batch sync threshold (sync every N operations).
+    ///
+    /// When configured, the WAL will be synced to disk every N operations
+    /// instead of on every operation. This improves performance at the cost
+    /// of potentially losing up to N operations on a crash.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use wrongodb::BTree;
+    /// # let mut tree = BTree::create("/tmp/db", 4096, true).unwrap();
+    /// tree.set_wal_sync_threshold(100);  // Sync every 100 operations
+    /// ```
+    pub fn set_wal_sync_threshold(&mut self, threshold: usize) {
+        self.pager.set_wal_sync_threshold(threshold);
+    }
+
+    /// Force WAL sync to disk.
+    ///
+    /// This ensures all pending WAL records are written to stable storage.
+    /// Call this explicitly if you need durability before a checkpoint.
+    pub fn sync_wal(&mut self) -> Result<(), WrongoDBError> {
+        self.pager.sync_wal()
     }
 
     pub fn range(
@@ -243,6 +288,23 @@ impl BTree {
         }
     }
 
+    /// Log a WAL record if WAL is enabled.
+    ///
+    /// This helper encapsulates the repetitive pattern of:
+    /// 1. Checking if WAL is enabled
+    /// 2. Logging the WAL record
+    /// 3. Tracking the operation for batch sync
+    fn log_wal_if_enabled<F>(&mut self, op: F) -> Result<(), WrongoDBError>
+    where
+        F: FnOnce(&mut WalFile) -> Result<crate::btree::wal::Lsn, WrongoDBError>,
+    {
+        if self.pager.wal().is_some() {
+            op(self.pager.wal_mut()?)?;
+            let _ = self.pager.log_wal_operation();
+        }
+        Ok(())
+    }
+
     /// Insert into a leaf page, splitting if it overflows.
     ///
     /// Leaf split is done by rebuilding two leaf pages from the post-insert sorted entry list:
@@ -268,6 +330,7 @@ impl BTree {
                 .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
             match leaf.put(key, value) {
                 Ok(()) => {
+                    self.log_wal_if_enabled(|w| w.log_leaf_insert(page_id, key, value))?;
                     return Ok(InsertResult {
                         new_node_id: page_id,
                         split: None,
@@ -280,9 +343,18 @@ impl BTree {
 
         let mut entries = leaf_entries(page.payload_mut())?;
         upsert_entry(&mut entries, key, value);
-        let (left_bytes, right_bytes, split_key) = split_leaf_entries(&entries, payload_len)?;
+        let (left_bytes, right_bytes, split_key, split_idx) = split_leaf_entries(&entries, payload_len)?;
 
+        // Allocate right sibling first (need page_id for WAL)
         let right_leaf_id = self.pager.write_new_page(&right_bytes)?;
+
+        // Log WAL record for the split
+        let left_entries = entries[..split_idx].to_vec();
+        let right_entries = entries[split_idx..].to_vec();
+        self.log_wal_if_enabled(|w| {
+            w.log_leaf_split(page_id, right_leaf_id, &split_key, &left_entries, &right_entries)
+        })?;
+
         page.payload_mut().copy_from_slice(&left_bytes);
         Ok(InsertResult {
             new_node_id: page_id,
@@ -328,6 +400,11 @@ impl BTree {
         }
 
         if let Some(split) = child_result.split {
+            // Log WAL record for separator insertion
+            self.log_wal_if_enabled(|w| {
+                w.log_internal_insert_sep(page_id, &split.sep_key, split.right_child)
+            })?;
+
             upsert_internal_entry(&mut entries, &split.sep_key, split.right_child);
         }
 
@@ -339,9 +416,23 @@ impl BTree {
             });
         }
 
-        let (left_bytes, right_bytes, promoted_key) =
+        let (left_bytes, right_bytes, promoted_key, left_first_child, left_separators, _promote_idx) =
             split_internal_entries(first_child, &entries, payload_len)?;
+
+        // Allocate right sibling first
         let right_internal_id = self.pager.write_new_page(&right_bytes)?;
+
+        // Log WAL record for internal split
+        self.log_wal_if_enabled(|w| {
+            w.log_internal_split(
+                page_id,
+                right_internal_id,
+                &promoted_key,
+                left_first_child,
+                &left_separators,
+            )
+        })?;
+
         page.payload_mut().copy_from_slice(&left_bytes);
         Ok(InsertResult {
             new_node_id: page_id,
@@ -472,7 +563,7 @@ fn child_index_for_key(entries: &[(Vec<u8>, u64)], key: &[u8]) -> usize {
 fn split_leaf_entries(
     entries: &[(Vec<u8>, Vec<u8>)],
     payload_len: usize,
-) -> Result<SplitResult, WrongoDBError> {
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, usize), WrongoDBError> {
     if entries.len() < 2 {
         return Err(StorageError("cannot split leaf with <2 entries".into()).into());
     }
@@ -500,7 +591,7 @@ fn split_leaf_entries(
         let left = build_leaf_page(&entries[..split_idx], payload_len);
         let right = build_leaf_page(&entries[split_idx..], payload_len);
         if let (Ok(l), Ok(r)) = (left, right) {
-            return Ok((l, r, entries[split_idx].0.clone()));
+            return Ok((l, r, entries[split_idx].0.clone(), split_idx));
         }
     }
 
@@ -546,7 +637,7 @@ fn split_internal_entries(
     first_child: u64,
     entries: &[(Vec<u8>, u64)],
     payload_len: usize,
-) -> Result<SplitResult, WrongoDBError> {
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, u64, Vec<(Vec<u8>, u64)>, usize), WrongoDBError> {
     if entries.is_empty() {
         return Err(StorageError("cannot split internal with 0 separators".into()).into());
     }
@@ -574,7 +665,7 @@ fn split_internal_entries(
         let left = build_internal_page(first_child, left_entries, payload_len);
         let right = build_internal_page(right_first_child, right_entries, payload_len);
         if let (Ok(l), Ok(r)) = (left, right) {
-            return Ok((l, r, promoted_key));
+            return Ok((l, r, promoted_key, first_child, left_entries.to_vec(), promote_idx));
         }
     }
 

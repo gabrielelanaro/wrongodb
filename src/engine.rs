@@ -37,9 +37,9 @@ impl Collection {
         let id_index_path = PathBuf::from(format!("{}.id_index.wt", path.display()));
         let id_index = if name == "test" {
             if id_index_path.exists() {
-                Some(BTree::open(&id_index_path)?)
+                Some(BTree::open(&id_index_path, true)?)
             } else {
-                Some(BTree::create(&id_index_path, 4096)?)
+                Some(BTree::create(&id_index_path, 4096, true)?)
             }
         } else {
             None
