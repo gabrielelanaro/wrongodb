@@ -4,23 +4,19 @@ use std::path::Path;
 use crate::{BlockFile, StorageError, WrongoDBError, NONE_BLOCK_ID};
 use crate::btree::wal::{WalFile, wal_path_from_data_path};
 
-#[allow(dead_code)]
 const DEFAULT_CACHE_CAPACITY_PAGES: usize = 256;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EvictionPolicy {
     Lru,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct PageCacheConfig {
     capacity_pages: usize,
     eviction_policy: EvictionPolicy,
 }
 
-#[allow(dead_code)]
 impl Default for PageCacheConfig {
     fn default() -> Self {
         Self {
@@ -30,7 +26,6 @@ impl Default for PageCacheConfig {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 struct PageCacheEntry {
     page_id: u64,
@@ -40,7 +35,6 @@ struct PageCacheEntry {
     last_access: u64,
 }
 
-#[allow(dead_code)]
 impl PageCacheEntry {
     fn new(page_id: u64, payload: Vec<u8>) -> Self {
         Self {
@@ -53,7 +47,6 @@ impl PageCacheEntry {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 struct PageCache {
     config: PageCacheConfig,
@@ -61,7 +54,6 @@ struct PageCache {
     access_counter: u64,
 }
 
-#[allow(dead_code)]
 impl PageCache {
     fn new(config: PageCacheConfig) -> Self {
         Self {
@@ -184,14 +176,11 @@ pub(super) struct Pager {
     bf: BlockFile,
     working_root: u64,
     working_pages: HashSet<u64>,
-    retired_blocks: HashSet<u64>,
-    #[allow(dead_code)]
     cache: PageCache,
     /// Number of updates since last checkpoint. Used for checkpoint scheduling.
     updates_since_checkpoint: usize,
     /// If set, checkpoint will be requested after this many updates.
     /// TODO: Wire up in Slice G2 (WAL) for automatic checkpoint triggering.
-    #[allow(dead_code)]
     checkpoint_after_updates: Option<usize>,
 
     // WAL fields
@@ -260,7 +249,6 @@ impl Pager {
             bf,
             working_root,
             working_pages: HashSet::new(),
-            retired_blocks: HashSet::new(),
             cache: PageCache::new(PageCacheConfig::default()),
             updates_since_checkpoint: 0,
             checkpoint_after_updates: None,
@@ -291,7 +279,6 @@ impl Pager {
             bf,
             working_root,
             working_pages: HashSet::new(),
-            retired_blocks: HashSet::new(),
             cache: PageCache::new(PageCacheConfig::default()),
             updates_since_checkpoint: 0,
             checkpoint_after_updates: None,
@@ -347,12 +334,11 @@ impl Pager {
         self.bf.set_root_block_id(new_root)?;
         // Ensure the new checkpoint root is durable before reclaiming blocks.
         self.bf.sync_all()?;
-        if !self.retired_blocks.is_empty() {
-            self.release_retired_blocks()?;
-            // Free-list updates are best-effort; sync so reuse after a successful checkpoint
-            // is durable, but crashes before this point may still leak space.
-            self.bf.sync_all()?;
-        }
+        // Reclaim discarded extents now that the checkpoint root is durable.
+        self.bf.reclaim_discarded()?;
+        // Free-list updates are best-effort; sync so reuse after a successful checkpoint
+        // is durable, but crashes before this point may still leak space.
+        self.bf.sync_all()?;
         self.working_pages.clear();
         Ok(())
     }
@@ -511,7 +497,7 @@ impl Pager {
         entry.dirty = true;
         entry.pin_count -= 1;
         if let Some(old_page_id) = original_page_id {
-            self.retire_page(old_page_id);
+            self.retire_page(old_page_id)?;
         }
         // Track this mutation for checkpoint scheduling
         self.track_update();
@@ -543,7 +529,7 @@ impl Pager {
             if remove_entry {
                 self.cache.remove(page_id);
             }
-            self.retire_page(page_id);
+            self.retire_page(page_id)?;
         }
         Ok(())
     }
@@ -563,22 +549,11 @@ impl Pager {
         Ok(page_id)
     }
 
-    pub(super) fn retire_page(&mut self, page_id: u64) {
+    pub(super) fn retire_page(&mut self, page_id: u64) -> Result<(), WrongoDBError> {
         if page_id == NONE_BLOCK_ID {
-            return;
-        }
-        self.retired_blocks.insert(page_id);
-    }
-
-    fn release_retired_blocks(&mut self) -> Result<(), WrongoDBError> {
-        if self.retired_blocks.is_empty() {
             return Ok(());
         }
-        let retired: Vec<u64> = self.retired_blocks.iter().copied().collect();
-        for block_id in retired {
-            self.bf.free_block(block_id)?;
-            self.retired_blocks.remove(&block_id);
-        }
+        self.bf.free_block(page_id)?;
         Ok(())
     }
 
