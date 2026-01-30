@@ -498,6 +498,43 @@ impl WalFile {
         Ok(())
     }
 
+    /// Truncate WAL file to checkpoint LSN, removing obsolete records.
+    ///
+    /// After a successful checkpoint, all records before the checkpoint LSN
+    /// are no longer needed for recovery. This method truncates the file
+    /// to reclaim space.
+    ///
+    /// The checkpoint record itself is preserved as it marks the recovery point.
+    pub fn truncate_to_checkpoint(&mut self) -> Result<(), WrongoDBError> {
+        // 1. Sync to ensure all data is written
+        self.sync()?;
+
+        // 2. Get the checkpoint offset (position to keep from)
+        let checkpoint_offset = self.header.checkpoint_lsn.offset;
+
+        // 3. If checkpoint is at header (no records yet), nothing to truncate
+        if checkpoint_offset <= WAL_HEADER_SIZE as u64 {
+            return Ok(());
+        }
+
+        // 4. Truncate file at checkpoint position
+        self.file.set_len(checkpoint_offset)?;
+
+        // 5. Update last_lsn to match checkpoint_lsn
+        // (since we removed everything after checkpoint)
+        self.last_lsn = self.header.checkpoint_lsn;
+
+        // 6. Rewrite header with updated last_lsn
+        self.header.last_lsn = self.last_lsn;
+        self.header.crc32 = self.header.compute_crc32();
+        let header_bytes = self.header.serialize();
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(&header_bytes)?;
+        self.file.sync_all()?;
+
+        Ok(())
+    }
+
     /// Sync the WAL file to disk.
     pub fn sync(&mut self) -> Result<(), WrongoDBError> {
         self.flush_buffer()?;

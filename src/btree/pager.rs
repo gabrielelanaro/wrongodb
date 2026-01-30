@@ -180,7 +180,6 @@ pub(super) struct Pager {
     /// Number of updates since last checkpoint. Used for checkpoint scheduling.
     updates_since_checkpoint: usize,
     /// If set, checkpoint will be requested after this many updates.
-    /// TODO: Wire up in Slice G2 (WAL) for automatic checkpoint triggering.
     checkpoint_after_updates: Option<usize>,
 
     // WAL fields

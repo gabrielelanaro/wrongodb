@@ -223,6 +223,14 @@ impl BTree {
 
         self.pager.checkpoint_flush_data()?;
         self.pager.checkpoint_commit(root)?;
+
+        // Truncate WAL after successful checkpoint to reclaim space
+        if self.pager.wal().is_some() {
+            if let Ok(wal) = self.pager.wal_mut() {
+                wal.truncate_to_checkpoint()?;
+            }
+        }
+
         Ok(())
     }
 
