@@ -1,6 +1,7 @@
 use std::path::Path;
 
 pub mod page;
+mod page_cache;
 mod pager;
 mod layout;
 mod iter;
