@@ -374,7 +374,7 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 ## 2025-12-21: Proposed checkpoint-first durability via copy-on-write (Option B)
 
 **Status**
-- Proposed in OpenSpec change `add-checkpoint-cow` (not yet approved).
+- Proposed (not yet approved).
 
 **Decision (proposed)**
 - Use copy-on-write for page updates and keep a stable on-disk root until checkpoint commit.
@@ -446,7 +446,7 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 ## 2025-12-23: Proposed in-memory page cache for COW coalescing
 
 **Status**
-- Proposed in OpenSpec change `add-page-cache` (not yet approved).
+- Proposed (not yet approved).
 
 **Decision (proposed)**
 - Add a bounded in-memory page cache between `Pager` and `BlockFile`.

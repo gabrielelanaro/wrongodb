@@ -16,8 +16,7 @@ This keeps entries ordered by the logical key while still guaranteeing uniquenes
 you do a range scan over the prefix `(tenant_id = X, *)` and read each record id.
 
 ## minimongo design choice (matches the above)
-- `minimongo/openspec/changes/add-persistent-index-storage/design.md`: we already decided to encode the index key as
-  `(scalar key, record offset)` to support duplicates without posting lists.
+- We encode the index key as `(scalar key, record offset)` to support duplicates without posting lists.
 
 ## Posting lists alternative (not chosen here)
 An alternative is to store a single key and point it at a posting list of record ids. We explicitly avoided this for now
