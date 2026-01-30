@@ -84,16 +84,13 @@ pub(super) trait CheckpointStore: std::fmt::Debug + Send + Sync {
     fn checkpoint_flush_data(&mut self) -> Result<(), WrongoDBError>;
     fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError>;
     fn sync_all(&mut self) -> Result<(), WrongoDBError>;
-}
-
-pub(super) trait DataPath: std::fmt::Debug + Send + Sync {
     fn data_path(&self) -> &Path;
 }
 
-pub(super) trait BTreeStore: PageRead + PageWrite + RootStore + CheckpointStore + DataPath {}
+pub(super) trait BTreeStore: PageRead + PageWrite + RootStore + CheckpointStore {}
 
 impl<T> BTreeStore for T where
-    T: PageRead + PageWrite + RootStore + CheckpointStore + DataPath
+    T: PageRead + PageWrite + RootStore + CheckpointStore
 {
 }
 
@@ -144,31 +141,17 @@ impl Pager {
     }
 
     /// Prepare for checkpoint by capturing the current working root.
-    ///
-    /// This freezes the root that will be persisted; subsequent mutations
-    /// will update a new working root.
-    pub(super) fn checkpoint_prepare(&self) -> u64 {
+    fn checkpoint_prepare(&self) -> u64 {
         self.working_root
     }
 
     /// Flush all dirty cached pages to disk.
-    ///
-    /// This is the data files stage of checkpoint. Dirty pages are written
-    /// to their working block locations. Dirty pinned pages will cause an error.
-    pub(super) fn checkpoint_flush_data(&mut self) -> Result<(), WrongoDBError> {
+    fn checkpoint_flush_data(&mut self) -> Result<(), WrongoDBError> {
         self.flush_cache()
     }
 
     /// Commit the checkpoint by atomically swapping the root and reclaiming retired blocks.
-    ///
-    /// Steps:
-    /// 1. Sync WAL to ensure checkpoint record is durable.
-    /// 2. Write the new root to the checkpoint slot.
-    /// 3. Sync to ensure the new root is durable.
-    /// 4. Release retired blocks to the free list (after root is durable).
-    /// 5. Sync again to make free list updates durable.
-    /// 6. Clear working_pages (all pages are now stable).
-    pub(super) fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError> {
+    fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError> {
         self.bf.set_root_block_id(new_root)?;
         // Ensure the new checkpoint root is durable before reclaiming blocks.
         self.bf.sync_all()?;
@@ -181,6 +164,11 @@ impl Pager {
         Ok(())
     }
 
+    /// Returns the path to the data file.
+    pub(super) fn data_path(&self) -> &Path {
+        self.bf.path.as_path()
+    }
+
     pub(super) fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         let root = self.checkpoint_prepare();
         self.checkpoint_flush_data()?;
@@ -190,23 +178,6 @@ impl Pager {
         Ok(())
     }
 
-    /// Request a checkpoint after the specified number of updates.
-    ///
-    /// Once the configured number of updates is reached, `checkpoint_requested()` returns true.
-    /// The caller is responsible for actually calling `checkpoint()`.
-    pub(super) fn request_checkpoint_after_updates(&mut self, count: usize) {
-        self.checkpoint_after_updates = Some(count);
-    }
-
-    /// Check if a checkpoint has been requested based on update count.
-    ///
-    /// Returns true if `checkpoint_after_updates` is set and the update threshold has been reached.
-    pub(super) fn checkpoint_requested(&self) -> bool {
-        if let Some(threshold) = self.checkpoint_after_updates {
-            return self.updates_since_checkpoint >= threshold;
-        }
-        false
-    }
 
     /// Increment the update counter (to be called after each mutation).
     fn track_update(&mut self) {
@@ -324,10 +295,6 @@ impl Pager {
         Ok(())
     }
 
-    pub(super) fn sync_all(&mut self) -> Result<(), WrongoDBError> {
-        self.bf.sync_all()
-    }
-
     fn load_page_and_pin(&mut self, page_id: u64) -> Result<Vec<u8>, WrongoDBError> {
         if !self.cache.contains(page_id) {
             self.evict_cache_if_full()?;
@@ -396,31 +363,37 @@ impl RootStore for Pager {
 
 impl CheckpointStore for Pager {
     fn request_checkpoint_after_updates(&mut self, count: usize) {
-        Pager::request_checkpoint_after_updates(self, count);
+        self.checkpoint_after_updates = Some(count);
     }
 
     fn checkpoint_requested(&self) -> bool {
-        Pager::checkpoint_requested(self)
+        if let Some(threshold) = self.checkpoint_after_updates {
+            return self.updates_since_checkpoint >= threshold;
+        }
+        false
     }
 
     fn checkpoint_prepare(&self) -> u64 {
-        Pager::checkpoint_prepare(self)
+        self.working_root
     }
 
     fn checkpoint_flush_data(&mut self) -> Result<(), WrongoDBError> {
-        Pager::checkpoint_flush_data(self)
+        self.flush_cache()
     }
 
     fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError> {
-        Pager::checkpoint_commit(self, new_root)
+        self.bf.set_root_block_id(new_root)?;
+        self.bf.sync_all()?;
+        self.bf.reclaim_discarded()?;
+        self.bf.sync_all()?;
+        self.working_pages.clear();
+        Ok(())
     }
 
     fn sync_all(&mut self) -> Result<(), WrongoDBError> {
-        Pager::sync_all(self)
+        self.bf.sync_all()
     }
-}
 
-impl DataPath for Pager {
     fn data_path(&self) -> &Path {
         self.bf.path.as_path()
     }
