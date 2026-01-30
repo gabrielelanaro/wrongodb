@@ -145,6 +145,80 @@ impl PageCache {
         self.access_counter = self.access_counter.saturating_add(1);
         self.access_counter
     }
+
+    /// Load a page from storage into cache and pin it.
+    fn load_and_pin<F>(&mut self, page_id: u64, mut read_fn: F) -> Result<Vec<u8>, WrongoDBError>
+    where
+        F: FnMut(u64) -> Result<Vec<u8>, WrongoDBError>,
+    {
+        if self.contains(page_id) {
+            self.pin(page_id)?;
+            let payload = self
+                .get(page_id)
+                .expect("page cache entry just pinned")
+                .payload
+                .clone();
+            return Ok(payload);
+        }
+
+        let payload = read_fn(page_id)?;
+        let entry = self.insert(page_id, payload.clone());
+        entry.pin_count = 1;
+        Ok(payload)
+    }
+
+    /// Load payload for CoW without pinning.
+    fn load_cow_payload<F>(&mut self, page_id: u64, mut read_fn: F) -> Result<Vec<u8>, WrongoDBError>
+    where
+        F: FnMut(u64) -> Result<Vec<u8>, WrongoDBError>,
+    {
+        if let Some(entry) = self.get_mut(page_id) {
+            return Ok(entry.payload.clone());
+        }
+        read_fn(page_id)
+    }
+
+    /// Evict LRU entry if cache is at capacity.
+    fn evict_if_full<F>(&mut self, mut write_fn: F) -> Result<(), WrongoDBError>
+    where
+        F: FnMut(u64, &[u8]) -> Result<(), WrongoDBError>,
+    {
+        if !self.is_full() {
+            return Ok(());
+        }
+        let entry = match self.evict_lru()? {
+            Some(entry) => entry,
+            None => return Ok(()),
+        };
+        if entry.dirty {
+            if let Err(err) = write_fn(entry.page_id, &entry.payload) {
+                self.entries.insert(entry.page_id, entry);
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush all dirty pages to storage.
+    fn flush<F>(&mut self, mut write_fn: F) -> Result<(), WrongoDBError>
+    where
+        F: FnMut(u64, &[u8]) -> Result<(), WrongoDBError>,
+    {
+        for entry in self.entries.values_mut() {
+            if !entry.dirty {
+                continue;
+            }
+            if entry.pin_count > 0 {
+                return Err(
+                    StorageError(format!("cannot flush dirty pinned page {}", entry.page_id))
+                        .into(),
+                );
+            }
+            write_fn(entry.page_id, &entry.payload)?;
+            entry.dirty = false;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -470,69 +544,26 @@ impl Pager {
     }
 
     fn load_page_and_pin(&mut self, page_id: u64) -> Result<Vec<u8>, WrongoDBError> {
-        if self.cache.contains(page_id) {
-            self.cache.pin(page_id)?;
-            let payload = self
-                .cache
-                .get(page_id)
-                .expect("page cache entry just pinned")
-                .payload
-                .clone();
-            return Ok(payload);
+        if !self.cache.contains(page_id) {
+            self.evict_cache_if_full()?;
         }
-
-        self.evict_cache_if_full()?;
-        let payload = self.bf.read_block(page_id, true)?;
-        let entry = self.cache.insert(page_id, payload.clone());
-        entry.pin_count = 1;
-        Ok(payload)
+        self.cache
+            .load_and_pin(page_id, |pid| self.bf.read_block(pid, true))
     }
 
     fn load_cow_payload(&mut self, page_id: u64) -> Result<Vec<u8>, WrongoDBError> {
-        if let Some(entry) = self.cache.get_mut(page_id) {
-            return Ok(entry.payload.clone());
-        }
-        self.bf.read_block(page_id, true)
+        self.cache
+            .load_cow_payload(page_id, |pid| self.bf.read_block(pid, true))
     }
 
     fn evict_cache_if_full(&mut self) -> Result<(), WrongoDBError> {
-        if !self.cache.is_full() {
-            return Ok(());
-        }
-        let entry = match self.cache.evict_lru()? {
-            Some(entry) => entry,
-            None => return Ok(()),
-        };
-        if entry.dirty {
-            if let Err(err) = self.bf.write_block(entry.page_id, &entry.payload) {
-                self.cache.entries.insert(entry.page_id, entry);
-                return Err(err);
-            }
-        }
-        Ok(())
+        self.cache
+            .evict_if_full(|page_id, payload| self.bf.write_block(page_id, payload))
     }
 
     fn flush_cache(&mut self) -> Result<(), WrongoDBError> {
-        let (bf, cache) = (&mut self.bf, &mut self.cache);
-        for entry in cache.entries.values_mut() {
-            if !entry.dirty {
-                continue;
-            }
-            // NOTE: Defensive programming - this check shouldn't be hit in the current
-            // single-threaded design because:
-            // 1. Pages are marked dirty only in unpin_page_mut_commit(), which also decrements pin_count
-            // 2. No concurrent operations (no background threads yet)
-            //
-            // This check becomes important when adding concurrent eviction/checkpoint (Slice G2+).
-            if entry.pin_count > 0 {
-                return Err(
-                    StorageError(format!("cannot flush dirty pinned page {}", entry.page_id)).into(),
-                );
-            }
-            bf.write_block(entry.page_id, &entry.payload)?;
-            entry.dirty = false;
-        }
-        Ok(())
+        self.cache
+            .flush(|page_id, payload| self.bf.write_block(page_id, payload))
     }
 }
 
