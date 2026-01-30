@@ -1,6 +1,6 @@
 use tempfile::tempdir;
 
-use wrongodb::{BlockFile, BTree, NONE_BLOCK_ID};
+use wrongodb::{BlockFile, BTree};
 
 #[test]
 fn checkpoint_commit_selects_new_root_on_reopen() {
@@ -61,18 +61,20 @@ fn retired_blocks_not_reused_before_checkpoint() {
     tree.put(b"k1", b"v1").unwrap();
     let mut bf = BlockFile::open(&path).unwrap();
     let blocks_after_first = bf.num_blocks().unwrap();
-    let free_head_after_first = bf.header.free_list_head;
+    let avail_after_first = bf.header.avail_count;
+    let discard_after_first = bf.header.discard_count;
     bf.close().unwrap();
 
-    assert_eq!(free_head_after_first, NONE_BLOCK_ID);
+    assert_eq!(avail_after_first, 0);
+    assert!(discard_after_first > 0);
 
     tree.put(b"k2", b"v2").unwrap();
     let mut bf2 = BlockFile::open(&path).unwrap();
     let blocks_after_second = bf2.num_blocks().unwrap();
-    let free_head_after_second = bf2.header.free_list_head;
+    let avail_after_second = bf2.header.avail_count;
     bf2.close().unwrap();
 
-    assert_eq!(free_head_after_second, NONE_BLOCK_ID);
+    assert_eq!(avail_after_second, 0);
     assert!(blocks_after_second >= blocks_after_first);
 }
 

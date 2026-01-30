@@ -94,7 +94,7 @@ fn checksum_mismatch_detected() {
 }
 
 #[test]
-fn free_list_reuse_survives_reopen() {
+fn discard_reuse_survives_checkpoint() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test.wt");
 
@@ -107,6 +107,8 @@ fn free_list_reuse_survives_reopen() {
     bf.write_block(b2, b"b").unwrap();
     bf.write_block(b3, b"c").unwrap();
     bf.free_block(b2).unwrap();
+    bf.set_root_block_id(b1).unwrap();
+    bf.reclaim_discarded().unwrap();
     bf.close().unwrap();
 
     let mut bf2 = BlockFile::open(&path).unwrap();
@@ -167,16 +169,8 @@ fn checkpoint_slot_invalid_falls_back_to_previous() {
     bf.close().unwrap();
 
     let bf2 = BlockFile::open(&path).unwrap();
-    let mut header = bf2.header.clone();
+    let page_size = bf2.page_size;
     bf2.close().unwrap();
-
-    header.checkpoint_slots[0].crc32 ^= 0xFFFF_FFFF;
-
-    let packed = header.pack().unwrap();
-    let max_payload = header.page_size as usize - 4;
-    let mut padded = vec![0u8; max_payload];
-    padded[..packed.len()].copy_from_slice(&packed);
-    let checksum = crc32(&padded);
 
     let mut fh = OpenOptions::new()
         .read(true)
@@ -184,8 +178,21 @@ fn checkpoint_slot_invalid_falls_back_to_previous() {
         .open(&path)
         .unwrap();
     fh.seek(SeekFrom::Start(0)).unwrap();
+    let mut page0 = vec![0u8; page_size];
+    fh.read_exact(&mut page0).unwrap();
+    let mut payload = page0[4..].to_vec();
+
+    // Flip the slot0 crc32 field to invalidate it.
+    let crc_offset = 8 + 2 + 4 + 4 + 4 + 4 + 8 + 8;
+    for b in &mut payload[crc_offset..crc_offset + 4] {
+        *b ^= 0xFF;
+    }
+
+    let checksum = crc32(&payload);
+
+    fh.seek(SeekFrom::Start(0)).unwrap();
     fh.write_all(&checksum.to_le_bytes()).unwrap();
-    fh.write_all(&padded).unwrap();
+    fh.write_all(&payload).unwrap();
     fh.flush().unwrap();
 
     let bf3 = BlockFile::open(&path).unwrap();

@@ -44,7 +44,7 @@ fn rebuilds_index_from_disk_on_open() {
 }
 
 #[test]
-fn find_one_by_id_hits_id_index() {
+fn find_one_by_id_uses_main_table() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("db.log");
 
@@ -57,7 +57,7 @@ fn find_one_by_id_hits_id_index() {
     assert_eq!(got.get("_id").unwrap(), bob.get("_id").unwrap());
     assert_eq!(got.get("name").unwrap().as_str().unwrap(), "bob");
 
-    // Re-open and ensure the id index is rebuilt from the append-only log.
+    // Re-open and ensure the main table persists _id lookups.
     drop(db);
     let mut db2 = WrongoDB::open(&path, ["name"], false).unwrap();
     let got2 = db2
@@ -65,4 +65,40 @@ fn find_one_by_id_hits_id_index() {
         .unwrap()
         .unwrap();
     assert_eq!(got2.get("name").unwrap().as_str().unwrap(), "alice");
+}
+
+#[test]
+fn document_crud_roundtrip() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("db.log");
+
+    let mut db = WrongoDB::open(&path, ["name"], false).unwrap();
+    let doc = db
+        .insert_one(json!({"name": "alice", "age": 30}))
+        .unwrap();
+    let id = doc.get("_id").unwrap().clone();
+
+    let fetched = db
+        .find_one(Some(json!({"_id": id.clone()})))
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.get("name").unwrap().as_str().unwrap(), "alice");
+
+    db.update_one_in(
+        "test",
+        Some(json!({"_id": id.clone()})),
+        json!({"$set": {"age": 31}}),
+    )
+    .unwrap();
+
+    let updated = db
+        .find_one(Some(json!({"_id": id.clone()})))
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.get("age").unwrap().as_i64().unwrap(), 31);
+
+    db.delete_one_in("test", Some(json!({"_id": id.clone()})))
+        .unwrap();
+    let missing = db.find_one(Some(json!({"_id": id}))).unwrap();
+    assert!(missing.is_none());
 }

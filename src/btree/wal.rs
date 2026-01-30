@@ -416,7 +416,6 @@ impl WalRecordHeader {
 /// Change vector logging: operations are logged as compact descriptions,
 /// not full page images. This matches WiredTiger's production architecture.
 #[derive(Debug)]
-#[allow(dead_code)]  // TODO: Remove when Slice H (WAL truncation) is implemented
 pub struct WalFile {
     path: PathBuf,
     file: File,
@@ -426,7 +425,6 @@ pub struct WalFile {
     last_lsn: Lsn,
 }
 
-#[allow(dead_code)]  // TODO: Remove when Slice H (WAL truncation) is implemented
 impl WalFile {
     /// Buffer capacity for WAL writes (64KB)
     const DEFAULT_BUFFER_CAPACITY: usize = 64 * 1024;

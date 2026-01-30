@@ -2,12 +2,15 @@
 //!
 //! This module provides composite key encoding for B+tree secondary indexes.
 //! Keys are encoded as:
-//!   [scalar_type: 1 byte][scalar_value: variable][record_offset: 8 bytes LE]
+//!   [scalar_type: 1 byte][scalar_value: variable][id_len: 4 bytes LE][id_bytes]
 //!
-//! The record_offset is appended to the scalar value to ensure uniqueness
+//! The `_id` bytes are appended to the scalar value to ensure uniqueness
 //! when multiple documents have the same indexed value (duplicate support).
 
 use serde_json::Value;
+
+use crate::bson_codec::{decode_id_value, encode_id_value};
+use crate::WrongoDBError;
 
 /// Scalar type tags for key encoding.
 /// These are single-byte encodings that also encode the value for fixed-size types.
@@ -38,16 +41,16 @@ fn encode_f64_for_sort(f: f64) -> [u8; 8] {
     transformed.to_be_bytes() // Use big-endian so lexicographic = numeric
 }
 
-/// Encode a scalar value and record offset into a composite index key.
+/// Encode a scalar value and document _id into a composite index key.
 ///
 /// The resulting key can be stored in a B+tree and supports:
 /// - Natural sort order by scalar value
-/// - Duplicate values (different offsets = different keys)
+/// - Duplicate values (different _id values = different keys)
 /// - Range scans by scalar value prefix
 ///
 /// # Format
 /// ```text
-/// [scalar_type: 1 byte][scalar_value: variable][record_offset: 8 bytes LE]
+/// [scalar_type: 1 byte][scalar_value: variable][id_len: 4 bytes LE][id_bytes]
 /// ```
 ///
 /// # Type Encodings
@@ -56,16 +59,25 @@ fn encode_f64_for_sort(f: f64) -> [u8; 8] {
 /// - Bool true: `0x02` (type byte itself encodes true)
 /// - Number: `0x03` followed by 8-byte LE f64
 /// - String: `0x04` followed by 4-byte LE length + UTF-8 bytes
-pub fn encode_index_key(scalar: &Value, offset: u64) -> Option<Vec<u8>> {
-    let mut result = encode_scalar_prefix(scalar)?;
-    result.extend_from_slice(&offset.to_le_bytes());
-    Some(result)
+pub fn encode_index_key(scalar: &Value, id: &Value) -> Result<Option<Vec<u8>>, WrongoDBError> {
+    let mut result = match encode_scalar_prefix(scalar) {
+        Some(prefix) => prefix,
+        None => return Ok(None),
+    };
+    let id_bytes = encode_id_value(id)?;
+    let id_len: u32 = id_bytes
+        .len()
+        .try_into()
+        .map_err(|_| crate::errors::StorageError("id encoding too large".into()))?;
+    result.extend_from_slice(&id_len.to_le_bytes());
+    result.extend_from_slice(&id_bytes);
+    Ok(Some(result))
 }
 
-/// Encode just the scalar value prefix (without offset).
+/// Encode just the scalar value prefix (without _id).
 ///
 /// This is useful for range scans where you want to find all records
-/// matching a particular scalar value regardless of offset.
+/// matching a particular scalar value regardless of _id.
 pub fn encode_scalar_prefix(scalar: &Value) -> Option<Vec<u8>> {
     match scalar {
         Value::Null => Some(vec![TAG_NULL]),
@@ -92,102 +104,147 @@ pub fn encode_scalar_prefix(scalar: &Value) -> Option<Vec<u8>> {
 /// Encode a range scan prefix for finding all records with a given scalar value.
 ///
 /// Returns (start_key, end_key) where:
-/// - start_key includes the scalar value with offset 0
-/// - end_key includes the scalar value with offset u64::MAX
+/// - start_key includes the scalar value with id_len = 0
+/// - end_key includes the scalar value with id_len = u32::MAX
 ///
 /// This allows a range scan to find all matching records.
 pub fn encode_range_bounds(scalar: &Value) -> Option<(Vec<u8>, Vec<u8>)> {
     let prefix = encode_scalar_prefix(scalar)?;
 
     let mut start = prefix.clone();
-    start.extend_from_slice(&0u64.to_le_bytes());
+    start.extend_from_slice(&0u32.to_le_bytes());
 
     let mut end = prefix;
-    end.extend_from_slice(&u64::MAX.to_le_bytes());
+    end.extend_from_slice(&u32::MAX.to_le_bytes());
 
     Some((start, end))
 }
 
-/// Extract the record offset from a composite index key.
+/// Decode the document _id from a composite index key.
 ///
-/// Returns None if the key is too short to contain an offset.
-#[allow(dead_code)]
-pub fn extract_offset(key: &[u8]) -> Option<u64> {
-    if key.len() < 8 {
+/// Returns Ok(None) if the key is too short or malformed.
+pub fn decode_index_id(key: &[u8]) -> Result<Option<Value>, WrongoDBError> {
+    let prefix_len = match scalar_prefix_len(key) {
+        Some(len) => len,
+        None => return Ok(None),
+    };
+    if key.len() < prefix_len + 4 {
+        return Ok(None);
+    }
+    let mut len_bytes = [0u8; 4];
+    len_bytes.copy_from_slice(&key[prefix_len..prefix_len + 4]);
+    let id_len = u32::from_le_bytes(len_bytes) as usize;
+    let start = prefix_len + 4;
+    let end = start + id_len;
+    if key.len() < end {
+        return Ok(None);
+    }
+    let id_bytes = &key[start..end];
+    Ok(Some(decode_id_value(id_bytes)?))
+}
+
+fn scalar_prefix_len(key: &[u8]) -> Option<usize> {
+    if key.is_empty() {
         return None;
     }
-    let offset_bytes = &key[key.len() - 8..];
-    Some(u64::from_le_bytes([
-        offset_bytes[0],
-        offset_bytes[1],
-        offset_bytes[2],
-        offset_bytes[3],
-        offset_bytes[4],
-        offset_bytes[5],
-        offset_bytes[6],
-        offset_bytes[7],
-    ]))
+    match key[0] {
+        TAG_NULL | TAG_BOOL_FALSE | TAG_BOOL_TRUE => Some(1),
+        TAG_NUMBER => {
+            if key.len() < 1 + 8 {
+                None
+            } else {
+                Some(1 + 8)
+            }
+        }
+        TAG_STRING => {
+            if key.len() < 1 + 4 {
+                return None;
+            }
+            let mut len_bytes = [0u8; 4];
+            len_bytes.copy_from_slice(&key[1..5]);
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            if key.len() < 1 + 4 + len {
+                None
+            } else {
+                Some(1 + 4 + len)
+            }
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bson_codec::encode_id_value;
 
     #[test]
     fn encode_null() {
-        let key = encode_index_key(&Value::Null, 42).unwrap();
-        assert_eq!(key.len(), 9); // 1 byte type + 8 bytes offset
+        let id = json!("id");
+        let key = encode_index_key(&Value::Null, &id).unwrap().unwrap();
+        assert!(key.len() >= 5); // type + id length
         assert_eq!(key[0], TAG_NULL);
-        assert_eq!(extract_offset(&key), Some(42));
+        assert_eq!(decode_index_id(&key).unwrap(), Some(id));
     }
 
     #[test]
     fn encode_bool_false() {
-        let key = encode_index_key(&Value::Bool(false), 100).unwrap();
-        assert_eq!(key.len(), 9);
+        let id = json!(100);
+        let key = encode_index_key(&Value::Bool(false), &id).unwrap().unwrap();
+        assert!(key.len() >= 5);
         assert_eq!(key[0], TAG_BOOL_FALSE);
-        assert_eq!(extract_offset(&key), Some(100));
+        assert_eq!(decode_index_id(&key).unwrap(), Some(id));
     }
 
     #[test]
     fn encode_bool_true() {
-        let key = encode_index_key(&Value::Bool(true), 200).unwrap();
-        assert_eq!(key.len(), 9);
+        let id = json!(200);
+        let key = encode_index_key(&Value::Bool(true), &id).unwrap().unwrap();
+        assert!(key.len() >= 5);
         assert_eq!(key[0], TAG_BOOL_TRUE);
-        assert_eq!(extract_offset(&key), Some(200));
+        assert_eq!(decode_index_id(&key).unwrap(), Some(id));
     }
 
     #[test]
     fn encode_number() {
-        let key = encode_index_key(&json!(3.14159), 999).unwrap();
-        assert_eq!(key.len(), 17); // 1 byte type + 8 bytes f64 + 8 bytes offset
+        let id = json!("abc");
+        let key = encode_index_key(&json!(3.14159), &id).unwrap().unwrap();
+        assert!(key.len() > 9); // type + f64 + len + id bytes
         assert_eq!(key[0], TAG_NUMBER);
-        assert_eq!(extract_offset(&key), Some(999));
+        assert_eq!(decode_index_id(&key).unwrap(), Some(id));
     }
 
     #[test]
     fn encode_string() {
-        let key = encode_index_key(&json!("hello"), 1234).unwrap();
-        assert_eq!(key.len(), 18); // 1 byte type + 4 bytes len + 5 bytes string + 8 bytes offset
+        let id = json!(1234);
+        let key = encode_index_key(&json!("hello"), &id).unwrap().unwrap();
+        let id_bytes = encode_id_value(&id).unwrap();
+        assert_eq!(key.len(), 1 + 4 + 5 + 4 + id_bytes.len());
         assert_eq!(key[0], TAG_STRING);
         assert_eq!(&key[1..5], &[5, 0, 0, 0]); // little-endian length
         assert_eq!(&key[5..10], b"hello");
-        assert_eq!(extract_offset(&key), Some(1234));
+        assert_eq!(decode_index_id(&key).unwrap(), Some(id));
     }
 
     #[test]
     fn encode_empty_string() {
-        let key = encode_index_key(&json!(""), 0).unwrap();
-        assert_eq!(key.len(), 13); // 1 byte type + 4 bytes len + 0 bytes string + 8 bytes offset
+        let id = json!(0);
+        let key = encode_index_key(&json!(""), &id).unwrap().unwrap();
+        let id_bytes = encode_id_value(&id).unwrap();
+        assert_eq!(key.len(), 1 + 4 + 4 + id_bytes.len());
         assert_eq!(key[0], TAG_STRING);
         assert_eq!(&key[1..5], &[0, 0, 0, 0]);
-        assert_eq!(extract_offset(&key), Some(0));
+        assert_eq!(decode_index_id(&key).unwrap(), Some(id));
     }
 
     #[test]
     fn rejects_arrays_and_objects() {
-        assert!(encode_index_key(&json!([1, 2, 3]), 0).is_none());
-        assert!(encode_index_key(&json!({"a": 1}), 0).is_none());
+        assert!(encode_index_key(&json!([1, 2, 3]), &json!(1))
+            .unwrap()
+            .is_none());
+        assert!(encode_index_key(&json!({"a": 1}), &json!(1))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -195,13 +252,7 @@ mod tests {
         let (start, end) = encode_range_bounds(&json!("test")).unwrap();
 
         // Both should have the same prefix
-        assert_eq!(&start[..start.len() - 8], &end[..end.len() - 8]);
-
-        // Start should have offset 0
-        assert_eq!(extract_offset(&start), Some(0));
-
-        // End should have offset MAX
-        assert_eq!(extract_offset(&end), Some(u64::MAX));
+        assert_eq!(&start[..start.len() - 4], &end[..end.len() - 4]);
     }
 
     #[test]

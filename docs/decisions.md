@@ -1,5 +1,44 @@
 # Decisions
 
+## 2026-01-28: Extent metadata in header payload + main table naming
+
+**Decision**
+- Replace the free-list head with persisted extent lists (alloc/avail/discard) stored in the header payload.
+- Track discarded extents with a generation tag and reclaim them into avail after checkpoint commit.
+- Store the main table as a dedicated B-tree file at `{collection_path}.main.wt`.
+- Encode `_id` keys and document values as BSON; secondary index keys append a length-prefixed BSON `_id`.
+- Use two skiplists per extent list (by-offset and by-size) instead of WiredTiger’s size-bucketed list.
+
+**Why**
+- Keep allocator metadata persistent without adding extra metadata files while aligning with COW + checkpoint semantics.
+- Separate main-table data from index files using a predictable naming convention.
+- BSON provides a deterministic binary representation for Mongo-like documents and ids.
+
+**Notes**
+- The alloc list reflects blocks reachable from the stable checkpoint; discard extents are reclaimed and coalesced into avail on checkpoint.
+- WiredTiger uses a by-size skiplist of size buckets, each pointing to a by-offset skiplist of extents of that size; we use a flat by-size skiplist keyed by `(size, offset)` plus a separate by-offset skiplist.
+
+**Skiplist Shapes (WT vs ours)**
+```
+WiredTiger (avail list):
+  by-size skiplist
+    size=4  -> size=8 -> size=16
+       |        |        |
+       v        v        v
+    by-offset by-offset by-offset
+    10->20    7->40     100
+
+Ours (avail list):
+  by-size skiplist (key = (size, offset))
+    (4,10) -> (4,20) -> (8,7) -> (8,40) -> (16,100)
+
+  by-offset skiplist (key = offset)
+    7 -> 10 -> 20 -> 40 -> 100
+```
+
+**Implication**
+- Allocation policy is the same (best-fit, then lowest offset within that size), but WT’s size buckets keep the top-level size list small when many extents share the same size. Our flat list is simpler to serialize but its size index scales with total extents.
+
 ## 2026-01-27: Logical WAL replay (WiredTiger-style)
 
 **Decision**

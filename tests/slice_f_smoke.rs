@@ -14,7 +14,7 @@ fn is_lower_hex_24(s: &str) -> bool {
 fn slice_f_primary_id_smoke() {
     let tmp = tempdir().unwrap();
     let log_path = tmp.path().join("db.log");
-    let id_index_path = tmp.path().join("db.log.id_index.wt");
+    let main_table_path = tmp.path().join("db.log.main.wt");
 
     let mut db = WrongoDB::open(&log_path, ["name"], true).unwrap();
 
@@ -24,7 +24,7 @@ fn slice_f_primary_id_smoke() {
     assert!(is_lower_hex_24(auto_id));
 
     // 2) Primary B+tree file is created and non-empty.
-    let meta = std::fs::metadata(&id_index_path).unwrap();
+    let meta = std::fs::metadata(&main_table_path).unwrap();
     assert!(meta.len() > 0);
 
     // 3) Uniqueness enforcement: duplicate `_id` insert fails.

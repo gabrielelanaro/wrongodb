@@ -5,17 +5,20 @@ use std::path::{Path, PathBuf};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
 
+use crate::block_manager::{BlockManager, Extent, ExtentLists};
 use crate::errors::StorageError;
 use crate::WrongoDBError;
 
 const CHECKSUM_SIZE: usize = 4;
 const DEFAULT_PAGE_SIZE: usize = 4096;
 const MAGIC: [u8; 8] = *b"MMWT0001";
-const VERSION: u16 = 2;
-const HEADER_PAD_SIZE: usize = 64;
+const VERSION: u16 = 3;
 const CHECKPOINT_SLOT_COUNT: usize = 2;
 const CHECKPOINT_SLOT_SIZE: usize = 8 + 8 + 4;
-const HEADER_MIN_SIZE: usize = 8 + 2 + 4 + 8 + (CHECKPOINT_SLOT_COUNT * CHECKPOINT_SLOT_SIZE);
+const HEADER_FIXED_SIZE: usize =
+    8 + 2 + 4 + 4 + 4 + 4 + (CHECKPOINT_SLOT_COUNT * CHECKPOINT_SLOT_SIZE);
+const HEADER_MIN_SIZE: usize = HEADER_FIXED_SIZE;
+const EXTENT_ENCODED_SIZE: usize = 8 + 8 + 8;
 pub const NONE_BLOCK_ID: u64 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +54,9 @@ pub struct FileHeader {
     pub magic: [u8; 8],
     pub version: u16,
     pub page_size: u32,
-    pub free_list_head: u64,
+    pub alloc_count: u32,
+    pub avail_count: u32,
+    pub discard_count: u32,
     pub checkpoint_slots: [CheckpointSlot; CHECKPOINT_SLOT_COUNT],
 }
 
@@ -63,32 +68,16 @@ impl Default for FileHeader {
             magic: MAGIC,
             version: VERSION,
             page_size: DEFAULT_PAGE_SIZE as u32,
-            free_list_head: NONE_BLOCK_ID,
+            alloc_count: 0,
+            avail_count: 0,
+            discard_count: 0,
             checkpoint_slots: [slot0, slot1],
         }
     }
 }
 
 impl FileHeader {
-    pub fn pack(&self) -> Result<[u8; HEADER_PAD_SIZE], WrongoDBError> {
-        let mut buf = Vec::with_capacity(HEADER_PAD_SIZE);
-        buf.extend_from_slice(&self.magic);
-        buf.write_u16::<LittleEndian>(self.version)?;
-        buf.write_u32::<LittleEndian>(self.page_size)?;
-        buf.write_u64::<LittleEndian>(self.free_list_head)?;
-        for slot in &self.checkpoint_slots {
-            buf.write_u64::<LittleEndian>(slot.root_block_id)?;
-            buf.write_u64::<LittleEndian>(slot.generation)?;
-            buf.write_u32::<LittleEndian>(slot.crc32)?;
-        }
-        if buf.len() > HEADER_PAD_SIZE {
-            return Err(StorageError("header struct too large".into()).into());
-        }
-        buf.resize(HEADER_PAD_SIZE, 0);
-        Ok(buf.try_into().expect("resized to exactly HEADER_PAD_SIZE"))
-    }
-
-    pub fn unpack(buf: &[u8]) -> Result<Self, WrongoDBError> {
+    pub(crate) fn unpack_fixed(buf: &[u8]) -> Result<Self, WrongoDBError> {
         if buf.len() < HEADER_MIN_SIZE {
             return Err(StorageError("header buffer too small".into()).into());
         }
@@ -98,7 +87,9 @@ impl FileHeader {
         rdr.read_exact(&mut magic)?;
         let version = rdr.read_u16::<LittleEndian>()?;
         let page_size = rdr.read_u32::<LittleEndian>()?;
-        let free_list_head = rdr.read_u64::<LittleEndian>()?;
+        let alloc_count = rdr.read_u32::<LittleEndian>()?;
+        let avail_count = rdr.read_u32::<LittleEndian>()?;
+        let discard_count = rdr.read_u32::<LittleEndian>()?;
         let mut checkpoint_slots = [CheckpointSlot {
             root_block_id: NONE_BLOCK_ID,
             generation: 0,
@@ -114,13 +105,113 @@ impl FileHeader {
                 crc32,
             };
         }
+
         Ok(Self {
             magic,
             version,
             page_size,
-            free_list_head,
+            alloc_count,
+            avail_count,
+            discard_count,
             checkpoint_slots,
         })
+    }
+
+    pub(crate) fn pack(
+        &self,
+        extents: &ExtentLists,
+        max_payload: usize,
+    ) -> Result<Vec<u8>, WrongoDBError> {
+        let mut buf = Vec::with_capacity(max_payload);
+        buf.extend_from_slice(&self.magic);
+        buf.write_u16::<LittleEndian>(self.version)?;
+        buf.write_u32::<LittleEndian>(self.page_size)?;
+        buf.write_u32::<LittleEndian>(extents.alloc.len() as u32)?;
+        buf.write_u32::<LittleEndian>(extents.avail.len() as u32)?;
+        buf.write_u32::<LittleEndian>(extents.discard.len() as u32)?;
+        for slot in &self.checkpoint_slots {
+            buf.write_u64::<LittleEndian>(slot.root_block_id)?;
+            buf.write_u64::<LittleEndian>(slot.generation)?;
+            buf.write_u32::<LittleEndian>(slot.crc32)?;
+        }
+
+        for extent in &extents.alloc {
+            write_extent(&mut buf, extent)?;
+        }
+        for extent in &extents.avail {
+            write_extent(&mut buf, extent)?;
+        }
+        for extent in &extents.discard {
+            write_extent(&mut buf, extent)?;
+        }
+
+        if buf.len() > max_payload {
+            return Err(StorageError("extent metadata exceeds header payload".into()).into());
+        }
+        buf.resize(max_payload, 0);
+        Ok(buf)
+    }
+
+    pub(crate) fn unpack(buf: &[u8]) -> Result<(Self, ExtentLists), WrongoDBError> {
+        if buf.len() < HEADER_MIN_SIZE {
+            return Err(StorageError("header buffer too small".into()).into());
+        }
+
+        let mut rdr = std::io::Cursor::new(buf);
+        let mut magic = [0u8; 8];
+        rdr.read_exact(&mut magic)?;
+        let version = rdr.read_u16::<LittleEndian>()?;
+        let page_size = rdr.read_u32::<LittleEndian>()?;
+        let alloc_count = rdr.read_u32::<LittleEndian>()?;
+        let avail_count = rdr.read_u32::<LittleEndian>()?;
+        let discard_count = rdr.read_u32::<LittleEndian>()?;
+        let mut checkpoint_slots = [CheckpointSlot {
+            root_block_id: NONE_BLOCK_ID,
+            generation: 0,
+            crc32: 0,
+        }; CHECKPOINT_SLOT_COUNT];
+        for slot in &mut checkpoint_slots {
+            let root_block_id = rdr.read_u64::<LittleEndian>()?;
+            let generation = rdr.read_u64::<LittleEndian>()?;
+            let crc32 = rdr.read_u32::<LittleEndian>()?;
+            *slot = CheckpointSlot {
+                root_block_id,
+                generation,
+                crc32,
+            };
+        }
+
+        let total_extents = alloc_count
+            .checked_add(avail_count)
+            .and_then(|v| v.checked_add(discard_count))
+            .ok_or_else(|| StorageError("extent count overflow".into()))?;
+        let required = HEADER_FIXED_SIZE
+            .checked_add((total_extents as usize).saturating_mul(EXTENT_ENCODED_SIZE))
+            .ok_or_else(|| StorageError("extent metadata size overflow".into()))?;
+        if buf.len() < required {
+            return Err(StorageError("header extent list truncated".into()).into());
+        }
+
+        let mut lists = ExtentLists::default();
+        for _ in 0..alloc_count {
+            lists.alloc.push(read_extent(&mut rdr)?);
+        }
+        for _ in 0..avail_count {
+            lists.avail.push(read_extent(&mut rdr)?);
+        }
+        for _ in 0..discard_count {
+            lists.discard.push(read_extent(&mut rdr)?);
+        }
+
+        Ok((Self {
+            magic,
+            version,
+            page_size,
+            alloc_count,
+            avail_count,
+            discard_count,
+            checkpoint_slots,
+        }, lists))
     }
 }
 
@@ -131,6 +222,7 @@ pub struct BlockFile {
     pub header: FileHeader,
     pub page_size: usize,
     active_checkpoint_slot: usize,
+    block_manager: BlockManager,
 }
 
 impl BlockFile {
@@ -171,7 +263,7 @@ impl BlockFile {
             return Err(StorageError(format!("file already exists: {path:?}")).into());
         }
 
-        if page_size < CHECKSUM_SIZE + HEADER_PAD_SIZE {
+        if page_size < CHECKSUM_SIZE + HEADER_MIN_SIZE {
             return Err(StorageError("page_size too small for header".into()).into());
         }
 
@@ -186,10 +278,13 @@ impl BlockFile {
             page_size: page_size as u32,
             ..FileHeader::default()
         };
-
-        write_header_page(&mut file, &header, page_size)?;
+        let extents = ExtentLists::default();
+        let payload = header.pack(&extents, page_size - CHECKSUM_SIZE)?;
+        write_header_page(&mut file, &payload)?;
         file.sync_all()?;
         let active_checkpoint_slot = Self::select_checkpoint_slot(&header)?;
+        let stable_generation = header.checkpoint_slots[active_checkpoint_slot].generation;
+        let block_manager = BlockManager::new(stable_generation, extents);
 
         Ok(Self {
             path,
@@ -197,6 +292,7 @@ impl BlockFile {
             header,
             page_size,
             active_checkpoint_slot,
+            block_manager,
         })
     }
 
@@ -208,15 +304,15 @@ impl BlockFile {
 
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
 
-        let mut prefix = vec![0u8; CHECKSUM_SIZE + HEADER_PAD_SIZE];
+        let mut prefix = vec![0u8; CHECKSUM_SIZE + HEADER_FIXED_SIZE];
         file.read_exact(&mut prefix)
             .map_err(|_| StorageError("file too small to contain header".into()))?;
 
         let mut rdr = std::io::Cursor::new(&prefix);
         let stored_checksum = rdr.read_u32::<LittleEndian>()?;
-        let mut header_payload = [0u8; HEADER_PAD_SIZE];
+        let mut header_payload = vec![0u8; HEADER_FIXED_SIZE];
         rdr.read_exact(&mut header_payload)?;
-        let header = FileHeader::unpack(&header_payload)?;
+        let header = FileHeader::unpack_fixed(&header_payload)?;
 
         if header.magic != MAGIC {
             return Err(StorageError("invalid file magic".into()).into());
@@ -225,7 +321,7 @@ impl BlockFile {
             return Err(StorageError(format!("unsupported version: {}", header.version)).into());
         }
         let page_size = header.page_size as usize;
-        if page_size < CHECKSUM_SIZE + HEADER_PAD_SIZE {
+        if page_size < CHECKSUM_SIZE + HEADER_MIN_SIZE {
             return Err(StorageError("corrupt header page_size".into()).into());
         }
 
@@ -239,18 +335,29 @@ impl BlockFile {
             return Err(StorageError("header checksum mismatch".into()).into());
         }
 
+        let payload0 = &page0[CHECKSUM_SIZE..];
+        let (header, extents) = FileHeader::unpack(payload0)?;
+
         let active_checkpoint_slot = Self::select_checkpoint_slot(&header)?;
+        let stable_generation = header.checkpoint_slots[active_checkpoint_slot].generation;
+        let block_manager = BlockManager::new(stable_generation, extents);
         Ok(Self {
             path,
             file,
             header,
             page_size,
             active_checkpoint_slot,
+            block_manager,
         })
     }
 
     fn write_header(&mut self) -> Result<(), WrongoDBError> {
-        write_header_page(&mut self.file, &self.header, self.page_size)?;
+        let extents = self.block_manager.extent_lists();
+        self.header.alloc_count = extents.alloc.len() as u32;
+        self.header.avail_count = extents.avail.len() as u32;
+        self.header.discard_count = extents.discard.len() as u32;
+        let payload = self.header.pack(&extents, self.page_size - CHECKSUM_SIZE)?;
+        write_header_page(&mut self.file, &payload)?;
         Ok(())
     }
 
@@ -267,51 +374,43 @@ impl BlockFile {
             next_gen = 1;
         }
         self.header.checkpoint_slots[next_slot].update(root_block_id, next_gen);
-        self.write_header()?;
         self.active_checkpoint_slot = next_slot;
+        self.block_manager.set_stable_generation(next_gen);
+        self.write_header()?;
         Ok(())
     }
 
     pub fn allocate_block(&mut self) -> Result<u64, WrongoDBError> {
-        let head = self.header.free_list_head;
-        if head != NONE_BLOCK_ID {
-            let block_id: u64 = head;
-            let current_blocks = self.num_blocks()?;
-            if block_id == 0 || block_id >= current_blocks {
-                return Err(StorageError(format!(
-                    "corrupt free_list_head={block_id} (num_blocks={current_blocks})"
-                ))
-                .into());
-            }
-            let payload = self.read_block(block_id, true)?;
-            if payload.len() < 8 {
-                return Err(StorageError(format!(
-                    "free list block {block_id} too small for next pointer"
-                ))
-                .into());
-            }
-            let mut rdr = std::io::Cursor::new(&payload);
-            let next = rdr.read_u64::<LittleEndian>()?;
-            if next != NONE_BLOCK_ID {
-                let current_blocks = self.num_blocks()?;
-                if next == 0 || next >= current_blocks {
-                    return Err(StorageError(format!(
-                        "corrupt free list next={next} in block {block_id} (num_blocks={current_blocks})"
-                    ))
-                    .into());
-                }
-            }
-            self.header.free_list_head = next;
+        Ok(self.allocate_extent(1)?.offset)
+    }
+
+    pub fn allocate_extent(&mut self, blocks: u64) -> Result<Extent, WrongoDBError> {
+        if blocks == 0 {
+            return Err(StorageError("cannot allocate zero-length extent".into()).into());
+        }
+
+        if let Some(extent) = self.block_manager.allocate_from_avail(blocks) {
             self.write_header()?;
-            return Ok(block_id);
+            return Ok(extent);
         }
 
         let new_id = self.num_blocks()?;
-        let new_len = (new_id + 1)
+        let new_len_blocks = new_id
+            .checked_add(blocks)
+            .ok_or_else(|| StorageError("block count overflow".into()))?;
+        let new_len = new_len_blocks
             .checked_mul(self.page_size as u64)
             .ok_or_else(|| StorageError("file length overflow".into()))?;
         self.file.set_len(new_len)?;
-        Ok(new_id)
+
+        let extent = Extent {
+            offset: new_id,
+            size: blocks,
+            generation: self.block_manager.stable_generation(),
+        };
+        self.block_manager.add_alloc_extent(extent);
+        self.write_header()?;
+        Ok(extent)
     }
 
     pub fn write_new_block(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError> {
@@ -332,16 +431,13 @@ impl BlockFile {
             ))
             .into());
         }
+        self.block_manager.free_extent(block_id, 1)?;
+        self.write_header()?;
+        Ok(())
+    }
 
-        let next = self.header.free_list_head;
-        let mut payload = vec![0u8; 8];
-        {
-            let mut w = std::io::Cursor::new(&mut payload);
-            w.write_u64::<LittleEndian>(next)?;
-        }
-
-        self.write_block(block_id, &payload)?;
-        self.header.free_list_head = block_id;
+    pub fn reclaim_discarded(&mut self) -> Result<(), WrongoDBError> {
+        self.block_manager.reclaim_discarded();
         self.write_header()?;
         Ok(())
     }
@@ -438,25 +534,31 @@ fn checkpoint_slot_crc(root_block_id: u64, generation: u64) -> u32 {
     hasher.finalize()
 }
 
-fn write_header_page(
-    file: &mut File,
-    header: &FileHeader,
-    page_size: usize,
-) -> Result<(), WrongoDBError> {
-    let max_payload = page_size - CHECKSUM_SIZE;
-    let packed = header.pack()?;
-    if packed.len() > max_payload {
-        return Err(StorageError("header does not fit in page".into()).into());
-    }
+fn write_extent(buf: &mut Vec<u8>, extent: &Extent) -> Result<(), WrongoDBError> {
+    buf.write_u64::<LittleEndian>(extent.offset)?;
+    buf.write_u64::<LittleEndian>(extent.size)?;
+    buf.write_u64::<LittleEndian>(extent.generation)?;
+    Ok(())
+}
 
-    let mut padded = vec![0u8; max_payload];
-    padded[..packed.len()].copy_from_slice(&packed);
-    let checksum = crc32(&padded);
+fn read_extent(rdr: &mut std::io::Cursor<&[u8]>) -> Result<Extent, WrongoDBError> {
+    let offset = rdr.read_u64::<LittleEndian>()?;
+    let size = rdr.read_u64::<LittleEndian>()?;
+    let generation = rdr.read_u64::<LittleEndian>()?;
+    Ok(Extent {
+        offset,
+        size,
+        generation,
+    })
+}
+
+fn write_header_page(file: &mut File, payload: &[u8]) -> Result<(), WrongoDBError> {
+    let checksum = crc32(payload);
 
     file.seek(SeekFrom::Start(0))?;
     let mut writer = std::io::BufWriter::new(file);
     writer.write_u32::<LittleEndian>(checksum)?;
-    writer.write_all(&padded)?;
+    writer.write_all(payload)?;
     writer.flush()?;
     Ok(())
 }

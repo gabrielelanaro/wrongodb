@@ -1,4 +1,6 @@
+mod block_manager;
 mod blockfile;
+mod bson_codec;
 mod btree;
 pub mod commands;
 mod document;
@@ -8,8 +10,8 @@ mod index;
 mod index_key;
 mod internal_page;
 mod leaf_page;
+mod main_table;
 mod server;
-mod storage;
 
 pub use crate::blockfile::{BlockFile, CheckpointSlot, FileHeader, NONE_BLOCK_ID};
 pub use crate::btree::BTree;
@@ -20,6 +22,5 @@ pub use crate::index::{InMemoryIndex, ScalarKey, SecondaryIndexManager};
 pub use crate::internal_page::{InternalPage, InternalPageError};
 pub use crate::leaf_page::{LeafPage, LeafPageError};
 pub use crate::server::start_server;
-pub use crate::storage::AppendOnlyStorage;
 
 pub type Document = serde_json::Map<String, serde_json::Value>;
