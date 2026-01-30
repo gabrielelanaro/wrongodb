@@ -26,6 +26,18 @@ A tiny, learning-oriented MongoDB-like store written in Rust.
 
 This repo evolves step by step. Check [PLAN.md](PLAN.md) to see where we are going (WiredTiger-inspired storage engine).
 
+## Source Layout
+
+The codebase is organized by domain to keep storage, engine, and server concerns separate:
+
+- `src/core/`: shared types/utilities (BSON codec, document helpers, errors).
+- `src/storage/`: on-disk storage (block file, B-tree, WAL, main table).
+- `src/index/`: secondary index implementation and key encoding.
+- `src/engine/`: database API and collection logic.
+- `src/server/`: MongoDB wire-protocol server and command handlers.
+
+Integration tests are grouped under `tests/` with entry points (e.g. `tests/storage.rs`) that include submodules in `tests/storage/`, `tests/engine/`, etc.
+
 ### Quickstart
 
 #### As a Library

@@ -1,9 +1,11 @@
+mod key;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::index_key::{decode_index_id, encode_index_key, encode_range_bounds};
+use self::key::{decode_index_id, encode_index_key, encode_range_bounds};
 use crate::{BTree, Document, WrongoDBError};
 
 /// A persistent secondary index backed by a B+tree.
@@ -15,7 +17,6 @@ use crate::{BTree, Document, WrongoDBError};
 /// This allows duplicate values (different _id values = different keys).
 #[derive(Debug)]
 pub struct PersistentIndex {
-    pub field: String,
     pub btree: BTree,
 }
 
@@ -23,7 +24,6 @@ impl PersistentIndex {
     /// Open an existing index BTree or create a new one if it doesn't exist.
     fn open_or_create(
         path: &Path,
-        field: &str,
         wal_enabled: bool,
     ) -> Result<(Self, bool), WrongoDBError> {
         let mut created = false;
@@ -43,7 +43,6 @@ impl PersistentIndex {
 
         Ok((
             Self {
-            field: field.to_string(),
             btree,
             },
             created,
@@ -131,8 +130,7 @@ impl SecondaryIndexManager {
             // Check if index exists BEFORE creating/opening
             let index_exists = index_path.exists();
 
-            let (mut index, created) =
-                PersistentIndex::open_or_create(&index_path, field, wal_enabled)?;
+            let (mut index, created) = PersistentIndex::open_or_create(&index_path, wal_enabled)?;
 
             // If the index file was just created, build it from existing documents
             if !index_exists || created {
@@ -224,7 +222,7 @@ impl SecondaryIndexManager {
 
         let index_path = Self::index_path(&self.collection_path, field);
         let (mut index, _created) =
-            PersistentIndex::open_or_create(&index_path, field, self.wal_enabled)?;
+            PersistentIndex::open_or_create(&index_path, self.wal_enabled)?;
 
         // Build index from existing documents
         for doc in existing_docs {
@@ -371,7 +369,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("test.idx.wt");
 
-        let (mut index, _created) = PersistentIndex::open_or_create(&path, "name", false).unwrap();
+        let (mut index, _created) = PersistentIndex::open_or_create(&path, false).unwrap();
 
         // Insert some values
         index.insert(&json!("alice"), &json!("id1")).unwrap();
@@ -397,7 +395,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("test.idx.wt");
 
-        let (mut index, _created) = PersistentIndex::open_or_create(&path, "name", false).unwrap();
+        let (mut index, _created) = PersistentIndex::open_or_create(&path, false).unwrap();
 
         index.insert(&json!("alice"), &json!("id1")).unwrap();
         index.insert(&json!("alice"), &json!("id2")).unwrap();
@@ -418,7 +416,7 @@ mod tests {
         // Create and populate index
         {
             let (mut index, _created) =
-                PersistentIndex::open_or_create(&path, "name", false).unwrap();
+                PersistentIndex::open_or_create(&path, false).unwrap();
             index.insert(&json!("alice"), &json!("id1")).unwrap();
             index.insert(&json!("bob"), &json!("id2")).unwrap();
             index.checkpoint().unwrap();
@@ -427,7 +425,7 @@ mod tests {
         // Reopen and verify
         {
             let (mut index, _created) =
-                PersistentIndex::open_or_create(&path, "name", false).unwrap();
+                PersistentIndex::open_or_create(&path, false).unwrap();
             let alice_ids = index.lookup(&json!("alice")).unwrap();
             assert_eq!(alice_ids.len(), 1);
             assert!(alice_ids.contains(&json!("id1")));

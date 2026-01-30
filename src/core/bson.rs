@@ -1,7 +1,7 @@
 use bson::Bson;
 use serde_json::Value;
 
-use crate::errors::StorageError;
+use crate::core::errors::StorageError;
 use crate::{Document, WrongoDBError};
 
 pub fn encode_id_value(id: &Value) -> Result<Vec<u8>, WrongoDBError> {

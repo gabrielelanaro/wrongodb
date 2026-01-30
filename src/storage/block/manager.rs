@@ -1,5 +1,4 @@
-use crate::errors::StorageError;
-use crate::WrongoDBError;
+use crate::core::errors::{StorageError, WrongoDBError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Extent {
@@ -57,17 +56,6 @@ where
             nodes: vec![head],
             seed,
         }
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn clear(&mut self) {
-        self.nodes.truncate(1);
-        self.nodes[0].forwards.fill(None);
-        self.level = 1;
-        self.len = 0;
     }
 
     fn random_level(&mut self) -> usize {
@@ -267,15 +255,6 @@ impl ExtentIndex {
             index.insert(extent);
         }
         index
-    }
-
-    fn len(&self) -> usize {
-        self.by_offset.len()
-    }
-
-    fn clear(&mut self) {
-        self.by_offset.clear();
-        self.by_size.clear();
     }
 
     fn insert(&mut self, extent: Extent) {

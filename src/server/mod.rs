@@ -1,3 +1,5 @@
+pub mod commands;
+
 use std::collections::HashMap;
 use std::io::{self, Cursor};
 use std::sync::Arc;
@@ -9,8 +11,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-use crate::commands::handlers::crud::{bson_to_value, value_to_bson};
-use crate::{CommandRegistry, WrongoDB, WrongoDBError};
+use self::commands::handlers::crud::{bson_to_value, value_to_bson};
+use self::commands::CommandRegistry;
+use crate::{WrongoDB, WrongoDBError};
 
 const OP_MSG: i32 = 2013;
 const OP_QUERY: i32 = 2004;

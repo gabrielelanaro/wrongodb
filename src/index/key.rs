@@ -9,7 +9,7 @@
 
 use serde_json::Value;
 
-use crate::bson_codec::{decode_id_value, encode_id_value};
+use crate::core::bson::{decode_id_value, encode_id_value};
 use crate::WrongoDBError;
 
 /// Scalar type tags for key encoding.
@@ -68,7 +68,7 @@ pub fn encode_index_key(scalar: &Value, id: &Value) -> Result<Option<Vec<u8>>, W
     let id_len: u32 = id_bytes
         .len()
         .try_into()
-        .map_err(|_| crate::errors::StorageError("id encoding too large".into()))?;
+        .map_err(|_| crate::core::errors::StorageError("id encoding too large".into()))?;
     result.extend_from_slice(&id_len.to_le_bytes());
     result.extend_from_slice(&id_bytes);
     Ok(Some(result))
@@ -176,7 +176,7 @@ fn scalar_prefix_len(key: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bson_codec::encode_id_value;
+    use crate::core::bson::encode_id_value;
 
     #[test]
     fn encode_null() {

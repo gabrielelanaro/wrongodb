@@ -1,15 +1,14 @@
 use std::path::Path;
 
+pub mod page;
 mod pager;
 pub mod wal;
 
-use self::wal::WalFile;
-
 use self::pager::{Pager, PinnedPage, PinnedPageMut};
-use crate::errors::StorageError;
-use crate::{
-    InternalPage, InternalPageError, LeafPage, LeafPageError, WrongoDBError, NONE_BLOCK_ID,
-};
+use self::wal::WalFile;
+use crate::core::errors::{StorageError, WrongoDBError};
+use crate::storage::block::file::NONE_BLOCK_ID;
+use page::{InternalPage, InternalPageError, LeafPage, LeafPageError};
 
 // Type aliases for B-tree operations to clarify intent and reduce complexity
 
@@ -266,7 +265,7 @@ impl BTree {
         // Get the data file path from the blockfile
         let data_path = &self.pager.blockfile().path;
 
-        let wal_path = crate::btree::wal::wal_path_from_data_path(data_path);
+        let wal_path = wal::wal_path_from_data_path(data_path);
 
         if !wal_path.exists() {
             // No WAL file - nothing to recover
@@ -274,7 +273,7 @@ impl BTree {
         }
 
         // Open WAL reader
-        let mut wal_reader = crate::btree::wal::WalReader::open(&wal_path)
+        let mut wal_reader = wal::WalReader::open(&wal_path)
             .map_err(|e| StorageError(format!("Failed to open WAL for recovery: {}", e)))?;
 
         let checkpoint_lsn = wal_reader.checkpoint_lsn();
@@ -296,15 +295,15 @@ impl BTree {
                 .map_err(|e| StorageError(format!("Failed to read WAL record: {}", e)))?
             {
                 match record {
-                    crate::btree::wal::WalRecord::Put { key, value } => {
+                    wal::WalRecord::Put { key, value } => {
                         self.put(&key, &value)?;
                         stats.puts += 1;
                     }
-                    crate::btree::wal::WalRecord::Delete { key } => {
+                    wal::WalRecord::Delete { key } => {
                         let _ = self.delete(&key)?;
                         stats.deletes += 1;
                     }
-                    crate::btree::wal::WalRecord::Checkpoint { .. } => {
+                    wal::WalRecord::Checkpoint { .. } => {
                         stats.checkpoints += 1;
                     }
                 }
@@ -479,7 +478,7 @@ impl BTree {
     /// 3. Tracking the operation for batch sync
     fn log_wal_if_enabled<F>(&mut self, op: F) -> Result<(), WrongoDBError>
     where
-        F: FnOnce(&mut WalFile) -> Result<crate::btree::wal::Lsn, WrongoDBError>,
+        F: FnOnce(&mut WalFile) -> Result<wal::Lsn, WrongoDBError>,
     {
         if self.pager.wal().is_some() {
             op(self.pager.wal_mut()?)?;

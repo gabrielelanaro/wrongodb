@@ -1,27 +1,21 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::{BlockFile, StorageError, WrongoDBError, NONE_BLOCK_ID};
-use crate::btree::wal::{WalFile, wal_path_from_data_path};
+use super::wal::{wal_path_from_data_path, WalFile};
+use crate::core::errors::{StorageError, WrongoDBError};
+use crate::storage::block::file::{BlockFile, NONE_BLOCK_ID};
 
 const DEFAULT_CACHE_CAPACITY_PAGES: usize = 256;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EvictionPolicy {
-    Lru,
-}
 
 #[derive(Debug, Clone)]
 struct PageCacheConfig {
     capacity_pages: usize,
-    eviction_policy: EvictionPolicy,
 }
 
 impl Default for PageCacheConfig {
     fn default() -> Self {
         Self {
             capacity_pages: DEFAULT_CACHE_CAPACITY_PAGES,
-            eviction_policy: EvictionPolicy::Lru,
         }
     }
 }
@@ -119,22 +113,6 @@ impl PageCache {
             return Err(StorageError(format!("page cache pin underflow for {page_id}")).into());
         }
         entry.pin_count -= 1;
-        Ok(())
-    }
-
-    fn mark_dirty(&mut self, page_id: u64) -> Result<(), WrongoDBError> {
-        let entry = self
-            .get_mut(page_id)
-            .ok_or_else(|| StorageError(format!("page cache miss for {page_id}")))?;
-        entry.dirty = true;
-        Ok(())
-    }
-
-    fn mark_clean(&mut self, page_id: u64) -> Result<(), WrongoDBError> {
-        let entry = self
-            .get_mut(page_id)
-            .ok_or_else(|| StorageError(format!("page cache miss for {page_id}")))?;
-        entry.dirty = false;
         Ok(())
     }
 
@@ -428,18 +406,6 @@ impl Pager {
         Ok(false)  // Not synced
     }
 
-    /// Disable WAL (for testing)
-    #[cfg(test)]
-    pub(super) fn disable_wal(&mut self) {
-        self.wal_enabled = false;
-    }
-
-    /// Enable WAL
-    #[cfg(test)]
-    pub(super) fn enable_wal(&mut self) {
-        self.wal_enabled = true;
-    }
-
     /// Get access to the underlying block file (for recovery)
     pub(super) fn blockfile(&mut self) -> &mut BlockFile {
         &mut self.bf
@@ -636,7 +602,6 @@ mod tests {
     fn lru_skips_pinned_pages() {
         let mut cache = PageCache::new(PageCacheConfig {
             capacity_pages: 3,
-            eviction_policy: EvictionPolicy::Lru,
         });
         cache.insert(1, vec![1]);
         cache.insert(2, vec![2]);
@@ -653,7 +618,6 @@ mod tests {
     fn evict_lru_errors_when_all_pinned() {
         let mut cache = PageCache::new(PageCacheConfig {
             capacity_pages: 2,
-            eviction_policy: EvictionPolicy::Lru,
         });
         cache.insert(1, vec![1]).pin_count = 1;
         cache.insert(2, vec![2]).pin_count = 1;
@@ -672,7 +636,6 @@ mod tests {
 
         pager.cache = PageCache::new(PageCacheConfig {
             capacity_pages: 1,
-            eviction_policy: EvictionPolicy::Lru,
         });
 
         let payload = vec![7u8; payload_len];
@@ -716,7 +679,6 @@ mod tests {
 
         pager.cache = PageCache::new(PageCacheConfig {
             capacity_pages: 1,
-            eviction_policy: EvictionPolicy::Lru,
         });
 
         let pinned = pager.pin_page(page1).unwrap();

@@ -5,9 +5,8 @@ use std::path::{Path, PathBuf};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
 
-use crate::block_manager::{BlockManager, Extent, ExtentLists};
-use crate::errors::StorageError;
-use crate::WrongoDBError;
+use super::manager::{BlockManager, Extent, ExtentLists};
+use crate::core::errors::{StorageError, WrongoDBError};
 
 const CHECKSUM_SIZE: usize = 4;
 const DEFAULT_PAGE_SIZE: usize = 4096;

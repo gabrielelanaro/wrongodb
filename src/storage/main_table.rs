@@ -2,8 +2,8 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::bson_codec::{decode_document, encode_document, encode_id_value};
-use crate::errors::{DocumentValidationError, StorageError};
+use crate::core::bson::{decode_document, encode_document, encode_id_value};
+use crate::core::errors::{DocumentValidationError, StorageError};
 use crate::{BTree, Document, WrongoDBError};
 
 #[derive(Debug)]

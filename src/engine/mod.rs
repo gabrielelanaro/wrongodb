@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::document::{normalize_document, validate_is_object};
+use crate::core::document::{normalize_document, validate_is_object};
 use crate::index::SecondaryIndexManager;
-use crate::main_table::MainTable;
+use crate::storage::main_table::MainTable;
 use crate::{Document, WrongoDBError};
 
 /// Represents a single collection within the database

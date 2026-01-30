@@ -417,7 +417,6 @@ impl WalRecordHeader {
 /// not full page images. This matches WiredTiger's production architecture.
 #[derive(Debug)]
 pub struct WalFile {
-    path: PathBuf,
     file: File,
     header: WalFileHeader,
     write_buffer: Vec<u8>,
@@ -440,7 +439,6 @@ impl WalFile {
         file.sync_all()?;
 
         Ok(Self {
-            path: path.to_path_buf(),
             file,
             header,
             write_buffer: Vec::with_capacity(Self::DEFAULT_BUFFER_CAPACITY),
@@ -468,18 +466,12 @@ impl WalFile {
         file.seek(SeekFrom::Start(last_lsn.offset))?;
 
         Ok(Self {
-            path: path.to_path_buf(),
             file,
             header,
             write_buffer: Vec::with_capacity(Self::DEFAULT_BUFFER_CAPACITY),
             buffer_capacity: Self::DEFAULT_BUFFER_CAPACITY,
             last_lsn,
         })
-    }
-
-    /// Get the checkpoint LSN - recovery should replay from this point.
-    pub fn checkpoint_lsn(&self) -> Lsn {
-        self.header.checkpoint_lsn
     }
 
     /// Update the checkpoint LSN in the WAL header.
@@ -642,21 +634,6 @@ impl WalFile {
         Ok(())
     }
 
-    /// Close the WAL file and delete it (after successful recovery).
-    pub fn close_and_delete(mut self) -> Result<(), WrongoDBError> {
-        // Flush any remaining data
-        let _ = self.flush_buffer();
-
-        // Get the path before self is dropped
-        let path = self.path.clone();
-
-        // File will be closed when self is dropped
-        drop(self);
-
-        // Delete the file
-        std::fs::remove_file(&path)?;
-        Ok(())
-    }
 }
 
 impl Drop for WalFile {
