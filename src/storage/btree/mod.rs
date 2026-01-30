@@ -12,7 +12,7 @@ use layout::{
     build_internal_page, internal_entries, leaf_entries, map_internal_err, map_leaf_err, page_type,
     split_internal_entries, split_leaf_entries, PageType,
 };
-use self::pager::{PageStore, Pager, PinnedPageMut};
+use self::pager::{BTreeStore, PageRead, Pager, PinnedPageMut};
 use self::wal::WalFile;
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::block::file::NONE_BLOCK_ID;
@@ -43,7 +43,7 @@ type KeyValueIter<'a> = BTreeRangeIter<'a>;
 
 #[derive(Debug)]
 pub struct BTree {
-    pager: Box<dyn PageStore>,
+    pager: Box<dyn BTreeStore>,
 }
 
 impl BTree {
@@ -341,7 +341,7 @@ impl BTree {
         if root == NONE_BLOCK_ID {
             return Ok(BTreeRangeIter::empty());
         }
-        BTreeRangeIter::new(self.pager.as_mut(), root, start, end)
+        BTreeRangeIter::new(self.pager.as_mut() as &mut dyn PageRead, root, start, end)
     }
 
     /// Delete a key from the subtree rooted at `node_id`.
@@ -642,7 +642,7 @@ struct DeleteResult {
     deleted: bool,
 }
 
-fn init_root_if_missing(pager: &mut dyn PageStore) -> Result<(), WrongoDBError> {
+fn init_root_if_missing(pager: &mut dyn BTreeStore) -> Result<(), WrongoDBError> {
     if pager.root_page_id() != NONE_BLOCK_ID {
         return Ok(());
     }

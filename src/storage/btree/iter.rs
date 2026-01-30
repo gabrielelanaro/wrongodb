@@ -2,7 +2,7 @@ use crate::core::errors::{StorageError, WrongoDBError};
 
 use super::layout::{map_internal_err, map_leaf_err, page_type, PageType};
 use super::page::{InternalPage, InternalPageError, LeafPage, LeafPageError};
-use super::pager::{PageStore, PinnedPage};
+use super::pager::{PageRead, PinnedPage};
 
 #[derive(Debug, Clone, Copy)]
 struct CursorFrame {
@@ -38,7 +38,7 @@ struct CursorFrame {
 ///   -> descend leftmost to the next leaf
 /// ```
 pub struct BTreeRangeIter<'a> {
-    pager: Option<&'a mut (dyn PageStore + 'a)>,
+    pager: Option<&'a mut (dyn PageRead + 'a)>,
     end: Option<Vec<u8>>,
     stack: Vec<CursorFrame>,
     leaf: Option<PinnedPage>,
@@ -63,7 +63,7 @@ impl<'a> BTreeRangeIter<'a> {
     }
 
     pub(super) fn new(
-        pager: &'a mut (dyn PageStore + 'a),
+        pager: &'a mut (dyn PageRead + 'a),
         root: u64,
         start: Option<&[u8]>,
         end: Option<&[u8]>,

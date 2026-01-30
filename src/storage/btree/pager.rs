@@ -209,25 +209,34 @@ impl PinnedPageMut {
     }
 }
 
-pub(super) trait PageStore: std::fmt::Debug + Send + Sync {
+pub(super) trait PageRead: std::fmt::Debug + Send + Sync {
     fn page_payload_len(&self) -> usize;
-    fn root_page_id(&self) -> u64;
-    fn set_root_page_id(&mut self, root_page_id: u64) -> Result<(), WrongoDBError>;
-
     fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError>;
     fn unpin_page(&mut self, page_id: u64);
+}
+
+pub(super) trait PageWrite: std::fmt::Debug + Send + Sync {
     fn pin_page_mut(&mut self, page_id: u64) -> Result<PinnedPageMut, WrongoDBError>;
     fn unpin_page_mut_commit(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError>;
     fn unpin_page_mut_abort(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError>;
     fn write_new_page(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError>;
+}
 
+pub(super) trait RootStore: std::fmt::Debug + Send + Sync {
+    fn root_page_id(&self) -> u64;
+    fn set_root_page_id(&mut self, root_page_id: u64) -> Result<(), WrongoDBError>;
+}
+
+pub(super) trait CheckpointStore: std::fmt::Debug + Send + Sync {
     fn request_checkpoint_after_updates(&mut self, count: usize);
     fn checkpoint_requested(&self) -> bool;
     fn checkpoint_prepare(&self) -> u64;
     fn checkpoint_flush_data(&mut self) -> Result<(), WrongoDBError>;
     fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError>;
     fn sync_all(&mut self) -> Result<(), WrongoDBError>;
+}
 
+pub(super) trait WalStore: std::fmt::Debug + Send + Sync {
     fn wal(&mut self) -> Option<&mut WalFile>;
     fn wal_mut(&mut self) -> Result<&mut WalFile, WrongoDBError>;
     fn take_wal(&mut self) -> Option<WalFile>;
@@ -235,8 +244,20 @@ pub(super) trait PageStore: std::fmt::Debug + Send + Sync {
     fn set_wal_sync_threshold(&mut self, threshold: usize);
     fn sync_wal(&mut self) -> Result<(), WrongoDBError>;
     fn log_wal_operation(&mut self) -> Result<bool, WrongoDBError>;
+}
 
+pub(super) trait DataPath: std::fmt::Debug + Send + Sync {
     fn data_path(&self) -> &Path;
+}
+
+pub(super) trait BTreeStore:
+    PageRead + PageWrite + RootStore + CheckpointStore + WalStore + DataPath
+{
+}
+
+impl<T> BTreeStore for T where
+    T: PageRead + PageWrite + RootStore + CheckpointStore + WalStore + DataPath
+{
 }
 
 impl Pager {
@@ -618,17 +639,9 @@ impl Pager {
     }
 }
 
-impl PageStore for Pager {
+impl PageRead for Pager {
     fn page_payload_len(&self) -> usize {
         Pager::page_payload_len(self)
-    }
-
-    fn root_page_id(&self) -> u64 {
-        Pager::root_page_id(self)
-    }
-
-    fn set_root_page_id(&mut self, root_page_id: u64) -> Result<(), WrongoDBError> {
-        Pager::set_root_page_id(self, root_page_id)
     }
 
     fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError> {
@@ -638,7 +651,9 @@ impl PageStore for Pager {
     fn unpin_page(&mut self, page_id: u64) {
         Pager::unpin_page(self, page_id);
     }
+}
 
+impl PageWrite for Pager {
     fn pin_page_mut(&mut self, page_id: u64) -> Result<PinnedPageMut, WrongoDBError> {
         Pager::pin_page_mut(self, page_id)
     }
@@ -654,7 +669,19 @@ impl PageStore for Pager {
     fn write_new_page(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError> {
         Pager::write_new_page(self, payload)
     }
+}
 
+impl RootStore for Pager {
+    fn root_page_id(&self) -> u64 {
+        Pager::root_page_id(self)
+    }
+
+    fn set_root_page_id(&mut self, root_page_id: u64) -> Result<(), WrongoDBError> {
+        Pager::set_root_page_id(self, root_page_id)
+    }
+}
+
+impl CheckpointStore for Pager {
     fn request_checkpoint_after_updates(&mut self, count: usize) {
         Pager::request_checkpoint_after_updates(self, count);
     }
@@ -678,7 +705,9 @@ impl PageStore for Pager {
     fn sync_all(&mut self) -> Result<(), WrongoDBError> {
         Pager::sync_all(self)
     }
+}
 
+impl WalStore for Pager {
     fn wal(&mut self) -> Option<&mut WalFile> {
         Pager::wal(self)
     }
@@ -706,7 +735,9 @@ impl PageStore for Pager {
     fn log_wal_operation(&mut self) -> Result<bool, WrongoDBError> {
         Pager::log_wal_operation(self)
     }
+}
 
+impl DataPath for Pager {
     fn data_path(&self) -> &Path {
         self.bf.path.as_path()
     }

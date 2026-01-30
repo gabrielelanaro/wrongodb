@@ -16,6 +16,20 @@
 - The trait uses the existing pinned page types (`PinnedPage`, `PinnedPageMut`) to keep the refactor small.
 - Dynamic dispatch is limited to pager calls; behavior and persistence semantics are unchanged.
 
+## 2026-01-30: Split pager abstraction into smaller traits
+
+**Decision**
+- Replace the monolithic `PageStore` with smaller traits (`PageRead`, `PageWrite`, `RootStore`,
+  `CheckpointStore`, `WalStore`, `DataPath`) and compose them via `BTreeStore`.
+- Keep `BTree` storing a boxed `dyn BTreeStore` while `BTreeRangeIter` only depends on `PageRead`.
+
+**Why**
+- Reduce interface surface per use site (ISP/SRP) while preserving the existing public `BTree` API.
+- Allow future components (e.g., iterators/tests) to depend on smaller capability sets.
+
+**Notes**
+- This is a refactor-only change; storage semantics and behavior remain the same.
+
 ## 2026-01-28: Extent metadata in header payload + main table naming
 
 **Decision**
