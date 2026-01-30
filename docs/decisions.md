@@ -30,6 +30,20 @@
 **Notes**
 - This is a refactor-only change; storage semantics and behavior remain the same.
 
+## 2026-01-30: Move WAL ownership out of Pager
+
+**Decision**
+- Introduce a `Wal` handle owned by `BTree` for logging/sync policy.
+- Remove WAL state and methods from `Pager`; `Pager` is now page + checkpoint only.
+
+**Why**
+- Keep the pager focused on page IO/COW/checkpointing (SRP).
+- Make WAL lifecycle/policy independent and easier to replace or disable.
+
+**Notes**
+- `Wal` is optional (`None` when disabled) and created in `BTree::create/open`.
+- Recovery temporarily detaches the `Wal` handle to avoid logging during replay.
+
 ## 2026-01-28: Extent metadata in header payload + main table naming
 
 **Decision**

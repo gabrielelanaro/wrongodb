@@ -13,7 +13,7 @@ use layout::{
     split_internal_entries, split_leaf_entries, PageType,
 };
 use self::pager::{BTreeStore, PageRead, Pager, PinnedPageMut};
-use self::wal::WalFile;
+use self::wal::Wal;
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::block::file::NONE_BLOCK_ID;
 use page::{InternalPage, LeafPage, LeafPageError};
@@ -44,23 +44,36 @@ type KeyValueIter<'a> = BTreeRangeIter<'a>;
 #[derive(Debug)]
 pub struct BTree {
     pager: Box<dyn BTreeStore>,
+    wal: Option<Wal>,
 }
 
 impl BTree {
     pub fn create<P: AsRef<Path>>(path: P, page_size: usize, wal_enabled: bool) -> Result<Self, WrongoDBError> {
-        let mut pager = Pager::create(path, page_size, wal_enabled)?;
+        let mut pager = Pager::create(path.as_ref(), page_size)?;
         init_root_if_missing(&mut pager)?;
         pager.checkpoint()?;
+        let wal = if wal_enabled {
+            Some(Wal::create(path.as_ref(), page_size)?)
+        } else {
+            None
+        };
         Ok(Self {
             pager: Box::new(pager),
+            wal,
         })
     }
 
     pub fn open<P: AsRef<Path>>(path: P, wal_enabled: bool) -> Result<Self, WrongoDBError> {
-        let mut pager = Pager::open(path, wal_enabled)?;
+        let mut pager = Pager::open(path.as_ref())?;
         init_root_if_missing(&mut pager)?;
+        let wal = if wal_enabled {
+            Some(Wal::open_or_create(path.as_ref(), pager.page_size())?)
+        } else {
+            None
+        };
         let mut tree = Self {
             pager: Box::new(pager),
+            wal,
         };
 
         if wal_enabled {
@@ -213,30 +226,26 @@ impl BTree {
         let root = self.pager.checkpoint_prepare();
 
         // Only log checkpoint if WAL is enabled
-        if self.pager.wal().is_some() {
-            if let Ok(wal) = self.pager.wal_mut() {
-                // Get current generation (simplified - using 0 for now)
-                let generation = 0;
+        if let Some(wal) = self.wal.as_mut() {
+            // Get current generation (simplified - using 0 for now)
+            let generation = 0;
 
-                // Log checkpoint record
-                let checkpoint_lsn = wal.log_checkpoint(root, generation)?;
+            // Log checkpoint record
+            let checkpoint_lsn = wal.log_checkpoint(root, generation)?;
 
-                // Update checkpoint_lsn in WAL header so recovery knows where to start
-                wal.set_checkpoint_lsn(checkpoint_lsn)?;
+            // Update checkpoint_lsn in WAL header so recovery knows where to start
+            wal.set_checkpoint_lsn(checkpoint_lsn)?;
 
-                // Sync WAL to ensure checkpoint record is durable
-                wal.sync()?;
-            }
+            // Sync WAL to ensure checkpoint record is durable
+            wal.sync()?;
         }
 
         self.pager.checkpoint_flush_data()?;
         self.pager.checkpoint_commit(root)?;
 
         // Truncate WAL after successful checkpoint to reclaim space
-        if self.pager.wal().is_some() {
-            if let Ok(wal) = self.pager.wal_mut() {
-                wal.truncate_to_checkpoint()?;
-            }
+        if let Some(wal) = self.wal.as_mut() {
+            wal.truncate_to_checkpoint()?;
         }
 
         Ok(())
@@ -255,7 +264,9 @@ impl BTree {
     /// tree.set_wal_sync_threshold(100);  // Sync every 100 operations
     /// ```
     pub fn set_wal_sync_threshold(&mut self, threshold: usize) {
-        self.pager.set_wal_sync_threshold(threshold);
+        if let Some(wal) = self.wal.as_mut() {
+            wal.set_sync_threshold(threshold);
+        }
     }
 
     /// Force WAL sync to disk.
@@ -263,7 +274,10 @@ impl BTree {
     /// This ensures all pending WAL records are written to stable storage.
     /// Call this explicitly if you need durability before a checkpoint.
     pub fn sync_wal(&mut self) -> Result<(), WrongoDBError> {
-        self.pager.sync_wal()
+        if let Some(wal) = self.wal.as_mut() {
+            wal.sync()?;
+        }
+        Ok(())
     }
 
     /// Recover from WAL after a crash.
@@ -293,7 +307,7 @@ impl BTree {
             eprintln!("Starting WAL recovery from beginning");
         }
 
-        let saved_wal = self.pager.take_wal();
+        let saved_wal = self.wal.take();
 
         let result = (|| {
             let mut stats = RecoveryStats::default();
@@ -327,7 +341,7 @@ impl BTree {
             Ok(())
         })();
 
-        self.pager.restore_wal(saved_wal);
+        self.wal = saved_wal;
         result
     }
 
@@ -487,11 +501,11 @@ impl BTree {
     /// 3. Tracking the operation for batch sync
     fn log_wal_if_enabled<F>(&mut self, op: F) -> Result<(), WrongoDBError>
     where
-        F: FnOnce(&mut WalFile) -> Result<wal::Lsn, WrongoDBError>,
+        F: FnOnce(&mut Wal) -> Result<wal::Lsn, WrongoDBError>,
     {
-        if self.pager.wal().is_some() {
-            op(self.pager.wal_mut()?)?;
-            let _ = self.pager.log_wal_operation();
+        if let Some(wal) = self.wal.as_mut() {
+            op(wal)?;
+            let _ = wal.log_wal_operation();
         }
         Ok(())
     }

@@ -649,6 +649,83 @@ pub fn wal_path_from_data_path(data_path: &Path) -> PathBuf {
     PathBuf::from(wal_path)
 }
 
+/// WAL handle with batching/sync policy.
+#[derive(Debug)]
+pub struct Wal {
+    file: WalFile,
+    sync_threshold: Option<usize>,
+    operations_since_sync: usize,
+}
+
+impl Wal {
+    pub fn create<P: AsRef<Path>>(data_path: P, page_size: usize) -> Result<Self, WrongoDBError> {
+        let wal_path = wal_path_from_data_path(data_path.as_ref());
+        let file = WalFile::create(&wal_path, page_size as u32)?;
+        Ok(Self {
+            file,
+            sync_threshold: None,
+            operations_since_sync: 0,
+        })
+    }
+
+    pub fn open_or_create<P: AsRef<Path>>(data_path: P, page_size: usize) -> Result<Self, WrongoDBError> {
+        let wal_path = wal_path_from_data_path(data_path.as_ref());
+        let file = if wal_path.exists() {
+            WalFile::open(&wal_path)?
+        } else {
+            WalFile::create(&wal_path, page_size as u32)?
+        };
+        Ok(Self {
+            file,
+            sync_threshold: None,
+            operations_since_sync: 0,
+        })
+    }
+
+    pub fn log_put(&mut self, key: &[u8], value: &[u8]) -> Result<Lsn, WrongoDBError> {
+        self.file.log_put(key, value)
+    }
+
+    pub fn log_delete(&mut self, key: &[u8]) -> Result<Lsn, WrongoDBError> {
+        self.file.log_delete(key)
+    }
+
+    pub fn log_checkpoint(&mut self, root_block_id: u64, generation: u64) -> Result<Lsn, WrongoDBError> {
+        self.file.log_checkpoint(root_block_id, generation)
+    }
+
+    pub fn set_checkpoint_lsn(&mut self, lsn: Lsn) -> Result<(), WrongoDBError> {
+        self.file.set_checkpoint_lsn(lsn)
+    }
+
+    pub fn truncate_to_checkpoint(&mut self) -> Result<(), WrongoDBError> {
+        self.file.truncate_to_checkpoint()
+    }
+
+    pub fn set_sync_threshold(&mut self, threshold: usize) {
+        self.sync_threshold = Some(threshold);
+    }
+
+    pub fn sync(&mut self) -> Result<(), WrongoDBError> {
+        self.file.sync()?;
+        self.operations_since_sync = 0;
+        Ok(())
+    }
+
+    pub fn log_wal_operation(&mut self) -> Result<bool, WrongoDBError> {
+        self.operations_since_sync = self.operations_since_sync.saturating_add(1);
+
+        if let Some(threshold) = self.sync_threshold {
+            if self.operations_since_sync >= threshold {
+                self.sync()?;
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+}
+
 /// Recovery-specific error type for WAL operations.
 #[derive(Debug)]
 pub enum RecoveryError {
