@@ -1,5 +1,21 @@
 # Decisions
 
+## 2026-01-30: BTree pager abstraction via `PageStore`
+
+**Decision**
+- Introduce a `PageStore` trait in the B-tree layer to abstract pager operations.
+- Store the pager in `BTree` as a `Box<dyn PageStore>` and route range iteration through the trait.
+- Add a `data_path()` accessor on the trait to avoid direct `BlockFile` exposure in recovery.
+
+**Why**
+- Decouple B-tree algorithms/iteration from the concrete pager implementation (DIP).
+- Enable alternative page-store implementations (tests, in-memory, future backends) without changing B-tree logic.
+- Keep the public `BTree` API unchanged while still enforcing the abstraction internally.
+
+**Notes**
+- The trait uses the existing pinned page types (`PinnedPage`, `PinnedPageMut`) to keep the refactor small.
+- Dynamic dispatch is limited to pager calls; behavior and persistence semantics are unchanged.
+
 ## 2026-01-28: Extent metadata in header payload + main table naming
 
 **Decision**

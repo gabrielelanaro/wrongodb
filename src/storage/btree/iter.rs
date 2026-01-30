@@ -2,7 +2,7 @@ use crate::core::errors::{StorageError, WrongoDBError};
 
 use super::layout::{map_internal_err, map_leaf_err, page_type, PageType};
 use super::page::{InternalPage, InternalPageError, LeafPage, LeafPageError};
-use super::pager::{Pager, PinnedPage};
+use super::pager::{PageStore, PinnedPage};
 
 #[derive(Debug, Clone, Copy)]
 struct CursorFrame {
@@ -38,12 +38,16 @@ struct CursorFrame {
 ///   -> descend leftmost to the next leaf
 /// ```
 pub struct BTreeRangeIter<'a> {
-    pager: Option<&'a mut Pager>,
+    pager: Option<&'a mut (dyn PageStore + 'a)>,
     end: Option<Vec<u8>>,
     stack: Vec<CursorFrame>,
     leaf: Option<PinnedPage>,
     slot_idx: usize,
     done: bool,
+}
+
+fn missing_pager() -> WrongoDBError {
+    StorageError("range iterator has no backing Pager".into()).into()
 }
 
 impl<'a> BTreeRangeIter<'a> {
@@ -59,7 +63,7 @@ impl<'a> BTreeRangeIter<'a> {
     }
 
     pub(super) fn new(
-        pager: &'a mut Pager,
+        pager: &'a mut (dyn PageStore + 'a),
         root: u64,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
@@ -76,15 +80,13 @@ impl<'a> BTreeRangeIter<'a> {
         Ok(it)
     }
 
-    fn pager_mut(&mut self) -> Result<&mut Pager, WrongoDBError> {
-        self.pager
-            .as_deref_mut()
-            .ok_or_else(|| StorageError("range iterator has no backing Pager".into()).into())
-    }
-
     fn clear_leaf(&mut self) -> Result<(), WrongoDBError> {
         if let Some(leaf) = self.leaf.take() {
-            self.pager_mut()?.unpin_page(leaf.page_id());
+            let pager = self
+                .pager
+                .as_deref_mut()
+                .ok_or_else(missing_pager)?;
+            pager.unpin_page(leaf.page_id());
         }
         Ok(())
     }
@@ -94,12 +96,16 @@ impl<'a> BTreeRangeIter<'a> {
         self.stack.clear();
         let mut node_id = root;
         loop {
-            let mut page = self.pager_mut()?.pin_page(node_id)?;
+            let pager = self
+                .pager
+                .as_deref_mut()
+                .ok_or_else(missing_pager)?;
+            let mut page = pager.pin_page(node_id)?;
             let page_id = page.page_id();
             let page_type = match page_type(page.payload()) {
                 Ok(t) => t,
                 Err(e) => {
-                    self.pager_mut()?.unpin_page(page_id);
+                    pager.unpin_page(page_id);
                     return Err(e);
                 }
             };
@@ -108,7 +114,7 @@ impl<'a> BTreeRangeIter<'a> {
                     let leaf = match LeafPage::open(page.payload_mut()) {
                         Ok(leaf) => leaf,
                         Err(e) => {
-                            self.pager_mut()?.unpin_page(page_id);
+                            pager.unpin_page(page_id);
                             return Err(StorageError(format!("corrupt leaf {node_id}: {e}")).into());
                         }
                     };
@@ -116,7 +122,7 @@ impl<'a> BTreeRangeIter<'a> {
                         match leaf_lower_bound(&leaf, start_key).map_err(map_leaf_err) {
                             Ok(idx) => idx,
                             Err(e) => {
-                                self.pager_mut()?.unpin_page(page_id);
+                                pager.unpin_page(page_id);
                                 return Err(e);
                             }
                         }
@@ -131,7 +137,7 @@ impl<'a> BTreeRangeIter<'a> {
                     let internal = match InternalPage::open(page.payload_mut()) {
                         Ok(internal) => internal,
                         Err(e) => {
-                            self.pager_mut()?.unpin_page(page_id);
+                            pager.unpin_page(page_id);
                             return Err(
                                 StorageError(format!("corrupt internal {node_id}: {e}")).into(),
                             );
@@ -143,7 +149,7 @@ impl<'a> BTreeRangeIter<'a> {
                         {
                             Ok(idx) => idx,
                             Err(e) => {
-                                self.pager_mut()?.unpin_page(page_id);
+                                pager.unpin_page(page_id);
                                 return Err(e);
                             }
                         }
@@ -153,7 +159,7 @@ impl<'a> BTreeRangeIter<'a> {
                     let child_id = match internal_child_at(&internal, child_idx).map_err(map_internal_err) {
                         Ok(id) => id,
                         Err(e) => {
-                            self.pager_mut()?.unpin_page(page_id);
+                            pager.unpin_page(page_id);
                             return Err(e);
                         }
                     };
@@ -161,7 +167,7 @@ impl<'a> BTreeRangeIter<'a> {
                         internal_id: node_id,
                         child_idx,
                     });
-                    self.pager_mut()?.unpin_page(page_id);
+                    pager.unpin_page(page_id);
                     node_id = child_id;
                 }
             }
@@ -171,7 +177,11 @@ impl<'a> BTreeRangeIter<'a> {
     fn advance_to_next_leaf(&mut self) -> Result<bool, WrongoDBError> {
         self.clear_leaf()?;
         while let Some(frame) = self.stack.pop() {
-            let mut page = self.pager_mut()?.pin_page(frame.internal_id)?;
+            let pager = self
+                .pager
+                .as_deref_mut()
+                .ok_or_else(missing_pager)?;
+            let mut page = pager.pin_page(frame.internal_id)?;
             let page_id = page.page_id();
             let next_child_id = match (|| {
                 let internal = InternalPage::open(page.payload_mut()).map_err(|e| {
@@ -195,11 +205,11 @@ impl<'a> BTreeRangeIter<'a> {
             })() {
                 Ok(next) => next,
                 Err(e) => {
-                    self.pager_mut()?.unpin_page(page_id);
+                    pager.unpin_page(page_id);
                     return Err(e);
                 }
             };
-            self.pager_mut()?.unpin_page(page_id);
+            pager.unpin_page(page_id);
             if let Some(next_child_id) = next_child_id {
                 self.descend_leftmost(next_child_id)?;
                 return Ok(true);
@@ -211,12 +221,16 @@ impl<'a> BTreeRangeIter<'a> {
     fn descend_leftmost(&mut self, start_id: u64) -> Result<(), WrongoDBError> {
         let mut node_id = start_id;
         loop {
-            let mut page = self.pager_mut()?.pin_page(node_id)?;
+            let pager = self
+                .pager
+                .as_deref_mut()
+                .ok_or_else(missing_pager)?;
+            let mut page = pager.pin_page(node_id)?;
             let page_id = page.page_id();
             let page_type = match page_type(page.payload()) {
                 Ok(t) => t,
                 Err(e) => {
-                    self.pager_mut()?.unpin_page(page_id);
+                    pager.unpin_page(page_id);
                     return Err(e);
                 }
             };
@@ -230,7 +244,7 @@ impl<'a> BTreeRangeIter<'a> {
                     let internal = match InternalPage::open(page.payload_mut()) {
                         Ok(internal) => internal,
                         Err(e) => {
-                            self.pager_mut()?.unpin_page(page_id);
+                            pager.unpin_page(page_id);
                             return Err(
                                 StorageError(format!("corrupt internal {node_id}: {e}")).into(),
                             );
@@ -239,7 +253,7 @@ impl<'a> BTreeRangeIter<'a> {
                     let child_id = match internal.first_child().map_err(map_internal_err) {
                         Ok(id) => id,
                         Err(e) => {
-                            self.pager_mut()?.unpin_page(page_id);
+                            pager.unpin_page(page_id);
                             return Err(e);
                         }
                     };
@@ -247,7 +261,7 @@ impl<'a> BTreeRangeIter<'a> {
                         internal_id: node_id,
                         child_idx: 0,
                     });
-                    self.pager_mut()?.unpin_page(page_id);
+                    pager.unpin_page(page_id);
                     node_id = child_id;
                 }
             }
@@ -273,7 +287,9 @@ impl<'a> Iterator for BTreeRangeIter<'a> {
                 Ok(v) => v,
                 Err(e) => {
                     self.done = true;
-                    let _ = self.pager_mut().map(|pager| pager.unpin_page(leaf_id));
+                    if let Some(pager) = self.pager.as_deref_mut() {
+                        pager.unpin_page(leaf_id);
+                    }
                     return Some(Err(StorageError(format!(
                         "corrupt leaf {}: {e}",
                         leaf_id
@@ -286,7 +302,9 @@ impl<'a> Iterator for BTreeRangeIter<'a> {
                 Ok(v) => v,
                 Err(e) => {
                     self.done = true;
-                    let _ = self.pager_mut().map(|pager| pager.unpin_page(leaf_id));
+                    if let Some(pager) = self.pager.as_deref_mut() {
+                        pager.unpin_page(leaf_id);
+                    }
                     return Some(Err(map_leaf_err(e)));
                 }
             };
@@ -296,14 +314,18 @@ impl<'a> Iterator for BTreeRangeIter<'a> {
                     Ok(v) => v.to_vec(),
                     Err(e) => {
                         self.done = true;
-                        let _ = self.pager_mut().map(|pager| pager.unpin_page(leaf_id));
+                        if let Some(pager) = self.pager.as_deref_mut() {
+                            pager.unpin_page(leaf_id);
+                        }
                         return Some(Err(map_leaf_err(e)));
                     }
                 };
                 if let Some(end) = &self.end {
                     if k.as_slice() >= end.as_slice() {
                         self.done = true;
-                        let _ = self.pager_mut().map(|pager| pager.unpin_page(leaf_id));
+                        if let Some(pager) = self.pager.as_deref_mut() {
+                            pager.unpin_page(leaf_id);
+                        }
                         return None;
                     }
                 }
@@ -311,7 +333,9 @@ impl<'a> Iterator for BTreeRangeIter<'a> {
                     Ok(v) => v.to_vec(),
                     Err(e) => {
                         self.done = true;
-                        let _ = self.pager_mut().map(|pager| pager.unpin_page(leaf_id));
+                        if let Some(pager) = self.pager.as_deref_mut() {
+                            pager.unpin_page(leaf_id);
+                        }
                         return Some(Err(map_leaf_err(e)));
                     }
                 };

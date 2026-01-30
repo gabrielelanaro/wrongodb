@@ -209,6 +209,36 @@ impl PinnedPageMut {
     }
 }
 
+pub(super) trait PageStore: std::fmt::Debug + Send + Sync {
+    fn page_payload_len(&self) -> usize;
+    fn root_page_id(&self) -> u64;
+    fn set_root_page_id(&mut self, root_page_id: u64) -> Result<(), WrongoDBError>;
+
+    fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError>;
+    fn unpin_page(&mut self, page_id: u64);
+    fn pin_page_mut(&mut self, page_id: u64) -> Result<PinnedPageMut, WrongoDBError>;
+    fn unpin_page_mut_commit(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError>;
+    fn unpin_page_mut_abort(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError>;
+    fn write_new_page(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError>;
+
+    fn request_checkpoint_after_updates(&mut self, count: usize);
+    fn checkpoint_requested(&self) -> bool;
+    fn checkpoint_prepare(&self) -> u64;
+    fn checkpoint_flush_data(&mut self) -> Result<(), WrongoDBError>;
+    fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError>;
+    fn sync_all(&mut self) -> Result<(), WrongoDBError>;
+
+    fn wal(&mut self) -> Option<&mut WalFile>;
+    fn wal_mut(&mut self) -> Result<&mut WalFile, WrongoDBError>;
+    fn take_wal(&mut self) -> Option<WalFile>;
+    fn restore_wal(&mut self, wal: Option<WalFile>);
+    fn set_wal_sync_threshold(&mut self, threshold: usize);
+    fn sync_wal(&mut self) -> Result<(), WrongoDBError>;
+    fn log_wal_operation(&mut self) -> Result<bool, WrongoDBError>;
+
+    fn data_path(&self) -> &Path;
+}
+
 impl Pager {
     pub(super) fn create<P: AsRef<Path>>(path: P, page_size: usize, wal_enabled: bool) -> Result<Self, WrongoDBError> {
         let bf = BlockFile::create(&path, page_size)?;
@@ -406,11 +436,6 @@ impl Pager {
         Ok(false)  // Not synced
     }
 
-    /// Get access to the underlying block file (for recovery)
-    pub(super) fn blockfile(&mut self) -> &mut BlockFile {
-        &mut self.bf
-    }
-
     pub(super) fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError> {
         let payload = self.load_page_and_pin(page_id)?;
         Ok(PinnedPage { page_id, payload })
@@ -590,6 +615,100 @@ impl Pager {
             entry.dirty = false;
         }
         Ok(())
+    }
+}
+
+impl PageStore for Pager {
+    fn page_payload_len(&self) -> usize {
+        Pager::page_payload_len(self)
+    }
+
+    fn root_page_id(&self) -> u64 {
+        Pager::root_page_id(self)
+    }
+
+    fn set_root_page_id(&mut self, root_page_id: u64) -> Result<(), WrongoDBError> {
+        Pager::set_root_page_id(self, root_page_id)
+    }
+
+    fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError> {
+        Pager::pin_page(self, page_id)
+    }
+
+    fn unpin_page(&mut self, page_id: u64) {
+        Pager::unpin_page(self, page_id);
+    }
+
+    fn pin_page_mut(&mut self, page_id: u64) -> Result<PinnedPageMut, WrongoDBError> {
+        Pager::pin_page_mut(self, page_id)
+    }
+
+    fn unpin_page_mut_commit(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError> {
+        Pager::unpin_page_mut_commit(self, page)
+    }
+
+    fn unpin_page_mut_abort(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError> {
+        Pager::unpin_page_mut_abort(self, page)
+    }
+
+    fn write_new_page(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError> {
+        Pager::write_new_page(self, payload)
+    }
+
+    fn request_checkpoint_after_updates(&mut self, count: usize) {
+        Pager::request_checkpoint_after_updates(self, count);
+    }
+
+    fn checkpoint_requested(&self) -> bool {
+        Pager::checkpoint_requested(self)
+    }
+
+    fn checkpoint_prepare(&self) -> u64 {
+        Pager::checkpoint_prepare(self)
+    }
+
+    fn checkpoint_flush_data(&mut self) -> Result<(), WrongoDBError> {
+        Pager::checkpoint_flush_data(self)
+    }
+
+    fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError> {
+        Pager::checkpoint_commit(self, new_root)
+    }
+
+    fn sync_all(&mut self) -> Result<(), WrongoDBError> {
+        Pager::sync_all(self)
+    }
+
+    fn wal(&mut self) -> Option<&mut WalFile> {
+        Pager::wal(self)
+    }
+
+    fn wal_mut(&mut self) -> Result<&mut WalFile, WrongoDBError> {
+        Pager::wal_mut(self)
+    }
+
+    fn take_wal(&mut self) -> Option<WalFile> {
+        Pager::take_wal(self)
+    }
+
+    fn restore_wal(&mut self, wal: Option<WalFile>) {
+        Pager::restore_wal(self, wal);
+    }
+
+    fn set_wal_sync_threshold(&mut self, threshold: usize) {
+        Pager::set_wal_sync_threshold(self, threshold);
+    }
+
+    fn sync_wal(&mut self) -> Result<(), WrongoDBError> {
+        Pager::sync_wal(self)
+    }
+
+    fn log_wal_operation(&mut self) -> Result<bool, WrongoDBError> {
+        Pager::log_wal_operation(self)
+    }
+
+    fn data_path(&self) -> &Path {
+        self.bf.path.as_path()
     }
 }
 

@@ -12,7 +12,7 @@ use layout::{
     build_internal_page, internal_entries, leaf_entries, map_internal_err, map_leaf_err, page_type,
     split_internal_entries, split_leaf_entries, PageType,
 };
-use self::pager::{Pager, PinnedPageMut};
+use self::pager::{PageStore, Pager, PinnedPageMut};
 use self::wal::WalFile;
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::block::file::NONE_BLOCK_ID;
@@ -43,7 +43,7 @@ type KeyValueIter<'a> = BTreeRangeIter<'a>;
 
 #[derive(Debug)]
 pub struct BTree {
-    pager: Pager,
+    pager: Box<dyn PageStore>,
 }
 
 impl BTree {
@@ -51,13 +51,17 @@ impl BTree {
         let mut pager = Pager::create(path, page_size, wal_enabled)?;
         init_root_if_missing(&mut pager)?;
         pager.checkpoint()?;
-        Ok(Self { pager })
+        Ok(Self {
+            pager: Box::new(pager),
+        })
     }
 
     pub fn open<P: AsRef<Path>>(path: P, wal_enabled: bool) -> Result<Self, WrongoDBError> {
-        let pager = Pager::open(path, wal_enabled)?;
-        let mut tree = Self { pager };
-        init_root_if_missing(&mut tree.pager)?;
+        let mut pager = Pager::open(path, wal_enabled)?;
+        init_root_if_missing(&mut pager)?;
+        let mut tree = Self {
+            pager: Box::new(pager),
+        };
 
         if wal_enabled {
             if let Err(e) = tree.recover_from_wal() {
@@ -268,7 +272,7 @@ impl BTree {
     /// It replays all WAL records from the checkpoint LSN via logical BTree operations.
     fn recover_from_wal(&mut self) -> Result<(), WrongoDBError> {
         // Get the data file path from the blockfile
-        let data_path = &self.pager.blockfile().path;
+        let data_path = self.pager.data_path();
 
         let wal_path = wal::wal_path_from_data_path(data_path);
 
@@ -337,7 +341,7 @@ impl BTree {
         if root == NONE_BLOCK_ID {
             return Ok(BTreeRangeIter::empty());
         }
-        BTreeRangeIter::new(&mut self.pager, root, start, end)
+        BTreeRangeIter::new(self.pager.as_mut(), root, start, end)
     }
 
     /// Delete a key from the subtree rooted at `node_id`.
@@ -638,7 +642,7 @@ struct DeleteResult {
     deleted: bool,
 }
 
-fn init_root_if_missing(pager: &mut Pager) -> Result<(), WrongoDBError> {
+fn init_root_if_missing(pager: &mut dyn PageStore) -> Result<(), WrongoDBError> {
     if pager.root_page_id() != NONE_BLOCK_ID {
         return Ok(());
     }
