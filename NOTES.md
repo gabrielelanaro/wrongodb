@@ -35,3 +35,23 @@ in favor of the composite-key approach above.
 ## Implications for minimongo
 - Prefer logical WAL records and replay via BTree writes to avoid page-id mapping and split logging.
 - Make replay idempotent (put as upsert, delete missing keys ok).
+
+# Notes: Insert latency benchmark (WrongoDB server vs MongoDB)
+
+Date: 2026-01-31
+
+Setup
+- WrongoDB server already running on 127.0.0.1:27017 (buildInfo version 0.0.1-wrongodb). Not restarted; existing data not cleared.
+- MongoDB docker container mongo:7 on 127.0.0.1:27018 via colima.
+- Client: pymongo with retryWrites=False, directConnection=True, default write concern.
+- Workload: 100B payload, 100 warmup inserts, 1000 measured inserts, sequential single-thread.
+
+Results (ms)
+- WrongoDB runs: avg 0.356 / 0.352 / 0.362; p50 0.350 / 0.347 / 0.352; p95 0.523 / 0.504 / 0.515; p99 0.631 / 0.597 / 0.711
+- MongoDB runs:  avg 0.238 / 0.218 / 0.238; p50 0.229 / 0.212 / 0.201; p95 0.306 / 0.286 / 0.284; p99 0.342 / 0.396 / 0.903
+- Medians: WrongoDB avg 0.356 ms; MongoDB avg 0.238 ms; ratio ~1.50x
+
+Command sketch
+- Start MongoDB: docker run --rm -d --name mongo-bench -p 27018:27017 mongo:7
+- Bench: Python script using pymongo insert_one timing (see terminal log for exact script).
+- Stop MongoDB: docker rm -f mongo-bench

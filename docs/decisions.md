@@ -1,5 +1,18 @@
 # Decisions
 
+## 2026-01-31: Configurable server listen address
+
+**Decision**
+- Allow the server listen address to be overridden via (in order): CLI arg, `WRONGO_ADDR`, `WRONGO_PORT`.
+- Default remains `127.0.0.1:27017` when no overrides are provided.
+
+**Why**
+- Avoid port collisions during local development and benchmarks.
+- Enable multiple local instances without code changes.
+
+**Notes**
+- `WRONGO_PORT` only changes the port and still binds on `127.0.0.1`.
+
 ## 2026-01-30: BTree pager abstraction via `PageStore`
 
 **Decision**
