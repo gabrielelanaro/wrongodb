@@ -40,6 +40,10 @@ Limit strictly to the following aspects and criteria:
 
 - Are we having unnecessary indirection? If a function is just calling another function, consider inlining it.
 
+### Comments
+
+- Do comments explain the "why" and not the "what"? Comments should only be added in confusing parts and explain why this particular decision was made. If the code is clear, it should not need comments, so consider removing them.
+
 ### Meaningful, tight interfaces
 
 - Are the interfaces defined meaningful and tight, are they a pleasure to use?
