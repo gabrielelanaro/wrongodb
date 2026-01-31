@@ -17,3 +17,9 @@ uuid = { version = "1", features = ["v4", "fast-rng"] }
 [dev-dependencies]
 tempfile = "3"
 futures-util = "0.3"
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+
+[[bench]]
+name = "insert_latency"
+harness = false
