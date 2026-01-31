@@ -22,7 +22,7 @@ fn server_addr() -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = WrongoDB::open("test.db", ["name"])?;
+    let db = WrongoDB::open("test.db")?;
     let db = Arc::new(Mutex::new(db));
     let addr = server_addr();
     start_server(&addr, db).await?;

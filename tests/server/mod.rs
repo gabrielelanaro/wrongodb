@@ -11,7 +11,7 @@ mod server_tests {
         // Start server in background
         let tmp = tempdir().unwrap();
         let db_path = tmp.path().join("test_server.db");
-        let db = WrongoDB::open(db_path.to_str().unwrap(), ["name"]).unwrap();
+        let db = WrongoDB::open(db_path.to_str().unwrap()).unwrap();
         let db = Arc::new(Mutex::new(db));
 
         let db_clone = Arc::clone(&db);
@@ -89,7 +89,7 @@ mod server_tests {
     async fn test_supported_mongosh_commands() {
         let tmp = tempdir().unwrap();
         let db_path = tmp.path().join("test_shell.db");
-        let db = WrongoDB::open(db_path.to_str().unwrap(), ["name"]).unwrap();
+        let db = WrongoDB::open(db_path.to_str().unwrap()).unwrap();
         let db = Arc::new(Mutex::new(db));
 
         let db_clone = Arc::clone(&db);

@@ -17,48 +17,30 @@ pub struct Collection {
     main_table: MainTable,
     secondary_indexes: SecondaryIndexManager,
     doc_count: usize,
-    wal_enabled: bool,
 }
 
 impl Collection {
-    pub(crate) fn new(
-        path: &Path,
-        index_fields: &HashSet<String>,
-    ) -> Result<Self, WrongoDBError> {
-        let wal_enabled = true; // Enable WAL for durability
+    pub(crate) fn new(path: &Path, wal_enabled: bool) -> Result<Self, WrongoDBError> {
         let main_table_path = PathBuf::from(format!("{}.main.wt", path.display()));
         let main_table = MainTable::open_or_create(&main_table_path, wal_enabled)?;
 
-        // Start with empty manager - indexes will be created in load_existing after reading docs
+        // Start with empty manager - indexes can be created via create_index()
         let secondary_indexes = SecondaryIndexManager::empty(path, wal_enabled);
 
         let mut coll = Self {
             main_table,
             secondary_indexes,
             doc_count: 0,
-            wal_enabled,
         };
-        coll.load_existing(path, index_fields)?;
+        coll.load_existing(path)?;
         Ok(coll)
     }
 
-    fn load_existing(
-        &mut self,
-        path: &Path,
-        index_fields: &HashSet<String>,
-    ) -> Result<(), WrongoDBError> {
+    fn load_existing(&mut self, _path: &Path) -> Result<(), WrongoDBError> {
         let docs = self.main_table.scan()?;
         self.doc_count = docs.len();
 
-        // Now rebuild secondary indexes with all documents
-        // This handles the case where index files don't exist yet
-        self.secondary_indexes = SecondaryIndexManager::open_or_rebuild(
-            path,
-            index_fields.iter().cloned(),
-            self.wal_enabled,
-            &docs,
-        )?;
-
+        // Indexes are not created automatically - use create_index() after getting collection
         Ok(())
     }
 

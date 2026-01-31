@@ -5,7 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔧 Testing checkpoint functionality...\n");
 
     // Open database
-    let mut db = WrongoDB::open("test_checkpoint.db", std::iter::empty::<String>())?;
+    let mut db = WrongoDB::open("test_checkpoint.db")?;
 
     {
         let coll = db.collection("test")?;

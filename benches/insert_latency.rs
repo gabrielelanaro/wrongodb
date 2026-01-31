@@ -35,7 +35,7 @@ fn create_db(name: &str) -> WrongoDB {
     // Clean up any existing database first
     let _ = fs::remove_dir_all(&path);
     // Open with no secondary indexes, sync_every_write: false for performance
-    WrongoDB::open(&path, Vec::<String>::new()).expect("Failed to create database")
+    WrongoDB::open(&path).expect("Failed to create database")
 }
 
 fn sequential_key(i: usize) -> String {

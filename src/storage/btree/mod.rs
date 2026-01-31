@@ -49,6 +49,7 @@ pub struct BTree {
 }
 
 impl BTree {
+    /// Create a new BTree with WAL enabled or disabled.
     pub fn create<P: AsRef<Path>>(path: P, page_size: usize, wal_enabled: bool) -> Result<Self, WrongoDBError> {
         let mut pager = Pager::create(path.as_ref(), page_size)?;
         init_root_if_missing(&mut pager)?;
@@ -64,6 +65,7 @@ impl BTree {
         })
     }
 
+    /// Open an existing BTree with WAL enabled or disabled.
     pub fn open<P: AsRef<Path>>(path: P, wal_enabled: bool) -> Result<Self, WrongoDBError> {
         let mut pager = Pager::open(path.as_ref())?;
         init_root_if_missing(&mut pager)?;
@@ -80,7 +82,6 @@ impl BTree {
         if wal_enabled {
             if let Err(e) = tree.recover_from_wal() {
                 eprintln!("WAL recovery failed: {}. Database may be inconsistent.", e);
-                // Continue anyway - corrupted WAL shouldn't prevent database open
             }
         }
 
@@ -346,6 +347,7 @@ impl BTree {
             eprintln!("Starting WAL recovery from beginning");
         }
 
+        // Temporarily take WAL to prevent re-logging during recovery
         let saved_wal = self.wal.take();
 
         let result = (|| {

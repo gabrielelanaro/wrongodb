@@ -1,9 +1,45 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::WrongoDBError;
 
 use super::collection::Collection;
+
+/// Configuration for opening a WrongoDB database.
+///
+/// # Example
+/// ```
+/// use wrongodb::WrongoDBConfig;
+///
+/// let config = WrongoDBConfig::new()
+///     .wal_enabled(true);
+/// ```
+#[derive(Debug, Clone)]
+pub struct WrongoDBConfig {
+    /// Enable WAL for durability (default: true)
+    pub wal_enabled: bool,
+}
+
+impl Default for WrongoDBConfig {
+    fn default() -> Self {
+        Self {
+            wal_enabled: true,
+        }
+    }
+}
+
+impl WrongoDBConfig {
+    /// Create a new config with defaults.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable or disable WAL (default: true).
+    pub fn wal_enabled(mut self, enabled: bool) -> Self {
+        self.wal_enabled = enabled;
+        self
+    }
+}
 
 /// Database statistics
 #[derive(Debug, Clone)]
@@ -17,33 +53,50 @@ pub struct DbStats {
 pub struct WrongoDB {
     base_path: PathBuf,
     collections: HashMap<String, Collection>,
-    default_index_fields: HashSet<String>,
+    wal_enabled: bool,
 }
 
 impl WrongoDB {
-    pub fn open<P, I, S>(path: P, index_fields: I) -> Result<Self, WrongoDBError>
+    /// Open a database with the given configuration.
+    ///
+    /// # Example
+    /// ```
+    /// use wrongodb::{WrongoDB, WrongoDBConfig};
+    ///
+    /// let config = WrongoDBConfig::new()
+    ///     .wal_enabled(true);
+    ///
+    /// let db = WrongoDB::open_with_config("data.db", config).unwrap();
+    /// ```
+    pub fn open_with_config<P>(path: P, config: WrongoDBConfig) -> Result<Self, WrongoDBError>
     where
         P: AsRef<Path>,
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
     {
         let base_path = path.as_ref().to_path_buf();
-        let default_index_fields: HashSet<String> =
-            index_fields.into_iter().map(|s| s.into()).collect();
 
         let db = Self {
             base_path,
             collections: HashMap::new(),
-            default_index_fields,
+            wal_enabled: config.wal_enabled,
         };
 
         Ok(db)
     }
 
+    /// Open a database with default settings.
+    ///
+    /// WAL is enabled by default.
+    pub fn open<P>(path: P) -> Result<Self, WrongoDBError>
+    where
+        P: AsRef<Path>,
+    {
+        Self::open_with_config(path, WrongoDBConfig::default())
+    }
+
     pub fn collection(&mut self, name: &str) -> Result<&mut Collection, WrongoDBError> {
         if !self.collections.contains_key(name) {
             let coll_path = PathBuf::from(format!("{}.{}", self.base_path.display(), name));
-            let coll = Collection::new(&coll_path, &self.default_index_fields)?;
+            let coll = Collection::new(&coll_path, self.wal_enabled)?;
             self.collections.insert(name.to_string(), coll);
         }
         Ok(self.collections.get_mut(name).unwrap())

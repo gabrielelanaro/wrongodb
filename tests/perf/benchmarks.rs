@@ -20,7 +20,7 @@ fn benchmark_main_table_vs_append_only() {
     let main_path = base.clone();
     let start = Instant::now();
     {
-        let mut db = WrongoDB::open(&main_path, [] as [&str; 0]).unwrap();
+        let mut db = WrongoDB::open(&main_path).unwrap();
         {
             let coll = db.collection("test").unwrap();
             for doc in &docs {

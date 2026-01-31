@@ -10,7 +10,7 @@ fn insert_and_find_roundtrip() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("db.log");
 
-    let mut db = WrongoDB::open(&path, ["name"]).unwrap();
+    let mut db = WrongoDB::open(&path).unwrap();
 
     let coll = db.collection("test").unwrap();
     let alice = coll.insert_one(json!({"name": "alice", "age": 30})).unwrap();
@@ -36,13 +36,13 @@ fn rebuilds_index_from_disk_on_open() {
     let path = tmp.path().join("db.log");
 
     {
-        let mut db = WrongoDB::open(&path, ["name"]).unwrap();
+        let mut db = WrongoDB::open(&path).unwrap();
         let coll = db.collection("test").unwrap();
         coll.insert_one(json!({"name": "alice"})).unwrap();
         coll.insert_one(json!({"name": "bob"})).unwrap();
     }
 
-    let mut db2 = WrongoDB::open(&path, ["name"]).unwrap();
+    let mut db2 = WrongoDB::open(&path).unwrap();
     let coll = db2.collection("test").unwrap();
     let bobs = coll.find(Some(json!({"name": "bob"}))).unwrap();
     assert_eq!(bobs.len(), 1);
@@ -53,7 +53,7 @@ fn find_one_by_id_uses_main_table() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("db.log");
 
-    let mut db = WrongoDB::open(&path, ["name"]).unwrap();
+    let mut db = WrongoDB::open(&path).unwrap();
     let alice_id = {
         let coll = db.collection("test").unwrap();
         let alice = coll.insert_one(json!({"name": "alice"})).unwrap();
@@ -72,7 +72,7 @@ fn find_one_by_id_uses_main_table() {
 
     // Re-open and ensure the main table persists _id lookups.
     drop(db);
-    let mut db2 = WrongoDB::open(&path, ["name"]).unwrap();
+    let mut db2 = WrongoDB::open(&path).unwrap();
     let coll2 = db2.collection("test").unwrap();
     let got2 = coll2
         .find_one(Some(json!({"_id": alice_id})))
@@ -86,7 +86,7 @@ fn document_crud_roundtrip() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("db.log");
 
-    let mut db = WrongoDB::open(&path, ["name"]).unwrap();
+    let mut db = WrongoDB::open(&path).unwrap();
     let coll = db.collection("test").unwrap();
     let doc = coll
         .insert_one(json!({"name": "alice", "age": 30}))

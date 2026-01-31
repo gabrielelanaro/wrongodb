@@ -17,9 +17,12 @@ fn index_created_on_empty_collection() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test.db");
 
-    let mut db = WrongoDB::open(&path, ["username"]).unwrap();
+    let mut db = WrongoDB::open(&path).unwrap();
     {
         let coll = db.collection("test").unwrap();
+
+        // Create index
+        coll.create_index("username").unwrap();
 
         // Insert documents
         coll.insert_one(json!({"username": "alice", "age": 30}))
@@ -51,9 +54,10 @@ fn index_survives_database_restart() {
 
     // Create database and insert documents
     {
-        let mut db = WrongoDB::open(&path, ["email"]).unwrap();
+        let mut db = WrongoDB::open(&path).unwrap();
         {
             let coll = db.collection("test").unwrap();
+            coll.create_index("email").unwrap();
             coll.insert_one(json!({"email": "alice@example.com", "name": "Alice"}))
                 .unwrap();
             coll.insert_one(json!({"email": "bob@example.com", "name": "Bob"}))
@@ -64,7 +68,7 @@ fn index_survives_database_restart() {
 
     // Reopen database
     {
-        let mut db = WrongoDB::open(&path, ["email"]).unwrap();
+        let mut db = WrongoDB::open(&path).unwrap();
 
         // Query should work immediately without rebuilding
         let coll = db.collection("test").unwrap();
@@ -86,7 +90,7 @@ fn index_builds_from_existing_documents() {
 
     // Create data without index
     {
-        let mut db = WrongoDB::open(&path, [] as [&str; 0]).unwrap();
+        let mut db = WrongoDB::open(&path).unwrap();
         {
             let coll = db.collection("test").unwrap();
             coll.insert_one(json!({"city": "nyc", "name": "alice"}))
@@ -98,10 +102,11 @@ fn index_builds_from_existing_documents() {
         db.checkpoint().unwrap();
     }
 
-    // Now open with city index - should build from existing documents
+    // Now create city index and query
     {
-        let mut db = WrongoDB::open(&path, ["city"]).unwrap();
+        let mut db = WrongoDB::open(&path).unwrap();
         let coll = db.collection("test").unwrap();
+        coll.create_index("city").unwrap();
         let nyc_docs = coll.find(Some(json!({"city": "nyc"}))).unwrap();
         assert_eq!(nyc_docs.len(), 2, "Expected 2 NYC docs");
     }
@@ -112,9 +117,10 @@ fn index_maintenance_on_update() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test.db");
 
-    let mut db = WrongoDB::open(&path, ["status"]).unwrap();
+    let mut db = WrongoDB::open(&path).unwrap();
 
     let coll = db.collection("test").unwrap();
+    coll.create_index("status").unwrap();
     coll.insert_one(json!({"name": "alice", "status": "active"}))
         .unwrap();
     coll.insert_one(json!({"name": "bob", "status": "inactive"}))
@@ -143,9 +149,10 @@ fn index_maintenance_on_delete() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test.db");
 
-    let mut db = WrongoDB::open(&path, ["category"]).unwrap();
+    let mut db = WrongoDB::open(&path).unwrap();
 
     let coll = db.collection("test").unwrap();
+    coll.create_index("category").unwrap();
     coll.insert_one(json!({"name": "item1", "category": "electronics"}))
         .unwrap();
     coll.insert_one(json!({"name": "item2", "category": "electronics"}))
@@ -173,9 +180,11 @@ fn multiple_indexes_on_same_collection() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test.db");
 
-    let mut db = WrongoDB::open(&path, ["dept", "role"]).unwrap();
+    let mut db = WrongoDB::open(&path).unwrap();
     {
         let coll = db.collection("test").unwrap();
+        coll.create_index("dept").unwrap();
+        coll.create_index("role").unwrap();
         coll.insert_one(json!({"name": "alice", "dept": "eng", "role": "dev"}))
             .unwrap();
         coll.insert_one(json!({"name": "bob", "dept": "eng", "role": "manager"}))
@@ -208,9 +217,10 @@ fn index_persistence_with_checkpoint() {
 
     // Create and populate database
     {
-        let mut db = WrongoDB::open(&path, ["priority"]).unwrap();
+        let mut db = WrongoDB::open(&path).unwrap();
         {
             let coll = db.collection("test").unwrap();
+            coll.create_index("priority").unwrap();
             coll.insert_one(json!({"task": "task1", "priority": 1}))
                 .unwrap();
             coll.insert_one(json!({"task": "task2", "priority": 2}))
@@ -226,7 +236,7 @@ fn index_persistence_with_checkpoint() {
 
     // Reopen and query
     {
-        let mut db = WrongoDB::open(&path, ["priority"]).unwrap();
+        let mut db = WrongoDB::open(&path).unwrap();
         let coll = db.collection("test").unwrap();
         let high_priority = coll.find(Some(json!({"priority": 2}))).unwrap();
         assert_eq!(high_priority.len(), 1);
@@ -243,7 +253,7 @@ fn create_index_dynamically() {
     let path = tmp.path().join("test.db");
 
     // Create data without index
-    let mut db = WrongoDB::open(&path, [] as [&str; 0]).unwrap();
+    let mut db = WrongoDB::open(&path).unwrap();
     {
         let coll = db.collection("test").unwrap();
         coll.insert_one(json!({"name": "alice", "country": "usa"}))

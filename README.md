@@ -46,13 +46,22 @@ use serde_json::json;
 use wrongodb::WrongoDB;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut db = WrongoDB::open("data/db.log", ["name"])?;
+    // Open database (WAL enabled by default)
+    let mut db = WrongoDB::open("data/db.log")?;
+
+    // Get collection
     let mut coll = db.collection("test")?;
+
+    // Create indexes for faster queries (optional)
+    coll.create_index("name")?;
+
+    // Insert documents
     coll.insert_one(json!({"name": "alice", "age": 30}))?;
     coll.insert_one(json!({"name": "bob", "age": 25}))?;
 
+    // Query (uses index if available, otherwise scans)
     println!("{:?}", coll.find(None)?); // all docs
-    println!("{:?}", coll.find(Some(json!({"name": "bob"})))?); // equality on indexed field
+    println!("{:?}", coll.find(Some(json!({"name": "bob"})))?);
     Ok(())
 }
 ```

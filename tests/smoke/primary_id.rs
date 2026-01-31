@@ -15,7 +15,7 @@ fn auto_id_generation() {
     let tmp = tempdir().unwrap();
     let log_path = tmp.path().join("db.log");
 
-    let mut db = WrongoDB::open(&log_path, ["name"]).unwrap();
+    let mut db = WrongoDB::open(&log_path).unwrap();
     let coll = db.collection("test").unwrap();
 
     // Default `_id` is ObjectId-like (24 lowercase hex chars).
@@ -30,7 +30,7 @@ fn primary_btree_file_created() {
     let log_path = tmp.path().join("db.log");
     let main_table_path = tmp.path().join("db.log.test.main.wt");
 
-    let mut db = WrongoDB::open(&log_path, ["name"]).unwrap();
+    let mut db = WrongoDB::open(&log_path).unwrap();
     let coll = db.collection("test").unwrap();
 
     coll.insert_one(json!({"name": "auto"})).unwrap();
@@ -45,7 +45,7 @@ fn duplicate_key_rejection() {
     let tmp = tempdir().unwrap();
     let log_path = tmp.path().join("db.log");
 
-    let mut db = WrongoDB::open(&log_path, ["name"]).unwrap();
+    let mut db = WrongoDB::open(&log_path).unwrap();
     let coll = db.collection("test").unwrap();
 
     // Uniqueness enforcement: duplicate `_id` insert fails.
@@ -67,7 +67,7 @@ fn embedded_id_field_ordering() {
     let tmp = tempdir().unwrap();
     let log_path = tmp.path().join("db.log");
 
-    let mut db = WrongoDB::open(&log_path, ["name"]).unwrap();
+    let mut db = WrongoDB::open(&log_path).unwrap();
     let coll = db.collection("test").unwrap();
 
     // Embedded-doc field order matters for `_id` (Mongo-like):
@@ -95,7 +95,7 @@ fn persistence_across_reopen() {
     let tmp = tempdir().unwrap();
     let log_path = tmp.path().join("db.log");
 
-    let mut db = WrongoDB::open(&log_path, ["name"]).unwrap();
+    let mut db = WrongoDB::open(&log_path).unwrap();
     {
         let coll = db.collection("test").unwrap();
         coll.insert_one(json!({"_id": {"b": 2, "a": 1}, "name": "order2"}))
@@ -104,7 +104,7 @@ fn persistence_across_reopen() {
 
     // Re-open and verify primary lookups still work (index rebuild on open).
     drop(db);
-    let mut db2 = WrongoDB::open(&log_path, ["name"]).unwrap();
+    let mut db2 = WrongoDB::open(&log_path).unwrap();
     let coll = db2.collection("test").unwrap();
     let got = coll
         .find_one(Some(json!({"_id": {"b": 2, "a": 1}})))
