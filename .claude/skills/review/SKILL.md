@@ -24,6 +24,10 @@ Limit strictly to the following aspects and criteria:
 
 - Does the current class contain a single isolated functionality or is it expanding into a god class? Think again on the overall purpose and evaluate how the responsibility can be split.
 
+## Dependency injection (DI)
+
+- Are we doing some weird initialization in the main constructor? Consider accepting dependencies directly by simplifying the main constructor and moving the initialization of its to a separate factory method. Or whether we need the factory method at all (maybe this is internally initialized class and we don't care)
+
 ### Naming
 
 - Files: does each file has a clear name that reflects its purpose? Or does it look like a leftover or a hack?
@@ -31,3 +35,15 @@ Limit strictly to the following aspects and criteria:
 ### Layout
 
 - Does the file belong to its location? Does the file belong to this module or specific directory? If not or it's weird consider renames, or repositioning the file in another place.
+
+### Simplicity
+
+- Are we having unnecessary indirection? If a function is just calling another function, consider inlining it.
+
+### Meaningful, tight interfaces
+
+- Are the interfaces defined meaningful and tight, are they a pleasure to use?
+- Are they too broad or too narrow?
+- Are they redundant?
+- Are they all used outside Are there too many publid methods? 3–7 public methods is a sweet spot.
+- Does it follow ISP, the interface segregation principle?
