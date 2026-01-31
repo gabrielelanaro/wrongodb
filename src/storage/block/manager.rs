@@ -374,6 +374,10 @@ impl BlockManager {
         self.insert_alloc(extent);
     }
 
+    pub fn add_avail_extent(&mut self, extent: Extent) {
+        self.insert_avail(extent);
+    }
+
     pub fn free_extent(&mut self, offset: u64, size: u64) -> Result<(), WrongoDBError> {
         if size == 0 {
             return Ok(());

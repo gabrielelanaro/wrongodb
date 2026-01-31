@@ -7,12 +7,16 @@ use serde_json::{Map, Value};
 // BSON <-> Value conversion utilities
 // ============================================================================
 
-pub fn bson_to_value(doc: &Document) -> Value {
+pub fn bson_to_json_document(doc: &Document) -> Map<String, Value> {
     let mut map = Map::new();
     for (k, v) in doc {
         map.insert(k.clone(), bson_value_to_value(v));
     }
-    Value::Object(map)
+    map
+}
+
+pub fn bson_to_value(doc: &Document) -> Value {
+    Value::Object(bson_to_json_document(doc))
 }
 
 pub fn bson_value_to_value(bson: &Bson) -> Value {
@@ -90,8 +94,8 @@ impl Command for InsertCommand {
                         Some(Bson::ObjectId(id)) => *id,
                         _ => ObjectId::new(),
                     };
-                    let json_value = bson_to_value(&doc_with_id);
-                    if db.insert_one_into(coll_name, json_value).is_ok() {
+                    let json_doc = bson_to_json_document(&doc_with_id);
+                    if db.insert_one_doc_into(coll_name, json_doc).is_ok() {
                         ids.push(id);
                     }
                 }

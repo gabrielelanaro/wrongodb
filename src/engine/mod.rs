@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::core::document::{normalize_document, validate_is_object};
+use crate::core::document::{normalize_document_in_place, validate_is_object};
 use crate::index::SecondaryIndexManager;
 use crate::storage::main_table::MainTable;
 use crate::{Document, WrongoDBError};
@@ -66,11 +66,15 @@ impl Collection {
     fn insert_one(&mut self, doc: Value) -> Result<Document, WrongoDBError> {
         validate_is_object(&doc)?;
         let obj = doc.as_object().expect("validated object").clone();
-        let normalized = normalize_document(&obj)?;
-        self.main_table.insert(&normalized)?;
-        self.secondary_indexes.add(&normalized)?;
+        self.insert_one_doc(obj)
+    }
+
+    fn insert_one_doc(&mut self, mut doc: Document) -> Result<Document, WrongoDBError> {
+        normalize_document_in_place(&mut doc)?;
+        self.main_table.insert(&doc)?;
+        self.secondary_indexes.add(&doc)?;
         self.doc_count = self.doc_count.saturating_add(1);
-        Ok(normalized)
+        Ok(doc)
     }
 
     fn find(&mut self, filter: Option<Value>) -> Result<Vec<Document>, WrongoDBError> {
@@ -401,6 +405,10 @@ impl WrongoDB {
         self.insert_one_into("test", doc)
     }
 
+    pub fn insert_one_doc(&mut self, doc: Document) -> Result<Document, WrongoDBError> {
+        self.insert_one_doc_into("test", doc)
+    }
+
     pub fn find(&mut self, filter: Option<Value>) -> Result<Vec<Document>, WrongoDBError> {
         self.find_in("test", filter)
     }
@@ -420,6 +428,15 @@ impl WrongoDB {
     ) -> Result<Document, WrongoDBError> {
         let coll = self.get_or_create_collection(collection)?;
         coll.insert_one(doc)
+    }
+
+    pub fn insert_one_doc_into(
+        &mut self,
+        collection: &str,
+        doc: Document,
+    ) -> Result<Document, WrongoDBError> {
+        let coll = self.get_or_create_collection(collection)?;
+        coll.insert_one_doc(doc)
     }
 
     pub fn find_in(

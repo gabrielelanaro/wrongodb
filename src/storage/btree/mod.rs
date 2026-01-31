@@ -148,7 +148,7 @@ impl BTree {
             return Err(StorageError("btree missing root".into()).into());
         }
 
-        let result = self.insert_recursive(root, key, value)?;
+        let result = self.insert_recursive(root, key, value, InsertMode::Upsert)?;
         if let Some(split) = result.split {
             let payload_len = self.pager.page_payload_len();
             let mut root_internal_bytes = vec![0u8; payload_len];
@@ -175,6 +175,44 @@ impl BTree {
         }
 
         Ok(())
+    }
+
+    pub fn insert_unique(&mut self, key: &[u8], value: &[u8]) -> Result<bool, WrongoDBError> {
+        let root = self.pager.root_page_id();
+        if root == NONE_BLOCK_ID {
+            return Err(StorageError("btree missing root".into()).into());
+        }
+
+        let result = self.insert_recursive(root, key, value, InsertMode::Unique)?;
+        if !result.inserted {
+            return Ok(false);
+        }
+
+        if let Some(split) = result.split {
+            let payload_len = self.pager.page_payload_len();
+            let mut root_internal_bytes = vec![0u8; payload_len];
+            {
+                let mut internal =
+                    InternalPage::init(&mut root_internal_bytes, result.new_node_id)
+                        .map_err(|e| StorageError(format!("init new root internal failed: {e}")))?;
+                internal
+                    .put_separator(&split.sep_key, split.right_child)
+                    .map_err(map_internal_err)?;
+            }
+
+            let new_root_id = self.pager.write_new_page(&root_internal_bytes)?;
+            self.pager.set_root_page_id(new_root_id)?;
+        } else {
+            self.pager.set_root_page_id(result.new_node_id)?;
+        }
+
+        self.log_wal_if_enabled(|w| w.log_put(key, value))?;
+
+        if self.pager.checkpoint_requested() {
+            self.checkpoint()?;
+        }
+
+        Ok(true)
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<bool, WrongoDBError> {
@@ -465,6 +503,7 @@ impl BTree {
         node_id: u64,
         key: &[u8],
         value: &[u8],
+        mode: InsertMode,
     ) -> Result<InsertResult, WrongoDBError> {
         let mut page = self.pager.pin_page_mut(node_id)?;
         let page_type = match page_type(page.payload()) {
@@ -477,12 +516,16 @@ impl BTree {
             }
         };
         let result = match page_type {
-            PageType::Leaf => self.insert_into_leaf(node_id, &mut page, key, value),
-            PageType::Internal => self.insert_into_internal(node_id, &mut page, key, value),
+            PageType::Leaf => self.insert_into_leaf(node_id, &mut page, key, value, mode),
+            PageType::Internal => self.insert_into_internal(node_id, &mut page, key, value, mode),
         };
         match result {
             Ok(ok) => {
-                self.pager.unpin_page_mut_commit(page)?;
+                if ok.inserted {
+                    self.pager.unpin_page_mut_commit(page)?;
+                } else {
+                    self.pager.unpin_page_mut_abort(page)?;
+                }
                 Ok(ok)
             }
             Err(err) => {
@@ -528,17 +571,28 @@ impl BTree {
         page: &mut PinnedPageMut,
         key: &[u8],
         value: &[u8],
+        mode: InsertMode,
     ) -> Result<InsertResult, WrongoDBError> {
         let payload_len = page.payload().len();
         let page_id = page.page_id();
         {
             let mut leaf = LeafPage::open(page.payload_mut())
                 .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
+            if mode == InsertMode::Unique {
+                if leaf.contains_key(key).map_err(map_leaf_err)? {
+                    return Ok(InsertResult {
+                        new_node_id: page_id,
+                        split: None,
+                        inserted: false,
+                    });
+                }
+            }
             match leaf.put(key, value) {
                 Ok(()) => {
                     return Ok(InsertResult {
                         new_node_id: page_id,
                         split: None,
+                        inserted: true,
                     });
                 }
                 Err(LeafPageError::PageFull) => { /* split below */ }
@@ -560,6 +614,7 @@ impl BTree {
                 sep_key: split_key,
                 right_child: right_leaf_id,
             }),
+            inserted: true,
         })
     }
 
@@ -579,6 +634,7 @@ impl BTree {
         page: &mut PinnedPageMut,
         key: &[u8],
         value: &[u8],
+        mode: InsertMode,
     ) -> Result<InsertResult, WrongoDBError> {
         let payload_len = page.payload().len();
         let page_id = page.page_id();
@@ -590,7 +646,14 @@ impl BTree {
             entries[child_idx - 1].1
         };
 
-        let child_result = self.insert_recursive(child_id, key, value)?;
+        let child_result = self.insert_recursive(child_id, key, value, mode)?;
+        if !child_result.inserted {
+            return Ok(InsertResult {
+                new_node_id: page_id,
+                split: None,
+                inserted: false,
+            });
+        }
         if child_idx == 0 {
             first_child = child_result.new_node_id;
         } else {
@@ -606,6 +669,7 @@ impl BTree {
             return Ok(InsertResult {
                 new_node_id: page_id,
                 split: None,
+                inserted: true,
             });
         }
 
@@ -622,6 +686,7 @@ impl BTree {
                 sep_key: promoted_key,
                 right_child: right_internal_id,
             }),
+            inserted: true,
         })
     }
 }
@@ -637,10 +702,17 @@ struct SplitInfo {
     right_child: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InsertMode {
+    Upsert,
+    Unique,
+}
+
 #[derive(Debug, Clone)]
 struct InsertResult {
     new_node_id: u64,
     split: Option<SplitInfo>,
+    inserted: bool,
 }
 
 #[derive(Debug, Default, Clone)]

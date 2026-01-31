@@ -1,5 +1,20 @@
 # Decisions
 
+## 2026-01-31: Insert fast-path + preallocation knob
+
+**Decision**
+- Add `insert_one_doc` / `insert_one_doc_into` API to accept a `serde_json::Map` directly (avoid `Value` wrapper + clone).
+- Add `BTree::insert_unique` to enforce `_id` uniqueness without a separate `get` traversal.
+- Add optional `WRONGO_PREALLOC_PAGES` env var to preallocate free extents when creating new BTree files.
+
+**Why**
+- Reduce per-insert overhead (fewer traversals and conversions) for latency benchmarks.
+- Avoid ftruncate/file-growth in hot paths by preallocating space.
+
+**Notes**
+- Preallocation extends the file and records the extra blocks as **avail** extents; it does not change the on-disk format.
+- The env var only affects **new** data files on create; existing files are unchanged.
+
 ## 2026-01-31: Configurable server listen address
 
 **Decision**

@@ -96,7 +96,15 @@ impl<T> BTreeStore for T where
 
 impl Pager {
     pub(super) fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
-        let bf = BlockFile::create(&path, page_size)?;
+        let mut bf = BlockFile::create(&path, page_size)?;
+        if let Ok(raw) = std::env::var("WRONGO_PREALLOC_PAGES") {
+            if !raw.is_empty() {
+                let blocks: u64 = raw.parse().map_err(|_| {
+                    StorageError(format!("invalid WRONGO_PREALLOC_PAGES value: {raw}"))
+                })?;
+                bf.preallocate_blocks(blocks)?;
+            }
+        }
         let working_root = bf.root_block_id();
 
         Ok(Self {

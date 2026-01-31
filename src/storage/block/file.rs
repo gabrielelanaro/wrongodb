@@ -383,6 +383,30 @@ impl BlockFile {
         Ok(self.allocate_extent(1)?.offset)
     }
 
+    pub fn preallocate_blocks(&mut self, blocks: u64) -> Result<(), WrongoDBError> {
+        if blocks == 0 {
+            return Ok(());
+        }
+
+        let current_blocks = self.num_blocks()?;
+        let new_len_blocks = current_blocks
+            .checked_add(blocks)
+            .ok_or_else(|| StorageError("block count overflow".into()))?;
+        let new_len = new_len_blocks
+            .checked_mul(self.page_size as u64)
+            .ok_or_else(|| StorageError("file length overflow".into()))?;
+        self.file.set_len(new_len)?;
+
+        let extent = Extent {
+            offset: current_blocks,
+            size: blocks,
+            generation: self.block_manager.stable_generation(),
+        };
+        self.block_manager.add_avail_extent(extent);
+        self.write_header()?;
+        Ok(())
+    }
+
     pub fn allocate_extent(&mut self, blocks: u64) -> Result<Extent, WrongoDBError> {
         if blocks == 0 {
             return Err(StorageError("cannot allocate zero-length extent".into()).into());

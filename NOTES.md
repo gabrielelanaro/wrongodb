@@ -55,3 +55,45 @@ Command sketch
 - Start MongoDB: docker run --rm -d --name mongo-bench -p 27018:27017 mongo:7
 - Bench: Python script using pymongo insert_one timing (see terminal log for exact script).
 - Stop MongoDB: docker rm -f mongo-bench
+
+# Notes: Sampling profiler (WrongoDB insert path)
+
+Date: 2026-01-31
+
+Setup
+- Profiler: /usr/bin/sample, 10s @ 1ms.
+- Workload: 200k inserts, 100B payload, single-threaded client (pymongo), ~12.8k ops/s.
+- Server: `cargo run --release --bin server -- 127.0.0.1:27019`.
+
+Top stacks seen during insert load (qualitative)
+- Server path: `handle_connection -> CommandRegistry::execute -> InsertCommand::execute -> WrongoDB::insert_one_into -> MainTable::insert -> BTree::put -> BTree::insert_recursive`.
+- B-tree inner work: `InternalPage::put_separator`, memmove/memcmp, and `build_internal_page` during splits.
+- Storage I/O: `BlockFile::allocate_extent` (ftruncate) and `write_header` show up, implying file growth/header writes during inserts.
+- WAL: `Wal::log_put` / `WalFile::append_record` appears in hot stacks.
+- Serialization: BSON decode (OP_MSG parsing) and BSON encode (`encode_document`, `encode_id_value`) + `bson_to_value` conversions show up.
+
+Notes
+- Sample includes idle time in tokio runtime, but active samples consistently include B-tree insert + BSON/WAL work.
+
+# Notes: Insert latency benchmark after low-hanging changes
+
+Date: 2026-01-31
+
+Changes applied
+- BTree unique insert avoids extra `get` traversal (`insert_unique`).
+- Insert path avoids `Value` wrapper clone via `insert_one_doc_into`.
+- Preallocation enabled via `WRONGO_PREALLOC_PAGES=20000` when creating new files.
+
+Setup
+- WrongoDB: `cargo run --release --bin server -- 127.0.0.1:27019` with `WRONGO_PREALLOC_PAGES=20000` and fresh `test.db` files.
+- MongoDB 7: docker `mongo:7` on 127.0.0.1:27018 via colima.
+- Client: pymongo, retryWrites=False, directConnection=True.
+- Workload: 100B payload, 100 warmup inserts, 1000 measured inserts.
+
+Results (ms)
+- WrongoDB runs: avg 0.076 / 0.067 / 0.068; p50 0.068 / 0.062 / 0.062; p95 0.106 / 0.092 / 0.096; p99 0.164 / 0.166 / 0.172
+- MongoDB runs:  avg 0.258 / 0.257 / 0.241; p50 0.245 / 0.244 / 0.233; p95 0.337 / 0.341 / 0.295; p99 0.633 / 0.630 / 0.545
+- Medians: WrongoDB avg 0.068 ms; MongoDB avg 0.257 ms; ratio ~0.26x
+
+Notes
+- This run includes preallocation and a fresh DB, so it is not directly comparable to earlier runs with an existing server process.

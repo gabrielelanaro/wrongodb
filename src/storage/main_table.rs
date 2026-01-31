@@ -26,11 +26,10 @@ impl MainTable {
             .get("_id")
             .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
         let key = encode_id_value(id)?;
-        if self.btree.get(&key)?.is_some() {
+        let value = encode_document(doc)?;
+        if !self.btree.insert_unique(&key, &value)? {
             return Err(DocumentValidationError("duplicate key error".into()).into());
         }
-        let value = encode_document(doc)?;
-        self.btree.put(&key, &value)?;
         Ok(())
     }
 

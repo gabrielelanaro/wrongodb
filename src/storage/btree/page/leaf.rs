@@ -379,6 +379,11 @@ impl<'a> LeafPage<'a> {
         Ok((lo, false))
     }
 
+    pub fn contains_key(&self, key: &[u8]) -> Result<bool, LeafPageError> {
+        let (_idx, found) = self.find_slot(key)?;
+        Ok(found)
+    }
+
     fn delete_at(&mut self, index: usize) -> Result<(), LeafPageError> {
         self.validate()?;
         let slot_count = self.slot_count()?;
