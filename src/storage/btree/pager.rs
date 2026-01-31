@@ -164,11 +164,6 @@ impl Pager {
         Ok(())
     }
 
-    /// Returns the path to the data file.
-    pub(super) fn data_path(&self) -> &Path {
-        self.bf.path.as_path()
-    }
-
     pub(super) fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         let root = self.checkpoint_prepare();
         self.checkpoint_flush_data()?;
