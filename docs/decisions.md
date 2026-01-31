@@ -1,5 +1,20 @@
 # Decisions
 
+## 2026-01-31: Explicit collections, no default "test"
+
+**Decision**
+- Remove top-level implicit CRUD on `WrongoDB` (no more default "test" collection operations).
+- Add `WrongoDB::collection(name) -> &mut Collection` and move collection-scoped operations onto the collection.
+- Stop auto-creating the `"test"` collection in `WrongoDB::open`; collections are created on explicit `collection(...)` access.
+
+**Why**
+- Prevent accidental writes/reads against a magic default collection.
+- Make the collection choice explicit at call sites and keep a single, consistent API shape.
+
+**Notes**
+- Wire-protocol commands still default to `"test"` when the client omits a collection name.
+- Collection file naming is unchanged: `"test"` uses the base path, other collections use `{base}.{collection}.db`.
+
 ## 2026-01-31: Insert fast-path + preallocation knob
 
 **Decision**

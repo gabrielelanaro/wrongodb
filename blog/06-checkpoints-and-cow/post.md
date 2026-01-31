@@ -6,8 +6,6 @@ The B+tree works. I can insert keys, they get sorted, pages split when they fill
 
 When I insert a key that triggers a split, the tree might touch four or five pages: two new leaves, a parent update, maybe a new root. Each page is a separate write to disk. If the program crashes after writing some pages but not others, the file is inconsistent. The root might point to a page that was recycled, or the tree might have orphan pages that nothing references.
 
-I could call `sync_all()` after every single page write. That would be safe, but slow. Each sync waits for the disk, and I'm doing several per insert.
-
 What I need is a way to batch changes, write them all, then say "okay, now it's safe." That's a checkpoint. And to make checkpoints work without copying the whole database each time, I need copy-on-write.
 
 ## Two views of the same data

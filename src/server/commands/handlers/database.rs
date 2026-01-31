@@ -111,8 +111,9 @@ impl Command for CollStatsCommand {
 
     fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("collStats").unwrap_or("test");
+        let coll = db.collection(coll_name)?;
 
-        let count = db.count(coll_name, None)?;
+        let count = coll.count(None)?;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),

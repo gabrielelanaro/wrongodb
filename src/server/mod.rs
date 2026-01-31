@@ -206,7 +206,13 @@ async fn handle_op_query(
 
     let filter_json = bson_to_value(&query_doc);
     let mut db_lock = db.lock().await;
-    let results = db_lock.find(Some(filter_json))?;
+    let coll_name = full_coll_name
+        .split_once('.')
+        .map(|(_, coll)| coll)
+        .unwrap_or(full_coll_name.as_str());
+    let results = db_lock
+        .collection(coll_name)?
+        .find(Some(filter_json))?;
     let results_bson: Vec<Bson> = results
         .into_iter()
         .map(|d| Bson::Document(value_to_bson(&Value::Object(d))))

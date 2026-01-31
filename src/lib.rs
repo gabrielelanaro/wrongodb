@@ -9,7 +9,7 @@ pub mod commands {
 }
 
 pub use crate::core::errors::{DocumentValidationError, StorageError, WrongoDBError};
-pub use crate::engine::{DbStats, IndexInfo, UpdateResult, WrongoDB};
+pub use crate::engine::{Collection, DbStats, IndexInfo, UpdateResult, WrongoDB};
 pub use crate::index::{InMemoryIndex, ScalarKey, SecondaryIndexManager};
 pub use crate::server::commands::CommandRegistry;
 pub use crate::server::start_server;

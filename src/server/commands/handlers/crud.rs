@@ -81,6 +81,7 @@ impl Command for InsertCommand {
 
     fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("insert").unwrap_or("test");
+        let coll = db.collection(coll_name)?;
 
         let inserted_ids: Vec<ObjectId> = if let Ok(docs) = doc.get_array("documents") {
             let mut ids = Vec::new();
@@ -95,7 +96,7 @@ impl Command for InsertCommand {
                         _ => ObjectId::new(),
                     };
                     let json_doc = bson_to_json_document(&doc_with_id);
-                    if db.insert_one_doc_into(coll_name, json_doc).is_ok() {
+                    if coll.insert_one_doc(json_doc).is_ok() {
                         ids.push(id);
                     }
                 }
@@ -131,11 +132,12 @@ impl Command for FindCommand {
 
     fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("find").unwrap_or("test");
+        let coll = db.collection(coll_name)?;
 
         let filter = doc.get("filter").and_then(|f| f.as_document()).cloned();
         let filter_json = filter.map(|d| bson_to_value(&d));
 
-        let mut results = db.find_in(coll_name, filter_json)?;
+        let mut results = coll.find(filter_json)?;
 
         // Handle skip
         let skip = doc.get("skip").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -191,6 +193,7 @@ impl Command for UpdateCommand {
 
     fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("update").unwrap_or("test");
+        let coll = db.collection(coll_name)?;
         let mut n_matched = 0i32;
         let mut n_modified = 0i32;
 
@@ -206,9 +209,9 @@ impl Command for UpdateCommand {
                         let update_json = bson_to_value(&update);
 
                         let result = if multi {
-                            db.update_many_in(coll_name, Some(filter_json), update_json)?
+                            coll.update_many(Some(filter_json), update_json)?
                         } else {
-                            db.update_one_in(coll_name, Some(filter_json), update_json)?
+                            coll.update_one(Some(filter_json), update_json)?
                         };
 
                         n_matched += result.matched as i32;
@@ -241,6 +244,7 @@ impl Command for DeleteCommand {
 
     fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("delete").unwrap_or("test");
+        let coll = db.collection(coll_name)?;
         let mut n_deleted = 0i32;
 
         if let Ok(deletes) = doc.get_array("deletes") {
@@ -252,9 +256,9 @@ impl Command for DeleteCommand {
                     if let Some(filter) = filter {
                         let filter_json = bson_to_value(&filter);
                         let count = if limit == 1 {
-                            db.delete_one_in(coll_name, Some(filter_json))?
+                            coll.delete_one(Some(filter_json))?
                         } else {
-                            db.delete_many_in(coll_name, Some(filter_json))?
+                            coll.delete_many(Some(filter_json))?
                         };
                         n_deleted += count as i32;
                     }
@@ -285,13 +289,14 @@ impl Command for DeleteManyCommand {
     fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
         // deleteMany format: {deleteMany: "collection", deletes: [{q: filter, limit: 1}]}
         let coll_name = doc.get_str("deleteMany").unwrap_or("test");
+        let coll = db.collection(coll_name)?;
         let filter = doc.get_document("filter").ok();
 
         let count = if let Some(filter_doc) = filter {
             let filter_json = bson_to_value(&filter_doc);
-            db.delete_many_in(coll_name, Some(filter_json))?
+            coll.delete_many(Some(filter_json))?
         } else {
-            db.delete_many_in(coll_name, None)?
+            coll.delete_many(None)?
         };
 
         Ok(doc! {

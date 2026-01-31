@@ -14,10 +14,11 @@ impl Command for CountCommand {
 
     fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("count").unwrap_or("test");
+        let coll = db.collection(coll_name)?;
         let query = doc.get("query").and_then(|q| q.as_document()).cloned();
         let filter_json = query.map(|d| bson_to_value(&d));
 
-        let count = db.count(coll_name, filter_json)?;
+        let count = coll.count(filter_json)?;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),
@@ -36,11 +37,12 @@ impl Command for DistinctCommand {
 
     fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("distinct").unwrap_or("test");
+        let coll = db.collection(coll_name)?;
         let key = doc.get_str("key").unwrap_or("_id");
         let query = doc.get("query").and_then(|q| q.as_document()).cloned();
         let filter_json = query.map(|d| bson_to_value(&d));
 
-        let values = db.distinct(coll_name, key, filter_json)?;
+        let values = coll.distinct(key, filter_json)?;
         let values_bson: Vec<Bson> = values
             .into_iter()
             .map(|v| value_to_bson_value(&v))
@@ -64,10 +66,11 @@ impl Command for AggregateCommand {
 
     fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("aggregate").unwrap_or("test");
+        let coll = db.collection(coll_name)?;
         let pipeline = doc.get_array("pipeline").cloned().unwrap_or_default();
 
         // Start with all documents
-        let mut results = db.find_in(coll_name, None)?;
+        let mut results = coll.find(None)?;
 
         for stage in pipeline {
             if let Bson::Document(stage_doc) = stage {

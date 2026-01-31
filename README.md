@@ -21,7 +21,7 @@ A tiny, learning-oriented MongoDB-like store written in Rust.
 ### Features
 - Append-only log on disk (newline-delimited JSON).
 - In-memory index rebuilt at startup.
-- API: `insert_one`, `find_one`, `find` with top-level equality filters.
+- API: `collection("name")` with `insert_one`, `find_one`, `find` and top-level equality filters.
 - Single-process, no concurrency controls (yet!).
 
 This repo evolves step by step. Check [PLAN.md](PLAN.md) to see where we are going (WiredTiger-inspired storage engine).
@@ -46,12 +46,13 @@ use serde_json::json;
 use wrongodb::WrongoDB;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut db = WrongoDB::open("data/db.log", ["name"], false)?;
-    db.insert_one(json!({"name": "alice", "age": 30}))?;
-    db.insert_one(json!({"name": "bob", "age": 25}))?;
+    let mut db = WrongoDB::open("data/db.log", ["name"])?;
+    let mut coll = db.collection("test")?;
+    coll.insert_one(json!({"name": "alice", "age": 30}))?;
+    coll.insert_one(json!({"name": "bob", "age": 25}))?;
 
-    println!("{:?}", db.find(None)?); // all docs
-    println!("{:?}", db.find(Some(json!({"name": "bob"})))?); // equality on indexed field
+    println!("{:?}", coll.find(None)?); // all docs
+    println!("{:?}", coll.find(Some(json!({"name": "bob"})))?); // equality on indexed field
     Ok(())
 }
 ```

@@ -12,7 +12,8 @@ impl Command for ListIndexesCommand {
 
     fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("listIndexes").unwrap_or("test");
-        let indexes = db.list_indexes(coll_name);
+        let coll = db.collection(coll_name)?;
+        let indexes = coll.list_indexes();
 
         let indexes_bson: Vec<Bson> = indexes
             .into_iter()
@@ -58,6 +59,7 @@ impl Command for CreateIndexesCommand {
 
     fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("createIndexes").unwrap_or("test");
+        let coll = db.collection(coll_name)?;
         let mut created = 0i32;
 
         if let Ok(indexes) = doc.get_array("indexes") {
@@ -65,7 +67,7 @@ impl Command for CreateIndexesCommand {
                 if let Bson::Document(spec) = index_spec {
                     if let Ok(key_doc) = spec.get_document("key") {
                         for (field, _) in key_doc {
-                            let _ = db.create_index(coll_name, field);
+                            let _ = coll.create_index(field);
                             created += 1;
                         }
                     }
@@ -73,7 +75,7 @@ impl Command for CreateIndexesCommand {
             }
         }
 
-        let total_indexes = db.list_indexes(coll_name).len() as i32 + 1; // +1 for _id
+        let total_indexes = coll.list_indexes().len() as i32 + 1; // +1 for _id
 
         Ok(doc! {
             "ok": Bson::Double(1.0),

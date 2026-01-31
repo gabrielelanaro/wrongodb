@@ -35,7 +35,7 @@ fn create_db(name: &str) -> WrongoDB {
     // Clean up any existing database first
     let _ = fs::remove_dir_all(&path);
     // Open with no secondary indexes, sync_every_write: false for performance
-    WrongoDB::open(&path, Vec::<String>::new(), false).expect("Failed to create database")
+    WrongoDB::open(&path, Vec::<String>::new()).expect("Failed to create database")
 }
 
 fn sequential_key(i: usize) -> String {
@@ -44,13 +44,14 @@ fn sequential_key(i: usize) -> String {
 
 fn pre_populate(db: &mut WrongoDB, count: usize) {
     let data = generate_data(VALUE_SIZE);
+    let coll = db.collection("test").expect("Failed to open collection");
     for i in 0..count {
         let key = sequential_key(i);
         let doc = json!({
             "_id": key,
             "data": &data
         });
-        db.insert_one_into("test", doc).expect("Failed to insert");
+        coll.insert_one(doc).expect("Failed to insert");
     }
 }
 
@@ -82,7 +83,10 @@ fn insert_latency(c: &mut Criterion) {
                         "_id": key,
                         "data": &data
                     });
-                    db.insert_one_into("test", doc).expect("Insert failed");
+                    {
+                        let coll = db.collection("test").expect("Failed to open collection");
+                        coll.insert_one(doc).expect("Insert failed");
+                    }
                     black_box(&db);
                 });
             },
