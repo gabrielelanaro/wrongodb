@@ -64,16 +64,12 @@ impl Collection {
 
     pub fn insert_one(&mut self, doc: Value) -> Result<Document, WrongoDBError> {
         validate_is_object(&doc)?;
-        let obj = doc.as_object().expect("validated object").clone();
-        self.insert_one_doc(obj)
-    }
-
-    pub fn insert_one_doc(&mut self, mut doc: Document) -> Result<Document, WrongoDBError> {
-        normalize_document_in_place(&mut doc)?;
-        self.main_table.insert(&doc)?;
-        self.secondary_indexes.add(&doc)?;
+        let mut obj = doc.as_object().expect("validated object").clone();
+        normalize_document_in_place(&mut obj)?;
+        self.main_table.insert(&obj)?;
+        self.secondary_indexes.add(&obj)?;
         self.doc_count = self.doc_count.saturating_add(1);
-        Ok(doc)
+        Ok(obj)
     }
 
     pub fn find(&mut self, filter: Option<Value>) -> Result<Vec<Document>, WrongoDBError> {
