@@ -1,0 +1,33 @@
+---
+name: review
+description: Review code or changes, and suggest improvements
+---
+
+# Review
+
+## When to use this skill
+Use this skill when you need to review changes and improve quality
+
+## How to use
+
+Review EACH individual file that is likely in scope to be reviewed (either uncommitted or in the PR, diff to main, depending on context, or the user specified file or directory)
+
+Really focus on the review on what the user intend to get out of it.
+
+At the end select the top 2-3 aspects that need to be addressed and a short suggestion. The user doesn't want to read a whole essay on the PR. Concise-focused suggestions are best. Like a skilled code reviewer would do.
+
+Limit strictly to the following aspects and criteria:
+
+### Single responsibility principle (SRP)
+
+- Does the current file contains a single isolated functionality or is it a mix? Consider splitting it into multiple files if it's not the case.
+
+- Does the current class contain a single isolated functionality or is it expanding into a god class? Think again on the overall purpose and evaluate how the responsibility can be split.
+
+### Naming
+
+- Files: does each file has a clear name that reflects its purpose? Or does it look like a leftover or a hack?
+
+### Layout
+
+- Does the file belong to its location? Does the file belong to this module or specific directory? If not or it's weird consider renames, or repositioning the file in another place.
