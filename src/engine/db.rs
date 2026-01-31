@@ -41,10 +41,6 @@ impl WrongoDB {
     }
 
     pub fn collection(&mut self, name: &str) -> Result<&mut Collection, WrongoDBError> {
-        self.get_or_create_collection(name)
-    }
-
-    fn get_or_create_collection(&mut self, name: &str) -> Result<&mut Collection, WrongoDBError> {
         if !self.collections.contains_key(name) {
             let coll_path = PathBuf::from(format!("{}.{}", self.base_path.display(), name));
             let coll = Collection::new(&coll_path, &self.default_index_fields)?;
