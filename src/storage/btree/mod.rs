@@ -170,11 +170,6 @@ impl BTree {
 
         self.log_wal_if_enabled(|w| w.log_put(key, value))?;
 
-        // Auto-checkpoint if threshold reached
-        if self.pager.checkpoint_requested() {
-            self.checkpoint()?;
-        }
-
         Ok(())
     }
 
@@ -209,10 +204,6 @@ impl BTree {
 
         self.log_wal_if_enabled(|w| w.log_put(key, value))?;
 
-        if self.pager.checkpoint_requested() {
-            self.checkpoint()?;
-        }
-
         Ok(true)
     }
 
@@ -227,27 +218,7 @@ impl BTree {
 
         self.log_wal_if_enabled(|w| w.log_delete(key))?;
 
-        if self.pager.checkpoint_requested() {
-            self.checkpoint()?;
-        }
-
         Ok(result.deleted)
-    }
-
-    /// Request automatic checkpointing after N updates.
-    ///
-    /// Once the threshold is reached, `put()` will automatically call `checkpoint()`
-    /// after the operation completes. This provides durability guarantees without
-    /// manual checkpoint management.
-    ///
-    /// # Example
-    /// ```no_run
-    /// # use wrongodb::BTree;
-    /// # let mut tree = BTree::create("/tmp/db", 4096, false).unwrap();
-    /// tree.request_checkpoint_after_updates(100);  // Auto-checkpoint every 100 puts
-    /// ```
-    pub fn request_checkpoint_after_updates(&mut self, count: usize) {
-        self.pager.request_checkpoint_after_updates(count);
     }
 
     pub fn sync_all(&mut self) -> Result<(), WrongoDBError> {
@@ -259,8 +230,6 @@ impl BTree {
     /// This flushes all dirty pages to disk and atomically swaps the root.
     /// After this returns, all previous mutations are durable.
     ///
-    /// Note: This is called automatically if `request_checkpoint_after_updates`
-    /// is configured and the threshold is reached.
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         // Log checkpoint record BEFORE preparing checkpoint (if WAL is enabled)
         let root = self.pager.checkpoint_prepare();

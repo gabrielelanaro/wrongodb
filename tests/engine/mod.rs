@@ -3,6 +3,7 @@ use tempfile::tempdir;
 
 use wrongodb::WrongoDB;
 
+mod collection_checkpoint;
 mod persistent_secondary_index;
 
 #[test]

@@ -103,47 +103,6 @@ fn coalesces_updates_between_checkpoints() {
     assert_eq!(blocks_after_second, blocks_after_first);
 }
 
-// ============================================================================
-// Slice G1b: Checkpoint wiring tests
-// ============================================================================
-
-#[test]
-fn auto_checkpoint_after_n_updates() {
-    let tmp = tempdir().unwrap();
-    let path = tmp.path().join("btree_auto_checkpoint.wt");
-
-    let mut tree = BTree::create(&path, 512, false).unwrap();
-    tree.request_checkpoint_after_updates(3);
-
-    // Insert 2 records - no checkpoint yet
-    tree.put(b"k1", b"v1").unwrap();
-    tree.put(b"k2", b"v2").unwrap();
-
-    // Simulate crash by dropping tree
-    drop(tree);
-
-    // Reopen and verify - data should be lost
-    let mut tree2 = BTree::open(&path, false).unwrap();
-    assert_eq!(tree2.get(b"k1").unwrap(), None);
-    assert_eq!(tree2.get(b"k2").unwrap(), None);
-
-    // Reconfigure auto-checkpoint (it's runtime-only, not persisted)
-    tree2.request_checkpoint_after_updates(3);
-
-    // Insert 3 more records - should auto-checkpoint after 3rd
-    tree2.put(b"k3", b"v3").unwrap();
-    tree2.put(b"k4", b"v4").unwrap();
-    tree2.put(b"k5", b"v5").unwrap(); // This triggers checkpoint
-
-    drop(tree2);
-
-    // Reopen and verify - k3, k4, k5 should be durable
-    let mut tree3 = BTree::open(&path, false).unwrap();
-    assert_eq!(tree3.get(b"k3").unwrap(), Some(b"v3".to_vec()));
-    assert_eq!(tree3.get(b"k4").unwrap(), Some(b"v4".to_vec()));
-    assert_eq!(tree3.get(b"k5").unwrap(), Some(b"v5".to_vec()));
-}
-
 #[test]
 fn checkpoint_then_crash_recovers_new_root() {
     let tmp = tempdir().unwrap();

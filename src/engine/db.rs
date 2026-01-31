@@ -12,18 +12,22 @@ use super::collection::Collection;
 /// use wrongodb::WrongoDBConfig;
 ///
 /// let config = WrongoDBConfig::new()
-///     .wal_enabled(true);
+///     .wal_enabled(true)
+///     .checkpoint_after_updates(100);
 /// ```
 #[derive(Debug, Clone)]
 pub struct WrongoDBConfig {
     /// Enable WAL for durability (default: true)
     pub wal_enabled: bool,
+    /// Automatically checkpoint after N document updates (default: None)
+    pub checkpoint_after_updates: Option<usize>,
 }
 
 impl Default for WrongoDBConfig {
     fn default() -> Self {
         Self {
             wal_enabled: true,
+            checkpoint_after_updates: None,
         }
     }
 }
@@ -37,6 +41,16 @@ impl WrongoDBConfig {
     /// Enable or disable WAL (default: true).
     pub fn wal_enabled(mut self, enabled: bool) -> Self {
         self.wal_enabled = enabled;
+        self
+    }
+
+    /// Automatically checkpoint after N document updates.
+    ///
+    /// When set, the collection will automatically flush all
+    /// changes to disk after every N insert/update/delete operations.
+    /// This provides durability without manual checkpoint calls.
+    pub fn checkpoint_after_updates(mut self, count: usize) -> Self {
+        self.checkpoint_after_updates = Some(count);
         self
     }
 }
@@ -54,6 +68,7 @@ pub struct WrongoDB {
     base_path: PathBuf,
     collections: HashMap<String, Collection>,
     wal_enabled: bool,
+    checkpoint_after_updates: Option<usize>,
 }
 
 impl WrongoDB {
@@ -78,6 +93,7 @@ impl WrongoDB {
             base_path,
             collections: HashMap::new(),
             wal_enabled: config.wal_enabled,
+            checkpoint_after_updates: config.checkpoint_after_updates,
         };
 
         Ok(db)
@@ -96,7 +112,7 @@ impl WrongoDB {
     pub fn collection(&mut self, name: &str) -> Result<&mut Collection, WrongoDBError> {
         if !self.collections.contains_key(name) {
             let coll_path = PathBuf::from(format!("{}.{}", self.base_path.display(), name));
-            let coll = Collection::new(&coll_path, self.wal_enabled)?;
+            let coll = Collection::new(&coll_path, self.wal_enabled, self.checkpoint_after_updates)?;
             self.collections.insert(name.to_string(), coll);
         }
         Ok(self.collections.get_mut(name).unwrap())
@@ -108,32 +124,6 @@ impl WrongoDB {
 
     pub fn list_collections(&self) -> Vec<String> {
         self.collections.keys().cloned().collect()
-    }
-
-    /// Checkpoint all id indexes to durable storage.
-    ///
-    /// This flushes all dirty pages to disk and atomically swaps the root.
-    /// After this returns, all previous mutations are durable.
-    ///
-    /// # Durability semantics
-    /// - `checkpoint()` = durability boundary
-    /// - Unflushed pages may be lost on crash
-    /// - Call after important writes to ensure they survive crashes
-    pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
-        for coll in self.collections.values_mut() {
-            coll.checkpoint()?;
-        }
-        Ok(())
-    }
-
-    /// Request automatic checkpointing after N updates on the id index.
-    ///
-    /// Once the threshold is reached, `put()` operations will automatically
-    /// call `checkpoint()` after the operation completes.
-    pub fn request_checkpoint_after_updates(&mut self, count: usize) {
-        for coll in self.collections.values_mut() {
-            coll.request_checkpoint_after_updates(count);
-        }
     }
 
     pub fn stats(&self) -> DbStats {

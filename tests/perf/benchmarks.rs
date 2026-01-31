@@ -26,8 +26,8 @@ fn benchmark_main_table_vs_append_only() {
             for doc in &docs {
                 coll.insert_one(doc.clone()).unwrap();
             }
+            coll.checkpoint().unwrap();
         }
-        db.checkpoint().unwrap();
     }
     let main_elapsed = start.elapsed();
 

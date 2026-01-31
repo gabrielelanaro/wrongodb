@@ -37,10 +37,9 @@ fn index_created_on_empty_collection() {
 
         let bobs = coll.find(Some(json!({"username": "bob"}))).unwrap();
         assert_eq!(bobs.len(), 1, "Expected 1 bob");
-    }
 
-    // Checkpoint to ensure persistence
-    db.checkpoint().unwrap();
+        coll.checkpoint().unwrap();
+    }
 
     // Verify index file exists (collection "test" creates files with .test extension)
     let index_path = tmp.path().join("test.db.test.username.idx.wt");
@@ -62,8 +61,8 @@ fn index_survives_database_restart() {
                 .unwrap();
             coll.insert_one(json!({"email": "bob@example.com", "name": "Bob"}))
                 .unwrap();
+            coll.checkpoint().unwrap();
         }
-        db.checkpoint().unwrap();
     }
 
     // Reopen database
@@ -98,8 +97,8 @@ fn index_builds_from_existing_documents() {
             coll.insert_one(json!({"city": "la", "name": "bob"})).unwrap();
             coll.insert_one(json!({"city": "nyc", "name": "charlie"}))
                 .unwrap();
+            coll.checkpoint().unwrap();
         }
-        db.checkpoint().unwrap();
     }
 
     // Now create city index and query
@@ -199,10 +198,9 @@ fn multiple_indexes_on_same_collection() {
         // Query by role
         let managers = coll.find(Some(json!({"role": "manager"}))).unwrap();
         assert_eq!(managers.len(), 2);
-    }
 
-    // Checkpoint and verify both index files exist (collection "test" creates files with .test extension)
-    db.checkpoint().unwrap();
+        coll.checkpoint().unwrap();
+    }
 
     let dept_idx = tmp.path().join("test.db.test.dept.idx.wt");
     let role_idx = tmp.path().join("test.db.test.role.idx.wt");
@@ -225,8 +223,8 @@ fn index_persistence_with_checkpoint() {
                 .unwrap();
             coll.insert_one(json!({"task": "task2", "priority": 2}))
                 .unwrap();
+            coll.checkpoint().unwrap();
         }
-        db.checkpoint().unwrap();
     }
 
     // Verify index file has content (collection "test" creates files with .test extension)
@@ -267,10 +265,11 @@ fn create_index_dynamically() {
         // Query using new index
         let usa_docs = coll.find(Some(json!({"country": "usa"}))).unwrap();
         assert_eq!(usa_docs.len(), 1);
+
+        coll.checkpoint().unwrap();
     }
 
     // Verify index file was created (collection "test" creates files with .test extension)
-    db.checkpoint().unwrap();
     let index_path = tmp.path().join("test.db.test.country.idx.wt");
     assert!(index_path.exists(), "Dynamically created index file should exist");
 }

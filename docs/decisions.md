@@ -43,6 +43,24 @@
 **Notes**
 - `WRONGO_PORT` only changes the port and still binds on `127.0.0.1`.
 
+## 2026-01-31: Collection-owned checkpoint scheduling
+
+**Decision**
+- Move automatic checkpoint scheduling (threshold + counters) to `Collection`.
+- Remove `BTree::request_checkpoint_after_updates` and pager-level checkpoint counters.
+- Remove `WrongoDB::checkpoint`; callers checkpoint collections directly.
+- Move checkpoint configuration to `WrongoDBConfig::checkpoint_after_updates`, removing the runtime `request_checkpoint_after_updates` method.
+
+**Why**
+- Only the collection can guarantee that main table and secondary indexes checkpoint together.
+- Avoids a top-level durability API that hides which data is being flushed.
+- Configuration belongs in the config object, not runtime method calls—this makes durability behavior explicit at database open time.
+
+**Notes**
+- `Collection::checkpoint()` remains the explicit durability boundary.
+- Auto-checkpointing now counts collection-level mutations (document updates), not page-level writes.
+- Checkpoint configuration is set once at `WrongoDB::open_with_config()` and applies to all collections.
+
 ## 2026-01-30: BTree pager abstraction via `PageStore`
 
 **Decision**

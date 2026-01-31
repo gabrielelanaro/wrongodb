@@ -12,10 +12,6 @@ pub(super) struct Pager {
     working_root: u64,
     working_pages: HashSet<u64>,
     cache: PageCache,
-    /// Number of updates since last checkpoint. Used for checkpoint scheduling.
-    updates_since_checkpoint: usize,
-    /// If set, checkpoint will be requested after this many updates.
-    checkpoint_after_updates: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -78,8 +74,6 @@ pub(super) trait RootStore: std::fmt::Debug + Send + Sync {
 }
 
 pub(super) trait CheckpointStore: std::fmt::Debug + Send + Sync {
-    fn request_checkpoint_after_updates(&mut self, count: usize);
-    fn checkpoint_requested(&self) -> bool;
     fn checkpoint_prepare(&self) -> u64;
     fn checkpoint_flush_data(&mut self) -> Result<(), WrongoDBError>;
     fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError>;
@@ -112,8 +106,6 @@ impl Pager {
             working_root,
             working_pages: HashSet::new(),
             cache: PageCache::new(PageCacheConfig::default()),
-            updates_since_checkpoint: 0,
-            checkpoint_after_updates: None,
         })
     }
 
@@ -126,8 +118,6 @@ impl Pager {
             working_root,
             working_pages: HashSet::new(),
             cache: PageCache::new(PageCacheConfig::default()),
-            updates_since_checkpoint: 0,
-            checkpoint_after_updates: None,
         })
     }
 
@@ -176,15 +166,7 @@ impl Pager {
         let root = self.checkpoint_prepare();
         self.checkpoint_flush_data()?;
         self.checkpoint_commit(root)?;
-        // Reset update counter after successful checkpoint
-        self.updates_since_checkpoint = 0;
         Ok(())
-    }
-
-
-    /// Increment the update counter (to be called after each mutation).
-    fn track_update(&mut self) {
-        self.updates_since_checkpoint = self.updates_since_checkpoint.saturating_add(1);
     }
 
     pub(super) fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError> {
@@ -240,8 +222,6 @@ impl Pager {
         if let Some(old_page_id) = original_page_id {
             self.retire_page(old_page_id)?;
         }
-        // Track this mutation for checkpoint scheduling
-        self.track_update();
         Ok(())
     }
 
@@ -365,17 +345,6 @@ impl RootStore for Pager {
 }
 
 impl CheckpointStore for Pager {
-    fn request_checkpoint_after_updates(&mut self, count: usize) {
-        self.checkpoint_after_updates = Some(count);
-    }
-
-    fn checkpoint_requested(&self) -> bool {
-        if let Some(threshold) = self.checkpoint_after_updates {
-            return self.updates_since_checkpoint >= threshold;
-        }
-        false
-    }
-
     fn checkpoint_prepare(&self) -> u64 {
         self.working_root
     }

@@ -75,8 +75,4 @@ impl MainTable {
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         self.btree.checkpoint()
     }
-
-    pub fn request_checkpoint_after_updates(&mut self, count: usize) {
-        self.btree.request_checkpoint_after_updates(count);
-    }
 }

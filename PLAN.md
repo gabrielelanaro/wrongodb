@@ -86,8 +86,8 @@ Status (2026-01-17)
 - **Deliverable**: Infrastructure is solid, but checkpointing is NOT yet wired into database operations.
 
 ### Slice G1b: Wire checkpointing into database operations
-- **Automatic checkpoint scheduling**: Configure `checkpoint_after_updates` threshold in Pager; call `checkpoint()` when threshold reached.
-- **Explicit checkpoint API**: Expose `BTree::checkpoint()` publicly; call from `WrongoDB::sync_all()`.
+- **Automatic checkpoint scheduling**: Configure `checkpoint_after_updates` in `Collection`; call `Collection::checkpoint()` when threshold reached.
+- **Explicit checkpoint API**: Expose `Collection::checkpoint()` as the durability boundary (BTree remains explicit but lower-level).
 - **Durability semantics**: Document that `sync_all()` = checkpoint = durability boundary; unflushed pages may be lost on crash.
 - **Test coverage**:
   - Insert N records, crash before checkpoint → verify old root is recovered

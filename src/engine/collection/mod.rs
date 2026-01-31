@@ -17,10 +17,16 @@ pub struct Collection {
     main_table: MainTable,
     secondary_indexes: SecondaryIndexManager,
     doc_count: usize,
+    checkpoint_after_updates: Option<usize>,
+    updates_since_checkpoint: usize,
 }
 
 impl Collection {
-    pub(crate) fn new(path: &Path, wal_enabled: bool) -> Result<Self, WrongoDBError> {
+    pub(crate) fn new(
+        path: &Path,
+        wal_enabled: bool,
+        checkpoint_after_updates: Option<usize>,
+    ) -> Result<Self, WrongoDBError> {
         let main_table_path = PathBuf::from(format!("{}.main.wt", path.display()));
         let main_table = MainTable::open_or_create(&main_table_path, wal_enabled)?;
 
@@ -31,6 +37,8 @@ impl Collection {
             main_table,
             secondary_indexes,
             doc_count: 0,
+            checkpoint_after_updates,
+            updates_since_checkpoint: 0,
         };
         coll.load_existing(path)?;
         Ok(coll)
@@ -51,6 +59,7 @@ impl Collection {
         self.main_table.insert(&obj)?;
         self.secondary_indexes.add(&obj)?;
         self.doc_count = self.doc_count.saturating_add(1);
+        self.maybe_checkpoint_after_updates(1)?;
         Ok(obj)
     }
 
@@ -153,6 +162,7 @@ impl Collection {
         self.secondary_indexes.remove(doc)?;
         self.main_table.update(&updated_doc)?;
         self.secondary_indexes.add(&updated_doc)?;
+        self.maybe_checkpoint_after_updates(1)?;
 
         Ok(UpdateResult {
             matched: 1,
@@ -182,6 +192,8 @@ impl Collection {
             modified += 1;
         }
 
+        self.maybe_checkpoint_after_updates(modified)?;
+
         Ok(UpdateResult {
             matched: modified,
             modified,
@@ -201,6 +213,7 @@ impl Collection {
         self.secondary_indexes.remove(doc)?;
         if self.main_table.delete(id)? {
             self.doc_count = self.doc_count.saturating_sub(1);
+            self.maybe_checkpoint_after_updates(1)?;
             return Ok(1);
         }
         Ok(0)
@@ -225,6 +238,7 @@ impl Collection {
 
         if deleted > 0 {
             self.doc_count = self.doc_count.saturating_sub(deleted);
+            self.maybe_checkpoint_after_updates(deleted)?;
         }
 
         Ok(deleted)
@@ -240,18 +254,32 @@ impl Collection {
 
     pub fn create_index(&mut self, field: &str) -> Result<(), WrongoDBError> {
         let existing_docs = self.main_table.scan()?;
+        let was_indexed = self.secondary_indexes.fields.contains(field);
         self.secondary_indexes.add_field(field, &existing_docs)?;
+        if !was_indexed {
+            self.maybe_checkpoint_after_updates(existing_docs.len())?;
+        }
         Ok(())
     }
 
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         self.main_table.checkpoint()?;
         self.secondary_indexes.checkpoint()?;
+        self.updates_since_checkpoint = 0;
         Ok(())
     }
 
-    pub fn request_checkpoint_after_updates(&mut self, count: usize) {
-        self.main_table.request_checkpoint_after_updates(count);
+    fn maybe_checkpoint_after_updates(&mut self, updates: usize) -> Result<(), WrongoDBError> {
+        if updates == 0 {
+            return Ok(());
+        }
+        self.updates_since_checkpoint = self.updates_since_checkpoint.saturating_add(updates);
+        if let Some(threshold) = self.checkpoint_after_updates {
+            if self.updates_since_checkpoint >= threshold {
+                self.checkpoint()?;
+            }
+        }
+        Ok(())
     }
 
     pub fn doc_count(&self) -> usize {

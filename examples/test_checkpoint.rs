@@ -66,14 +66,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Explicit checkpoint test
     println!("💾 Testing explicit checkpoint...");
-    db.checkpoint()?;
+    let coll = db.collection("test")?;
+    coll.checkpoint()?;
     println!("   ✅ Checkpoint completed!\n");
 
     println!("✅ All operations completed successfully!");
     println!("\n💡 The checkpoint infrastructure is working internally:");
     println!("   - BTree id index is being used for _id lookups");
-    println!("   - Auto-checkpointing can be configured with request_checkpoint_after_updates()");
-    println!("   - Explicit checkpoint() flushes dirty pages to disk");
+    println!("   - Auto-checkpointing can be configured on a collection");
+    println!("   - Collection::checkpoint() flushes dirty pages to disk");
 
     Ok(())
 }
