@@ -40,6 +40,12 @@ Limit strictly to the following aspects and criteria:
 
 - Are we having unnecessary indirection? If a function is just calling another function, consider inlining it.
 
+## Consistency
+
+- Are we duplicating logic that already exists elsewhere in the codebase? Search for similar patterns, helper methods, or services that we should be using instead.
+- Are there other places in the codebase with similar situations where this same logic/fix should be applied? We don't want inconsistency.
+- Check for opportunities to consolidate with existing utilities, concerns, or services.
+
 ### Comments
 
 - Do comments explain the "why" and not the "what"? Comments should only be added in confusing parts and explain why this particular decision was made. If the code is clear, it should not need comments, so consider removing them.
