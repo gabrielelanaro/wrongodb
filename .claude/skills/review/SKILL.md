@@ -20,6 +20,8 @@ Provide links to the relevant parts of the code for each suggestion so I can qui
 
 Limit strictly to the following aspects and criteria:
 
+## Criteria
+
 ### Single responsibility principle (SRP)
 
 - Does the current file contains a single isolated functionality or is it a mix? Consider splitting it into multiple files if it's not the case.
