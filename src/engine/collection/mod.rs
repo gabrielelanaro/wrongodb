@@ -7,10 +7,10 @@ use serde_json::Value;
 use crate::core::document::{normalize_document_in_place, validate_is_object};
 use crate::txn::GlobalTxnState;
 
-mod update;
+pub mod update;
 mod txn;
 
-pub use self::txn::CollectionTxn;
+pub use self::txn::{CollectionTxn, IndexOp};
 use self::update::apply_update;
 use crate::index::SecondaryIndexManager;
 use crate::storage::main_table::MainTable;
@@ -82,6 +82,13 @@ impl Collection {
     }
 
     /// Shared query implementation used by both Collection and CollectionTxn.
+    // TODO: Return an iterator instead of Vec to enable lazy evaluation.
+    // Currently this eagerly collects all documents into memory, which is
+    // inefficient for large collections and forces find_one() to load all
+    // results just to take the first one. Consider:
+    //   A) Return impl Iterator<Item = Result<Document, WrongoDBError>>
+    //   B) Add a find_one_txn() method that stops after first match
+    //   C) Use a callback-based API for streaming results
     pub(crate) fn find_with_txn(
         &mut self,
         filter: Option<Value>,
@@ -329,6 +336,35 @@ impl Collection {
 
     pub fn index_count(&self) -> usize {
         self.secondary_indexes.fields.len()
+    }
+
+    // ========================================================================
+    // Internal methods for MultiCollectionTxn
+    // ========================================================================
+
+    /// Get mutable access to the main table.
+    pub(crate) fn main_table(&mut self) -> &mut MainTable {
+        &mut self.main_table
+    }
+
+    /// Get access to the secondary indexes.
+    pub(crate) fn secondary_indexes(&mut self) -> &mut SecondaryIndexManager {
+        &mut self.secondary_indexes
+    }
+
+    /// Increment the document count.
+    pub(crate) fn increment_doc_count(&mut self) {
+        self.doc_count = self.doc_count.saturating_add(1);
+    }
+
+    /// Decrement the document count.
+    pub(crate) fn decrement_doc_count(&mut self) {
+        self.doc_count = self.doc_count.saturating_sub(1);
+    }
+
+    /// Decrement the document count by a specific amount.
+    pub(crate) fn decrement_doc_count_by(&mut self, count: usize) {
+        self.doc_count = self.doc_count.saturating_sub(count);
     }
 
     /// Begin a new transaction on this collection.

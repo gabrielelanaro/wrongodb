@@ -175,4 +175,10 @@ impl MainTable {
     pub fn run_gc(&mut self) -> (usize, usize, usize) {
         self.btree.run_gc()
     }
+
+    /// Sync the WAL to ensure durability.
+    /// This is a no-op if WAL is disabled.
+    pub fn sync_wal(&mut self) -> Result<(), WrongoDBError> {
+        self.btree.sync_wal()
+    }
 }

@@ -6,6 +6,7 @@ use crate::txn::GlobalTxnState;
 use crate::WrongoDBError;
 
 use super::collection::Collection;
+use super::transaction::MultiCollectionTxn;
 
 /// Configuration for opening a WrongoDB database.
 ///
@@ -166,5 +167,104 @@ impl WrongoDB {
             document_count: doc_count,
             index_count,
         }
+    }
+
+    // ========================================================================
+    // Multi-collection transaction API
+    // ========================================================================
+
+    /// Begin a multi-collection transaction.
+    ///
+    /// Returns a `MultiCollectionTxn` that supports atomic operations across
+    /// multiple collections with snapshot isolation.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use wrongodb::WrongoDB;
+    /// # use serde_json::json;
+    /// # let tmp = tempfile::tempdir().unwrap();
+    /// # let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
+    /// let mut txn = db.begin_txn().unwrap();
+    ///
+    /// let doc = txn.insert_one("collection_a", json!({"name": "alice"})).unwrap();
+    ///
+    /// txn.commit().unwrap();
+    /// ```
+    pub fn begin_txn(&mut self) -> Result<MultiCollectionTxn<'_>, WrongoDBError> {
+        MultiCollectionTxn::new(self)
+    }
+
+    /// Run a function in a multi-collection transaction.
+    ///
+    /// If the function returns `Ok`, the transaction is committed.
+    /// If the function returns `Err`, the transaction is aborted.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use wrongodb::WrongoDB;
+    /// # use serde_json::json;
+    /// # let tmp = tempfile::tempdir().unwrap();
+    /// # let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
+    /// let result: Result<_, _> = db.with_txn(|txn| {
+    ///     let doc = txn.insert_one("test", json!({"name": "alice"}))?;
+    ///     Ok(doc)
+    /// });
+    /// ```
+    pub fn with_txn<F, R>(&mut self, f: F) -> Result<R, WrongoDBError>
+    where
+        F: FnOnce(&mut MultiCollectionTxn<'_>) -> Result<R, WrongoDBError>,
+    {
+        let mut txn = self.begin_txn()?;
+        match f(&mut txn) {
+            Ok(result) => {
+                txn.commit()?;
+                Ok(result)
+            }
+            Err(e) => {
+                let _ = txn.abort();
+                Err(e)
+            }
+        }
+    }
+
+    /// Checkpoint all collections.
+    ///
+    /// This flushes all changes to disk and runs garbage collection
+    /// on MVCC update chains for all collections.
+    pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
+        for coll in self.collections.values_mut() {
+            coll.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // Internal methods for MultiCollectionTxn
+    // ========================================================================
+
+    /// Get a reference to the global transaction state.
+    pub(crate) fn global_txn(&self) -> &GlobalTxnState {
+        &self.global_txn
+    }
+
+    /// Check if a collection exists.
+    pub(crate) fn has_collection(&self, name: &str) -> bool {
+        self.collections.contains_key(name)
+    }
+
+    /// Create a new collection without returning it.
+    pub(crate) fn create_collection(&mut self, name: &str) -> Result<(), WrongoDBError> {
+        let _ = self.collection(name)?;
+        Ok(())
+    }
+
+    /// Get a mutable reference to a collection by name.
+    pub(crate) fn get_collection_mut(
+        &mut self,
+        name: &str,
+    ) -> Result<&mut Collection, WrongoDBError> {
+        self.collection(name)
     }
 }

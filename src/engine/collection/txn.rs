@@ -15,11 +15,21 @@ use crate::{Document, WrongoDBError};
 
 /// A pending index operation to be applied on commit.
 #[derive(Debug, Clone)]
-enum IndexOp {
+pub enum IndexOp {
     /// Add a document to the indexes
     Add { doc: Document },
     /// Remove a document from the indexes
     Remove { doc: Document },
+}
+
+impl IndexOp {
+    /// Returns the inverse operation needed to undo this operation.
+    pub fn inverse(&self) -> Self {
+        match self {
+            IndexOp::Add { doc } => IndexOp::Remove { doc: doc.clone() },
+            IndexOp::Remove { doc } => IndexOp::Add { doc: doc.clone() },
+        }
+    }
 }
 
 /// A transaction handle for Collection operations.
@@ -52,7 +62,7 @@ impl<'a> CollectionTxn<'a> {
     /// Insert a document in this transaction.
     ///
     /// - Main table: uses MVCC (transactional)
-    /// - Indexes: deferred until commit for atomic visibility
+    /// - Indexes: applied immediately, tracked for rollback on abort
     pub fn insert_one(&mut self, doc: Value) -> Result<Document, WrongoDBError> {
         validate_is_object(&doc)?;
         let mut obj = doc.as_object().expect("validated object").clone();
@@ -61,7 +71,10 @@ impl<'a> CollectionTxn<'a> {
         // Transactional: main table (MVCC)
         self.collection.main_table.insert_mvcc(&obj, &mut self.txn)?;
 
-        // Queue index operation for deferred application on commit
+        // Apply index update immediately (not deferred) for visibility
+        self.collection.secondary_indexes.add(&obj)?;
+
+        // Track for potential rollback on abort
         self.pending_index_ops.push(IndexOp::Add { doc: obj.clone() });
 
         Ok(obj)
@@ -84,7 +97,7 @@ impl<'a> CollectionTxn<'a> {
 
     /// Update one document in this transaction.
     ///
-    /// Index updates are deferred until commit for consistency.
+    /// Index updates are applied immediately for visibility, tracked for rollback on abort.
     pub fn update_one(
         &mut self,
         filter: Option<Value>,
@@ -106,7 +119,11 @@ impl<'a> CollectionTxn<'a> {
             .main_table
             .update_mvcc(&updated_doc, &mut self.txn)?;
 
-        // Queue index operations for deferred application on commit
+        // Apply index updates immediately (not deferred) for visibility
+        self.collection.secondary_indexes.remove(doc)?;
+        self.collection.secondary_indexes.add(&updated_doc)?;
+
+        // Track for potential rollback on abort (inverse operations)
         self.pending_index_ops.push(IndexOp::Remove {
             doc: doc.clone(),
         });
@@ -122,7 +139,7 @@ impl<'a> CollectionTxn<'a> {
 
     /// Update many documents in this transaction.
     ///
-    /// Index updates are deferred until commit for consistency.
+    /// Index updates are applied immediately for visibility, tracked for rollback on abort.
     pub fn update_many(
         &mut self,
         filter: Option<Value>,
@@ -145,7 +162,11 @@ impl<'a> CollectionTxn<'a> {
                 .main_table
                 .update_mvcc(&updated_doc, &mut self.txn)?;
 
-            // Queue index operations for deferred application on commit
+            // Apply index updates immediately (not deferred) for visibility
+            self.collection.secondary_indexes.remove(&doc)?;
+            self.collection.secondary_indexes.add(&updated_doc)?;
+
+            // Track for potential rollback on abort (inverse operations)
             self.pending_index_ops.push(IndexOp::Remove {
                 doc: doc.clone(),
             });
@@ -163,7 +184,7 @@ impl<'a> CollectionTxn<'a> {
 
     /// Delete one document in this transaction.
     ///
-    /// Index updates are deferred until commit for consistency.
+    /// Index updates are applied immediately for visibility, tracked for rollback on abort.
     pub fn delete_one(&mut self, filter: Option<Value>) -> Result<usize, WrongoDBError> {
         let docs = self.find(filter)?;
         if docs.is_empty() {
@@ -178,7 +199,10 @@ impl<'a> CollectionTxn<'a> {
         // Delete from main table (MVCC)
         match self.collection.main_table.delete_mvcc(id, &mut self.txn) {
             Ok(true) => {
-                // Queue index removal for deferred application on commit
+                // Apply index removal immediately (not deferred) for visibility
+                self.collection.secondary_indexes.remove(doc)?;
+
+                // Track for potential rollback on abort
                 self.pending_index_ops.push(IndexOp::Remove {
                     doc: doc.clone(),
                 });
@@ -192,7 +216,7 @@ impl<'a> CollectionTxn<'a> {
 
     /// Delete many documents in this transaction.
     ///
-    /// Index updates are deferred until commit for consistency.
+    /// Index updates are applied immediately for visibility, tracked for rollback on abort.
     pub fn delete_many(&mut self, filter: Option<Value>) -> Result<usize, WrongoDBError> {
         let docs = self.find(filter)?;
         if docs.is_empty() {
@@ -208,7 +232,10 @@ impl<'a> CollectionTxn<'a> {
             // Delete from main table (MVCC)
             match self.collection.main_table.delete_mvcc(id, &mut self.txn) {
                 Ok(true) => {
-                    // Queue index removal for deferred application on commit
+                    // Apply index removal immediately (not deferred) for visibility
+                    self.collection.secondary_indexes.remove(&doc)?;
+
+                    // Track for potential rollback on abort
                     self.pending_index_ops.push(IndexOp::Remove {
                         doc: doc.clone(),
                     });
@@ -228,22 +255,15 @@ impl<'a> CollectionTxn<'a> {
 
     /// Commit the transaction.
     ///
-    /// This makes all main table changes durable and visible to other transactions,
-    /// then applies all pending index updates atomically.
+    /// This makes all main table changes durable and visible to other transactions.
+    /// Index changes are already applied immediately during operations.
     pub fn commit(mut self) -> Result<(), WrongoDBError> {
-        // 1. Commit main table transaction first (durability boundary)
+        // Commit main table transaction (durability boundary)
+        // Index changes are already applied immediately during operations
         self.collection.main_table.commit_txn(&mut self.txn)?;
 
-        // 2. Apply all pending index operations
-        // These are applied after the main table commit so that:
-        // - If index update fails, the main table is still committed
-        // - Readers may miss an index entry but will find via _id fallback
-        for op in self.pending_index_ops {
-            if let Err(e) = Self::apply_index_op(self.collection, op) {
-                // Log warning but don't fail - index inconsistency is recoverable
-                eprintln!("Warning: failed to apply index operation on commit: {}", e);
-            }
-        }
+        // Clear tracking - no longer need rollback info
+        self.pending_index_ops.clear();
 
         Ok(())
     }
@@ -261,14 +281,26 @@ impl<'a> CollectionTxn<'a> {
 
     /// Abort the transaction.
     ///
-    /// This discards all main table changes and all pending index operations.
-    /// The indexes remain unchanged since operations were deferred.
+    /// This rolls back all index changes (in reverse order), then discards
+    /// all main table changes. The index is restored to its pre-transaction state.
     pub fn abort(mut self) -> Result<(), WrongoDBError> {
+        // Rollback index changes in reverse order (LIFO)
+        // This ensures consistency if the same key was touched multiple times
+        for op in self.pending_index_ops.iter().rev() {
+            let inverse = op.inverse();
+            if let Err(e) = Self::apply_index_op(self.collection, inverse) {
+                // Log warning but continue - partial rollback is better than none
+                // Index inconsistency is recoverable via index rebuild
+                eprintln!("Warning: failed to rollback index operation: {}", e);
+            }
+        }
+
+        // Clear tracking after rollback
+        self.pending_index_ops.clear();
+
         // Abort main table transaction - this marks updates as aborted
         self.collection.main_table.abort_txn(&mut self.txn)?;
 
-        // Pending index operations are simply dropped with self
-        // No cleanup needed since they were never applied
         Ok(())
     }
 }
@@ -731,5 +763,136 @@ mod tests {
         assert!(found.is_none(), "charlie should not exist (insert aborted)");
         let found = coll.find_one(Some(json!({"name": "alice_updated"}))).unwrap();
         assert!(found.is_none(), "alice_updated should not exist (update aborted)");
+    }
+
+    // =========================================================================
+    // Immediate Index Update Tests (New - verifies index sees uncommitted writes)
+    // =========================================================================
+
+    #[test]
+    fn test_index_query_sees_uncommitted_insert() {
+        let tmp = tempdir().unwrap();
+        let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
+        let coll = db.collection("test").unwrap();
+
+        // Create an index on the 'name' field
+        coll.create_index("name").unwrap();
+
+        let mut txn = coll.begin_txn().unwrap();
+        let doc = txn.insert_one(json!({"name": "alice"})).unwrap();
+        let id = doc.get("_id").unwrap().clone();
+
+        // Query BY INDEX should find the uncommitted doc within the transaction
+        let found = txn.find_one(Some(json!({"name": "alice"}))).unwrap();
+        assert!(found.is_some(), "should find uncommitted doc via index query within txn");
+        assert_eq!(found.unwrap().get("name").unwrap(), "alice");
+
+        // Also verify _id lookup still works
+        let found = txn.find_one(Some(json!({"_id": id}))).unwrap();
+        assert!(found.is_some(), "should find uncommitted doc via _id lookup within txn");
+
+        txn.commit().unwrap();
+
+        // After commit, should still be findable
+        let found = coll.find_one(Some(json!({"name": "alice"}))).unwrap();
+        assert!(found.is_some(), "should find committed doc via index after commit");
+    }
+
+    #[test]
+    fn test_index_query_sees_uncommitted_update() {
+        let tmp = tempdir().unwrap();
+        let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
+        let coll = db.collection("test").unwrap();
+
+        // Create an index on the 'name' field
+        coll.create_index("name").unwrap();
+
+        // Insert initial document
+        let doc = coll.insert_one(json!({"name": "alice"})).unwrap();
+        let id = doc.get("_id").unwrap().clone();
+
+        let mut txn = coll.begin_txn().unwrap();
+
+        // Update within transaction
+        txn.update_one(
+            Some(json!({"_id": id.clone()})),
+            json!({"$set": {"name": "bob"}}),
+        ).unwrap();
+
+        // Old value should NOT be found via index (within transaction)
+        let found = txn.find_one(Some(json!({"name": "alice"}))).unwrap();
+        assert!(found.is_none(), "old value should not be found via index after update within txn");
+
+        // New value SHOULD be found via index (within transaction)
+        let found = txn.find_one(Some(json!({"name": "bob"}))).unwrap();
+        assert!(found.is_some(), "new value should be found via index after update within txn");
+
+        txn.commit().unwrap();
+
+        // After commit, old value still should not be found
+        let found = coll.find_one(Some(json!({"name": "alice"}))).unwrap();
+        assert!(found.is_none(), "old value should not exist after commit");
+
+        // New value should be found
+        let found = coll.find_one(Some(json!({"name": "bob"}))).unwrap();
+        assert!(found.is_some(), "new value should exist after commit");
+    }
+
+    #[test]
+    fn test_index_query_does_not_see_aborted_insert() {
+        let tmp = tempdir().unwrap();
+        let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
+        let coll = db.collection("test").unwrap();
+
+        // Create an index on the 'name' field
+        coll.create_index("name").unwrap();
+
+        let mut txn = coll.begin_txn().unwrap();
+        txn.insert_one(json!({"name": "alice"})).unwrap();
+
+        // Should be visible within transaction before abort
+        let found = txn.find_one(Some(json!({"name": "alice"}))).unwrap();
+        assert!(found.is_some(), "should see uncommitted insert within txn");
+
+        txn.abort().unwrap();
+
+        // After abort, should NOT be findable
+        let found = coll.find_one(Some(json!({"name": "alice"}))).unwrap();
+        assert!(found.is_none(), "should not find doc after abort - index should have been rolled back");
+    }
+
+    #[test]
+    fn test_index_rollback_after_update_abort() {
+        let tmp = tempdir().unwrap();
+        let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
+        let coll = db.collection("test").unwrap();
+
+        // Create an index on the 'name' field
+        coll.create_index("name").unwrap();
+
+        // Insert initial document
+        let doc = coll.insert_one(json!({"name": "alice"})).unwrap();
+        let id = doc.get("_id").unwrap().clone();
+
+        let mut txn = coll.begin_txn().unwrap();
+
+        // Update within transaction
+        txn.update_one(
+            Some(json!({"_id": id.clone()})),
+            json!({"$set": {"name": "bob"}}),
+        ).unwrap();
+
+        // New value visible before abort
+        let found = txn.find_one(Some(json!({"name": "bob"}))).unwrap();
+        assert!(found.is_some(), "should see updated value within txn");
+
+        txn.abort().unwrap();
+
+        // After abort, original value should be restored in index
+        let found = coll.find_one(Some(json!({"name": "alice"}))).unwrap();
+        assert!(found.is_some(), "original value should be restored in index after abort");
+
+        let found = coll.find_one(Some(json!({"name": "bob"}))).unwrap();
+        assert!(found.is_none(), "updated value should not exist after abort");
     }
 }
