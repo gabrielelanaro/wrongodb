@@ -10,3 +10,10 @@
 ## Communication style
 - Use normal paragraph style for explanations and reviews unless asked otherwise.
 - If asked for explanations or reviews with structure, use short, meaningful section titles (not "Chunk N") and small sections; include ASCII diagrams where helpful.
+
+# Reference implementation
+
+You can find the repositories to compare the implementation of wrongodb with the reference implementation of WiredTiger and MongoDB:
+
+- WiredTiger: ~/workspace/wiredtiger
+- MongoDB: ~/workspace/mongo
