@@ -92,6 +92,12 @@ impl PersistentIndex {
     fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         self.btree.checkpoint()
     }
+
+    /// Run garbage collection on MVCC update chains.
+    /// Returns (chains_cleaned, updates_removed, chains_dropped).
+    fn run_gc(&mut self) -> (usize, usize, usize) {
+        self.btree.run_gc()
+    }
 }
 
 /// Manages persistent secondary indexes for a collection.
@@ -253,6 +259,27 @@ impl SecondaryIndexManager {
             index.checkpoint()?;
         }
         Ok(())
+    }
+
+    /// Run garbage collection on all index MVCC update chains.
+    /// Returns total (chains_cleaned, updates_removed, chains_dropped) across all indexes.
+    pub fn run_gc(&mut self) -> (usize, usize, usize) {
+        let mut total_chains_cleaned = 0;
+        let mut total_updates_removed = 0;
+        let mut total_chains_dropped = 0;
+
+        for index in self.persistent.values_mut() {
+            let (chains_cleaned, updates_removed, chains_dropped) = index.run_gc();
+            total_chains_cleaned += chains_cleaned;
+            total_updates_removed += updates_removed;
+            total_chains_dropped += chains_dropped;
+        }
+
+        (
+            total_chains_cleaned,
+            total_updates_removed,
+            total_chains_dropped,
+        )
     }
 
     /// Get the paths of all index files (for cleanup/verification).

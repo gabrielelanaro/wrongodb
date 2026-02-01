@@ -11,6 +11,8 @@ pub struct GlobalTxnState {
     current_txn_id: AtomicU64,
     active_txns: RwLock<Vec<TxnId>>,
     aborted_txns: RwLock<HashSet<TxnId>>,
+    // Cached oldest active transaction ID for GC threshold
+    oldest_active_txn_id: AtomicU64,
 }
 
 impl GlobalTxnState {
@@ -19,6 +21,38 @@ impl GlobalTxnState {
             current_txn_id: AtomicU64::new(TXN_NONE),
             active_txns: RwLock::new(Vec::new()),
             aborted_txns: RwLock::new(HashSet::new()),
+            oldest_active_txn_id: AtomicU64::new(TXN_NONE),
+        }
+    }
+
+    /// Get the oldest active transaction ID.
+    /// This is the threshold for GC - updates with start_txn < oldest_active
+    /// may be eligible for removal if they have a stop_ts.
+    pub fn oldest_active_txn_id(&self) -> TxnId {
+        let cached = self.oldest_active_txn_id.load(Ordering::Acquire);
+        if cached == TXN_NONE {
+            // No active transactions, use current + 1 as threshold
+            self.current_txn_id.load(Ordering::Acquire) + 1
+        } else {
+            cached
+        }
+    }
+
+    /// Recalculate the oldest active transaction ID.
+    /// Should be called when a transaction unregisters or aborts.
+    fn recalculate_oldest(&self) {
+        let active_guard = self
+            .active_txns
+            .read()
+            .expect("active_txns lock poisoned");
+        let oldest = active_guard.iter().copied().min();
+        drop(active_guard);
+
+        if let Some(oldest_id) = oldest {
+            self.oldest_active_txn_id.store(oldest_id, Ordering::Release);
+        } else {
+            // No active transactions - reset to TXN_NONE
+            self.oldest_active_txn_id.store(TXN_NONE, Ordering::Release);
         }
     }
 
@@ -31,7 +65,15 @@ impl GlobalTxnState {
             .active_txns
             .write()
             .expect("active_txns lock poisoned");
+
+        // If this is the first active transaction, it becomes the oldest
+        let was_empty = guard.is_empty();
         guard.push(txn_id);
+        drop(guard);
+
+        if was_empty {
+            self.oldest_active_txn_id.store(txn_id, Ordering::Release);
+        }
     }
 
     pub fn unregister_active(&self, txn_id: TxnId) {
@@ -39,7 +81,17 @@ impl GlobalTxnState {
             .active_txns
             .write()
             .expect("active_txns lock poisoned");
+
+        // Check if we're removing the oldest active transaction
+        let was_oldest = guard.iter().min().copied() == Some(txn_id);
+
         guard.retain(|id| *id != txn_id);
+        drop(guard);
+
+        // Recalculate oldest if we removed the oldest transaction
+        if was_oldest {
+            self.recalculate_oldest();
+        }
     }
 
     /// Mark a transaction as aborted

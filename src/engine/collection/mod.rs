@@ -288,6 +288,24 @@ impl Collection {
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         self.main_table.checkpoint()?;
         self.secondary_indexes.checkpoint()?;
+
+        // Run GC on the main table's MVCC update chains
+        let (main_chains, main_updates, main_dropped) = self.main_table.run_gc();
+
+        // Run GC on secondary indexes' MVCC update chains
+        let (idx_chains, idx_updates, idx_dropped) = self.secondary_indexes.run_gc();
+
+        let total_chains = main_chains + idx_chains;
+        let total_updates = main_updates + idx_updates;
+        let total_dropped = main_dropped + idx_dropped;
+
+        if total_chains > 0 || total_dropped > 0 {
+            eprintln!(
+                "GC complete: {} chains cleaned, {} updates removed, {} chains dropped",
+                total_chains, total_updates, total_dropped
+            );
+        }
+
         self.updates_since_checkpoint = 0;
         Ok(())
     }

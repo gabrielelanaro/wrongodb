@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use crate::core::errors::WrongoDBError;
 use crate::txn::{
-    GlobalTxnState, IsolationLevel, ReadContext, Transaction, Update, UpdateChain, UpdateType, WriteOp,
+    GlobalTxnState, IsolationLevel, ReadContext, Transaction, Update, UpdateChain, UpdateType,
+    WriteOp,
 };
 
 use super::BTree;
@@ -28,6 +29,39 @@ impl MvccState {
 
     pub(super) fn chain_mut_or_create(&mut self, key: &[u8]) -> &mut UpdateChain {
         self.chains.entry(key.to_vec()).or_default()
+    }
+
+    /// Run garbage collection on all update chains.
+    /// Returns (chains_cleaned, updates_removed, chains_dropped).
+    pub(super) fn run_gc(&mut self) -> (usize, usize, usize) {
+        let threshold = self.global.oldest_active_txn_id();
+        let mut chains_cleaned = 0;
+        let mut updates_removed = 0;
+        let mut keys_to_remove = Vec::new();
+
+        for (key, chain) in self.chains.iter_mut() {
+            let removed = chain.truncate_obsolete(threshold);
+            if removed > 0 {
+                chains_cleaned += 1;
+                updates_removed += removed;
+            }
+            if chain.is_empty() {
+                keys_to_remove.push(key.clone());
+            }
+        }
+
+        let chains_dropped = keys_to_remove.len();
+        for key in keys_to_remove {
+            self.chains.remove(&key);
+        }
+
+        (chains_cleaned, updates_removed, chains_dropped)
+    }
+
+    /// Get the number of update chains currently stored.
+    #[allow(dead_code)]
+    pub(super) fn chain_count(&self) -> usize {
+        self.chains.len()
     }
 }
 
@@ -71,8 +105,15 @@ impl BTree {
             wal.log_put(key, value, txn.id())?;
         }
 
+        let chain = self.mvcc.chain_mut_or_create(key);
+
+        // Mark the current head as stopped (overwritten) before prepending
+        if let Some(head) = chain.head_mut() {
+            head.mark_stopped(txn.id());
+        }
+
         let update = Update::new(txn.id(), UpdateType::Standard, value.to_vec());
-        self.mvcc.chain_mut_or_create(key).prepend(update);
+        chain.prepend(update);
         txn.track_write(key, WriteOp::Put);
         Ok(())
     }
@@ -87,8 +128,15 @@ impl BTree {
             wal.log_delete(key, txn.id())?;
         }
 
+        let chain = self.mvcc.chain_mut_or_create(key);
+
+        // Mark the current head as stopped (deleted) before prepending tombstone
+        if let Some(head) = chain.head_mut() {
+            head.mark_stopped(txn.id());
+        }
+
         let update = Update::new(txn.id(), UpdateType::Tombstone, Vec::new());
-        self.mvcc.chain_mut_or_create(key).prepend(update);
+        chain.prepend(update);
         txn.track_write(key, WriteOp::Delete);
         Ok(())
     }

@@ -169,4 +169,10 @@ impl MainTable {
     pub fn abort_txn(&mut self, txn: &mut Transaction) -> Result<(), WrongoDBError> {
         self.btree.abort_txn(txn)
     }
+
+    /// Run garbage collection on MVCC update chains.
+    /// Returns (chains_cleaned, updates_removed, chains_dropped).
+    pub fn run_gc(&mut self) -> (usize, usize, usize) {
+        self.btree.run_gc()
+    }
 }

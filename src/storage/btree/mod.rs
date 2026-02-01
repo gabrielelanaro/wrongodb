@@ -307,6 +307,14 @@ impl BTree {
         Ok(())
     }
 
+    /// Run garbage collection on MVCC update chains.
+    ///
+    /// Removes obsolete updates that are no longer visible to any active transaction.
+    /// Returns (chains_cleaned, updates_removed, chains_dropped).
+    pub fn run_gc(&mut self) -> (usize, usize, usize) {
+        self.mvcc.run_gc()
+    }
+
     /// Recover from WAL after a crash.
     ///
     /// This is called automatically during BTree::open() if WAL is enabled.
