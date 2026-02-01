@@ -16,6 +16,8 @@ Really focus on the review on what the user intend to get out of it.
 
 At the end select the top 2-3 aspects that need to be addressed and a short suggestion. The user doesn't want to read a whole essay on the PR. Concise-focused suggestions are best. Like a skilled code reviewer would do.
 
+Provide links to the relevant parts of the code for each suggestion so I can quickly jump to the relevant parts.
+
 Limit strictly to the following aspects and criteria:
 
 ### Single responsibility principle (SRP)
