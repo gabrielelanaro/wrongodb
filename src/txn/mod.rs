@@ -1,9 +1,12 @@
 pub mod global_txn;
+pub mod recovery;
 pub mod snapshot;
 pub mod transaction;
 pub mod update;
 
 pub use global_txn::GlobalTxnState;
+#[allow(unused_imports)]
+pub use recovery::RecoveryTxnTable;
 #[allow(unused_imports)]
 pub use transaction::{IsolationLevel, Transaction, TxnState, WriteOp, WriteRef};
 pub use update::{Update, UpdateChain, UpdateType};

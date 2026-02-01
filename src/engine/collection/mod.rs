@@ -77,6 +77,16 @@ impl Collection {
     }
 
     pub fn find(&mut self, filter: Option<Value>) -> Result<Vec<Document>, WrongoDBError> {
+        let txn = self.begin_snapshot_txn();
+        self.find_with_txn(filter, &txn)
+    }
+
+    /// Shared query implementation used by both Collection and CollectionTxn.
+    pub(crate) fn find_with_txn(
+        &mut self,
+        filter: Option<Value>,
+        txn: &Transaction,
+    ) -> Result<Vec<Document>, WrongoDBError> {
         let filter_doc = match filter {
             None => Document::new(),
             Some(v) => {
@@ -85,11 +95,8 @@ impl Collection {
             }
         };
 
-        // Create a snapshot transaction for MVCC reads
-        let txn = self.begin_snapshot_txn();
-
         if filter_doc.is_empty() {
-            return self.main_table.scan(&txn);
+            return self.main_table.scan(txn);
         }
 
         let matches_filter = |doc: &Document| {
@@ -104,7 +111,7 @@ impl Collection {
         };
 
         if let Some(id_value) = filter_doc.get("_id") {
-            let doc = self.main_table.get(id_value, &txn)?;
+            let doc = self.main_table.get(id_value, txn)?;
             return Ok(match doc {
                 Some(doc) if matches_filter(&doc) => vec![doc],
                 _ => Vec::new(),
@@ -121,7 +128,7 @@ impl Collection {
             let ids = self.secondary_indexes.lookup(&field, value)?;
             let mut results = Vec::new();
             for id in ids {
-                if let Some(doc) = self.main_table.get(&id, &txn)? {
+                if let Some(doc) = self.main_table.get(&id, txn)? {
                     if matches_filter(&doc) {
                         results.push(doc);
                     }
@@ -130,7 +137,7 @@ impl Collection {
             return Ok(results);
         }
 
-        let docs = self.main_table.scan(&txn)?;
+        let docs = self.main_table.scan(txn)?;
         Ok(docs.into_iter().filter(|doc| matches_filter(doc)).collect())
     }
 

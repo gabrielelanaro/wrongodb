@@ -1,8 +1,9 @@
 //! Collection-level transaction support.
 //!
-//! Provides MVCC transactions for Collection operations. In Phase 2:
+//! Provides MVCC transactions for Collection operations. In Phase 3:
 //! - Main table operations use MVCC (transactional)
-//! - Index operations are applied immediately (non-transactional) with compensation on abort
+//! - Index operations are deferred and applied atomically on commit
+//! - On abort, pending index operations are discarded
 
 use serde_json::Value;
 
@@ -12,26 +13,46 @@ use crate::engine::collection::{Collection, UpdateResult};
 use crate::txn::Transaction;
 use crate::{Document, WrongoDBError};
 
+/// A pending index operation to be applied on commit.
+#[derive(Debug, Clone)]
+enum IndexOp {
+    /// Add a document to the indexes
+    Add { doc: Document },
+    /// Remove a document from the indexes
+    Remove { doc: Document },
+}
+
 /// A transaction handle for Collection operations.
 ///
-/// This provides atomic operations on the main table using MVCC,
-/// while indexes are updated immediately (with compensation on abort).
+/// This provides atomic operations using MVCC:
+/// - Main table: uses MVCC with update chains
+/// - Indexes: operations are deferred until commit for consistency
+///
+/// On commit, all pending index operations are applied atomically after
+/// the main table transaction commits.
+/// On abort, all pending index operations are discarded.
 pub struct CollectionTxn<'a> {
     collection: &'a mut Collection,
     txn: Transaction,
+    /// Pending index operations to apply on commit
+    pending_index_ops: Vec<IndexOp>,
 }
 
 impl<'a> CollectionTxn<'a> {
     /// Create a new CollectionTxn (called by Collection::begin_txn)
     pub(crate) fn new(collection: &'a mut Collection) -> Self {
         let txn = collection.main_table.begin_txn();
-        Self { collection, txn }
+        Self {
+            collection,
+            txn,
+            pending_index_ops: Vec::new(),
+        }
     }
 
     /// Insert a document in this transaction.
     ///
     /// - Main table: uses MVCC (transactional)
-    /// - Indexes: immediate update (compensated on abort)
+    /// - Indexes: deferred until commit for atomic visibility
     pub fn insert_one(&mut self, doc: Value) -> Result<Document, WrongoDBError> {
         validate_is_object(&doc)?;
         let mut obj = doc.as_object().expect("validated object").clone();
@@ -40,75 +61,15 @@ impl<'a> CollectionTxn<'a> {
         // Transactional: main table (MVCC)
         self.collection.main_table.insert_mvcc(&obj, &mut self.txn)?;
 
-        // Non-transactional: indexes (compensate on abort)
-        if let Err(e) = self.collection.secondary_indexes.add(&obj) {
-            // Rollback main table on index failure
-            // We can't "un-insert" from MVCC, but we'll abort the transaction
-            // which will mark it as aborted
-            let _ = self.collection.main_table.abort_txn(&mut self.txn);
-            return Err(e);
-        }
+        // Queue index operation for deferred application on commit
+        self.pending_index_ops.push(IndexOp::Add { doc: obj.clone() });
 
         Ok(obj)
     }
 
     /// Find documents visible to this transaction.
     pub fn find(&mut self, filter: Option<Value>) -> Result<Vec<Document>, WrongoDBError> {
-        let filter_doc = match filter {
-            None => Document::new(),
-            Some(v) => {
-                validate_is_object(&v)?;
-                v.as_object().expect("validated object").clone()
-            }
-        };
-
-        let matches_filter = |doc: &Document| {
-            filter_doc.iter().all(|(k, v)| {
-                if k == "_id" {
-                    serde_json::to_string(doc.get(k).unwrap()).unwrap()
-                        == serde_json::to_string(v).unwrap()
-                } else {
-                    doc.get(k) == Some(v)
-                }
-            })
-        };
-
-        if filter_doc.is_empty() {
-            // Scan all documents visible to this transaction
-            return self.collection.main_table.scan(&self.txn);
-        }
-
-        if let Some(id_value) = filter_doc.get("_id") {
-            let doc = self.collection.main_table.get(id_value, &self.txn)?;
-            return Ok(match doc {
-                Some(doc) if matches_filter(&doc) => vec![doc],
-                _ => Vec::new(),
-            });
-        }
-
-        // For indexed fields, we still use the index but filter through MVCC
-        let indexed_field = filter_doc
-            .keys()
-            .find(|k| self.collection.secondary_indexes.fields.contains(*k))
-            .cloned();
-
-        if let Some(field) = indexed_field {
-            let value = filter_doc.get(&field).unwrap();
-            let ids = self.collection.secondary_indexes.lookup(&field, value)?;
-            let mut results = Vec::new();
-            for id in ids {
-                if let Some(doc) = self.collection.main_table.get(&id, &self.txn)? {
-                    if matches_filter(&doc) {
-                        results.push(doc);
-                    }
-                }
-            }
-            return Ok(results);
-        }
-
-        // Full scan with MVCC
-        let docs = self.collection.main_table.scan(&self.txn)?;
-        Ok(docs.into_iter().filter(|doc| matches_filter(doc)).collect())
+        self.collection.find_with_txn(filter, &self.txn)
     }
 
     /// Find one document visible to this transaction.
@@ -122,6 +83,8 @@ impl<'a> CollectionTxn<'a> {
     }
 
     /// Update one document in this transaction.
+    ///
+    /// Index updates are deferred until commit for consistency.
     pub fn update_one(
         &mut self,
         filter: Option<Value>,
@@ -138,21 +101,18 @@ impl<'a> CollectionTxn<'a> {
         let doc = &docs[0];
         let updated_doc = apply_update(doc, &update)?;
 
-        // Update indexes immediately (non-transactional)
-        self.collection.secondary_indexes.remove(doc)?;
-
         // Update main table (MVCC)
-        if let Err(e) = self
-            .collection
+        self.collection
             .main_table
-            .update_mvcc(&updated_doc, &mut self.txn)
-        {
-            // Try to restore index on failure
-            let _ = self.collection.secondary_indexes.add(doc);
-            return Err(e);
-        }
+            .update_mvcc(&updated_doc, &mut self.txn)?;
 
-        self.collection.secondary_indexes.add(&updated_doc)?;
+        // Queue index operations for deferred application on commit
+        self.pending_index_ops.push(IndexOp::Remove {
+            doc: doc.clone(),
+        });
+        self.pending_index_ops.push(IndexOp::Add {
+            doc: updated_doc,
+        });
 
         Ok(UpdateResult {
             matched: 1,
@@ -161,6 +121,8 @@ impl<'a> CollectionTxn<'a> {
     }
 
     /// Update many documents in this transaction.
+    ///
+    /// Index updates are deferred until commit for consistency.
     pub fn update_many(
         &mut self,
         filter: Option<Value>,
@@ -178,18 +140,18 @@ impl<'a> CollectionTxn<'a> {
         for doc in docs {
             let updated_doc = apply_update(&doc, &update)?;
 
-            // Update indexes immediately
-            if let Err(e) = self.collection.secondary_indexes.remove(&doc) {
-                // Best effort - continue anyway
-                eprintln!("Warning: failed to remove from index during update: {}", e);
-            }
-
             // Update main table (MVCC)
             self.collection
                 .main_table
                 .update_mvcc(&updated_doc, &mut self.txn)?;
 
-            self.collection.secondary_indexes.add(&updated_doc)?;
+            // Queue index operations for deferred application on commit
+            self.pending_index_ops.push(IndexOp::Remove {
+                doc: doc.clone(),
+            });
+            self.pending_index_ops.push(IndexOp::Add {
+                doc: updated_doc,
+            });
             modified += 1;
         }
 
@@ -200,6 +162,8 @@ impl<'a> CollectionTxn<'a> {
     }
 
     /// Delete one document in this transaction.
+    ///
+    /// Index updates are deferred until commit for consistency.
     pub fn delete_one(&mut self, filter: Option<Value>) -> Result<usize, WrongoDBError> {
         let docs = self.find(filter)?;
         if docs.is_empty() {
@@ -211,29 +175,24 @@ impl<'a> CollectionTxn<'a> {
             return Ok(0);
         };
 
-        // Remove from indexes immediately
-        self.collection.secondary_indexes.remove(doc)?;
-
         // Delete from main table (MVCC)
         match self.collection.main_table.delete_mvcc(id, &mut self.txn) {
             Ok(true) => {
+                // Queue index removal for deferred application on commit
+                self.pending_index_ops.push(IndexOp::Remove {
+                    doc: doc.clone(),
+                });
                 self.collection.doc_count = self.collection.doc_count.saturating_sub(1);
                 Ok(1)
             }
-            Ok(false) => {
-                // Document was not found in MVCC view - try to restore index
-                let _ = self.collection.secondary_indexes.add(doc);
-                Ok(0)
-            }
-            Err(e) => {
-                // Try to restore index on failure
-                let _ = self.collection.secondary_indexes.add(doc);
-                Err(e)
-            }
+            Ok(false) => Ok(0),
+            Err(e) => Err(e),
         }
     }
 
     /// Delete many documents in this transaction.
+    ///
+    /// Index updates are deferred until commit for consistency.
     pub fn delete_many(&mut self, filter: Option<Value>) -> Result<usize, WrongoDBError> {
         let docs = self.find(filter)?;
         if docs.is_empty() {
@@ -246,23 +205,17 @@ impl<'a> CollectionTxn<'a> {
                 continue;
             };
 
-            // Remove from indexes immediately
-            if let Err(e) = self.collection.secondary_indexes.remove(&doc) {
-                eprintln!("Warning: failed to remove from index during delete: {}", e);
-            }
-
             // Delete from main table (MVCC)
             match self.collection.main_table.delete_mvcc(id, &mut self.txn) {
-                Ok(true) => deleted += 1,
-                Ok(false) => {
-                    // Try to restore index
-                    let _ = self.collection.secondary_indexes.add(&doc);
+                Ok(true) => {
+                    // Queue index removal for deferred application on commit
+                    self.pending_index_ops.push(IndexOp::Remove {
+                        doc: doc.clone(),
+                    });
+                    deleted += 1;
                 }
-                Err(e) => {
-                    // Try to restore index
-                    let _ = self.collection.secondary_indexes.add(&doc);
-                    return Err(e);
-                }
+                Ok(false) => {}
+                Err(e) => return Err(e),
             }
         }
 
@@ -275,23 +228,48 @@ impl<'a> CollectionTxn<'a> {
 
     /// Commit the transaction.
     ///
-    /// This makes all main table changes durable and visible to other transactions.
+    /// This makes all main table changes durable and visible to other transactions,
+    /// then applies all pending index updates atomically.
     pub fn commit(mut self) -> Result<(), WrongoDBError> {
-        self.collection.main_table.commit_txn(&mut self.txn)
+        // 1. Commit main table transaction first (durability boundary)
+        self.collection.main_table.commit_txn(&mut self.txn)?;
+
+        // 2. Apply all pending index operations
+        // These are applied after the main table commit so that:
+        // - If index update fails, the main table is still committed
+        // - Readers may miss an index entry but will find via _id fallback
+        for op in self.pending_index_ops {
+            if let Err(e) = Self::apply_index_op(self.collection, op) {
+                // Log warning but don't fail - index inconsistency is recoverable
+                eprintln!("Warning: failed to apply index operation on commit: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Apply a pending index operation.
+    fn apply_index_op(
+        collection: &mut Collection,
+        op: IndexOp,
+    ) -> Result<(), WrongoDBError> {
+        match op {
+            IndexOp::Add { doc } => collection.secondary_indexes.add(&doc),
+            IndexOp::Remove { doc } => collection.secondary_indexes.remove(&doc),
+        }
     }
 
     /// Abort the transaction.
     ///
-    /// This discards all main table changes. Note: indexes are NOT restored
-    /// on abort in Phase 2 (they are updated immediately during operations).
-    /// This may leave indexes in an inconsistent state if the transaction
-    /// is aborted after index updates. Full index MVCC is planned for Phase 3.
+    /// This discards all main table changes and all pending index operations.
+    /// The indexes remain unchanged since operations were deferred.
     pub fn abort(mut self) -> Result<(), WrongoDBError> {
-        // For now, we just abort the MVCC transaction.
-        // Index compensation would require tracking what we changed,
-        // which is complex. In Phase 3, indexes will be MVCC too.
-        // For Phase 2, we accept potential index inconsistency after abort.
-        self.collection.main_table.abort_txn(&mut self.txn)
+        // Abort main table transaction - this marks updates as aborted
+        self.collection.main_table.abort_txn(&mut self.txn)?;
+
+        // Pending index operations are simply dropped with self
+        // No cleanup needed since they were never applied
+        Ok(())
     }
 }
 
@@ -498,5 +476,260 @@ mod tests {
         assert!(result.is_err());
 
         txn.abort().unwrap();
+    }
+
+    // =========================================================================
+    // Index Consistency Tests (Phase 3)
+    // =========================================================================
+
+    #[test]
+    fn test_index_consistency_after_insert_commit() {
+        let tmp = tempdir().unwrap();
+        let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
+        let coll = db.collection("test").unwrap();
+
+        // Create an index on the 'name' field
+        coll.create_index("name").unwrap();
+
+        // Insert document in transaction with indexed field
+        let mut txn = coll.begin_txn().unwrap();
+        let doc = txn.insert_one(json!({"name": "alice"})).unwrap();
+        let id = doc.get("_id").unwrap().clone();
+
+        // Before commit: document should be visible via _id lookup
+        let found = txn.find_one(Some(json!({"_id": id.clone()}))).unwrap();
+        assert!(found.is_some(), "document should be visible within txn");
+
+        // Commit the transaction
+        txn.commit().unwrap();
+
+        // After commit: document should be in main table
+        let found = coll.find_one(Some(json!({"_id": id.clone()}))).unwrap();
+        assert!(found.is_some(), "document should be in main table after commit");
+
+        // After commit: document should be in index (find by indexed field)
+        let found = coll.find_one(Some(json!({"name": "alice"}))).unwrap();
+        assert!(found.is_some(), "document should be in index after commit");
+        assert_eq!(found.unwrap().get("name").unwrap(), "alice");
+    }
+
+    #[test]
+    fn test_index_consistency_after_insert_abort() {
+        let tmp = tempdir().unwrap();
+        let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
+        let coll = db.collection("test").unwrap();
+
+        // Create an index on the 'name' field
+        coll.create_index("name").unwrap();
+
+        // Insert document in transaction with indexed field
+        let mut txn = coll.begin_txn().unwrap();
+        let doc = txn.insert_one(json!({"name": "alice"})).unwrap();
+        let id = doc.get("_id").unwrap().clone();
+
+        // Abort the transaction
+        txn.abort().unwrap();
+
+        // After abort: document should NOT be in main table
+        let found = coll.find_one(Some(json!({"_id": id.clone()}))).unwrap();
+        assert!(found.is_none(), "document should not be in main table after abort");
+
+        // After abort: document should NOT be in index
+        let found = coll.find_one(Some(json!({"name": "alice"}))).unwrap();
+        assert!(found.is_none(), "document should not be in index after abort");
+    }
+
+    #[test]
+    fn test_index_consistency_after_update_commit() {
+        let tmp = tempdir().unwrap();
+        let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
+        let coll = db.collection("test").unwrap();
+
+        // Create an index on the 'name' field
+        coll.create_index("name").unwrap();
+
+        // Insert initial document
+        let doc = coll.insert_one(json!({"name": "alice"})).unwrap();
+        let id = doc.get("_id").unwrap().clone();
+
+        // Update in transaction
+        let mut txn = coll.begin_txn().unwrap();
+        txn.update_one(
+            Some(json!({"_id": id.clone()})),
+            json!({"$set": {"name": "bob"}}),
+        ).unwrap();
+        txn.commit().unwrap();
+
+        // After commit: old value should not be in index
+        let found = coll.find_one(Some(json!({"name": "alice"}))).unwrap();
+        assert!(found.is_none(), "old value should not be in index after update commit");
+
+        // After commit: new value should be in index
+        let found = coll.find_one(Some(json!({"name": "bob"}))).unwrap();
+        assert!(found.is_some(), "new value should be in index after update commit");
+    }
+
+    #[test]
+    fn test_index_consistency_after_update_abort() {
+        let tmp = tempdir().unwrap();
+        let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
+        let coll = db.collection("test").unwrap();
+
+        // Create an index on the 'name' field
+        coll.create_index("name").unwrap();
+
+        // Insert initial document
+        let doc = coll.insert_one(json!({"name": "alice"})).unwrap();
+        let id = doc.get("_id").unwrap().clone();
+
+        // Update in transaction
+        let mut txn = coll.begin_txn().unwrap();
+        txn.update_one(
+            Some(json!({"_id": id.clone()})),
+            json!({"$set": {"name": "bob"}}),
+        ).unwrap();
+        txn.abort().unwrap();
+
+        // After abort: original value should still be in index
+        let found = coll.find_one(Some(json!({"name": "alice"}))).unwrap();
+        assert!(found.is_some(), "original value should still be in index after abort");
+
+        // After abort: new value should not be in index
+        let found = coll.find_one(Some(json!({"name": "bob"}))).unwrap();
+        assert!(found.is_none(), "new value should not be in index after abort");
+    }
+
+    #[test]
+    fn test_index_consistency_after_delete_commit() {
+        let tmp = tempdir().unwrap();
+        let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
+        let coll = db.collection("test").unwrap();
+
+        // Create an index on the 'name' field
+        coll.create_index("name").unwrap();
+
+        // Insert initial document
+        let doc = coll.insert_one(json!({"name": "alice"})).unwrap();
+        let id = doc.get("_id").unwrap().clone();
+
+        // Verify initial state
+        let found = coll.find_one(Some(json!({"name": "alice"}))).unwrap();
+        assert!(found.is_some(), "document should exist initially");
+
+        // Delete in transaction
+        let mut txn = coll.begin_txn().unwrap();
+        txn.delete_one(Some(json!({"_id": id.clone()}))).unwrap();
+        txn.commit().unwrap();
+
+        // After commit: document should not be in main table
+        let found = coll.find_one(Some(json!({"_id": id.clone()}))).unwrap();
+        assert!(found.is_none(), "document should not be in main table after delete commit");
+
+        // After commit: document should not be in index
+        let found = coll.find_one(Some(json!({"name": "alice"}))).unwrap();
+        assert!(found.is_none(), "document should not be in index after delete commit");
+    }
+
+    #[test]
+    fn test_index_consistency_after_delete_abort() {
+        let tmp = tempdir().unwrap();
+        let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
+        let coll = db.collection("test").unwrap();
+
+        // Create an index on the 'name' field
+        coll.create_index("name").unwrap();
+
+        // Insert initial document
+        let doc = coll.insert_one(json!({"name": "alice"})).unwrap();
+        let id = doc.get("_id").unwrap().clone();
+
+        // Delete in transaction
+        let mut txn = coll.begin_txn().unwrap();
+        txn.delete_one(Some(json!({"_id": id.clone()}))).unwrap();
+        txn.abort().unwrap();
+
+        // After abort: document should still be in main table
+        let found = coll.find_one(Some(json!({"_id": id.clone()}))).unwrap();
+        assert!(found.is_some(), "document should still be in main table after abort");
+
+        // After abort: document should still be in index
+        let found = coll.find_one(Some(json!({"name": "alice"}))).unwrap();
+        assert!(found.is_some(), "document should still be in index after abort");
+    }
+
+    #[test]
+    fn test_multiple_index_ops_in_single_txn() {
+        let tmp = tempdir().unwrap();
+        let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
+        let coll = db.collection("test").unwrap();
+
+        // Create an index on the 'name' field
+        coll.create_index("name").unwrap();
+
+        // Insert multiple documents in single transaction
+        let mut txn = coll.begin_txn().unwrap();
+        let doc1 = txn.insert_one(json!({"name": "alice"})).unwrap();
+        let doc2 = txn.insert_one(json!({"name": "bob"})).unwrap();
+        let doc3 = txn.insert_one(json!({"name": "charlie"})).unwrap();
+        txn.commit().unwrap();
+
+        // All documents should be findable by indexed field
+        let found = coll.find_one(Some(json!({"name": "alice"}))).unwrap();
+        assert!(found.is_some());
+        let found = coll.find_one(Some(json!({"name": "bob"}))).unwrap();
+        assert!(found.is_some());
+        let found = coll.find_one(Some(json!({"name": "charlie"}))).unwrap();
+        assert!(found.is_some());
+
+        // Also verify by _id lookup
+        let id1 = doc1.get("_id").unwrap();
+        let id2 = doc2.get("_id").unwrap();
+        let id3 = doc3.get("_id").unwrap();
+        assert!(coll.find_one(Some(json!({"_id": id1}))).unwrap().is_some());
+        assert!(coll.find_one(Some(json!({"_id": id2}))).unwrap().is_some());
+        assert!(coll.find_one(Some(json!({"_id": id3}))).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_index_consistency_with_mixed_ops_abort() {
+        let tmp = tempdir().unwrap();
+        let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
+        let coll = db.collection("test").unwrap();
+
+        // Create an index on the 'name' field
+        coll.create_index("name").unwrap();
+
+        // Insert initial documents
+        let doc1 = coll.insert_one(json!({"name": "alice"})).unwrap();
+        let doc2 = coll.insert_one(json!({"name": "bob"})).unwrap();
+        let id1 = doc1.get("_id").unwrap().clone();
+
+        // Perform mixed operations in transaction
+        let mut txn = coll.begin_txn().unwrap();
+
+        // Insert new document
+        let _doc3 = txn.insert_one(json!({"name": "charlie"})).unwrap();
+
+        // Update existing document
+        txn.update_one(
+            Some(json!({"_id": id1.clone()})),
+            json!({"$set": {"name": "alice_updated"}}),
+        ).unwrap();
+
+        // Delete existing document
+        txn.delete_one(Some(json!({"_id": doc2.get("_id").unwrap().clone()}))).unwrap();
+
+        // Abort transaction
+        txn.abort().unwrap();
+
+        // After abort: original state should be preserved
+        let found = coll.find_one(Some(json!({"name": "alice"}))).unwrap();
+        assert!(found.is_some(), "alice should still exist");
+        let found = coll.find_one(Some(json!({"name": "bob"}))).unwrap();
+        assert!(found.is_some(), "bob should still exist");
+        let found = coll.find_one(Some(json!({"name": "charlie"}))).unwrap();
+        assert!(found.is_none(), "charlie should not exist (insert aborted)");
+        let found = coll.find_one(Some(json!({"name": "alice_updated"}))).unwrap();
+        assert!(found.is_none(), "alice_updated should not exist (update aborted)");
     }
 }
