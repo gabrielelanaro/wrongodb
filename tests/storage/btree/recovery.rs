@@ -1,8 +1,9 @@
 //! Integration tests for WAL recovery
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::tempdir;
-use wrongodb::BTree;
+use wrongodb::{BTree, GlobalTxnState};
 
 /// Helper to create a test database path
 fn test_db_path(name: &str) -> PathBuf {
@@ -16,7 +17,7 @@ fn recover_from_wal_after_crash() {
 
     // Create database with WAL enabled
     {
-        let mut tree = BTree::create(&db_path, 512, true).unwrap();
+        let mut tree = BTree::create(&db_path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
 
         // Insert some records
         for i in 0..10 {
@@ -31,7 +32,7 @@ fn recover_from_wal_after_crash() {
 
     // Reopen database - should recover from WAL
     {
-        let mut tree = BTree::open(&db_path, true).unwrap();
+        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
 
         // Verify all data is present
         let result = tree.get(b"key0").unwrap();
@@ -45,7 +46,7 @@ fn recover_single_insert_no_split() {
 
     // Create database with WAL enabled
     {
-        let mut tree = BTree::create(&db_path, 512, true).unwrap();
+        let mut tree = BTree::create(&db_path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
 
         // Insert only one record (no split)
         tree.put(b"key0", b"value0").unwrap();
@@ -54,7 +55,7 @@ fn recover_single_insert_no_split() {
 
     // Reopen database - should recover from WAL
     {
-        let mut tree = BTree::open(&db_path, true).unwrap();
+        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
 
         let result = tree.get(b"key0").unwrap();
         assert_eq!(result, Some(b"value0".to_vec()));
@@ -67,7 +68,7 @@ fn recovery_after_checkpoint() {
 
     // Create database with WAL and insert initial data
     {
-        let mut tree = BTree::create(&db_path, 512, true).unwrap();
+        let mut tree = BTree::create(&db_path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
 
         for i in 0..5 {
             let key = format!("key{}", i);
@@ -81,7 +82,7 @@ fn recovery_after_checkpoint() {
 
     // Add more data after checkpoint
     {
-        let mut tree = BTree::open(&db_path, true).unwrap();
+        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
 
         for i in 5..10 {
             let key = format!("key{}", i);
@@ -97,7 +98,7 @@ fn recovery_after_checkpoint() {
 
     // Reopen - should have checkpointed data + WAL-recovered data
     {
-        let mut tree = BTree::open(&db_path, true).unwrap();
+        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
 
         // Verify all data is present (0-4 from checkpoint, 5-9 from WAL)
         for i in 0..10 {
@@ -115,7 +116,7 @@ fn recovery_idempotent() {
 
     // Create database with data
     {
-        let mut tree = BTree::create(&db_path, 512, true).unwrap();
+        let mut tree = BTree::create(&db_path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
 
         for i in 0..5 {
             let key = format!("key{}", i);
@@ -129,7 +130,7 @@ fn recovery_idempotent() {
 
     // First recovery
     {
-        let mut tree = BTree::open(&db_path, true).unwrap();
+        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
         for i in 0..5 {
             let key = format!("key{}", i);
             let value = format!("value{}", i);
@@ -140,7 +141,7 @@ fn recovery_idempotent() {
 
     // Second recovery (should be idempotent - same data)
     {
-        let mut tree = BTree::open(&db_path, true).unwrap();
+        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
         for i in 0..5 {
             let key = format!("key{}", i);
             let value = format!("value{}", i);
@@ -156,7 +157,7 @@ fn recovery_with_multiple_splits() {
 
     // Create database with WAL and insert enough data to cause splits
     {
-        let mut tree = BTree::create(&db_path, 256, true).unwrap();  // Small page size to force splits
+        let mut tree = BTree::create(&db_path, 256, true, Arc::new(GlobalTxnState::new())).unwrap();  // Small page size to force splits
 
         // Insert many records to trigger multiple leaf splits
         for i in 0..50 {
@@ -173,7 +174,7 @@ fn recovery_with_multiple_splits() {
 
     // Recover and verify all data
     {
-        let mut tree = BTree::open(&db_path, true).unwrap();
+        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
 
         for i in 0..50 {
             let key = format!("key{:010}", i);
@@ -201,7 +202,7 @@ fn recovery_with_corrupted_wal() {
 
     // Create database with WAL
     {
-        let mut tree = BTree::create(&db_path, 512, true).unwrap();
+        let mut tree = BTree::create(&db_path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
 
         for i in 0..5 {
             let key = format!("key{}", i);
@@ -233,7 +234,7 @@ fn recovery_with_corrupted_wal() {
     // Reopen - should handle corrupted WAL gracefully
     {
         // This should not fail - corrupted WAL should be handled gracefully
-        let result = BTree::open(&db_path, true);
+        let result = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new()));
 
         // Either it opens successfully (with warnings) or fails gracefully
         // We don't assert success/failure, just that it doesn't panic
@@ -256,12 +257,12 @@ fn recovery_empty_database() {
 
     // Create empty database
     {
-        let _tree = BTree::create(&db_path, 512, true).unwrap();
+        let _tree = BTree::create(&db_path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
     }
 
     // Reopen empty database
     {
-        let mut tree = BTree::open(&db_path, true).unwrap();
+        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
 
         // Should be able to query and get None
         let result = tree.get(b"nonexistent").unwrap();
@@ -275,7 +276,7 @@ fn recovery_large_keys_and_values() {
 
     // Create database with large keys and values
     {
-        let mut tree = BTree::create(&db_path, 1024, true).unwrap();
+        let mut tree = BTree::create(&db_path, 1024, true, Arc::new(GlobalTxnState::new())).unwrap();
 
         for i in 0..10 {
             let key = format!("key_{}_with_lots_of_padding_data_{}", i, i);
@@ -289,7 +290,7 @@ fn recovery_large_keys_and_values() {
 
     // Recover and verify
     {
-        let mut tree = BTree::open(&db_path, true).unwrap();
+        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
 
         for i in 0..10 {
             let key = format!("key_{}_with_lots_of_padding_data_{}", i, i);
@@ -306,7 +307,7 @@ fn recovery_with_wal_disabled() {
 
     // Create database WITHOUT WAL
     {
-        let mut tree = BTree::create(&db_path, 512, false).unwrap();
+        let mut tree = BTree::create(&db_path, 512, false, Arc::new(GlobalTxnState::new())).unwrap();
 
         for i in 0..5 {
             let key = format!("key{}", i);
@@ -320,7 +321,7 @@ fn recovery_with_wal_disabled() {
 
     // Reopen - should work normally without WAL
     {
-        let mut tree = BTree::open(&db_path, false).unwrap();
+        let mut tree = BTree::open(&db_path, false, Arc::new(GlobalTxnState::new())).unwrap();
 
         for i in 0..5 {
             let key = format!("key{}", i);

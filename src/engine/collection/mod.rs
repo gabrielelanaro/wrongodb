@@ -1,9 +1,11 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::core::document::{normalize_document_in_place, validate_is_object};
+use crate::txn::GlobalTxnState;
 
 mod update;
 use self::update::apply_update;
@@ -26,12 +28,13 @@ impl Collection {
         path: &Path,
         wal_enabled: bool,
         checkpoint_after_updates: Option<usize>,
+        global_txn: Arc<GlobalTxnState>,
     ) -> Result<Self, WrongoDBError> {
         let main_table_path = PathBuf::from(format!("{}.main.wt", path.display()));
-        let main_table = MainTable::open_or_create(&main_table_path, wal_enabled)?;
+        let main_table = MainTable::open_or_create(&main_table_path, wal_enabled, global_txn.clone())?;
 
         // Start with empty manager - indexes can be created via create_index()
-        let secondary_indexes = SecondaryIndexManager::empty(path, wal_enabled);
+        let secondary_indexes = SecondaryIndexManager::empty(path, wal_enabled, global_txn);
 
         let mut coll = Self {
             main_table,

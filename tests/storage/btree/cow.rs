@@ -1,13 +1,14 @@
+use std::sync::Arc;
 use tempfile::tempdir;
 
-use wrongodb::{BlockFile, BTree, LeafPage};
+use wrongodb::{BlockFile, BTree, GlobalTxnState, LeafPage};
 
 #[test]
 fn cow_put_preserves_old_root_leaf() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("btree_cow.wt");
 
-    let mut tree = BTree::create(&path, 512, false).unwrap();
+    let mut tree = BTree::create(&path, 512, false, Arc::new(GlobalTxnState::new())).unwrap();
 
     let bf = BlockFile::open(&path).unwrap();
     let old_root = bf.root_block_id();

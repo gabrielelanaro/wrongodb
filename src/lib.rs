@@ -3,6 +3,7 @@ mod engine;
 mod index;
 mod server;
 mod storage;
+mod txn;
 
 pub mod commands {
     pub use crate::server::commands::*;
@@ -16,5 +17,6 @@ pub use crate::server::start_server;
 pub use crate::storage::block::file::{BlockFile, CheckpointSlot, FileHeader, NONE_BLOCK_ID};
 pub use crate::storage::btree::page::{InternalPage, InternalPageError, LeafPage, LeafPageError};
 pub use crate::storage::btree::BTree;
+pub use crate::txn::GlobalTxnState;
 
 pub type Document = serde_json::Map<String, serde_json::Value>;

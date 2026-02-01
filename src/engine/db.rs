@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::txn::GlobalTxnState;
 use crate::WrongoDBError;
 
 use super::collection::Collection;
@@ -69,6 +71,7 @@ pub struct WrongoDB {
     collections: HashMap<String, Collection>,
     wal_enabled: bool,
     checkpoint_after_updates: Option<usize>,
+    global_txn: Arc<GlobalTxnState>,
 }
 
 impl WrongoDB {
@@ -88,12 +91,14 @@ impl WrongoDB {
         P: AsRef<Path>,
     {
         let base_path = path.as_ref().to_path_buf();
+        let global_txn = Arc::new(GlobalTxnState::new());
 
         let db = Self {
             base_path,
             collections: HashMap::new(),
             wal_enabled: config.wal_enabled,
             checkpoint_after_updates: config.checkpoint_after_updates,
+            global_txn,
         };
 
         Ok(db)
@@ -112,7 +117,12 @@ impl WrongoDB {
     pub fn collection(&mut self, name: &str) -> Result<&mut Collection, WrongoDBError> {
         if !self.collections.contains_key(name) {
             let coll_path = PathBuf::from(format!("{}.{}", self.base_path.display(), name));
-            let coll = Collection::new(&coll_path, self.wal_enabled, self.checkpoint_after_updates)?;
+            let coll = Collection::new(
+                &coll_path,
+                self.wal_enabled,
+                self.checkpoint_after_updates,
+                self.global_txn.clone(),
+            )?;
             self.collections.insert(name.to_string(), coll);
         }
         Ok(self.collections.get_mut(name).unwrap())

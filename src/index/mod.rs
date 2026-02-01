@@ -2,10 +2,12 @@ mod key;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::Value;
 
 use self::key::{decode_index_id, encode_index_key, encode_range_bounds};
+use crate::txn::GlobalTxnState;
 use crate::{BTree, Document, WrongoDBError};
 
 /// A persistent secondary index backed by a B+tree.
@@ -25,20 +27,21 @@ impl PersistentIndex {
     fn open_or_create(
         path: &Path,
         wal_enabled: bool,
+        global_txn: Arc<GlobalTxnState>,
     ) -> Result<(Self, bool), WrongoDBError> {
         let mut created = false;
         let btree = if path.exists() {
-            match BTree::open(path, wal_enabled) {
+            match BTree::open(path, wal_enabled, global_txn.clone()) {
                 Ok(tree) => tree,
                 Err(_) => {
                     std::fs::remove_file(path)?;
                     created = true;
-                    BTree::create(path, 4096, wal_enabled)?
+                    BTree::create(path, 4096, wal_enabled, global_txn)?
                 }
             }
         } else {
             created = true;
-            BTree::create(path, 4096, wal_enabled)?
+            BTree::create(path, 4096, wal_enabled, global_txn)?
         };
 
         Ok((
@@ -101,6 +104,7 @@ pub struct SecondaryIndexManager {
     persistent: HashMap<String, PersistentIndex>,
     collection_path: PathBuf,
     wal_enabled: bool,
+    global_txn: Arc<GlobalTxnState>,
 }
 
 impl SecondaryIndexManager {
@@ -114,6 +118,7 @@ impl SecondaryIndexManager {
         fields: I,
         wal_enabled: bool,
         documents: &[Document],
+        global_txn: Arc<GlobalTxnState>,
     ) -> Result<Self, WrongoDBError>
     where
         P: AsRef<Path>,
@@ -130,7 +135,7 @@ impl SecondaryIndexManager {
             // Check if index exists BEFORE creating/opening
             let index_exists = index_path.exists();
 
-            let (mut index, created) = PersistentIndex::open_or_create(&index_path, wal_enabled)?;
+            let (mut index, created) = PersistentIndex::open_or_create(&index_path, wal_enabled, global_txn.clone())?;
 
             // If the index file was just created, build it from existing documents
             if !index_exists || created {
@@ -152,16 +157,18 @@ impl SecondaryIndexManager {
             persistent,
             collection_path,
             wal_enabled,
+            global_txn,
         })
     }
 
     /// Create an empty manager with no indexes (for new collections).
-    pub fn empty<P: AsRef<Path>>(collection_path: P, wal_enabled: bool) -> Self {
+    pub fn empty<P: AsRef<Path>>(collection_path: P, wal_enabled: bool, global_txn: Arc<GlobalTxnState>) -> Self {
         Self {
             fields: HashSet::new(),
             persistent: HashMap::new(),
             collection_path: collection_path.as_ref().to_path_buf(),
             wal_enabled,
+            global_txn,
         }
     }
 
@@ -222,7 +229,7 @@ impl SecondaryIndexManager {
 
         let index_path = Self::index_path(&self.collection_path, field);
         let (mut index, _created) =
-            PersistentIndex::open_or_create(&index_path, self.wal_enabled)?;
+            PersistentIndex::open_or_create(&index_path, self.wal_enabled, self.global_txn.clone())?;
 
         // Build index from existing documents
         for doc in existing_docs {
@@ -360,6 +367,8 @@ impl InMemoryIndex {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use serde_json::json;
     use tempfile::tempdir;
@@ -368,8 +377,9 @@ mod tests {
     fn persistent_index_insert_and_lookup() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("test.idx.wt");
+        let global_txn = Arc::new(GlobalTxnState::new());
 
-        let (mut index, _created) = PersistentIndex::open_or_create(&path, false).unwrap();
+        let (mut index, _created) = PersistentIndex::open_or_create(&path, false, global_txn).unwrap();
 
         // Insert some values
         index.insert(&json!("alice"), &json!("id1")).unwrap();
@@ -394,8 +404,9 @@ mod tests {
     fn persistent_index_remove() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("test.idx.wt");
+        let global_txn = Arc::new(GlobalTxnState::new());
 
-        let (mut index, _created) = PersistentIndex::open_or_create(&path, false).unwrap();
+        let (mut index, _created) = PersistentIndex::open_or_create(&path, false, global_txn).unwrap();
 
         index.insert(&json!("alice"), &json!("id1")).unwrap();
         index.insert(&json!("alice"), &json!("id2")).unwrap();
@@ -415,8 +426,9 @@ mod tests {
 
         // Create and populate index
         {
+            let global_txn = Arc::new(GlobalTxnState::new());
             let (mut index, _created) =
-                PersistentIndex::open_or_create(&path, false).unwrap();
+                PersistentIndex::open_or_create(&path, false, global_txn).unwrap();
             index.insert(&json!("alice"), &json!("id1")).unwrap();
             index.insert(&json!("bob"), &json!("id2")).unwrap();
             index.checkpoint().unwrap();
@@ -424,8 +436,9 @@ mod tests {
 
         // Reopen and verify
         {
+            let global_txn = Arc::new(GlobalTxnState::new());
             let (mut index, _created) =
-                PersistentIndex::open_or_create(&path, false).unwrap();
+                PersistentIndex::open_or_create(&path, false, global_txn).unwrap();
             let alice_ids = index.lookup(&json!("alice")).unwrap();
             assert_eq!(alice_ids.len(), 1);
             assert!(alice_ids.contains(&json!("id1")));
@@ -436,6 +449,7 @@ mod tests {
     fn secondary_index_manager_open_or_rebuild() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("collection.db");
+        let global_txn = Arc::new(GlobalTxnState::new());
 
         // Simulate existing documents
         let docs: Vec<Document> = vec![
@@ -445,7 +459,7 @@ mod tests {
         ];
 
         let mut manager =
-            SecondaryIndexManager::open_or_rebuild(&path, ["name", "age"], false, &docs).unwrap();
+            SecondaryIndexManager::open_or_rebuild(&path, ["name", "age"], false, &docs, global_txn).unwrap();
 
         // Test lookups
         let name_ids = manager.lookup("name", &json!("alice")).unwrap();
@@ -462,6 +476,7 @@ mod tests {
     fn secondary_index_manager_add_field() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("collection.db");
+        let global_txn = Arc::new(GlobalTxnState::new());
 
         let docs: Vec<Document> = vec![
             serde_json::from_value(json!({"_id": "a1", "name": "alice", "city": "nyc"})).unwrap(),
@@ -470,7 +485,7 @@ mod tests {
 
         // Start with just name index
         let mut manager =
-            SecondaryIndexManager::open_or_rebuild(&path, ["name"], false, &docs).unwrap();
+            SecondaryIndexManager::open_or_rebuild(&path, ["name"], false, &docs, global_txn).unwrap();
 
         // Add city index
         manager.add_field("city", &docs).unwrap();

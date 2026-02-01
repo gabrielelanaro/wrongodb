@@ -1,10 +1,12 @@
 use std::path::Path;
+use std::sync::Arc;
 
 pub mod page;
 mod page_cache;
 mod pager;
 mod layout;
 mod iter;
+mod mvcc;
 pub mod wal;
 
 pub use iter::BTreeRangeIter;
@@ -14,9 +16,11 @@ use layout::{
     split_internal_entries, split_leaf_entries, PageType,
 };
 use self::pager::{BTreeStore, PageRead, Pager, PinnedPageMut};
+use self::mvcc::MvccState;
 use self::wal::Wal;
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::block::file::NONE_BLOCK_ID;
+use crate::txn::GlobalTxnState;
 use page::{InternalPage, LeafPage, LeafPageError};
 
 // Type aliases for B-tree operations to clarify intent and reduce complexity
@@ -46,11 +50,17 @@ type KeyValueIter<'a> = BTreeRangeIter<'a>;
 pub struct BTree {
     pager: Box<dyn BTreeStore>,
     wal: Option<Wal>,
+    mvcc: MvccState,
 }
 
 impl BTree {
     /// Create a new BTree with WAL enabled or disabled.
-    pub fn create<P: AsRef<Path>>(path: P, page_size: usize, wal_enabled: bool) -> Result<Self, WrongoDBError> {
+    pub fn create<P: AsRef<Path>>(
+        path: P,
+        page_size: usize,
+        wal_enabled: bool,
+        global_txn: Arc<GlobalTxnState>,
+    ) -> Result<Self, WrongoDBError> {
         let mut pager = Pager::create(path.as_ref(), page_size)?;
         init_root_if_missing(&mut pager)?;
         pager.checkpoint()?;
@@ -62,11 +72,16 @@ impl BTree {
         Ok(Self {
             pager: Box::new(pager),
             wal,
+            mvcc: MvccState::new(global_txn),
         })
     }
 
     /// Open an existing BTree with WAL enabled or disabled.
-    pub fn open<P: AsRef<Path>>(path: P, wal_enabled: bool) -> Result<Self, WrongoDBError> {
+    pub fn open<P: AsRef<Path>>(
+        path: P,
+        wal_enabled: bool,
+        global_txn: Arc<GlobalTxnState>,
+    ) -> Result<Self, WrongoDBError> {
         let mut pager = Pager::open(path.as_ref())?;
         init_root_if_missing(&mut pager)?;
         let wal = if wal_enabled {
@@ -77,6 +92,7 @@ impl BTree {
         let mut tree = Self {
             pager: Box::new(pager),
             wal,
+            mvcc: MvccState::new(global_txn),
         };
 
         if wal_enabled {
@@ -268,8 +284,10 @@ impl BTree {
     ///
     /// # Example
     /// ```no_run
-    /// # use wrongodb::BTree;
-    /// # let mut tree = BTree::create("/tmp/db", 4096, true).unwrap();
+    /// # use std::sync::Arc;
+    /// # use wrongodb::{BTree, GlobalTxnState};
+    /// # let global_txn = Arc::new(GlobalTxnState::new());
+    /// # let mut tree = BTree::create("/tmp/db", 4096, true, global_txn).unwrap();
     /// tree.set_wal_sync_threshold(100);  // Sync every 100 operations
     /// ```
     pub fn set_wal_sync_threshold(&mut self, threshold: usize) {

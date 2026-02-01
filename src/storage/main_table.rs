@@ -1,9 +1,11 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::core::bson::{decode_document, encode_document, encode_id_value};
 use crate::core::errors::{DocumentValidationError, StorageError};
+use crate::txn::GlobalTxnState;
 use crate::{BTree, Document, WrongoDBError};
 
 #[derive(Debug)]
@@ -12,11 +14,15 @@ pub struct MainTable {
 }
 
 impl MainTable {
-    pub fn open_or_create<P: AsRef<Path>>(path: P, wal_enabled: bool) -> Result<Self, WrongoDBError> {
+    pub fn open_or_create<P: AsRef<Path>>(
+        path: P,
+        wal_enabled: bool,
+        global_txn: Arc<GlobalTxnState>,
+    ) -> Result<Self, WrongoDBError> {
         let btree = if path.as_ref().exists() {
-            BTree::open(path, wal_enabled)?
+            BTree::open(path, wal_enabled, global_txn)?
         } else {
-            BTree::create(path, 4096, wal_enabled)?
+            BTree::create(path, 4096, wal_enabled, global_txn)?
         };
         Ok(Self { btree })
     }

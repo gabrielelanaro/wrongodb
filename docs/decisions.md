@@ -14,6 +14,20 @@
 - HS is an internal B-tree keyed by `(btree_id, user_key, start_ts, counter)` with values carrying stop/durable timestamps and value.
 - GC can drop HS entries once `stop_ts < pinned_ts` (pinned = min active read timestamp and configured oldest).
 
+## 2026-02-01: Phase 1 keeps update chains in memory only
+
+**Decision**
+- Phase 1 MVCC update chains are stored in-memory and are not persisted or reconciled into pages.
+- MVCC BTree APIs are additive and not wired into engine CRUD yet.
+
+**Why**
+- Keeps Phase 1 focused on core MVCC primitives and visibility logic.
+- Avoids changing on-disk formats or WAL semantics before transaction lifecycle is implemented.
+
+**Notes**
+- `get_mvcc/put_mvcc/delete_mvcc` are internal building blocks for later phases.
+- Persistence, WAL markers, and history store integration are deferred to Phase 2+.
+
 ## 2026-02-01: MVCC WAL recovery filters by commit markers
 
 **Decision**

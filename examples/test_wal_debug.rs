@@ -1,13 +1,15 @@
+use std::sync::Arc;
 use tempfile::tempdir;
-use wrongodb::BTree;
+use wrongodb::{BTree, GlobalTxnState};
 
 fn main() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("test.db");
-    
+
     // Create database with WAL
     {
-        let mut tree = BTree::create(&db_path, 512, true).unwrap();
+        let global_txn = Arc::new(GlobalTxnState::new());
+        let mut tree = BTree::create(&db_path, 512, true, global_txn).unwrap();
         
         // Insert enough records to cause a split
         for i in 0..10 {

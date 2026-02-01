@@ -1,14 +1,15 @@
 //! WAL integration tests for BTree operations.
 
+use std::sync::Arc;
 use tempfile::tempdir;
-use wrongodb::BTree;
+use wrongodb::{BTree, GlobalTxnState};
 
 #[test]
 fn btree_creates_with_wal_enabled() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test.wt");
 
-    let _tree = BTree::create(&path, 512, true).unwrap();
+    let _tree = BTree::create(&path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
 
     // Verify WAL file exists
     let wal_path = path.with_extension("wt.wal");
@@ -20,7 +21,7 @@ fn btree_creates_without_wal() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test.wt");
 
-    let _tree = BTree::create(&path, 512, false).unwrap();
+    let _tree = BTree::create(&path, 512, false, Arc::new(GlobalTxnState::new())).unwrap();
 
     // Verify WAL file does NOT exist
     let wal_path = path.with_extension("wt.wal");
@@ -32,7 +33,7 @@ fn leaf_insert_logs_wal_record() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test.wt");
 
-    let mut tree = BTree::create(&path, 512, true).unwrap();
+    let mut tree = BTree::create(&path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
     tree.put(b"key1", b"value1").unwrap();
     // Sync WAL to flush the buffer
     tree.sync_wal().unwrap();
@@ -49,7 +50,7 @@ fn multiple_inserts_log_wal_records() {
     let path = tmp.path().join("test_split.wt");
 
     // Use small page size to create multiple updates
-    let mut tree = BTree::create(&path, 256, true).unwrap();
+    let mut tree = BTree::create(&path, 256, true, Arc::new(GlobalTxnState::new())).unwrap();
 
     // Insert many keys to generate multiple WAL records
     for i in 0..20 {
@@ -71,7 +72,7 @@ fn batch_sync_threshold() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test_batch.wt");
 
-    let mut tree = BTree::create(&path, 512, true).unwrap();
+    let mut tree = BTree::create(&path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
     tree.set_wal_sync_threshold(5);  // Sync every 5 operations
 
     // Insert 10 keys (should trigger 2 syncs)
@@ -93,7 +94,7 @@ fn checkpoint_logs_wal_record() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test_ckpt.wt");
 
-    let mut tree = BTree::create(&path, 512, true).unwrap();
+    let mut tree = BTree::create(&path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
     tree.put(b"key", b"value").unwrap();
     tree.checkpoint().unwrap();
 
@@ -109,7 +110,7 @@ fn wal_disabled_no_file_created() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test_no_wal.wt");
 
-    let mut tree = BTree::create(&path, 512, false).unwrap();
+    let mut tree = BTree::create(&path, 512, false, Arc::new(GlobalTxnState::new())).unwrap();
     tree.put(b"key", b"value").unwrap();
     tree.checkpoint().unwrap();
 
@@ -125,7 +126,7 @@ fn open_with_wal_reopens_existing_wal() {
 
     // Create with WAL
     {
-        let mut tree = BTree::create(&path, 512, true).unwrap();
+        let mut tree = BTree::create(&path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
         tree.put(b"key1", b"value1").unwrap();
         // Checkpoint to persist data
         tree.checkpoint().unwrap();
@@ -137,7 +138,7 @@ fn open_with_wal_reopens_existing_wal() {
 
     // Reopen with WAL enabled
     {
-        let mut tree = BTree::open(&path, true).unwrap();
+        let mut tree = BTree::open(&path, true, Arc::new(GlobalTxnState::new())).unwrap();
         // Verify data is accessible
         let value = tree.get(b"key1").unwrap();
         assert_eq!(value, Some(b"value1".to_vec()));
