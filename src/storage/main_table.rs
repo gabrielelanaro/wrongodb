@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::core::bson::{decode_document, encode_document, encode_id_value};
 use crate::core::errors::{DocumentValidationError, StorageError};
-use crate::txn::GlobalTxnState;
+use crate::txn::{GlobalTxnState, NonTransactional, ReadContext, Transaction};
 use crate::{BTree, Document, WrongoDBError};
 
 #[derive(Debug)]
@@ -39,12 +39,13 @@ impl MainTable {
         Ok(())
     }
 
-    pub fn get(&mut self, id: &Value) -> Result<Option<Document>, WrongoDBError> {
+    /// Get a document (transactional or non-transactional)
+    pub fn get(&mut self, id: &Value, ctx: impl ReadContext) -> Result<Option<Document>, WrongoDBError> {
         let key = encode_id_value(id)?;
-        let Some(bytes) = self.btree.get(&key)? else {
-            return Ok(None);
-        };
-        Ok(Some(decode_document(&bytes)?))
+        match self.btree.get_ctx(&key, &ctx)? {
+            Some(bytes) => Ok(Some(decode_document(&bytes)?)),
+            None => Ok(None),
+        }
     }
 
     pub fn update(&mut self, doc: &Document) -> Result<bool, WrongoDBError> {
@@ -65,20 +66,107 @@ impl MainTable {
         self.btree.delete(&key)
     }
 
-    pub fn scan(&mut self) -> Result<Vec<Document>, WrongoDBError> {
+    /// Scan all documents visible to the context
+    pub fn scan(&mut self, ctx: impl ReadContext) -> Result<Vec<Document>, WrongoDBError> {
         let mut out = Vec::new();
-        let iter = self
+
+        // Collect all keys first to avoid borrow issues
+        let keys: Vec<Vec<u8>> = self
             .btree
             .range(None, None)
-            .map_err(|e| StorageError(format!("main table scan failed: {e}")))?;
-        for entry in iter {
-            let (_, value) = entry?;
-            out.push(decode_document(&value)?);
+            .map_err(|e| StorageError(format!("main table scan failed: {e}")))?
+            .map(|entry| entry.map(|(k, _v)| k.to_vec()))
+            .collect::<Result<_, _>>()?;
+
+        for key in keys {
+            // Use get_ctx to respect the read context (MVCC or non-transactional)
+            if let Some(bytes) = self.btree.get_ctx(&key, &ctx)? {
+                out.push(decode_document(&bytes)?);
+            }
         }
         Ok(out)
     }
 
+    /// Scan all documents without a transaction (non-transactional)
+    pub fn scan_non_txn(&mut self) -> Result<Vec<Document>, WrongoDBError> {
+        self.scan(NonTransactional)
+    }
+
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         self.btree.checkpoint()
+    }
+
+    /// Insert a document within a transaction (MVCC)
+    pub fn insert_mvcc(
+        &mut self,
+        doc: &Document,
+        txn: &mut Transaction,
+    ) -> Result<(), WrongoDBError> {
+        let id = doc
+            .get("_id")
+            .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
+        let key = encode_id_value(id)?;
+        let value = encode_document(doc)?;
+
+        // Check if key already exists in this transaction's view
+        if self.btree.get_mvcc(&key, txn)?.is_some() {
+            return Err(DocumentValidationError("duplicate key error".into()).into());
+        }
+
+        self.btree.put_mvcc(&key, &value, txn)?;
+        Ok(())
+    }
+
+    /// Update a document within a transaction (MVCC)
+    pub fn update_mvcc(
+        &mut self,
+        doc: &Document,
+        txn: &mut Transaction,
+    ) -> Result<bool, WrongoDBError> {
+        let id = doc
+            .get("_id")
+            .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
+        let key = encode_id_value(id)?;
+
+        // Check if document exists in this transaction's view
+        if self.btree.get_mvcc(&key, txn)?.is_none() {
+            return Ok(false);
+        }
+
+        let value = encode_document(doc)?;
+        self.btree.put_mvcc(&key, &value, txn)?;
+        Ok(true)
+    }
+
+    /// Delete a document within a transaction (MVCC)
+    pub fn delete_mvcc(
+        &mut self,
+        id: &Value,
+        txn: &mut Transaction,
+    ) -> Result<bool, WrongoDBError> {
+        let key = encode_id_value(id)?;
+
+        // Check if document exists in this transaction's view
+        if self.btree.get_mvcc(&key, txn)?.is_none() {
+            return Ok(false);
+        }
+
+        self.btree.delete_mvcc(&key, txn)?;
+        Ok(true)
+    }
+
+    /// Get the underlying BTree's MVCC state for transaction management
+    pub fn begin_txn(&self) -> Transaction {
+        self.btree.begin_txn(crate::txn::IsolationLevel::Snapshot)
+    }
+
+    /// Commit a transaction on the underlying BTree
+    pub fn commit_txn(&mut self, txn: &mut Transaction) -> Result<(), WrongoDBError> {
+        self.btree.commit_txn(txn)
+    }
+
+    /// Abort a transaction on the underlying BTree
+    pub fn abort_txn(&mut self, txn: &mut Transaction) -> Result<(), WrongoDBError> {
+        self.btree.abort_txn(txn)
     }
 }

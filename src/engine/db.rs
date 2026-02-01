@@ -114,6 +114,27 @@ impl WrongoDB {
         Self::open_with_config(path, WrongoDBConfig::default())
     }
 
+    /// Open a database with an existing GlobalTxnState for sharing across databases.
+    ///
+    /// This is primarily useful for tests where multiple collections need to
+    /// share the same transaction state.
+    pub fn open_with_global_txn<P>(path: P, global_txn: Arc<GlobalTxnState>) -> Result<Self, WrongoDBError>
+    where
+        P: AsRef<Path>,
+    {
+        let base_path = path.as_ref().to_path_buf();
+
+        let db = Self {
+            base_path,
+            collections: HashMap::new(),
+            wal_enabled: true,
+            checkpoint_after_updates: None,
+            global_txn,
+        };
+
+        Ok(db)
+    }
+
     pub fn collection(&mut self, name: &str) -> Result<&mut Collection, WrongoDBError> {
         if !self.collections.contains_key(name) {
             let coll_path = PathBuf::from(format!("{}.{}", self.base_path.display(), name));

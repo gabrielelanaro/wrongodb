@@ -8,9 +8,13 @@ use crate::core::document::{normalize_document_in_place, validate_is_object};
 use crate::txn::GlobalTxnState;
 
 mod update;
+mod txn;
+
+pub use self::txn::CollectionTxn;
 use self::update::apply_update;
 use crate::index::SecondaryIndexManager;
 use crate::storage::main_table::MainTable;
+use crate::txn::Transaction;
 use crate::{Document, WrongoDBError};
 
 /// Represents a single collection within the database
@@ -21,6 +25,7 @@ pub struct Collection {
     doc_count: usize,
     checkpoint_after_updates: Option<usize>,
     updates_since_checkpoint: usize,
+    global_txn: Arc<GlobalTxnState>,
 }
 
 impl Collection {
@@ -34,7 +39,7 @@ impl Collection {
         let main_table = MainTable::open_or_create(&main_table_path, wal_enabled, global_txn.clone())?;
 
         // Start with empty manager - indexes can be created via create_index()
-        let secondary_indexes = SecondaryIndexManager::empty(path, wal_enabled, global_txn);
+        let secondary_indexes = SecondaryIndexManager::empty(path, wal_enabled, global_txn.clone());
 
         let mut coll = Self {
             main_table,
@@ -42,13 +47,18 @@ impl Collection {
             doc_count: 0,
             checkpoint_after_updates,
             updates_since_checkpoint: 0,
+            global_txn,
         };
         coll.load_existing(path)?;
         Ok(coll)
     }
 
+    fn begin_snapshot_txn(&self) -> Transaction {
+        self.global_txn.begin_snapshot_txn()
+    }
+
     fn load_existing(&mut self, _path: &Path) -> Result<(), WrongoDBError> {
-        let docs = self.main_table.scan()?;
+        let docs = self.main_table.scan_non_txn()?;
         self.doc_count = docs.len();
 
         // Indexes are not created automatically - use create_index() after getting collection
@@ -75,8 +85,11 @@ impl Collection {
             }
         };
 
+        // Create a snapshot transaction for MVCC reads
+        let txn = self.begin_snapshot_txn();
+
         if filter_doc.is_empty() {
-            return self.main_table.scan();
+            return self.main_table.scan(&txn);
         }
 
         let matches_filter = |doc: &Document| {
@@ -91,7 +104,7 @@ impl Collection {
         };
 
         if let Some(id_value) = filter_doc.get("_id") {
-            let doc = self.main_table.get(id_value)?;
+            let doc = self.main_table.get(id_value, &txn)?;
             return Ok(match doc {
                 Some(doc) if matches_filter(&doc) => vec![doc],
                 _ => Vec::new(),
@@ -108,7 +121,7 @@ impl Collection {
             let ids = self.secondary_indexes.lookup(&field, value)?;
             let mut results = Vec::new();
             for id in ids {
-                if let Some(doc) = self.main_table.get(&id)? {
+                if let Some(doc) = self.main_table.get(&id, &txn)? {
                     if matches_filter(&doc) {
                         results.push(doc);
                     }
@@ -117,7 +130,7 @@ impl Collection {
             return Ok(results);
         }
 
-        let docs = self.main_table.scan()?;
+        let docs = self.main_table.scan(&txn)?;
         Ok(docs.into_iter().filter(|doc| matches_filter(doc)).collect())
     }
 
@@ -256,7 +269,7 @@ impl Collection {
     }
 
     pub fn create_index(&mut self, field: &str) -> Result<(), WrongoDBError> {
-        let existing_docs = self.main_table.scan()?;
+        let existing_docs = self.main_table.scan_non_txn()?;
         let was_indexed = self.secondary_indexes.fields.contains(field);
         self.secondary_indexes.add_field(field, &existing_docs)?;
         if !was_indexed {
@@ -291,6 +304,57 @@ impl Collection {
 
     pub fn index_count(&self) -> usize {
         self.secondary_indexes.fields.len()
+    }
+
+    /// Begin a new transaction on this collection.
+    ///
+    /// # Example
+    /// ```
+    /// # use wrongodb::WrongoDB;
+    /// # use serde_json::json;
+    /// # let tmp = tempfile::tempdir().unwrap();
+    /// # let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
+    /// # let coll = db.collection("test").unwrap();
+    /// let mut txn = coll.begin_txn().unwrap();
+    /// let doc = txn.insert_one(json!({"name": "alice"})).unwrap();
+    /// txn.commit().unwrap();
+    /// ```
+    pub fn begin_txn(&mut self) -> Result<CollectionTxn<'_>, WrongoDBError> {
+        Ok(CollectionTxn::new(self))
+    }
+
+    /// Run a function in a transaction, automatically committing or aborting.
+    ///
+    /// If the function returns Ok, the transaction is committed.
+    /// If the function returns Err, the transaction is aborted.
+    ///
+    /// # Example
+    /// ```
+    /// # use wrongodb::WrongoDB;
+    /// # use serde_json::json;
+    /// # let tmp = tempfile::tempdir().unwrap();
+    /// # let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
+    /// # let coll = db.collection("test").unwrap();
+    /// let result = coll.with_txn(|txn| {
+    ///     let doc = txn.insert_one(json!({"name": "alice"}))?;
+    ///     Ok(doc)
+    /// }).unwrap();
+    /// ```
+    pub fn with_txn<F, R>(&mut self, f: F) -> Result<R, WrongoDBError>
+    where
+        F: FnOnce(&mut CollectionTxn<'_>) -> Result<R, WrongoDBError>,
+    {
+        let mut txn = self.begin_txn()?;
+        match f(&mut txn) {
+            Ok(result) => {
+                txn.commit()?;
+                Ok(result)
+            }
+            Err(e) => {
+                let _ = txn.abort();
+                Err(e)
+            }
+        }
     }
 }
 

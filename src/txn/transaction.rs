@@ -113,8 +113,9 @@ impl Transaction {
                 // Clear modifications
                 self.modifications.clear();
 
-                // Unregister from active transactions
+                // Mark as aborted and unregister from active transactions
                 if self.id != TXN_NONE {
+                    global.mark_aborted(self.id);
                     global.unregister_active(self.id);
                 }
 

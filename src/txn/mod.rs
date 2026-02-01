@@ -16,5 +16,31 @@ pub type Timestamp = u64;
 pub const TS_NONE: Timestamp = 0;
 pub const TS_MAX: Timestamp = u64::MAX;
 
+/// Context for read operations - can be a transaction or non-transactional context
+pub trait ReadContext {
+    fn txn(&self) -> Option<&Transaction>;
+}
+
+impl ReadContext for Transaction {
+    fn txn(&self) -> Option<&Transaction> {
+        Some(self)
+    }
+}
+
+impl ReadContext for &Transaction {
+    fn txn(&self) -> Option<&Transaction> {
+        Some(self)
+    }
+}
+
+/// Non-transactional context uses TXN_NONE
+pub struct NonTransactional;
+
+impl ReadContext for NonTransactional {
+    fn txn(&self) -> Option<&Transaction> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests;

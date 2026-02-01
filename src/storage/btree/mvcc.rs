@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::core::errors::WrongoDBError;
 use crate::txn::{
-    GlobalTxnState, IsolationLevel, Transaction, Update, UpdateChain, UpdateType, WriteOp,
+    GlobalTxnState, IsolationLevel, ReadContext, Transaction, Update, UpdateChain, UpdateType, WriteOp,
 };
 
 use super::BTree;
@@ -50,6 +50,14 @@ impl BTree {
         }
 
         self.get(key)
+    }
+
+    /// Unified read - uses MVCC if txn provided, else reads committed data
+    pub fn get_ctx(&mut self, key: &[u8], ctx: &dyn ReadContext) -> Result<Option<Vec<u8>>, WrongoDBError> {
+        match ctx.txn() {
+            Some(txn) => self.get_mvcc(key, txn),
+            None => self.get(key),
+        }
     }
 
     pub fn put_mvcc(
