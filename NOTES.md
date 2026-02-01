@@ -97,3 +97,25 @@ Results (ms)
 
 Notes
 - This run includes preallocation and a fresh DB, so it is not directly comparable to earlier runs with an existing server process.
+
+# Notes: MVCC / transactions (WiredTiger + MongoDB)
+
+## Evidence from WiredTiger docs
+- Transactions are per-session; a transaction id is assigned on first write, and snapshot isolation uses a snapshot of concurrent txns (max/min + active list).
+  - `wiredtiger/src/docs/arch-transaction.dox`, `wiredtiger/src/docs/arch-snapshot.dox`
+- Each key has an in-memory update chain (newest first). Reads walk the chain; if no visible update, they check the on-disk value, then the history store.
+  - `wiredtiger/src/docs/arch-transaction.dox`
+- Older versions are stored in a dedicated history store table. Keys include (btree id, user key, start ts, counter); values include stop ts, durable ts, type, value.
+  - `wiredtiger/src/docs/arch-hs.dox`
+- GC / stability relies on oldest/stable timestamps; rollback-to-stable removes updates newer than stable.
+  - `wiredtiger/src/docs/arch-timestamp.dox`, `wiredtiger/src/docs/arch-rts.dox`
+
+## Evidence from MongoDB storage API
+- Storage engines expose `RecoveryUnit` + `WriteUnitOfWork` for snapshot-isolated storage transactions; snapshots open lazily on first read/write.
+  - `mongodb/src/mongo/db/storage/README.md`
+- Timestamped reads use a `ReadSource` to return data committed at or before a read timestamp; write conflicts are surfaced as `WriteConflictException`.
+  - `mongodb/src/mongo/db/storage/README.md`
+
+## Implications for minimongo
+- A WT-like MVCC core implies per-key update chains in memory, a history store for older versions, and snapshot visibility based on txn ids + timestamps.
+- A Mongo-like API surface suggests RAII write units of work and lazy snapshot creation, with retryable write conflicts.

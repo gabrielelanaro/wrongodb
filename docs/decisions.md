@@ -1,5 +1,47 @@
 # Decisions
 
+## 2026-02-01: MVCC includes history store for older versions
+
+**Decision**
+- The MVCC design will include a dedicated history store (HS) table to retain older committed versions.
+- Read path will consult update chains, then on-disk base value, then HS.
+
+**Why**
+- Snapshot isolation must remain correct across eviction/checkpoint; without HS, long-running readers can lose older versions.
+- Matches the WiredTiger/MongoDB model and avoids unbounded in-memory version chains.
+
+**Notes**
+- HS is an internal B-tree keyed by `(btree_id, user_key, start_ts, counter)` with values carrying stop/durable timestamps and value.
+- GC can drop HS entries once `stop_ts < pinned_ts` (pinned = min active read timestamp and configured oldest).
+
+## 2026-02-01: MVCC WAL recovery filters by commit markers
+
+**Decision**
+- WAL recovery will apply logical operations only for transactions with a `TxnCommit` record.
+- Transactions without a commit record at end-of-log are treated as aborted.
+
+**Why**
+- Preserves atomicity during crash recovery and matches WiredTiger’s logical replay model.
+- Avoids partially applying uncommitted writes when using per-txn WAL grouping.
+
+**Notes**
+- Recovery still starts from the checkpoint LSN.
+- Prepared transactions (future) will be rolled back to stable during recovery unless explicitly made durable.
+
+## 2026-02-01: Multi-file atomic commit via txn visibility + WAL commit marker
+
+**Decision**
+- Multi-document transactions are made atomic across multiple files by global transaction visibility.
+- `TxnCommit` in the WAL is the durability boundary; only committed txns are applied during recovery.
+
+**Why**
+- Avoids the need for cross-file atomic writes while still providing all-at-once visibility.
+- Mirrors WiredTiger/MongoDB’s logical recovery model and preserves crash safety.
+
+**Notes**
+- Checkpoints may flush some files earlier than others; WAL replay reconciles them to the same committed state.
+- Collection main tables and indexes all participate in the same transaction context.
+
 ## 2026-01-31: Explicit collections, no default "test"
 
 **Decision**
