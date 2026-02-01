@@ -79,4 +79,21 @@ impl UpdateChain {
         }
         None
     }
+
+    /// Get mutable access to the head of the chain.
+    pub fn head_mut(&mut self) -> Option<&mut Update> {
+        self.head.as_deref_mut()
+    }
+
+    /// Mark all updates from a given transaction as aborted.
+    pub fn mark_aborted(&mut self, txn_id: TxnId) {
+        let mut current = self.head.as_deref_mut();
+        while let Some(update) = current {
+            if update.txn_id == txn_id {
+                update.time_window.stop_ts = TS_NONE;
+                update.time_window.stop_txn = TXN_ABORTED;
+            }
+            current = update.next.as_deref_mut();
+        }
+    }
 }

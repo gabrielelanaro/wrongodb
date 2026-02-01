@@ -4,7 +4,8 @@ pub mod transaction;
 pub mod update;
 
 pub use global_txn::GlobalTxnState;
-pub use transaction::{IsolationLevel, Transaction};
+#[allow(unused_imports)]
+pub use transaction::{IsolationLevel, Transaction, TxnState, WriteOp, WriteRef};
 pub use update::{Update, UpdateChain, UpdateType};
 
 pub type TxnId = u64;

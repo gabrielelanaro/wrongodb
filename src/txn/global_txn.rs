@@ -66,6 +66,6 @@ impl GlobalTxnState {
         let txn_id = self.allocate_txn_id();
         self.register_active(txn_id);
         let snapshot = self.take_snapshot(txn_id);
-        Transaction::new_with_snapshot(txn_id, IsolationLevel::Snapshot, snapshot)
+        Transaction::new(txn_id, IsolationLevel::Snapshot, snapshot)
     }
 }

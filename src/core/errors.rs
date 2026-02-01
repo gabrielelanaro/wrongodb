@@ -22,6 +22,9 @@ pub enum WrongoDBError {
 
     #[error("protocol error: {0}")]
     Protocol(String),
+
+    #[error("invalid transaction state: {0}")]
+    InvalidTransactionState(String),
 }
 
 #[derive(Debug, Error)]

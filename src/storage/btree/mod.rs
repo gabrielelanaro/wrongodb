@@ -20,7 +20,7 @@ use self::mvcc::MvccState;
 use self::wal::Wal;
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::block::file::NONE_BLOCK_ID;
-use crate::txn::GlobalTxnState;
+use crate::txn::{GlobalTxnState, TxnId, TXN_NONE};
 use page::{InternalPage, LeafPage, LeafPageError};
 
 // Type aliases for B-tree operations to clarify intent and reduce complexity
@@ -184,7 +184,7 @@ impl BTree {
             self.pager.set_root_page_id(result.new_node_id)?;
         }
 
-        self.log_wal_if_enabled(|w| w.log_put(key, value))?;
+        self.log_wal_if_enabled(|w| w.log_put(key, value, TXN_NONE))?;
 
         Ok(())
     }
@@ -218,7 +218,7 @@ impl BTree {
             self.pager.set_root_page_id(result.new_node_id)?;
         }
 
-        self.log_wal_if_enabled(|w| w.log_put(key, value))?;
+        self.log_wal_if_enabled(|w| w.log_put(key, value, TXN_NONE))?;
 
         Ok(true)
     }
@@ -232,7 +232,7 @@ impl BTree {
         let result = self.delete_recursive(root, key)?;
         self.pager.set_root_page_id(result.new_node_id)?;
 
-        self.log_wal_if_enabled(|w| w.log_delete(key))?;
+        self.log_wal_if_enabled(|w| w.log_delete(key, TXN_NONE))?;
 
         Ok(result.deleted)
     }
@@ -340,30 +340,67 @@ impl BTree {
         let result = (|| {
             let mut stats = RecoveryStats::default();
 
-            // Replay all records
+            // Phase 1: Build transaction table from commit/abort markers
+            let mut committed_txns: std::collections::HashSet<TxnId> = std::collections::HashSet::new();
+            let mut aborted_txns: std::collections::HashSet<TxnId> = std::collections::HashSet::new();
+
             while let Some((_header, record)) = wal_reader
                 .read_record()
                 .map_err(|e| StorageError(format!("Failed to read WAL record: {}", e)))?
             {
                 match record {
-                    wal::WalRecord::Put { key, value } => {
-                        self.put(&key, &value)?;
-                        stats.puts += 1;
+                    wal::WalRecord::TxnCommit { txn_id, .. } => {
+                        committed_txns.insert(txn_id);
                     }
-                    wal::WalRecord::Delete { key } => {
-                        let _ = self.delete(&key)?;
-                        stats.deletes += 1;
+                    wal::WalRecord::TxnAbort { txn_id } => {
+                        aborted_txns.insert(txn_id);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Reset reader to start from checkpoint again
+            let mut wal_reader = wal::WalReader::open(&wal_path)
+                .map_err(|e| StorageError(format!("Failed to reopen WAL for recovery: {}", e)))?;
+
+            // Phase 2: Replay only committed operations
+            while let Some((_header, record)) = wal_reader
+                .read_record()
+                .map_err(|e| StorageError(format!("Failed to read WAL record: {}", e)))?
+            {
+                match record {
+                    wal::WalRecord::Put { key, value, txn_id } => {
+                        // Replay if: non-transactional (TXN_NONE) or committed
+                        if txn_id == TXN_NONE || committed_txns.contains(&txn_id) {
+                            self.put(&key, &value)?;
+                            stats.puts += 1;
+                        }
+                        // Skip if aborted or uncommitted
+                    }
+                    wal::WalRecord::Delete { key, txn_id } => {
+                        // Replay if: non-transactional (TXN_NONE) or committed
+                        if txn_id == TXN_NONE || committed_txns.contains(&txn_id) {
+                            let _ = self.delete(&key)?;
+                            stats.deletes += 1;
+                        }
+                        // Skip if aborted or uncommitted
                     }
                     wal::WalRecord::Checkpoint { .. } => {
                         stats.checkpoints += 1;
+                    }
+                    wal::WalRecord::TxnCommit { .. } => {
+                        stats.txn_commits += 1;
+                    }
+                    wal::WalRecord::TxnAbort { .. } => {
+                        stats.txn_aborts += 1;
                     }
                 }
                 stats.operations_replayed += 1;
             }
 
             eprintln!(
-                "WAL recovery complete: {} operations replayed (puts={}, deletes={}, checkpoints={})",
-                stats.operations_replayed, stats.puts, stats.deletes, stats.checkpoints
+                "WAL recovery complete: {} operations replayed (puts={}, deletes={}, checkpoints={}, commits={}, aborts={})",
+                stats.operations_replayed, stats.puts, stats.deletes, stats.checkpoints, stats.txn_commits, stats.txn_aborts
             );
 
             Ok(())
@@ -710,6 +747,8 @@ struct RecoveryStats {
     puts: usize,
     deletes: usize,
     checkpoints: usize,
+    txn_commits: usize,
+    txn_aborts: usize,
 }
 
 #[derive(Debug, Clone)]
