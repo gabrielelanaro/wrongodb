@@ -142,6 +142,29 @@ impl Table {
         Ok(true)
     }
 
+    pub fn get_mvcc(&mut self, key: &[u8], txn: &Transaction) -> Result<Option<Vec<u8>>, WrongoDBError> {
+        self.btree.get_mvcc(key, txn)
+    }
+
+    /// Scan all key/value pairs visible to the given transaction.
+    pub fn scan_txn(&mut self, txn: &Transaction) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
+        let mut out = Vec::new();
+
+        let entries = self
+            .btree
+            .range(None, None)
+            .map_err(|e| crate::core::errors::StorageError(format!("table scan failed: {e}")))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (key, _value) in entries {
+            if let Some(bytes) = self.btree.get_mvcc(&key, txn)? {
+                out.push((key.to_vec(), bytes));
+            }
+        }
+
+        Ok(out)
+    }
+
     pub fn run_gc(&mut self) -> (usize, usize, usize) {
         self.btree.run_gc()
     }

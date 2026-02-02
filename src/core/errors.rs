@@ -25,6 +25,12 @@ pub enum WrongoDBError {
 
     #[error("invalid transaction state: {0}")]
     InvalidTransactionState(String),
+
+    #[error("transaction already active")]
+    TransactionAlreadyActive,
+
+    #[error("no active transaction")]
+    NoActiveTransaction,
 }
 
 #[derive(Debug, Error)]
