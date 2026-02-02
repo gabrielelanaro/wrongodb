@@ -21,6 +21,7 @@ use crate::txn::{NonTransactional, Transaction};
 use crate::{Document, WrongoDBError};
 
 /// Represents a single collection within the database
+/// NOTE: refactoring in progress, we should use Session/Cursor based transactions instead of this crap
 #[derive(Debug)]
 pub struct Collection {
     main_table: Arc<RwLock<Table>>,
