@@ -17,7 +17,7 @@ use self::update::apply_update;
 use crate::core::bson::{decode_document, encode_document, encode_id_value};
 use crate::index::SecondaryIndexManager;
 use crate::storage::table::Table;
-use crate::txn::{NonTransactional, Transaction};
+use crate::txn::{Transaction, TXN_NONE};
 use crate::{Document, WrongoDBError};
 
 /// Represents a single collection within the database
@@ -62,10 +62,9 @@ impl Collection {
     }
 
     fn load_existing(&mut self, _path: &Path) -> Result<(), WrongoDBError> {
-        let entries = self.main_table.write().scan(&NonTransactional)?;
+        let entries = self.main_table.write().scan(TXN_NONE)?;
         self.doc_count = entries.len();
 
-        // Indexes are not created automatically - use create_index() after getting collection
         Ok(())
     }
 
@@ -107,7 +106,7 @@ impl Collection {
         };
 
         if filter_doc.is_empty() {
-            let entries = self.main_table.write().scan(txn)?;
+            let entries = self.main_table.write().scan(txn.id())?;
             return entries
                 .into_iter()
                 .map(|(_, v)| decode_document(&v))
@@ -127,7 +126,7 @@ impl Collection {
 
         if let Some(id_value) = filter_doc.get("_id") {
             let key = encode_id_value(id_value)?;
-            let doc_bytes = self.main_table.write().get(&key, txn)?;
+            let doc_bytes = self.main_table.write().get(&key, txn.id())?;
             return Ok(match doc_bytes {
                 Some(bytes) => {
                     let doc = decode_document(&bytes)?;
@@ -152,7 +151,7 @@ impl Collection {
             let mut results = Vec::new();
             for id in ids {
                 let key = encode_id_value(&id)?;
-                if let Some(bytes) = self.main_table.write().get(&key, txn)? {
+                if let Some(bytes) = self.main_table.write().get(&key, txn.id())? {
                     let doc = decode_document(&bytes)?;
                     if matches_filter(&doc) {
                         results.push(doc);
@@ -162,7 +161,7 @@ impl Collection {
             return Ok(results);
         }
 
-        let entries = self.main_table.write().scan(txn)?;
+        let entries = self.main_table.write().scan(txn.id())?;
         let mut results = Vec::new();
         for (_, bytes) in entries {
             let doc = decode_document(&bytes)?;
@@ -325,7 +324,7 @@ impl Collection {
     }
 
     pub fn create_index(&mut self, field: &str) -> Result<(), WrongoDBError> {
-        let entries = self.main_table.write().scan(&NonTransactional)?;
+        let entries = self.main_table.write().scan(TXN_NONE)?;
         let existing_docs: Vec<Document> = entries
             .into_iter()
             .map(|(_, v)| decode_document(&v))

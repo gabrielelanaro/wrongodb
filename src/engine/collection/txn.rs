@@ -53,9 +53,8 @@ pub struct CollectionTxn<'a> {
 }
 
 impl<'a> CollectionTxn<'a> {
-    /// Create a new CollectionTxn (called by Collection::begin_txn)
     pub(crate) fn new(collection: &'a mut Collection) -> Self {
-        let txn = collection.main_table().begin_txn();
+        let txn = collection.begin_snapshot_txn();
         let cursor = collection.main_table_cursor();
         Self {
             collection,

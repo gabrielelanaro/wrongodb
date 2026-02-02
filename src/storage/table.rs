@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::storage::btree::BTree;
-use crate::txn::{GlobalTxnState, ReadContext, Transaction};
+use crate::txn::{GlobalTxnState, TxnId};
 use crate::WrongoDBError;
 
 /// A low-level storage table, wrapping a BTree.
@@ -47,18 +47,15 @@ impl Table {
         Ok(true)
     }
 
-    /// Get a value by key within a context.
-    pub fn get(&mut self, key: &[u8], ctx: &dyn ReadContext) -> Result<Option<Vec<u8>>, WrongoDBError> {
-        self.btree.get_ctx(key, ctx)
+    pub fn get(&mut self, key: &[u8], txn_id: TxnId) -> Result<Option<Vec<u8>>, WrongoDBError> {
+        self.btree.get_version(key, txn_id)
     }
 
-    /// Delete a key.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool, WrongoDBError> {
         self.btree.delete(key)
     }
 
-    /// Scan all key/value pairs visible to the given context.
-    pub fn scan(&mut self, ctx: &dyn ReadContext) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
+    pub fn scan(&mut self, txn_id: TxnId) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
         let mut out = Vec::new();
 
         let entries = self
@@ -68,7 +65,7 @@ impl Table {
             .collect::<Result<Vec<_>, _>>()?;
 
         for (key, _value) in entries {
-            if let Some(bytes) = self.btree.get_ctx(&key, ctx)? {
+            if let Some(bytes) = self.btree.get_version(&key, txn_id)? {
                 out.push((key.to_vec(), bytes));
             }
         }
@@ -84,62 +81,36 @@ impl Table {
     // MVCC operations
     // ==========================================================================
 
-    pub fn begin_txn(&self) -> Transaction {
-        self.btree.begin_txn(crate::txn::IsolationLevel::Snapshot)
-    }
-
-    /// Mark all updates from this transaction as committed in MVCC chains
-    /// and log the commit to WAL
-    pub(crate) fn mark_updates_committed(&mut self, txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
+    pub fn mark_updates_committed(&mut self, txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
         self.btree.mark_updates_committed(txn_id)
     }
 
-    /// Mark all updates from this transaction as aborted in MVCC chains
-    /// and log the abort to WAL
-    pub(crate) fn mark_updates_aborted(&mut self, txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
+    pub fn mark_updates_aborted(&mut self, txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
         self.btree.mark_updates_aborted(txn_id)
     }
 
-    pub fn insert_mvcc(&mut self, key: &[u8], value: &[u8], txn: &mut Transaction) -> Result<(), WrongoDBError> {
-        if self.btree.get_mvcc(key, txn)?.is_some() {
-            return Err(crate::core::errors::DocumentValidationError("duplicate key error".into()).into());
-        }
-        self.btree.put_mvcc(key, value, txn)?;
+    pub fn insert_mvcc(&mut self, key: &[u8], value: &[u8], txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
+        self.btree.put_version(key, value, txn_id)?;
         Ok(())
     }
 
-    pub fn update_mvcc(&mut self, key: &[u8], value: &[u8], txn: &mut Transaction) -> Result<bool, WrongoDBError> {
-        if self.btree.get_mvcc(key, txn)?.is_none() {
-            return Ok(false);
-        }
-        self.btree.put_mvcc(key, value, txn)?;
+    pub fn update_mvcc(&mut self, key: &[u8], value: &[u8], txn_id: crate::txn::TxnId) -> Result<bool, WrongoDBError> {
+        self.btree.put_version(key, value, txn_id)?;
         Ok(true)
     }
 
-    pub fn delete_mvcc(&mut self, key: &[u8], txn: &mut Transaction) -> Result<bool, WrongoDBError> {
-        if self.btree.get_mvcc(key, txn)?.is_none() {
-            return Ok(false);
-        }
-        self.btree.delete_mvcc(key, txn)?;
+    pub fn delete_mvcc(&mut self, key: &[u8], txn_id: crate::txn::TxnId) -> Result<bool, WrongoDBError> {
+        self.btree.delete_version(key, txn_id)?;
         Ok(true)
     }
 
-    pub fn get_mvcc(&mut self, key: &[u8], txn: &Transaction) -> Result<Option<Vec<u8>>, WrongoDBError> {
-        self.btree.get_mvcc(key, txn)
+    pub fn get_version(&mut self, key: &[u8], txn_id: TxnId) -> Result<Option<Vec<u8>>, WrongoDBError> {
+        self.btree.get_version(key, txn_id)
     }
 
-    /// Scan key/value pairs visible to the given transaction, starting from a specific key.
-    ///
-    /// If `start_key` is None, starts from the beginning.
-    /// If `start_key` is Some, starts from the key *after* the given key.
-    pub fn scan_txn_from(
-        &mut self,
-        start_key: Option<&[u8]>,
-        txn: &Transaction,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
+    pub fn scan_from(&mut self, start_key: Option<&[u8]>, txn_id: TxnId) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
         let mut out = Vec::new();
 
-        // Use range iterator to efficiently scan from the start position
         let entries = self
             .btree
             .range(start_key, None)
@@ -147,15 +118,13 @@ impl Table {
             .collect::<Result<Vec<_>, _>>()?;
 
         for (key, _value) in entries {
-            // Skip the start_key itself if provided (we want keys *after* it)
             if let Some(start) = start_key {
                 if key.as_slice() == start {
                     continue;
                 }
             }
 
-            // Check MVCC visibility
-            if let Some(bytes) = self.btree.get_mvcc(&key, txn)? {
+            if let Some(bytes) = self.btree.get_version(&key, txn_id)? {
                 out.push((key.to_vec(), bytes));
             }
         }

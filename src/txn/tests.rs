@@ -1,4 +1,4 @@
-use super::{GlobalTxnState, Update, UpdateChain, UpdateType, TXN_NONE};
+use super::{GlobalTxnState, Transaction, Update, UpdateChain, UpdateType, TXN_NONE};
 
 #[test]
 fn snapshot_visibility_basic() {
@@ -27,14 +27,29 @@ fn update_chain_visibility() {
     chain.prepend(Update::new(t1.id(), UpdateType::Standard, b"v1".to_vec()));
     chain.prepend(Update::new(t2.id(), UpdateType::Standard, b"v2".to_vec()));
 
-    let visible_t2 = chain.find_visible(&t2).expect("t2 visible update");
+    let visible_t2 = find_visible(&chain, &t2).expect("t2 visible update");
     assert_eq!(visible_t2.data, b"v2".to_vec());
 
-    let visible_t1 = chain.find_visible(&t1).expect("t1 visible update");
+    let visible_t1 = find_visible(&chain, &t1).expect("t1 visible update");
     assert_eq!(visible_t1.data, b"v1".to_vec());
 
     let t3 = global.begin_snapshot_txn();
-    assert!(chain.find_visible(&t3).is_none());
+    assert!(find_visible(&chain, &t3).is_none());
+}
+
+fn find_visible<'a>(chain: &'a UpdateChain, txn: &Transaction) -> Option<&'a Update> {
+    let mut current = chain.iter().next();
+    while let Some(update) = current {
+        if txn.can_see(update) {
+            if update.type_ == UpdateType::Reserve {
+                current = update.next.as_deref();
+                continue;
+            }
+            return Some(update);
+        }
+        current = update.next.as_deref();
+    }
+    None
 }
 
 #[test]

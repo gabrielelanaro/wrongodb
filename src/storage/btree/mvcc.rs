@@ -3,8 +3,7 @@ use std::sync::Arc;
 
 use crate::core::errors::WrongoDBError;
 use crate::txn::{
-    GlobalTxnState, IsolationLevel, ReadContext, Transaction, TxnId, Update, UpdateChain, UpdateType,
-    WriteOp,
+    GlobalTxnState, TxnId, Update, UpdateChain, UpdateType,
 };
 
 use super::BTree;
@@ -66,78 +65,66 @@ impl MvccState {
 }
 
 impl BTree {
-    pub fn begin_txn(&self, isolation: IsolationLevel) -> Transaction {
-        match isolation {
-            IsolationLevel::Snapshot => self.mvcc.global.begin_snapshot_txn(),
-        }
-    }
-
-    pub fn get_mvcc(&mut self, key: &[u8], txn: &Transaction) -> Result<Option<Vec<u8>>, WrongoDBError> {
+    pub fn get_version(&mut self, key: &[u8], txn_id: TxnId) -> Result<Option<Vec<u8>>, WrongoDBError> {
         if let Some(chain) = self.mvcc.chain(key) {
-            if let Some(update) = chain.find_visible(txn) {
-                return match update.type_ {
-                    UpdateType::Standard => Ok(Some(update.data.clone())),
-                    UpdateType::Tombstone => Ok(None),
-                    UpdateType::Reserve => Ok(None),
-                };
+            for update in chain.iter() {
+                let is_aborted = update.time_window.stop_txn == crate::txn::TXN_ABORTED
+                    && update.time_window.stop_ts == crate::txn::TS_NONE;
+                if is_aborted {
+                    continue;
+                }
+
+                if update.txn_id <= txn_id {
+                    if update.type_ == UpdateType::Standard {
+                        return Ok(Some(update.data.clone()));
+                    } else if update.type_ == UpdateType::Tombstone {
+                        return Ok(None);
+                    }
+                }
             }
         }
 
         self.get(key)
     }
 
-    /// Unified read - uses MVCC if txn provided, else reads committed data
-    pub fn get_ctx(&mut self, key: &[u8], ctx: &dyn ReadContext) -> Result<Option<Vec<u8>>, WrongoDBError> {
-        match ctx.txn() {
-            Some(txn) => self.get_mvcc(key, txn),
-            None => self.get(key),
-        }
-    }
-
-    pub fn put_mvcc(
+    pub fn put_version(
         &mut self,
         key: &[u8],
         value: &[u8],
-        txn: &mut Transaction,
+        txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
-        // Log to WAL with transaction ID
         if let Some(wal) = self.wal.as_mut() {
-            wal.log_put(key, value, txn.id())?;
+            wal.log_put(key, value, txn_id)?;
         }
 
         let chain = self.mvcc.chain_mut_or_create(key);
 
-        // Mark the current head as stopped (overwritten) before prepending
         if let Some(head) = chain.head_mut() {
-            head.mark_stopped(txn.id());
+            head.mark_stopped(txn_id);
         }
 
-        let update = Update::new(txn.id(), UpdateType::Standard, value.to_vec());
+        let update = Update::new(txn_id, UpdateType::Standard, value.to_vec());
         chain.prepend(update);
-        txn.track_write(key, WriteOp::Put);
         Ok(())
     }
 
-    pub fn delete_mvcc(
+    pub fn delete_version(
         &mut self,
         key: &[u8],
-        txn: &mut Transaction,
+        txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
-        // Log to WAL with transaction ID
         if let Some(wal) = self.wal.as_mut() {
-            wal.log_delete(key, txn.id())?;
+            wal.log_delete(key, txn_id)?;
         }
 
         let chain = self.mvcc.chain_mut_or_create(key);
 
-        // Mark the current head as stopped (deleted) before prepending tombstone
         if let Some(head) = chain.head_mut() {
-            head.mark_stopped(txn.id());
+            head.mark_stopped(txn_id);
         }
 
-        let update = Update::new(txn.id(), UpdateType::Tombstone, Vec::new());
+        let update = Update::new(txn_id, UpdateType::Tombstone, Vec::new());
         chain.prepend(update);
-        txn.track_write(key, WriteOp::Delete);
         Ok(())
     }
 

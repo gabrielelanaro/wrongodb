@@ -1,4 +1,3 @@
-use super::transaction::Transaction;
 use super::{Timestamp, TxnId, TS_MAX, TS_NONE, TXN_ABORTED};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -93,27 +92,10 @@ impl UpdateChain {
         self.head = Some(Box::new(update));
     }
 
-    pub fn find_visible<'a>(&'a self, txn: &Transaction) -> Option<&'a Update> {
-        let mut current = self.head.as_deref();
-        while let Some(update) = current {
-            if txn.can_see(update) {
-                if update.type_ == UpdateType::Reserve {
-                    current = update.next.as_deref();
-                    continue;
-                }
-                return Some(update);
-            }
-            current = update.next.as_deref();
-        }
-        None
-    }
-
-    /// Get mutable access to the head of the chain.
     pub fn head_mut(&mut self) -> Option<&mut Update> {
         self.head.as_deref_mut()
     }
 
-    /// Mark all updates from a given transaction as aborted.
     pub fn mark_aborted(&mut self, txn_id: TxnId) {
         let mut current = self.head.as_deref_mut();
         while let Some(update) = current {
@@ -164,6 +146,28 @@ impl UpdateChain {
     /// Check if the chain is empty.
     pub fn is_empty(&self) -> bool {
         self.head.is_none()
+    }
+
+    /// Iterate over all updates in the chain (from head to tail).
+    pub fn iter(&self) -> UpdateChainIter<'_> {
+        UpdateChainIter {
+            current: self.head.as_deref(),
+        }
+    }
+}
+
+/// Iterator over updates in an UpdateChain.
+pub struct UpdateChainIter<'a> {
+    current: Option<&'a Update>,
+}
+
+impl<'a> Iterator for UpdateChainIter<'a> {
+    type Item = &'a Update;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.current?;
+        self.current = current.next.as_deref();
+        Some(current)
     }
 }
 
