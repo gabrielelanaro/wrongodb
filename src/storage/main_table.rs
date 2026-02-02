@@ -181,4 +181,46 @@ impl MainTable {
     pub fn sync_wal(&mut self) -> Result<(), WrongoDBError> {
         self.btree.sync_wal()
     }
+
+    // ==========================================================================
+    // Raw byte-oriented API (for Cursor)
+    // ==========================================================================
+
+    /// Insert a raw key/value pair.
+    pub fn insert_raw(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
+        if !self.btree.insert_unique(key, value)? {
+            return Err(DocumentValidationError("duplicate key error".into()).into());
+        }
+        Ok(())
+    }
+
+    /// Get a raw value by key within a transaction context.
+    pub fn get_raw(&mut self, key: &[u8], ctx: impl ReadContext) -> Result<Option<Vec<u8>>, WrongoDBError> {
+        self.btree.get_ctx(key, &ctx)
+    }
+
+    /// Delete a raw key.
+    pub fn delete_raw(&mut self, key: &[u8]) -> Result<bool, WrongoDBError> {
+        self.btree.delete(key)
+    }
+
+    /// Scan all raw key/value pairs visible to the given context.
+    #[allow(dead_code)]
+    pub fn scan_raw(&mut self, ctx: impl ReadContext) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
+        let mut out = Vec::new();
+
+        let entries = self
+            .btree
+            .range(None, None)
+            .map_err(|e| StorageError(format!("main table scan failed: {e}")))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (key, _value) in entries {
+            if let Some(bytes) = self.btree.get_ctx(&key, &ctx)? {
+                out.push((key.to_vec(), bytes));
+            }
+        }
+
+        Ok(out)
+    }
 }

@@ -8,6 +8,7 @@ bson = "2"
 byteorder = "1"
 crc32fast = "1"
 mongodb = "3"
+parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "1"

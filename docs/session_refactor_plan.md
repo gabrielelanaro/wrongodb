@@ -234,3 +234,91 @@ Two options (choose in implementation):
 - Internal separation: `data/` owns table/index logic; `connection/session/cursor` own API glue
 - Test coverage: All engine tests use new session/cursor API
 - Documentation updated: `README.md`, `docs/server.md` reflect new patterns
+
+---
+
+## Implementation Log
+
+### Slice 1: Basic Connection → Session → Cursor (Table-only, no transactions)
+
+**Goal**: Get a minimal working Connection API that can:
+1. Open a database connection
+2. Create a session
+3. Open a cursor on a table
+4. Insert and get documents
+
+**Files to Create/Modify:**
+
+```
+src/
+├── connection.rs          # NEW: Connection, ConnectionConfig, DataHandleCache
+├── session.rs             # NEW: Session (minimal - no txn yet)
+├── cursor.rs              # NEW: Cursor (Table-only)
+├── data/
+│   ├── mod.rs             # NEW: module exports
+│   └── table.rs           # NEW: move from engine/collection/mod.rs
+└── lib.rs                 # MODIFY: export new types
+```
+
+**API for this slice:**
+
+```rust
+// connection.rs
+pub struct ConnectionConfig { pub wal_enabled: bool; }
+pub struct Connection { ... }
+impl Connection {
+    pub fn open<P>(path: P) -> Result<Self>;
+    pub fn open_session(&self) -> Session;
+}
+
+// session.rs
+pub struct Session { ... }
+impl Session {
+    pub fn create(&mut self, uri: &str) -> Result<()>;  // "table:<name>"
+    pub fn open_cursor(&mut self, uri: &str) -> Result<Cursor<'_>>;
+}
+
+// cursor.rs
+pub struct Cursor<'s> { ... }
+impl Cursor<'_> {
+    pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()>;
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+}
+```
+
+**Test to verify the slice:**
+
+```rust
+#[test]
+fn test_connection_basic() {
+    let tmp = tempdir().unwrap();
+    let conn = Connection::open(tmp.path()).unwrap();
+
+    let mut session = conn.open_session();
+    session.create("table:test").unwrap();
+
+    let mut cursor = session.open_cursor("table:test").unwrap();
+    cursor.insert(b"key1", b"value1").unwrap();
+
+    let value = cursor.get(b"key1").unwrap();
+    assert_eq!(value, Some(b"value1".to_vec()));
+}
+```
+
+**Key decisions for this slice:**
+
+1. **Catalog**: Use Option B (file scanning) - simplest for now
+2. **DataHandle**: Cache opened tables in Connection
+3. **Table**: Move existing Collection logic, strip down to just main table operations
+4. **No transactions yet**: Add in next slice
+5. **No indexes yet**: Add in next slice
+6. **Raw bytes API**: Work with raw bytes first, add BSON/Document layer later
+
+**Status**: Completed (2025-02-02)
+
+**Implementation Notes**:
+- Used `parking_lot::RwLock` for concurrent access to DataHandleCache
+- Connection is shared across sessions via `Arc<Connection>`
+- DataHandle refcount is simple `u32` (no additional locking needed)
+- All e2e tests pass (test_connection_basic, test_connection_with_config, test_cursor_delete)
+- All existing tests still pass (86 total)
