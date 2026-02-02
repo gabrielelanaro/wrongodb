@@ -15,18 +15,6 @@ pub struct Table {
 }
 
 impl Table {
-    /// Open or create a table by name in given base path.
-    #[allow(dead_code)]
-    pub fn new(
-        base_path: &std::path::Path,
-        name: &str,
-        wal_enabled: bool,
-        global_txn: Arc<GlobalTxnState>,
-    ) -> Result<Self, WrongoDBError> {
-        let table_path = std::path::PathBuf::from(format!("{}.{}.main.wt", base_path.display(), name));
-        Self::open_or_create(table_path, wal_enabled, global_txn)
-    }
-
     pub fn open_or_create<P: AsRef<Path>>(
         path: P,
         wal_enabled: bool,
@@ -88,16 +76,6 @@ impl Table {
         Ok(out)
     }
 
-    /// Iterate over key/value pairs in range [start, end).
-    #[allow(dead_code)]
-    pub fn range(
-        &mut self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> Result<crate::storage::btree::BTreeRangeIter<'_>, WrongoDBError> {
-        self.btree.range(start, end)
-    }
-
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         self.btree.checkpoint()
     }
@@ -120,22 +98,6 @@ impl Table {
     /// and log the abort to WAL
     pub(crate) fn mark_updates_aborted(&mut self, txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
         self.btree.mark_updates_aborted(txn_id)
-    }
-
-    /// Deprecated: Use mark_updates_committed instead.
-    /// This method exists for backward compatibility during refactoring.
-    #[deprecated(since = "0.1.0", note = "Use mark_updates_committed instead")]
-    #[allow(dead_code)]
-    pub fn commit_txn(&mut self, txn: &mut crate::txn::Transaction) -> Result<(), WrongoDBError> {
-        self.mark_updates_committed(txn.id())
-    }
-
-    /// Deprecated: Use mark_updates_aborted instead.
-    /// This method exists for backward compatibility during refactoring.
-    #[deprecated(since = "0.1.0", note = "Use mark_updates_aborted instead")]
-    #[allow(dead_code)]
-    pub fn abort_txn(&mut self, txn: &mut crate::txn::Transaction) -> Result<(), WrongoDBError> {
-        self.mark_updates_aborted(txn.id())
     }
 
     pub fn insert_mvcc(&mut self, key: &[u8], value: &[u8], txn: &mut Transaction) -> Result<(), WrongoDBError> {
@@ -164,12 +126,6 @@ impl Table {
 
     pub fn get_mvcc(&mut self, key: &[u8], txn: &Transaction) -> Result<Option<Vec<u8>>, WrongoDBError> {
         self.btree.get_mvcc(key, txn)
-    }
-
-    /// Scan all key/value pairs visible to the given transaction.
-    #[allow(dead_code)]
-    pub fn scan_txn(&mut self, txn: &Transaction) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
-        self.scan_txn_from(None, txn)
     }
 
     /// Scan key/value pairs visible to the given transaction, starting from a specific key.
