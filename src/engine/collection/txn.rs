@@ -278,9 +278,12 @@ impl<'a> CollectionTxn<'a> {
     /// This makes all main table changes durable and visible to other transactions.
     /// Index changes are already applied immediately during operations.
     pub fn commit(mut self) -> Result<(), WrongoDBError> {
-        // Commit main table transaction (durability boundary)
+        // Step 1: Update global transaction state
+        self.txn.commit(&self.collection.global_txn)?;
+
+        // Step 2: Commit main table transaction (durability boundary)
         // Index changes are already applied immediately during operations
-        self.collection.main_table().commit_txn(&mut self.txn)?;
+        self.collection.main_table().mark_updates_committed(self.txn.id())?;
 
         // Clear tracking - no longer need rollback info
         self.pending_index_ops.clear();
@@ -318,8 +321,11 @@ impl<'a> CollectionTxn<'a> {
         // Clear tracking after rollback
         self.pending_index_ops.clear();
 
-        // Abort main table transaction - this marks updates as aborted
-        self.collection.main_table().abort_txn(&mut self.txn)?;
+        // Step 1: Update global transaction state
+        self.txn.abort(&self.collection.global_txn)?;
+
+        // Step 2: Abort main table transaction - this marks updates as aborted
+        self.collection.main_table().mark_updates_aborted(self.txn.id())?;
 
         Ok(())
     }

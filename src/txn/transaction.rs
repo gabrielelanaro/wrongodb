@@ -26,6 +26,7 @@ pub enum WriteOp {
 
 #[derive(Debug, Clone)]
 pub struct WriteRef {
+    #[allow(dead_code)]
     pub key: Vec<u8>,
     #[allow(dead_code)]
     pub op: WriteOp,

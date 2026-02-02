@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::core::errors::WrongoDBError;
 use crate::txn::{
-    GlobalTxnState, IsolationLevel, ReadContext, Transaction, Update, UpdateChain, UpdateType,
+    GlobalTxnState, IsolationLevel, ReadContext, Transaction, TxnId, Update, UpdateChain, UpdateType,
     WriteOp,
 };
 
@@ -141,27 +141,24 @@ impl BTree {
         Ok(())
     }
 
-    /// Commit a transaction, making all its updates visible.
-    pub fn commit_txn(&mut self, txn: &mut Transaction) -> Result<(), WrongoDBError> {
+    /// Mark all updates from this transaction as committed in MVCC chains
+    /// and log the commit to WAL.
+    /// Note: This does NOT update the transaction state - that's done by Session.
+    pub fn mark_updates_committed(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
         // Log commit to WAL first (for durability)
         if let Some(wal) = self.wal.as_mut() {
-            let _commit_ts = wal.log_txn_commit(txn.id(), txn.id())?;
+            let _commit_ts = wal.log_txn_commit(txn_id, txn_id)?;
             wal.sync()?; // Ensure commit is durable
         }
 
-        // Update the transaction state
-        let _commit_ts = txn.commit(&self.mvcc.global)?;
-
         // Update time windows for all modifications to mark them as committed
-        for write_ref in &txn.modifications {
-            if let Some(chain) = self.mvcc.chains.get_mut(&write_ref.key) {
-                // The head of the chain is our most recent update
-                // Update its time window to reflect the commit
-                if let Some(head) = chain.head_mut() {
-                    if head.txn_id == txn.id() {
-                        head.time_window.start_ts = txn.id();
-                        head.time_window.stop_ts = u64::MAX;
-                    }
+        // We scan all chains to find updates from this transaction
+        for (_, chain) in self.mvcc.chains.iter_mut() {
+            // The head of the chain is our most recent update
+            if let Some(head) = chain.head_mut() {
+                if head.txn_id == txn_id {
+                    head.time_window.start_ts = txn_id;
+                    head.time_window.stop_ts = u64::MAX;
                 }
             }
         }
@@ -169,23 +166,19 @@ impl BTree {
         Ok(())
     }
 
-    /// Abort a transaction, discarding all its updates.
-    pub fn abort_txn(&mut self, txn: &mut Transaction) -> Result<(), WrongoDBError> {
+    /// Mark all updates from this transaction as aborted in MVCC chains
+    /// and log the abort to WAL.
+    /// Note: This does NOT update the transaction state - that's done by Session.
+    pub fn mark_updates_aborted(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
         // Log abort to WAL
         if let Some(wal) = self.wal.as_mut() {
-            wal.log_txn_abort(txn.id())?;
+            wal.log_txn_abort(txn_id)?;
         }
 
         // Mark all updates in chains as aborted
-        for write_ref in &txn.modifications {
-            if let Some(chain) = self.mvcc.chains.get_mut(&write_ref.key) {
-                // Mark all updates from this transaction as aborted
-                chain.mark_aborted(txn.id());
-            }
+        for (_, chain) in self.mvcc.chains.iter_mut() {
+            chain.mark_aborted(txn_id);
         }
-
-        // Update the transaction state
-        txn.abort(&self.mvcc.global)?;
 
         Ok(())
     }

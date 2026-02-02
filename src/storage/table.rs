@@ -110,12 +110,32 @@ impl Table {
         self.btree.begin_txn(crate::txn::IsolationLevel::Snapshot)
     }
 
-    pub fn commit_txn(&mut self, txn: &mut Transaction) -> Result<(), WrongoDBError> {
-        self.btree.commit_txn(txn)
+    /// Mark all updates from this transaction as committed in MVCC chains
+    /// and log the commit to WAL
+    pub(crate) fn mark_updates_committed(&mut self, txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
+        self.btree.mark_updates_committed(txn_id)
     }
 
-    pub fn abort_txn(&mut self, txn: &mut Transaction) -> Result<(), WrongoDBError> {
-        self.btree.abort_txn(txn)
+    /// Mark all updates from this transaction as aborted in MVCC chains
+    /// and log the abort to WAL
+    pub(crate) fn mark_updates_aborted(&mut self, txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
+        self.btree.mark_updates_aborted(txn_id)
+    }
+
+    /// Deprecated: Use mark_updates_committed instead.
+    /// This method exists for backward compatibility during refactoring.
+    #[deprecated(since = "0.1.0", note = "Use mark_updates_committed instead")]
+    #[allow(dead_code)]
+    pub fn commit_txn(&mut self, txn: &mut crate::txn::Transaction) -> Result<(), WrongoDBError> {
+        self.mark_updates_committed(txn.id())
+    }
+
+    /// Deprecated: Use mark_updates_aborted instead.
+    /// This method exists for backward compatibility during refactoring.
+    #[deprecated(since = "0.1.0", note = "Use mark_updates_aborted instead")]
+    #[allow(dead_code)]
+    pub fn abort_txn(&mut self, txn: &mut crate::txn::Transaction) -> Result<(), WrongoDBError> {
+        self.mark_updates_aborted(txn.id())
     }
 
     pub fn insert_mvcc(&mut self, key: &[u8], value: &[u8], txn: &mut Transaction) -> Result<(), WrongoDBError> {

@@ -495,7 +495,7 @@ impl<'a> MultiCollectionTxn<'a> {
     //   B) Or ensure index WAL entries are covered by the main table's commit
     pub fn commit(mut self) -> Result<(), WrongoDBError> {
         // Take ownership of the transaction
-        let mut txn = self.txn.take().expect("transaction present");
+        let txn = self.txn.take().expect("transaction present");
 
         // Step 1: Commit the transaction (once, globally)
         // We commit on the first touched collection's BTree (if any)
@@ -503,7 +503,7 @@ impl<'a> MultiCollectionTxn<'a> {
         let first_coll = self.touched_collections.iter().next().cloned();
         if let Some(first_coll_name) = first_coll {
             let coll = self.db.get_collection_mut(&first_coll_name)?;
-            coll.main_table().commit_txn(&mut txn)?;
+            coll.main_table().mark_updates_committed(txn.id())?;
         }
 
         // Step 2: For other collections, just sync the WAL (if needed)
@@ -552,10 +552,10 @@ impl<'a> MultiCollectionTxn<'a> {
         self.pending_index_ops.clear();
 
         // Step 2: Mark all main table updates as aborted
-        let mut txn = self.txn.take().expect("transaction present");
+        let txn = self.txn.take().expect("transaction present");
         for coll_name in &self.touched_collections {
             let coll = self.db.get_collection_mut(coll_name)?;
-            coll.main_table().abort_txn(&mut txn)?;
+            coll.main_table().mark_updates_aborted(txn.id())?;
         }
 
         Ok(())

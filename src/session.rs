@@ -154,7 +154,7 @@ impl<'a> SessionTxn<'a> {
                     )?;
                 let mut table_guard = table.write();
                 if is_first {
-                    table_guard.commit_txn(&mut txn)?;
+                    table_guard.mark_updates_committed(txn.id())?;
                     is_first = false;
                 } else {
                     table_guard.sync_wal()?;
@@ -190,7 +190,7 @@ impl<'a> SessionTxn<'a> {
                         self.session.global_txn.clone(),
                     )?;
                 let mut table_guard = table.write();
-                table_guard.abort_txn(&mut txn)?;
+                table_guard.mark_updates_aborted(txn.id())?;
             }
         }
         self.committed = true; // Mark as handled so drop doesn't rollback
