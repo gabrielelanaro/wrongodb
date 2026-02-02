@@ -1,10 +1,14 @@
-use crate::cursor::Cursor;
-use crate::core::errors::StorageError;
-use crate::datahandle_cache::DataHandleCache;
-use crate::txn::{GlobalTxnState, Transaction};
-use crate::WrongoDBError;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use parking_lot::RwLock;
+
+use crate::core::errors::StorageError;
+use crate::cursor::Cursor;
+use crate::datahandle_cache::DataHandleCache;
+use crate::storage::table::Table;
+use crate::txn::{GlobalTxnState, Transaction};
+use crate::WrongoDBError;
 
 pub struct Session {
     cache: Arc<DataHandleCache>,
@@ -30,15 +34,29 @@ impl Session {
         }
     }
 
+    /// Mark a table as touched in the current transaction.
+    fn mark_table_touched(&mut self, uri: &str) {
+        if let Some(ref mut txn) = self.txn {
+            txn.mark_table_touched(uri);
+        }
+    }
+
+    /// Get a table from the cache and mark it as touched if a transaction is active.
+    fn get_table(&mut self, uri: &str) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
+        let table_path = self.base_path.join(&uri[6..]);
+        let table = self.cache.get_or_open_table(
+            uri,
+            &table_path,
+            self.wal_enabled,
+            self.global_txn.clone(),
+        )?;
+        self.mark_table_touched(uri);
+        Ok(table)
+    }
+
     pub fn create(&mut self, uri: &str) -> Result<(), WrongoDBError> {
         if uri.starts_with("table:") {
-            let table_path = self.base_path.join(&uri[6..]);
-            let _table = self.cache.get_or_open_table(
-                uri,
-                &table_path,
-                self.wal_enabled,
-                self.global_txn.clone(),
-            )?;
+            let _table = self.get_table(uri)?;
             Ok(())
         } else {
             Err(WrongoDBError::Storage(StorageError(
@@ -48,13 +66,7 @@ impl Session {
     }
 
     pub fn open_cursor(&mut self, uri: &str) -> Result<Cursor, WrongoDBError> {
-        let table_path = self.base_path.join(&uri[6..]);
-        let table = self.cache.get_or_open_table(
-            uri,
-            &table_path,
-            self.wal_enabled,
-            self.global_txn.clone(),
-        )?;
+        let table = self.get_table(uri)?;
         Ok(Cursor::new(table))
     }
 
@@ -114,22 +126,72 @@ impl<'a> SessionTxn<'a> {
     }
 
     /// Commit the transaction.
-    /// 
+    ///
     /// After calling this, the transaction handle is consumed and cannot be used again.
+    /// Commits the transaction across all touched tables.
     pub fn commit(mut self) -> Result<(), WrongoDBError> {
         if let Some(mut txn) = self.session.txn.take() {
+            // Get touched tables before we consume txn
+            let touched_tables: Vec<String> = txn.touched_tables().iter().cloned().collect();
+
+            // Step 1: Update global transaction state
             txn.commit(&self.session.global_txn)?;
+
+            // Step 2: Commit each touched table
+            // The first table writes the commit record to WAL
+            // Subsequent tables just sync their WAL
+            let mut is_first = true;
+            for uri in &touched_tables {
+                let table_path = self.session.base_path.join(&uri[6..]);
+                let table = self
+                    .session
+                    .cache
+                    .get_or_open_table(
+                        uri,
+                        &table_path,
+                        self.session.wal_enabled,
+                        self.session.global_txn.clone(),
+                    )?;
+                let mut table_guard = table.write();
+                if is_first {
+                    table_guard.commit_txn(&mut txn)?;
+                    is_first = false;
+                } else {
+                    table_guard.sync_wal()?;
+                }
+            }
         }
         self.committed = true;
         Ok(())
     }
 
     /// Abort/rollback the transaction.
-    /// 
+    ///
     /// After calling this, the transaction handle is consumed and cannot be used again.
+    /// Aborts the transaction across all touched tables.
     pub fn abort(mut self) -> Result<(), WrongoDBError> {
         if let Some(mut txn) = self.session.txn.take() {
+            // Get touched tables before we consume txn
+            let touched_tables: Vec<String> = txn.touched_tables().iter().cloned().collect();
+
+            // Step 1: Update global transaction state
             txn.abort(&self.session.global_txn)?;
+
+            // Step 2: Abort each touched table
+            for uri in &touched_tables {
+                let table_path = self.session.base_path.join(&uri[6..]);
+                let table = self
+                    .session
+                    .cache
+                    .get_or_open_table(
+                        uri,
+                        &table_path,
+                        self.session.wal_enabled,
+                        self.session.global_txn.clone(),
+                    )?;
+                let mut table_guard = table.write();
+                table_guard.abort_txn(&mut txn)?;
+            }
         }
         self.committed = true; // Mark as handled so drop doesn't rollback
         Ok(())
@@ -157,6 +219,8 @@ impl<'a> Drop for SessionTxn<'a> {
             if let Some(mut txn) = self.session.txn.take() {
                 let _ = txn.abort(&self.session.global_txn);
             }
+            // Note: touched_tables are in Transaction, not Session
+            // They will be dropped when txn is dropped
         }
     }
 }

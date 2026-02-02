@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::core::errors::WrongoDBError;
 use crate::txn::global_txn::GlobalTxnState;
 use crate::txn::snapshot::Snapshot;
@@ -38,6 +40,8 @@ pub struct Transaction {
     read_ts: Option<Timestamp>,
     state: TxnState,
     pub(crate) modifications: Vec<WriteRef>,
+    /// Tables (URIs) that have been touched in this transaction
+    pub(crate) touched_tables: HashSet<String>,
 }
 
 impl Transaction {
@@ -53,7 +57,18 @@ impl Transaction {
             read_ts: None,
             state: TxnState::Active,
             modifications: Vec::new(),
+            touched_tables: HashSet::new(),
         }
+    }
+
+    /// Mark a table as touched by this transaction.
+    pub fn mark_table_touched(&mut self, uri: &str) {
+        self.touched_tables.insert(uri.to_string());
+    }
+
+    /// Get the set of tables touched by this transaction.
+    pub fn touched_tables(&self) -> &HashSet<String> {
+        &self.touched_tables
     }
 
     pub fn id(&self) -> TxnId {

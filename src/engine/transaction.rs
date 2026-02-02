@@ -125,7 +125,8 @@ impl<'a> MultiCollectionTxn<'a> {
         // Do the insert - this is self-contained
         let result = (|| {
             let collection = self.db.get_collection_mut(collection_name)?;
-            collection.main_table().insert_mvcc(&key, &value, &mut txn)?;
+            let mut cursor = collection.main_table_cursor();
+            cursor.insert(&key, &value, &mut txn)?;
             Ok::<(), WrongoDBError>(())
         })();
 
@@ -234,9 +235,8 @@ impl<'a> MultiCollectionTxn<'a> {
 
         // Get collection and do the update
         let collection = self.get_collection(collection_name)?;
-        let result = collection
-            .main_table()
-            .update_mvcc(&key, &value, &mut txn);
+        let mut cursor = collection.main_table_cursor();
+        let result = cursor.update(&key, &value, &mut txn);
 
         // Restore the transaction
         self.txn = Some(txn);
@@ -308,9 +308,8 @@ impl<'a> MultiCollectionTxn<'a> {
 
             // Get collection and do the update
             let collection = self.get_collection(collection_name)?;
-            let result = collection
-                .main_table()
-                .update_mvcc(&key, &value, &mut txn);
+            let mut cursor = collection.main_table_cursor();
+            let result = cursor.update(&key, &value, &mut txn);
 
             // Restore the transaction
             self.txn = Some(txn);
@@ -377,13 +376,14 @@ impl<'a> MultiCollectionTxn<'a> {
 
         // Get collection and do the delete
         let collection = self.get_collection(collection_name)?;
-        let result = collection.main_table().delete_mvcc(&key, &mut txn);
+        let mut cursor = collection.main_table_cursor();
+        let result = cursor.delete(&key, &mut txn);
 
         // Restore the transaction
         self.txn = Some(txn);
 
         match result {
-            Ok(true) => {
+            Ok(()) => {
                 // Apply index removal immediately (not deferred) for visibility
                 // Use a scope to ensure collection borrow is dropped before pending_index_ops access
                 {
@@ -403,8 +403,7 @@ impl<'a> MultiCollectionTxn<'a> {
 
                 Ok(1)
             }
-            Ok(false) => Ok(0),
-            Err(e) => Err(e),
+            Err(_) => Ok(0),
         }
     }
 
@@ -443,13 +442,14 @@ impl<'a> MultiCollectionTxn<'a> {
 
             // Get collection and do the delete
             let collection = self.get_collection(collection_name)?;
-            let result = collection.main_table().delete_mvcc(&key, &mut txn);
+            let mut cursor = collection.main_table_cursor();
+            let result = cursor.delete(&key, &mut txn);
 
             // Restore the transaction
             self.txn = Some(txn);
 
             match result {
-                Ok(true) => {
+                Ok(()) => {
                     // Apply index removal immediately (not deferred) for visibility
                     let collection = self.get_collection(collection_name)?;
                     collection.secondary_indexes().remove(&doc)?;
@@ -464,8 +464,7 @@ impl<'a> MultiCollectionTxn<'a> {
                     });
                     deleted += 1;
                 }
-                Ok(false) => {}
-                Err(e) => return Err(e),
+                Err(_) => {}
             }
         }
 

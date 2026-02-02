@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::core::bson::{encode_document, encode_id_value};
 use crate::core::document::{normalize_document_in_place, validate_is_object};
+use crate::cursor::Cursor;
 use crate::engine::collection::update::apply_update;
 use crate::engine::collection::{Collection, UpdateResult};
 use crate::txn::Transaction;
@@ -45,6 +46,8 @@ impl IndexOp {
 pub struct CollectionTxn<'a> {
     collection: &'a mut Collection,
     txn: Transaction,
+    /// Cursor for main table operations
+    cursor: Cursor,
     /// Pending index operations to apply on commit
     pending_index_ops: Vec<IndexOp>,
 }
@@ -52,10 +55,12 @@ pub struct CollectionTxn<'a> {
 impl<'a> CollectionTxn<'a> {
     /// Create a new CollectionTxn (called by Collection::begin_txn)
     pub(crate) fn new(collection: &'a mut Collection) -> Self {
-        let txn = collection.main_table.begin_txn();
+        let txn = collection.main_table().begin_txn();
+        let cursor = collection.main_table_cursor();
         Self {
             collection,
             txn,
+            cursor,
             pending_index_ops: Vec::new(),
         }
     }
@@ -76,7 +81,7 @@ impl<'a> CollectionTxn<'a> {
         let value = encode_document(&obj)?;
 
         // Transactional: main table (MVCC)
-        self.collection.main_table.insert_mvcc(&key, &value, &mut self.txn)?;
+        self.cursor.insert(&key, &value, &mut self.txn)?;
 
         // Apply index update immediately (not deferred) for visibility
         self.collection.secondary_indexes.add(&obj)?;
@@ -128,9 +133,7 @@ impl<'a> CollectionTxn<'a> {
         let value = encode_document(&updated_doc)?;
 
         // Update main table (MVCC)
-        self.collection
-            .main_table
-            .update_mvcc(&key, &value, &mut self.txn)?;
+        self.cursor.update(&key, &value, &mut self.txn)?;
 
         // Apply index updates immediately (not deferred) for visibility
         self.collection.secondary_indexes.remove(doc)?;
@@ -177,9 +180,7 @@ impl<'a> CollectionTxn<'a> {
             let value = encode_document(&updated_doc)?;
 
             // Update main table (MVCC)
-            self.collection
-                .main_table
-                .update_mvcc(&key, &value, &mut self.txn)?;
+            self.cursor.update(&key, &value, &mut self.txn)?;
 
             // Apply index updates immediately (not deferred) for visibility
             self.collection.secondary_indexes.remove(&doc)?;
@@ -217,8 +218,8 @@ impl<'a> CollectionTxn<'a> {
         let key = encode_id_value(id)?;
 
         // Delete from main table (MVCC)
-        match self.collection.main_table.delete_mvcc(&key, &mut self.txn) {
-            Ok(true) => {
+        match self.cursor.delete(&key, &mut self.txn) {
+            Ok(()) => {
                 // Apply index removal immediately (not deferred) for visibility
                 self.collection.secondary_indexes.remove(doc)?;
 
@@ -229,8 +230,7 @@ impl<'a> CollectionTxn<'a> {
                 self.collection.doc_count = self.collection.doc_count.saturating_sub(1);
                 Ok(1)
             }
-            Ok(false) => Ok(0),
-            Err(e) => Err(e),
+            Err(_) => Ok(0),
         }
     }
 
@@ -251,8 +251,8 @@ impl<'a> CollectionTxn<'a> {
             let key = encode_id_value(id)?;
 
             // Delete from main table (MVCC)
-            match self.collection.main_table.delete_mvcc(&key, &mut self.txn) {
-                Ok(true) => {
+            match self.cursor.delete(&key, &mut self.txn) {
+                Ok(()) => {
                     // Apply index removal immediately (not deferred) for visibility
                     self.collection.secondary_indexes.remove(&doc)?;
 
@@ -262,8 +262,7 @@ impl<'a> CollectionTxn<'a> {
                     });
                     deleted += 1;
                 }
-                Ok(false) => {}
-                Err(e) => return Err(e),
+                Err(_) => {}
             }
         }
 
@@ -281,7 +280,7 @@ impl<'a> CollectionTxn<'a> {
     pub fn commit(mut self) -> Result<(), WrongoDBError> {
         // Commit main table transaction (durability boundary)
         // Index changes are already applied immediately during operations
-        self.collection.main_table.commit_txn(&mut self.txn)?;
+        self.collection.main_table().commit_txn(&mut self.txn)?;
 
         // Clear tracking - no longer need rollback info
         self.pending_index_ops.clear();
@@ -320,7 +319,7 @@ impl<'a> CollectionTxn<'a> {
         self.pending_index_ops.clear();
 
         // Abort main table transaction - this marks updates as aborted
-        self.collection.main_table.abort_txn(&mut self.txn)?;
+        self.collection.main_table().abort_txn(&mut self.txn)?;
 
         Ok(())
     }

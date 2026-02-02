@@ -147,16 +147,38 @@ impl Table {
     }
 
     /// Scan all key/value pairs visible to the given transaction.
+    #[allow(dead_code)]
     pub fn scan_txn(&mut self, txn: &Transaction) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
+        self.scan_txn_from(None, txn)
+    }
+
+    /// Scan key/value pairs visible to the given transaction, starting from a specific key.
+    ///
+    /// If `start_key` is None, starts from the beginning.
+    /// If `start_key` is Some, starts from the key *after* the given key.
+    pub fn scan_txn_from(
+        &mut self,
+        start_key: Option<&[u8]>,
+        txn: &Transaction,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
         let mut out = Vec::new();
 
+        // Use range iterator to efficiently scan from the start position
         let entries = self
             .btree
-            .range(None, None)
+            .range(start_key, None)
             .map_err(|e| crate::core::errors::StorageError(format!("table scan failed: {e}")))?
             .collect::<Result<Vec<_>, _>>()?;
 
         for (key, _value) in entries {
+            // Skip the start_key itself if provided (we want keys *after* it)
+            if let Some(start) = start_key {
+                if key.as_slice() == start {
+                    continue;
+                }
+            }
+
+            // Check MVCC visibility
             if let Some(bytes) = self.btree.get_mvcc(&key, txn)? {
                 out.push((key.to_vec(), bytes));
             }

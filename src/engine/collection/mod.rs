@@ -2,9 +2,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use parking_lot::RwLock;
 use serde_json::Value;
 
 use crate::core::document::{normalize_document_in_place, validate_is_object};
+use crate::cursor::Cursor;
 use crate::txn::GlobalTxnState;
 
 pub mod update;
@@ -21,7 +23,7 @@ use crate::{Document, WrongoDBError};
 /// Represents a single collection within the database
 #[derive(Debug)]
 pub struct Collection {
-    main_table: Table,
+    main_table: Arc<RwLock<Table>>,
     secondary_indexes: SecondaryIndexManager,
     doc_count: usize,
     checkpoint_after_updates: Option<usize>,
@@ -37,7 +39,7 @@ impl Collection {
         global_txn: Arc<GlobalTxnState>,
     ) -> Result<Self, WrongoDBError> {
         let main_table_path = PathBuf::from(format!("{}.main.wt", path.display()));
-        let main_table = Table::open_or_create(&main_table_path, wal_enabled, global_txn.clone())?;
+        let main_table = Arc::new(RwLock::new(Table::open_or_create(&main_table_path, wal_enabled, global_txn.clone())?));
 
         // Start with empty manager - indexes can be created via create_index()
         let secondary_indexes = SecondaryIndexManager::empty(path, wal_enabled, global_txn.clone());
@@ -59,7 +61,7 @@ impl Collection {
     }
 
     fn load_existing(&mut self, _path: &Path) -> Result<(), WrongoDBError> {
-        let entries = self.main_table.scan(&NonTransactional)?;
+        let entries = self.main_table.write().scan(&NonTransactional)?;
         self.doc_count = entries.len();
 
         // Indexes are not created automatically - use create_index() after getting collection
@@ -77,7 +79,7 @@ impl Collection {
         let key = encode_id_value(id)?;
         let value = encode_document(&obj)?;
 
-        self.main_table.insert(&key, &value)?;
+        self.main_table.write().insert(&key, &value)?;
         self.secondary_indexes.add(&obj)?;
         self.doc_count = self.doc_count.saturating_add(1);
         self.maybe_checkpoint_after_updates(1)?;
@@ -104,7 +106,7 @@ impl Collection {
         };
 
         if filter_doc.is_empty() {
-            let entries = self.main_table.scan(txn)?;
+            let entries = self.main_table.write().scan(txn)?;
             return entries
                 .into_iter()
                 .map(|(_, v)| decode_document(&v))
@@ -124,7 +126,7 @@ impl Collection {
 
         if let Some(id_value) = filter_doc.get("_id") {
             let key = encode_id_value(id_value)?;
-            let doc_bytes = self.main_table.get(&key, txn)?;
+            let doc_bytes = self.main_table.write().get(&key, txn)?;
             return Ok(match doc_bytes {
                 Some(bytes) => {
                     let doc = decode_document(&bytes)?;
@@ -149,7 +151,7 @@ impl Collection {
             let mut results = Vec::new();
             for id in ids {
                 let key = encode_id_value(&id)?;
-                if let Some(bytes) = self.main_table.get(&key, txn)? {
+                if let Some(bytes) = self.main_table.write().get(&key, txn)? {
                     let doc = decode_document(&bytes)?;
                     if matches_filter(&doc) {
                         results.push(doc);
@@ -159,7 +161,7 @@ impl Collection {
             return Ok(results);
         }
 
-        let entries = self.main_table.scan(txn)?;
+        let entries = self.main_table.write().scan(txn)?;
         let mut results = Vec::new();
         for (_, bytes) in entries {
             let doc = decode_document(&bytes)?;
@@ -218,7 +220,7 @@ impl Collection {
         let value = encode_document(&updated_doc)?;
 
         self.secondary_indexes.remove(doc)?;
-        self.main_table.update(&key, &value)?;
+        self.main_table.write().update(&key, &value)?;
         self.secondary_indexes.add(&updated_doc)?;
         self.maybe_checkpoint_after_updates(1)?;
 
@@ -252,7 +254,7 @@ impl Collection {
             let value = encode_document(&updated_doc)?;
 
             self.secondary_indexes.remove(&doc)?;
-            self.main_table.update(&key, &value)?;
+            self.main_table.write().update(&key, &value)?;
             self.secondary_indexes.add(&updated_doc)?;
             modified += 1;
         }
@@ -278,7 +280,7 @@ impl Collection {
         let key = encode_id_value(id)?;
 
         self.secondary_indexes.remove(doc)?;
-        if self.main_table.delete(&key)? {
+        if self.main_table.write().delete(&key)? {
             self.doc_count = self.doc_count.saturating_sub(1);
             self.maybe_checkpoint_after_updates(1)?;
             return Ok(1);
@@ -300,7 +302,7 @@ impl Collection {
             let key = encode_id_value(id)?;
 
             self.secondary_indexes.remove(&doc)?;
-            if self.main_table.delete(&key)? {
+            if self.main_table.write().delete(&key)? {
                 deleted += 1;
             }
         }
@@ -322,7 +324,7 @@ impl Collection {
     }
 
     pub fn create_index(&mut self, field: &str) -> Result<(), WrongoDBError> {
-        let entries = self.main_table.scan(&NonTransactional)?;
+        let entries = self.main_table.write().scan(&NonTransactional)?;
         let existing_docs: Vec<Document> = entries
             .into_iter()
             .map(|(_, v)| decode_document(&v))
@@ -337,11 +339,11 @@ impl Collection {
     }
 
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
-        self.main_table.checkpoint()?;
+        self.main_table.write().checkpoint()?;
         self.secondary_indexes.checkpoint()?;
 
         // Run GC on the main table's MVCC update chains
-        let (main_chains, main_updates, main_dropped) = self.main_table.run_gc();
+        let (main_chains, main_updates, main_dropped) = self.main_table.write().run_gc();
 
         // Run GC on secondary indexes' MVCC update chains
         let (idx_chains, idx_updates, idx_dropped) = self.secondary_indexes.run_gc();
@@ -386,9 +388,14 @@ impl Collection {
     // Internal methods for MultiCollectionTxn
     // ========================================================================
 
-    /// Get mutable access to the main table.
-    pub(crate) fn main_table(&mut self) -> &mut Table {
-        &mut self.main_table
+    /// Get a cursor for the main table.
+    pub(crate) fn main_table_cursor(&self) -> Cursor {
+        Cursor::new(self.main_table.clone())
+    }
+
+    /// Get mutable access to the main table for internal operations.
+    pub(crate) fn main_table(&self) -> parking_lot::RwLockWriteGuard<'_, Table> {
+        self.main_table.write()
     }
 
     /// Get access to the secondary indexes.
