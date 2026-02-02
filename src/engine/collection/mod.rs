@@ -12,15 +12,16 @@ mod txn;
 
 pub use self::txn::{CollectionTxn, IndexOp};
 use self::update::apply_update;
+use crate::core::bson::{decode_document, encode_document, encode_id_value};
 use crate::index::SecondaryIndexManager;
-use crate::storage::main_table::MainTable;
-use crate::txn::Transaction;
+use crate::storage::table::Table;
+use crate::txn::{NonTransactional, Transaction};
 use crate::{Document, WrongoDBError};
 
 /// Represents a single collection within the database
 #[derive(Debug)]
 pub struct Collection {
-    main_table: MainTable,
+    main_table: Table,
     secondary_indexes: SecondaryIndexManager,
     doc_count: usize,
     checkpoint_after_updates: Option<usize>,
@@ -36,7 +37,7 @@ impl Collection {
         global_txn: Arc<GlobalTxnState>,
     ) -> Result<Self, WrongoDBError> {
         let main_table_path = PathBuf::from(format!("{}.main.wt", path.display()));
-        let main_table = MainTable::open_or_create(&main_table_path, wal_enabled, global_txn.clone())?;
+        let main_table = Table::open_or_create(&main_table_path, wal_enabled, global_txn.clone())?;
 
         // Start with empty manager - indexes can be created via create_index()
         let secondary_indexes = SecondaryIndexManager::empty(path, wal_enabled, global_txn.clone());
@@ -58,8 +59,8 @@ impl Collection {
     }
 
     fn load_existing(&mut self, _path: &Path) -> Result<(), WrongoDBError> {
-        let docs = self.main_table.scan_non_txn()?;
-        self.doc_count = docs.len();
+        let entries = self.main_table.scan(&NonTransactional)?;
+        self.doc_count = entries.len();
 
         // Indexes are not created automatically - use create_index() after getting collection
         Ok(())
@@ -69,7 +70,14 @@ impl Collection {
         validate_is_object(&doc)?;
         let mut obj = doc.as_object().expect("validated object").clone();
         normalize_document_in_place(&mut obj)?;
-        self.main_table.insert(&obj)?;
+
+        let id = obj
+            .get("_id")
+            .ok_or_else(|| crate::core::errors::DocumentValidationError("missing _id".into()))?;
+        let key = encode_id_value(id)?;
+        let value = encode_document(&obj)?;
+
+        self.main_table.insert(&key, &value)?;
         self.secondary_indexes.add(&obj)?;
         self.doc_count = self.doc_count.saturating_add(1);
         self.maybe_checkpoint_after_updates(1)?;
@@ -82,13 +90,6 @@ impl Collection {
     }
 
     /// Shared query implementation used by both Collection and CollectionTxn.
-    // TODO: Return an iterator instead of Vec to enable lazy evaluation.
-    // Currently this eagerly collects all documents into memory, which is
-    // inefficient for large collections and forces find_one() to load all
-    // results just to take the first one. Consider:
-    //   A) Return impl Iterator<Item = Result<Document, WrongoDBError>>
-    //   B) Add a find_one_txn() method that stops after first match
-    //   C) Use a callback-based API for streaming results
     pub(crate) fn find_with_txn(
         &mut self,
         filter: Option<Value>,
@@ -103,7 +104,11 @@ impl Collection {
         };
 
         if filter_doc.is_empty() {
-            return self.main_table.scan(txn);
+            let entries = self.main_table.scan(txn)?;
+            return entries
+                .into_iter()
+                .map(|(_, v)| decode_document(&v))
+                .collect();
         }
 
         let matches_filter = |doc: &Document| {
@@ -118,9 +123,17 @@ impl Collection {
         };
 
         if let Some(id_value) = filter_doc.get("_id") {
-            let doc = self.main_table.get(id_value, txn)?;
-            return Ok(match doc {
-                Some(doc) if matches_filter(&doc) => vec![doc],
+            let key = encode_id_value(id_value)?;
+            let doc_bytes = self.main_table.get(&key, txn)?;
+            return Ok(match doc_bytes {
+                Some(bytes) => {
+                    let doc = decode_document(&bytes)?;
+                    if matches_filter(&doc) {
+                        vec![doc]
+                    } else {
+                        Vec::new()
+                    }
+                }
                 _ => Vec::new(),
             });
         }
@@ -135,7 +148,9 @@ impl Collection {
             let ids = self.secondary_indexes.lookup(&field, value)?;
             let mut results = Vec::new();
             for id in ids {
-                if let Some(doc) = self.main_table.get(&id, txn)? {
+                let key = encode_id_value(&id)?;
+                if let Some(bytes) = self.main_table.get(&key, txn)? {
+                    let doc = decode_document(&bytes)?;
                     if matches_filter(&doc) {
                         results.push(doc);
                     }
@@ -144,8 +159,15 @@ impl Collection {
             return Ok(results);
         }
 
-        let docs = self.main_table.scan(txn)?;
-        Ok(docs.into_iter().filter(|doc| matches_filter(doc)).collect())
+        let entries = self.main_table.scan(txn)?;
+        let mut results = Vec::new();
+        for (_, bytes) in entries {
+            let doc = decode_document(&bytes)?;
+            if matches_filter(&doc) {
+                results.push(doc);
+            }
+        }
+        Ok(results)
     }
 
     pub fn find_one(&mut self, filter: Option<Value>) -> Result<Option<Document>, WrongoDBError> {
@@ -189,8 +211,14 @@ impl Collection {
         let doc = &docs[0];
         let updated_doc = apply_update(doc, &update)?;
 
+        let id = doc
+            .get("_id")
+            .ok_or_else(|| crate::core::errors::DocumentValidationError("missing _id".into()))?;
+        let key = encode_id_value(id)?;
+        let value = encode_document(&updated_doc)?;
+
         self.secondary_indexes.remove(doc)?;
-        self.main_table.update(&updated_doc)?;
+        self.main_table.update(&key, &value)?;
         self.secondary_indexes.add(&updated_doc)?;
         self.maybe_checkpoint_after_updates(1)?;
 
@@ -216,8 +244,15 @@ impl Collection {
         let mut modified = 0;
         for doc in docs {
             let updated_doc = apply_update(&doc, &update)?;
+
+            let id = doc
+                .get("_id")
+                .ok_or_else(|| crate::core::errors::DocumentValidationError("missing _id".into()))?;
+            let key = encode_id_value(id)?;
+            let value = encode_document(&updated_doc)?;
+
             self.secondary_indexes.remove(&doc)?;
-            self.main_table.update(&updated_doc)?;
+            self.main_table.update(&key, &value)?;
             self.secondary_indexes.add(&updated_doc)?;
             modified += 1;
         }
@@ -240,8 +275,10 @@ impl Collection {
         let Some(id) = doc.get("_id") else {
             return Ok(0);
         };
+        let key = encode_id_value(id)?;
+
         self.secondary_indexes.remove(doc)?;
-        if self.main_table.delete(id)? {
+        if self.main_table.delete(&key)? {
             self.doc_count = self.doc_count.saturating_sub(1);
             self.maybe_checkpoint_after_updates(1)?;
             return Ok(1);
@@ -260,8 +297,10 @@ impl Collection {
             let Some(id) = doc.get("_id") else {
                 continue;
             };
+            let key = encode_id_value(id)?;
+
             self.secondary_indexes.remove(&doc)?;
-            if self.main_table.delete(id)? {
+            if self.main_table.delete(&key)? {
                 deleted += 1;
             }
         }
@@ -283,7 +322,12 @@ impl Collection {
     }
 
     pub fn create_index(&mut self, field: &str) -> Result<(), WrongoDBError> {
-        let existing_docs = self.main_table.scan_non_txn()?;
+        let entries = self.main_table.scan(&NonTransactional)?;
+        let existing_docs: Vec<Document> = entries
+            .into_iter()
+            .map(|(_, v)| decode_document(&v))
+            .collect::<Result<_, _>>()?;
+
         let was_indexed = self.secondary_indexes.fields.contains(field);
         self.secondary_indexes.add_field(field, &existing_docs)?;
         if !was_indexed {
@@ -343,7 +387,7 @@ impl Collection {
     // ========================================================================
 
     /// Get mutable access to the main table.
-    pub(crate) fn main_table(&mut self) -> &mut MainTable {
+    pub(crate) fn main_table(&mut self) -> &mut Table {
         &mut self.main_table
     }
 

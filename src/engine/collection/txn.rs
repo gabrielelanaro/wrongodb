@@ -7,6 +7,7 @@
 
 use serde_json::Value;
 
+use crate::core::bson::{encode_document, encode_id_value};
 use crate::core::document::{normalize_document_in_place, validate_is_object};
 use crate::engine::collection::update::apply_update;
 use crate::engine::collection::{Collection, UpdateResult};
@@ -68,8 +69,14 @@ impl<'a> CollectionTxn<'a> {
         let mut obj = doc.as_object().expect("validated object").clone();
         normalize_document_in_place(&mut obj)?;
 
+        let id = obj
+            .get("_id")
+            .ok_or_else(|| crate::core::errors::DocumentValidationError("missing _id".into()))?;
+        let key = encode_id_value(id)?;
+        let value = encode_document(&obj)?;
+
         // Transactional: main table (MVCC)
-        self.collection.main_table.insert_mvcc(&obj, &mut self.txn)?;
+        self.collection.main_table.insert_mvcc(&key, &value, &mut self.txn)?;
 
         // Apply index update immediately (not deferred) for visibility
         self.collection.secondary_indexes.add(&obj)?;
@@ -114,10 +121,16 @@ impl<'a> CollectionTxn<'a> {
         let doc = &docs[0];
         let updated_doc = apply_update(doc, &update)?;
 
+        let id = doc
+            .get("_id")
+            .ok_or_else(|| crate::core::errors::DocumentValidationError("missing _id".into()))?;
+        let key = encode_id_value(id)?;
+        let value = encode_document(&updated_doc)?;
+
         // Update main table (MVCC)
         self.collection
             .main_table
-            .update_mvcc(&updated_doc, &mut self.txn)?;
+            .update_mvcc(&key, &value, &mut self.txn)?;
 
         // Apply index updates immediately (not deferred) for visibility
         self.collection.secondary_indexes.remove(doc)?;
@@ -157,10 +170,16 @@ impl<'a> CollectionTxn<'a> {
         for doc in docs {
             let updated_doc = apply_update(&doc, &update)?;
 
+            let id = doc
+                .get("_id")
+                .ok_or_else(|| crate::core::errors::DocumentValidationError("missing _id".into()))?;
+            let key = encode_id_value(id)?;
+            let value = encode_document(&updated_doc)?;
+
             // Update main table (MVCC)
             self.collection
                 .main_table
-                .update_mvcc(&updated_doc, &mut self.txn)?;
+                .update_mvcc(&key, &value, &mut self.txn)?;
 
             // Apply index updates immediately (not deferred) for visibility
             self.collection.secondary_indexes.remove(&doc)?;
@@ -195,9 +214,10 @@ impl<'a> CollectionTxn<'a> {
         let Some(id) = doc.get("_id") else {
             return Ok(0);
         };
+        let key = encode_id_value(id)?;
 
         // Delete from main table (MVCC)
-        match self.collection.main_table.delete_mvcc(id, &mut self.txn) {
+        match self.collection.main_table.delete_mvcc(&key, &mut self.txn) {
             Ok(true) => {
                 // Apply index removal immediately (not deferred) for visibility
                 self.collection.secondary_indexes.remove(doc)?;
@@ -228,9 +248,10 @@ impl<'a> CollectionTxn<'a> {
             let Some(id) = doc.get("_id") else {
                 continue;
             };
+            let key = encode_id_value(id)?;
 
             // Delete from main table (MVCC)
-            match self.collection.main_table.delete_mvcc(id, &mut self.txn) {
+            match self.collection.main_table.delete_mvcc(&key, &mut self.txn) {
                 Ok(true) => {
                     // Apply index removal immediately (not deferred) for visibility
                     self.collection.secondary_indexes.remove(&doc)?;

@@ -11,16 +11,15 @@ fn test_connection_basic() {
     let mut cursor = session.open_cursor("table:test").unwrap();
     cursor.insert(b"key1", b"value1").unwrap();
 
-    let value = cursor.get(b"key1").unwrap();
-    assert_eq!(value, Some(b"value1".to_vec()));
+    let value = cursor.get(b"key1").unwrap().unwrap();
+    assert_eq!(value, b"value1");
 }
 
 #[test]
 fn test_connection_with_config() {
     let tmp = tempfile::tempdir().unwrap();
     let config = ConnectionConfig::new()
-        .wal_enabled(false)
-        .checkpoint_after_updates(100);
+        .wal_enabled(false);
     let conn = Connection::open(tmp.path().join("test"), config).unwrap();
 
     let mut session = conn.open_session();
@@ -30,10 +29,11 @@ fn test_connection_with_config() {
     cursor.insert(b"user1", b"alice").unwrap();
     cursor.insert(b"user2", b"bob").unwrap();
 
-    let value1 = cursor.get(b"user1").unwrap();
-    let value2 = cursor.get(b"user2").unwrap();
-    assert_eq!(value1, Some(b"alice".to_vec()));
-    assert_eq!(value2, Some(b"bob".to_vec()));
+    let value = cursor.get(b"user1").unwrap().unwrap();
+    assert_eq!(value, b"alice");
+
+    let value = cursor.get(b"user2").unwrap().unwrap();
+    assert_eq!(value, b"bob");
 }
 
 #[test]
@@ -48,15 +48,13 @@ fn test_cursor_delete() {
     cursor.insert(b"item1", b"apple").unwrap();
     cursor.insert(b"item2", b"banana").unwrap();
 
-    let value1 = cursor.get(b"item1").unwrap();
-    assert_eq!(value1, Some(b"apple".to_vec()));
+    let value = cursor.get(b"item1").unwrap().unwrap();
+    assert_eq!(value, b"apple");
 
-    let deleted = cursor.delete(b"item1").unwrap();
-    assert_eq!(deleted, true);
+    cursor.delete(b"item1").unwrap();
 
-    let value1_after = cursor.get(b"item1").unwrap();
-    assert_eq!(value1_after, None);
+    assert!(cursor.get(b"item1").unwrap().is_none());
 
-    let value2_after = cursor.get(b"item2").unwrap();
-    assert_eq!(value2_after, Some(b"banana".to_vec()));
+    let value = cursor.get(b"item2").unwrap().unwrap();
+    assert_eq!(value, b"banana");
 }

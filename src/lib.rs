@@ -1,7 +1,6 @@
 mod connection;
 mod core;
 mod cursor;
-mod data;
 mod datahandle_cache;
 mod engine;
 mod index;

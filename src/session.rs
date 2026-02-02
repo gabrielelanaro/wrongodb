@@ -10,7 +10,6 @@ pub struct Session {
     cache: Arc<DataHandleCache>,
     base_path: PathBuf,
     wal_enabled: bool,
-    checkpoint_after_updates: Option<usize>,
     global_txn: Arc<GlobalTxnState>,
 }
 
@@ -19,25 +18,23 @@ impl Session {
         cache: Arc<DataHandleCache>,
         base_path: PathBuf,
         wal_enabled: bool,
-        checkpoint_after_updates: Option<usize>,
         global_txn: Arc<GlobalTxnState>,
     ) -> Self {
         Self {
             cache,
             base_path,
             wal_enabled,
-            checkpoint_after_updates,
             global_txn,
         }
     }
 
     pub fn create(&mut self, uri: &str) -> Result<(), WrongoDBError> {
         if uri.starts_with("table:") {
+            let table_path = self.base_path.join(&uri[6..]);
             let _table = self.cache.get_or_open_table(
                 uri,
-                &self.base_path,
+                &table_path,
                 self.wal_enabled,
-                self.checkpoint_after_updates,
                 self.global_txn.clone(),
             )?;
             Ok(())
@@ -49,13 +46,13 @@ impl Session {
     }
 
     pub fn open_cursor(&mut self, uri: &str) -> Result<Cursor, WrongoDBError> {
+        let table_path = self.base_path.join(&uri[6..]);
         let table = self.cache.get_or_open_table(
             uri,
-            &self.base_path,
+            &table_path,
             self.wal_enabled,
-            self.checkpoint_after_updates,
             self.global_txn.clone(),
         )?;
-        Ok(Cursor::new_table(table))
+        Ok(Cursor::new(table))
     }
 }

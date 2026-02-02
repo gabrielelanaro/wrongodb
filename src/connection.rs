@@ -8,14 +8,12 @@ use crate::WrongoDBError;
 
 pub struct ConnectionConfig {
     pub wal_enabled: bool,
-    pub checkpoint_after_updates: Option<usize>,
 }
 
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
             wal_enabled: true,
-            checkpoint_after_updates: None,
         }
     }
 }
@@ -29,18 +27,12 @@ impl ConnectionConfig {
         self.wal_enabled = enabled;
         self
     }
-
-    pub fn checkpoint_after_updates(mut self, count: usize) -> Self {
-        self.checkpoint_after_updates = Some(count);
-        self
-    }
 }
 
 pub struct Connection {
     base_path: PathBuf,
     dhandle_cache: Arc<DataHandleCache>,
     wal_enabled: bool,
-    checkpoint_after_updates: Option<usize>,
     global_txn: Arc<GlobalTxnState>,
 }
 
@@ -56,7 +48,6 @@ impl Connection {
             base_path,
             dhandle_cache: Arc::new(DataHandleCache::new()),
             wal_enabled: config.wal_enabled,
-            checkpoint_after_updates: config.checkpoint_after_updates,
             global_txn,
         })
     }
@@ -66,7 +57,6 @@ impl Connection {
             self.dhandle_cache.clone(),
             self.base_path.clone(),
             self.wal_enabled,
-            self.checkpoint_after_updates,
             self.global_txn.clone(),
         )
     }
