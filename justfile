@@ -29,4 +29,4 @@ all: check test clippy fmt
 
 # Run development server with auto-reload
 dev-server:
-    cargo watch --ignore "test.db*" -x 'run --bin server'
+    cargo watch --ignore "test.db*" -x 'run --bin wrongodb-server'
