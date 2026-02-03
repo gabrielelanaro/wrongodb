@@ -22,7 +22,7 @@ src/
 ├── data/                  # new: internal table/index logic (renamed from engine/collection)
 │   ├── mod.rs
 │   ├── table.rs             # renamed from Collection
-│   ├── index.rs             # wraps PersistentIndex/SecondaryIndexManager
+│   ├── index.rs             # wraps Index/SecondaryIndexManager
 │   └── update.rs            # from collection/update.rs
 ├── engine/                 # internal glue only (or remove)
 ├── index/                 # unchanged
@@ -92,7 +92,7 @@ pub enum CursorKind {
 pub struct Cursor<'s> {
     session: &'s mut Session,
     kind: CursorKind,
-    // Internal: Table or PersistentIndex handle
+    // Internal: Table or Index handle
 }
 
 impl Cursor<'_> {
@@ -134,7 +134,7 @@ impl Metadata {
 pub struct DataHandle {
     uri: String,
     table: Option<Table>,              // main table + indexes
-    index: Option<PersistentIndex>, // for index cursors
+    index: Option<Index>, // for index cursors
     refcount: u32,
 }
 
@@ -155,7 +155,7 @@ impl DataHandleCache {
 
 ### `Index` Wrapper
 - Location: `src/data/index.rs`
-- Thin wrapper over `PersistentIndex`/`SecondaryIndexManager`
+- Thin wrapper over `Index`/`SecondaryIndexManager`
 - Provides table-like API for cursor ops
 
 ## 4. URI Scheme

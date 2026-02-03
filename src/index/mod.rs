@@ -63,11 +63,11 @@ impl IndexOpRecord {
 /// The value stored is always empty since the _id is embedded in the key.
 /// This allows duplicate values (different _id values = different keys).
 #[derive(Debug)]
-pub struct PersistentIndex {
+pub struct Index {
     table: Arc<RwLock<Table>>,
 }
 
-impl PersistentIndex {
+impl Index {
     /// Open an existing index BTree or create a new one if it doesn't exist.
     fn open_or_create(
         path: &Path,
@@ -163,7 +163,7 @@ pub struct IndexCatalog {
     collection: String,
     db_dir: PathBuf,
     definitions: BTreeMap<String, IndexDefinition>,
-    indexes: BTreeMap<String, PersistentIndex>,
+    indexes: BTreeMap<String, Index>,
     wal_enabled: bool,
     global_txn: Arc<GlobalTxnState>,
 }
@@ -233,7 +233,7 @@ impl IndexCatalog {
         for def in definitions.values() {
             let index_path = db_dir.join(&def.source);
             let (index, _created) =
-                PersistentIndex::open_or_create(&index_path, wal_enabled, global_txn.clone())?;
+                Index::open_or_create(&index_path, wal_enabled, global_txn.clone())?;
             indexes.insert(def.name.clone(), index);
         }
 
@@ -312,7 +312,7 @@ impl IndexCatalog {
         let index_exists = index_path.exists();
 
         let (mut index, created) =
-            PersistentIndex::open_or_create(&index_path, self.wal_enabled, self.global_txn.clone())?;
+            Index::open_or_create(&index_path, self.wal_enabled, self.global_txn.clone())?;
 
         if !index_exists || created {
             let field = &columns[0];
@@ -463,12 +463,12 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn persistent_index_insert_and_lookup() {
+    fn index_insert_and_lookup() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("test.idx.wt");
         let global_txn = Arc::new(GlobalTxnState::new());
 
-        let (mut index, _created) = PersistentIndex::open_or_create(&path, false, global_txn).unwrap();
+        let (mut index, _created) = Index::open_or_create(&path, false, global_txn).unwrap();
 
         index.insert(&json!("alice"), &json!("id1")).unwrap();
         index.insert(&json!("bob"), &json!("id2")).unwrap();
