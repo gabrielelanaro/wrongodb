@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::storage::table::Table;
+use crate::storage::wal::GlobalWal;
 use crate::txn::GlobalTxnState;
 use crate::WrongoDBError;
 use parking_lot::RwLock;
@@ -23,7 +24,7 @@ impl DataHandleCache {
         uri: &str,
         collection: &str,
         db_dir: &Path,
-        wal_enabled: bool,
+        wal: Option<Arc<GlobalWal>>,
         global_txn: Arc<GlobalTxnState>,
     ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
         if let Some(cached) = self.handles.read().get(uri) {
@@ -38,7 +39,7 @@ impl DataHandleCache {
         let table = Arc::new(RwLock::new(Table::open_or_create_primary(
             collection,
             db_dir,
-            wal_enabled,
+            wal,
             global_txn,
         )?));
         handles.insert(uri.to_string(), table.clone());

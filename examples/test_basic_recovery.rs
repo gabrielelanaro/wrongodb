@@ -1,33 +1,41 @@
 use std::path::PathBuf;
-use std::sync::Arc;
-use wrongodb::{BTree, GlobalTxnState};
+use wrongodb::{Connection, ConnectionConfig};
 
 fn main() {
-    let db_path: PathBuf = "/tmp/test_recovery.db".into();
+    let db_path: PathBuf = "/tmp/test_recovery".into();
 
     // Clean up
-    let _ = std::fs::remove_file(&db_path);
-    let _ = std::fs::remove_file(db_path.with_extension("db.wal"));
+    let _ = std::fs::remove_dir_all(&db_path);
+    let _ = std::fs::remove_file(db_path.join("wrongo.wal"));
 
     println!("=== Creating database ===");
     {
-        let global_txn = Arc::new(GlobalTxnState::new());
-        let mut tree = BTree::create(&db_path, 512, true, global_txn).unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::default().disable_auto_checkpoint())
+            .unwrap();
+        let mut session = conn.open_session();
+        session.create("table:test").unwrap();
+
+        let mut txn = session.transaction().unwrap();
+        let txn_id = txn.as_mut().id();
+        let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
 
         println!("Inserting key0");
-        tree.put(b"key0", b"value0").unwrap();
-
-        println!("Syncing WAL");
-        tree.sync_wal().unwrap();
+        cursor.insert(b"key0", b"value0", txn_id).unwrap();
+        txn.commit().unwrap();
     }
 
     println!("\n=== Reopening database (recovery) ===");
     {
-        let global_txn = Arc::new(GlobalTxnState::new());
-        let mut tree = BTree::open(&db_path, true, global_txn).unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::default().disable_auto_checkpoint())
+            .unwrap();
+        let mut session = conn.open_session();
+        let mut cursor = session.open_cursor("table:test").unwrap();
+
+        let mut txn = session.transaction().unwrap();
+        let txn_id = txn.as_mut().id();
 
         println!("Trying to get key0");
-        match tree.get(b"key0") {
+        match cursor.get(b"key0", txn_id) {
             Ok(Some(v)) => println!("Found: {:?}", String::from_utf8_lossy(&v)),
             Ok(None) => println!("Not found (None)"),
             Err(e) => println!("Error: {}", e),

@@ -1,301 +1,241 @@
-//! Integration tests for WAL recovery
+//! Integration tests for DB-level WAL recovery.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use tempfile::tempdir;
-use wrongodb::{BTree, GlobalTxnState};
+use std::path::{Path, PathBuf};
 
-/// Helper to create a test database path
-fn test_db_path(name: &str) -> PathBuf {
+use tempfile::{tempdir, TempDir};
+use wrongodb::{Connection, ConnectionConfig};
+
+const TABLE_URI: &str = "table:test";
+const READ_TXN_ID: u64 = u64::MAX - 1;
+
+fn test_db_dir(name: &str) -> (TempDir, PathBuf) {
     let tmp = tempdir().unwrap();
-    tmp.path().join(name)
+    let path = tmp.path().join(name);
+    (tmp, path)
+}
+
+fn open_conn(path: &Path, wal_enabled: bool) -> Connection {
+    Connection::open(
+        path,
+        ConnectionConfig::default()
+            .wal_enabled(wal_enabled)
+            .disable_auto_checkpoint(),
+    )
+    .unwrap()
+}
+
+fn insert_range(conn: &Connection, start: usize, end: usize) {
+    let mut session = conn.open_session();
+    session.create(TABLE_URI).unwrap();
+
+    let mut txn = session.transaction().unwrap();
+    let txn_id = txn.as_mut().id();
+    let mut cursor = txn.session_mut().open_cursor(TABLE_URI).unwrap();
+
+    for i in start..end {
+        let key = format!("key{}", i);
+        let value = format!("value{}", i);
+        cursor.insert(key.as_bytes(), value.as_bytes(), txn_id).unwrap();
+    }
+
+    txn.commit().unwrap();
+}
+
+fn assert_range(conn: &Connection, start: usize, end: usize) {
+    let mut session = conn.open_session();
+    let mut cursor = session.open_cursor(TABLE_URI).unwrap();
+
+    for i in start..end {
+        let key = format!("key{}", i);
+        let value = format!("value{}", i);
+        let result = cursor.get(key.as_bytes(), READ_TXN_ID).unwrap();
+        assert_eq!(result, Some(value.as_bytes().to_vec()));
+    }
 }
 
 #[test]
 fn recover_from_wal_after_crash() {
-    let db_path = test_db_path("recover_crash.db");
+    let (_tmp, db_path) = test_db_dir("recover_crash");
 
-    // Create database with WAL enabled
     {
-        let mut tree = BTree::create(&db_path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
-
-        // Insert some records
-        for i in 0..10 {
-            let key = format!("key{}", i);
-            let value = format!("value{}", i);
-            tree.put(key.as_bytes(), value.as_bytes()).unwrap();
-        }
-
-        // Sync WAL to ensure all records are on disk
-        tree.sync_wal().unwrap();
+        let conn = open_conn(&db_path, true);
+        insert_range(&conn, 0, 10);
     }
 
-    // Reopen database - should recover from WAL
     {
-        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
-
-        // Verify all data is present
-        let result = tree.get(b"key0").unwrap();
-        assert_eq!(result, Some(b"value0".to_vec()));
+        let conn = open_conn(&db_path, true);
+        assert_range(&conn, 0, 10);
     }
 }
 
 #[test]
 fn recover_single_insert_no_split() {
-    let db_path = test_db_path("recover_single.db");
+    let (_tmp, db_path) = test_db_dir("recover_single");
 
-    // Create database with WAL enabled
     {
-        let mut tree = BTree::create(&db_path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
-
-        // Insert only one record (no split)
-        tree.put(b"key0", b"value0").unwrap();
-        tree.sync_wal().unwrap();
+        let conn = open_conn(&db_path, true);
+        insert_range(&conn, 0, 1);
     }
 
-    // Reopen database - should recover from WAL
     {
-        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
-
-        let result = tree.get(b"key0").unwrap();
-        assert_eq!(result, Some(b"value0".to_vec()));
+        let conn = open_conn(&db_path, true);
+        assert_range(&conn, 0, 1);
     }
 }
 
 #[test]
 fn recovery_after_checkpoint() {
-    let db_path = test_db_path("recover_checkpoint.db");
+    let (_tmp, db_path) = test_db_dir("recover_checkpoint");
 
-    // Create database with WAL and insert initial data
-    {
-        let mut tree = BTree::create(&db_path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
+    let conn = open_conn(&db_path, true);
+    insert_range(&conn, 0, 5);
+    conn.checkpoint_all().unwrap();
+    insert_range(&conn, 5, 10);
+    drop(conn);
 
-        for i in 0..5 {
-            let key = format!("key{}", i);
-            let value = format!("value{}", i);
-            tree.put(key.as_bytes(), value.as_bytes()).unwrap();
-        }
-
-        // Checkpoint to flush to disk
-        tree.checkpoint().unwrap();
-    }
-
-    // Add more data after checkpoint
-    {
-        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
-
-        for i in 5..10 {
-            let key = format!("key{}", i);
-            let value = format!("value{}", i);
-            tree.put(key.as_bytes(), value.as_bytes()).unwrap();
-        }
-
-        // Sync WAL to ensure records are durable before "crash"
-        tree.sync_wal().unwrap();
-
-        // Simulate crash: close without checkpointing
-    }
-
-    // Reopen - should have checkpointed data + WAL-recovered data
-    {
-        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
-
-        // Verify all data is present (0-4 from checkpoint, 5-9 from WAL)
-        for i in 0..10 {
-            let key = format!("key{}", i);
-            let value = format!("value{}", i);
-            let result = tree.get(key.as_bytes()).unwrap();
-            assert_eq!(result, Some(value.as_bytes().to_vec()));
-        }
-    }
+    let conn = open_conn(&db_path, true);
+    assert_range(&conn, 0, 10);
 }
 
 #[test]
 fn recovery_idempotent() {
-    let db_path = test_db_path("recover_idempotent.db");
+    let (_tmp, db_path) = test_db_dir("recover_idempotent");
 
-    // Create database with data
     {
-        let mut tree = BTree::create(&db_path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
-
-        for i in 0..5 {
-            let key = format!("key{}", i);
-            let value = format!("value{}", i);
-            tree.put(key.as_bytes(), value.as_bytes()).unwrap();
-        }
-
-        // Sync WAL to ensure records are durable
-        tree.sync_wal().unwrap();
+        let conn = open_conn(&db_path, true);
+        insert_range(&conn, 0, 5);
     }
 
-    // First recovery
     {
-        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
-        for i in 0..5 {
-            let key = format!("key{}", i);
-            let value = format!("value{}", i);
-            let result = tree.get(key.as_bytes()).unwrap();
-            assert_eq!(result, Some(value.as_bytes().to_vec()));
-        }
+        let conn = open_conn(&db_path, true);
+        assert_range(&conn, 0, 5);
     }
 
-    // Second recovery (should be idempotent - same data)
     {
-        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
-        for i in 0..5 {
-            let key = format!("key{}", i);
-            let value = format!("value{}", i);
-            let result = tree.get(key.as_bytes()).unwrap();
-            assert_eq!(result, Some(value.as_bytes().to_vec()));
-        }
+        let conn = open_conn(&db_path, true);
+        assert_range(&conn, 0, 5);
     }
 }
 
 #[test]
 fn recovery_with_multiple_splits() {
-    let db_path = test_db_path("recover_splits.db");
+    let (_tmp, db_path) = test_db_dir("recover_splits");
 
-    // Create database with WAL and insert enough data to cause splits
     {
-        let mut tree = BTree::create(&db_path, 256, true, Arc::new(GlobalTxnState::new())).unwrap();  // Small page size to force splits
+        let conn = open_conn(&db_path, true);
+        let mut session = conn.open_session();
+        session.create(TABLE_URI).unwrap();
 
-        // Insert many records to trigger multiple leaf splits
-        for i in 0..50 {
-            let key = format!("key{:010}", i);  // Padded for sorting
-            let value = format!("value{}", i);
-            tree.put(key.as_bytes(), value.as_bytes()).unwrap();
-        }
+        let mut txn = session.transaction().unwrap();
+        let txn_id = txn.as_mut().id();
+        let mut cursor = txn.session_mut().open_cursor(TABLE_URI).unwrap();
 
-        // Sync WAL to ensure records are durable
-        tree.sync_wal().unwrap();
-
-        // Simulate crash
-    }
-
-    // Recover and verify all data
-    {
-        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
-
-        for i in 0..50 {
+        for i in 0..200 {
             let key = format!("key{:010}", i);
             let value = format!("value{}", i);
-            let result = tree.get(key.as_bytes()).unwrap();
-            assert_eq!(result, Some(value.as_bytes().to_vec()));
+            cursor.insert(key.as_bytes(), value.as_bytes(), txn_id).unwrap();
         }
 
-        // Verify range scan works
-        let mut iter = tree.range(Some(b"key0000000000"), Some(b"key0000000100")).unwrap();
+        txn.commit().unwrap();
+    }
+
+    {
+        let conn = open_conn(&db_path, true);
+        let mut session = conn.open_session();
+        let mut cursor = session.open_cursor(TABLE_URI).unwrap();
+
+        cursor.set_range(
+            Some(b"key0000000000".to_vec()),
+            Some(b"key0000000200".to_vec()),
+        );
+
         let mut count = 0;
-        while let Some(Ok((k, v))) = iter.next() {
+        while let Some((k, v)) = cursor.next(READ_TXN_ID).unwrap() {
             assert!(k.starts_with(b"key"));
             assert!(v.starts_with(b"value"));
             count += 1;
         }
-        assert_eq!(count, 50);
+        assert_eq!(count, 200);
     }
 }
 
 #[test]
 fn recovery_with_corrupted_wal() {
-    let db_path = test_db_path("recover_corrupt.db");
-    let wal_path = db_path.with_extension("db.wal");
+    let (_tmp, db_path) = test_db_dir("recover_corrupt");
+    let wal_path = db_path.join("wrongo.wal");
 
-    // Create database with WAL
     {
-        let mut tree = BTree::create(&db_path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
-
-        for i in 0..5 {
-            let key = format!("key{}", i);
-            let value = format!("value{}", i);
-            tree.put(key.as_bytes(), value.as_bytes()).unwrap();
-        }
-
-        // Ensure WAL is durable before corruption
-        tree.sync_wal().unwrap();
+        let conn = open_conn(&db_path, true);
+        insert_range(&conn, 0, 20);
     }
 
-    // Corrupt the WAL file
     {
         use std::fs::OpenOptions;
-        use std::io::Write;
+        use std::io::{Seek, SeekFrom, Write};
 
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(&wal_path)
-            .unwrap();
+        let len = std::fs::metadata(&wal_path).unwrap().len();
+        let offset = if len > 600 { 600 } else { len / 2 };
 
-        // Overwrite some bytes in the WAL
-        use std::io::Seek;
-        use std::io::SeekFrom;
-        file.seek(SeekFrom::Start(600)).unwrap();
+        let mut file = OpenOptions::new().write(true).open(&wal_path).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
         file.write_all(b"CORRUPT_DATA_HERE").unwrap();
     }
 
-    // Reopen - should handle corrupted WAL gracefully
-    {
-        // This should not fail - corrupted WAL should be handled gracefully
-        let result = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new()));
-
-        // Either it opens successfully (with warnings) or fails gracefully
-        // We don't assert success/failure, just that it doesn't panic
-        match result {
-            Ok(mut tree) => {
-                // If it opened, try to read some data
-                // (Some data may be lost due to corruption, which is acceptable)
-                let _ = tree.get(b"key0");
-            }
-            Err(_) => {
-                // Failed to open - also acceptable for corrupted WAL
-            }
-        }
-    }
+    let conn = open_conn(&db_path, true);
+    let mut session = conn.open_session();
+    let mut cursor = session.open_cursor(TABLE_URI).unwrap();
+    let _ = cursor.get(b"key0", READ_TXN_ID);
 }
 
 #[test]
 fn recovery_empty_database() {
-    let db_path = test_db_path("recover_empty.db");
+    let (_tmp, db_path) = test_db_dir("recover_empty");
 
-    // Create empty database
     {
-        let _tree = BTree::create(&db_path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
+        let conn = open_conn(&db_path, true);
+        let mut session = conn.open_session();
+        session.create(TABLE_URI).unwrap();
     }
 
-    // Reopen empty database
     {
-        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
-
-        // Should be able to query and get None
-        let result = tree.get(b"nonexistent").unwrap();
+        let conn = open_conn(&db_path, true);
+        let mut session = conn.open_session();
+        let mut cursor = session.open_cursor(TABLE_URI).unwrap();
+        let result = cursor.get(b"nonexistent", READ_TXN_ID).unwrap();
         assert_eq!(result, None);
     }
 }
 
 #[test]
 fn recovery_large_keys_and_values() {
-    let db_path = test_db_path("recover_large.db");
+    let (_tmp, db_path) = test_db_dir("recover_large");
 
-    // Create database with large keys and values
     {
-        let mut tree = BTree::create(&db_path, 1024, true, Arc::new(GlobalTxnState::new())).unwrap();
+        let conn = open_conn(&db_path, true);
+        let mut session = conn.open_session();
+        session.create(TABLE_URI).unwrap();
+
+        let mut txn = session.transaction().unwrap();
+        let txn_id = txn.as_mut().id();
+        let mut cursor = txn.session_mut().open_cursor(TABLE_URI).unwrap();
 
         for i in 0..10 {
             let key = format!("key_{}_with_lots_of_padding_data_{}", i, i);
             let value = format!("value_{}_with_even_more_padding_data_{}", i, i);
-            tree.put(key.as_bytes(), value.as_bytes()).unwrap();
+            cursor.insert(key.as_bytes(), value.as_bytes(), txn_id).unwrap();
         }
 
-        // Sync WAL to ensure records are on disk
-        tree.sync_wal().unwrap();
+        txn.commit().unwrap();
     }
 
-    // Recover and verify
     {
-        let mut tree = BTree::open(&db_path, true, Arc::new(GlobalTxnState::new())).unwrap();
-
+        let conn = open_conn(&db_path, true);
+        let mut session = conn.open_session();
+        let mut cursor = session.open_cursor(TABLE_URI).unwrap();
         for i in 0..10 {
             let key = format!("key_{}_with_lots_of_padding_data_{}", i, i);
             let value = format!("value_{}_with_even_more_padding_data_{}", i, i);
-            let result = tree.get(key.as_bytes()).unwrap();
+            let result = cursor.get(key.as_bytes(), READ_TXN_ID).unwrap();
             assert_eq!(result, Some(value.as_bytes().to_vec()));
         }
     }
@@ -303,31 +243,16 @@ fn recovery_large_keys_and_values() {
 
 #[test]
 fn recovery_with_wal_disabled() {
-    let db_path = test_db_path("recover_no_wal.db");
+    let (_tmp, db_path) = test_db_dir("recover_no_wal");
 
-    // Create database WITHOUT WAL
     {
-        let mut tree = BTree::create(&db_path, 512, false, Arc::new(GlobalTxnState::new())).unwrap();
-
-        for i in 0..5 {
-            let key = format!("key{}", i);
-            let value = format!("value{}", i);
-            tree.put(key.as_bytes(), value.as_bytes()).unwrap();
-        }
-
-        // Without WAL, durability requires checkpoint
-        tree.checkpoint().unwrap();
+        let conn = open_conn(&db_path, false);
+        insert_range(&conn, 0, 5);
+        conn.checkpoint_all().unwrap();
     }
 
-    // Reopen - should work normally without WAL
     {
-        let mut tree = BTree::open(&db_path, false, Arc::new(GlobalTxnState::new())).unwrap();
-
-        for i in 0..5 {
-            let key = format!("key{}", i);
-            let value = format!("value{}", i);
-            let result = tree.get(key.as_bytes()).unwrap();
-            assert_eq!(result, Some(value.as_bytes().to_vec()));
-        }
+        let conn = open_conn(&db_path, false);
+        assert_range(&conn, 0, 5);
     }
 }

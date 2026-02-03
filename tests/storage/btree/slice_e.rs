@@ -30,7 +30,7 @@ fn grows_tree_height_past_two_levels_and_survives_reopen() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("btree_slice_e_height.wt");
 
-    let mut tree = BTree::create(&path, 256, false, Arc::new(GlobalTxnState::new())).unwrap();
+    let mut tree = BTree::create(&path, 256, Arc::new(GlobalTxnState::new())).unwrap();
     for i in 0..800u32 {
         let k = format!("k{i:04}").into_bytes();
         let v = vec![b'v'; 24];
@@ -50,7 +50,7 @@ fn grows_tree_height_past_two_levels_and_survives_reopen() {
 
     drop(tree);
 
-    let mut tree2 = BTree::open(&path, false, Arc::new(GlobalTxnState::new())).unwrap();
+    let mut tree2 = BTree::open(&path, Arc::new(GlobalTxnState::new())).unwrap();
     for i in 0..800u32 {
         let k = format!("k{i:04}").into_bytes();
         assert!(tree2.get(&k).unwrap().is_some());
@@ -63,7 +63,7 @@ fn ordered_range_scan_is_sorted_and_respects_bounds() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("btree_slice_e_scan.wt");
 
-    let mut tree = BTree::create(&path, 384, false, Arc::new(GlobalTxnState::new())).unwrap();
+    let mut tree = BTree::create(&path, 384, Arc::new(GlobalTxnState::new())).unwrap();
     for i in 0..500u32 {
         let k = format!("k{i:04}").into_bytes();
         let v = format!("v{i:04}").into_bytes();
@@ -94,7 +94,7 @@ fn ordered_range_scan_is_sorted_and_respects_bounds() {
 
     drop(tree);
 
-    let mut tree2 = BTree::open(&path, false, Arc::new(GlobalTxnState::new())).unwrap();
+    let mut tree2 = BTree::open(&path, Arc::new(GlobalTxnState::new())).unwrap();
     let slice2: Vec<Vec<u8>> = tree2
         .range(Some(b"k0100"), Some(b"k0200"))
         .unwrap()

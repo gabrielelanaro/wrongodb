@@ -17,7 +17,7 @@ pub use crate::connection::{Connection, ConnectionConfig};
 pub use crate::core::errors::{DocumentValidationError, StorageError, WrongoDBError};
 pub use crate::cursor::{Cursor, CursorKind};
 pub use crate::engine::{Collection, DbStats, IndexInfo, UpdateResult, WrongoDB, WrongoDBConfig};
-pub use crate::index::{decode_index_id, encode_index_key, encode_range_bounds, encode_scalar_prefix, IndexCatalog, IndexDefinition, IndexOpRecord, IndexOpType};
+pub use crate::index::{decode_index_id, encode_index_key, encode_range_bounds, encode_scalar_prefix, IndexCatalog, IndexDefinition};
 pub use crate::server::commands::CommandRegistry;
 pub use crate::server::start_server;
 pub use crate::session::Session;

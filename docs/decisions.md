@@ -702,3 +702,21 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - **Leaf-only pinning** minimizes pin count but may re-read parent pages during iteration if they're evicted.
 - **Full-path pinning** would keep the entire path from root to leaf pinned, preventing any re-reads but consuming more cache capacity.
 - Current implementation uses leaf-only pinning for simplicity; full-path pinning can be added later if needed for performance.
+
+## 2026-02-03: Global WAL + Snapshot-Based Checkpointing (Default Auto-Checkpoint On)
+
+**Decision**
+- Replace per-table WALs with a **single global WAL** under the database directory.
+- WAL `Put/Delete` records now carry the **target URI** (`table:<name>` / `index:<collection>:<index>`).
+- Checkpointing is **snapshot-based** (WT-like): use a global snapshot to select committed updates for materialization.
+- Auto-checkpointing is **enabled by default**: every 60s or 64MB of WAL growth.
+- Expose DB-wide checkpoint via `Session::checkpoint()` and `Connection::checkpoint_all()`.
+
+**Why**
+- Global WAL simplifies recovery and truncation, and matches WT’s architecture.
+- Snapshot-based checkpoints avoid blocking concurrent operations while preserving a consistent view.
+- Default auto-checkpointing bounds recovery time and WAL growth without explicit user action.
+
+**Notes**
+- WAL truncation is only advanced when no active transactions exist at checkpoint time to avoid losing
+  WAL needed by in-flight transactions.
