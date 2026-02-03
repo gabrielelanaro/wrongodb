@@ -81,7 +81,8 @@ impl Command for InsertCommand {
 
     fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("insert").unwrap_or("test");
-        let coll = db.collection(coll_name)?;
+        let coll = db.collection(coll_name);
+        let mut session = db.open_session();
 
         let inserted_ids: Vec<ObjectId> = if let Ok(docs) = doc.get_array("documents") {
             let mut ids = Vec::new();
@@ -96,7 +97,10 @@ impl Command for InsertCommand {
                         _ => ObjectId::new(),
                     };
                     let json_doc = bson_to_json_document(&doc_with_id);
-                    if coll.insert_one(Value::Object(json_doc)).is_ok() {
+                    if coll
+                        .insert_one(&mut session, Value::Object(json_doc))
+                        .is_ok()
+                    {
                         ids.push(id);
                     }
                 }
@@ -132,12 +136,13 @@ impl Command for FindCommand {
 
     fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("find").unwrap_or("test");
-        let coll = db.collection(coll_name)?;
+        let coll = db.collection(coll_name);
+        let mut session = db.open_session();
 
         let filter = doc.get("filter").and_then(|f| f.as_document()).cloned();
         let filter_json = filter.map(|d| bson_to_value(&d));
 
-        let mut results = coll.find(filter_json)?;
+        let mut results = coll.find(&mut session, filter_json)?;
 
         // Handle skip
         let skip = doc.get("skip").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -193,30 +198,30 @@ impl Command for UpdateCommand {
 
     fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("update").unwrap_or("test");
-        let coll = db.collection(coll_name)?;
+        let coll = db.collection(coll_name);
+        let mut session = db.open_session();
         let mut n_matched = 0i32;
         let mut n_modified = 0i32;
 
         if let Ok(updates) = doc.get_array("updates") {
-            for update_spec in updates {
-                if let Bson::Document(spec) = update_spec {
-                    let filter = spec.get_document("q").ok().cloned();
-                    let update_doc = spec.get_document("u").ok().cloned();
-                    let multi = spec.get_bool("multi").unwrap_or(false);
+            for update in updates {
+                if let Bson::Document(update_doc) = update {
+                    let filter = update_doc.get("q").and_then(|q| q.as_document()).cloned();
+                    let filter_json = filter.map(|d| bson_to_value(&d));
 
-                    if let (Some(filter), Some(update)) = (filter, update_doc) {
-                        let filter_json = bson_to_value(&filter);
-                        let update_json = bson_to_value(&update);
+                    let update_spec = update_doc.get("u").and_then(|u| u.as_document()).cloned();
+                    let update_json = update_spec.map(|d| bson_to_value(&d)).unwrap_or(Value::Null);
 
-                        let result = if multi {
-                            coll.update_many(Some(filter_json), update_json)?
-                        } else {
-                            coll.update_one(Some(filter_json), update_json)?
-                        };
+                    let multi = update_doc.get_bool("multi").unwrap_or(false);
 
-                        n_matched += result.matched as i32;
-                        n_modified += result.modified as i32;
-                    }
+                    let result = if multi {
+                        coll.update_many(&mut session, filter_json, update_json)?
+                    } else {
+                        coll.update_one(&mut session, filter_json, update_json)?
+                    };
+
+                    n_matched += result.matched as i32;
+                    n_modified += result.modified as i32;
                 }
             }
         }
@@ -225,8 +230,6 @@ impl Command for UpdateCommand {
             "ok": Bson::Double(1.0),
             "n": Bson::Int32(n_matched),
             "nModified": Bson::Int32(n_modified),
-            "writeErrors": Bson::Array(vec![]),
-            "writeConcernErrors": Bson::Array(vec![]),
         })
     }
 }
@@ -244,23 +247,22 @@ impl Command for DeleteCommand {
 
     fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("delete").unwrap_or("test");
-        let coll = db.collection(coll_name)?;
+        let coll = db.collection(coll_name);
+        let mut session = db.open_session();
         let mut n_deleted = 0i32;
 
         if let Ok(deletes) = doc.get_array("deletes") {
-            for delete_spec in deletes {
-                if let Bson::Document(spec) = delete_spec {
-                    let filter = spec.get_document("q").ok().cloned();
-                    let limit = spec.get_i32("limit").unwrap_or(0);
+            for delete in deletes {
+                if let Bson::Document(delete_doc) = delete {
+                    let filter = delete_doc.get("q").and_then(|q| q.as_document()).cloned();
+                    let filter_json = filter.map(|d| bson_to_value(&d));
 
-                    if let Some(filter) = filter {
-                        let filter_json = bson_to_value(&filter);
-                        let count = if limit == 1 {
-                            coll.delete_one(Some(filter_json))?
-                        } else {
-                            coll.delete_many(Some(filter_json))?
-                        };
-                        n_deleted += count as i32;
+                    let limit = delete_doc.get_i32("limit").unwrap_or(0);
+
+                    if limit == 1 {
+                        n_deleted += coll.delete_one(&mut session, filter_json)? as i32;
+                    } else {
+                        n_deleted += coll.delete_many(&mut session, filter_json)? as i32;
                     }
                 }
             }
@@ -269,39 +271,6 @@ impl Command for DeleteCommand {
         Ok(doc! {
             "ok": Bson::Double(1.0),
             "n": Bson::Int32(n_deleted),
-            "writeErrors": Bson::Array(vec![]),
-            "writeConcernErrors": Bson::Array(vec![]),
-        })
-    }
-}
-
-// ============================================================================
-// DeleteMany Command (mongosh helper)
-// ============================================================================
-
-pub struct DeleteManyCommand;
-
-impl Command for DeleteManyCommand {
-    fn names(&self) -> &[&str] {
-        &["deleteMany"]
-    }
-
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
-        // deleteMany format: {deleteMany: "collection", deletes: [{q: filter, limit: 1}]}
-        let coll_name = doc.get_str("deleteMany").unwrap_or("test");
-        let coll = db.collection(coll_name)?;
-        let filter = doc.get_document("filter").ok();
-
-        let count = if let Some(filter_doc) = filter {
-            let filter_json = bson_to_value(&filter_doc);
-            coll.delete_many(Some(filter_json))?
-        } else {
-            coll.delete_many(None)?
-        };
-
-        Ok(doc! {
-            "acknowledged": Bson::Boolean(true),
-            "deletedCount": Bson::Int32(count as i32),
         })
     }
 }

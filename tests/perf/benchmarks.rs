@@ -11,7 +11,7 @@ use wrongodb::WrongoDB;
 #[ignore]
 fn benchmark_main_table_vs_append_only() {
     let tmp = tempdir().unwrap();
-    let base = tmp.path().join("bench.db");
+    let base = tmp.path().join("bench");
 
     let docs: Vec<_> = (0..2000)
         .map(|i| json!({"name": format!("user-{i}"), "age": i % 100}))
@@ -20,13 +20,14 @@ fn benchmark_main_table_vs_append_only() {
     let main_path = base.clone();
     let start = Instant::now();
     {
-        let mut db = WrongoDB::open(&main_path).unwrap();
+        let db = WrongoDB::open(&main_path).unwrap();
         {
-            let coll = db.collection("test").unwrap();
+            let coll = db.collection("test");
+            let mut session = db.open_session();
             for doc in &docs {
-                coll.insert_one(doc.clone()).unwrap();
+                coll.insert_one(&mut session, doc.clone()).unwrap();
             }
-            coll.checkpoint().unwrap();
+            coll.checkpoint(&mut session).unwrap();
         }
     }
     let main_elapsed = start.elapsed();

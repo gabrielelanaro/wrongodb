@@ -1,5 +1,26 @@
 # Decisions
 
+## 2026-02-02: Table-owned index catalog + Session-only transactions
+
+**Decision**
+- Move secondary index ownership into `Table` via a persisted per-collection catalog.
+- Expose read-only index cursors (`index:<collection>:<index>`) via `Session::open_cursor`.
+- Remove `CollectionTxn`/`MultiCollectionTxn`; all transactions are `SessionTxn`.
+- Switch to directory-based storage layout:
+  - Main table: `<db_dir>/<collection>.main.wt`
+  - Index: `<db_dir>/<collection>.<index>.idx.wt`
+  - Catalog: `<db_dir>/<collection>.meta.json`
+- No migration for legacy `{base}.{collection}.main.wt` layouts.
+
+**Why**
+- Aligns with WiredTiger’s model: tables own indexes, sessions own transactions, and cursors are the access path.
+- Reduces duplication and complexity in `collection/` by pushing storage/index concerns into `Table`.
+- Establishes a stable on-disk catalog for index discovery and `index:` URI mapping.
+
+**Notes**
+- Index cursors are read-only; writes flow through the table/collection path.
+- Index updates remain immediate with rollback-on-abort until MVCC index writes are implemented.
+
 ## 2026-02-01: MVCC includes history store for older versions
 
 **Decision**

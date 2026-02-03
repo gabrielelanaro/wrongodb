@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::core::errors::WrongoDBError;
 use crate::txn::{
-    GlobalTxnState, TxnId, Update, UpdateChain, UpdateType,
+    GlobalTxnState, TxnId, Update, UpdateChain, UpdateType, TS_NONE, TXN_ABORTED,
 };
 
 use super::BTree;
@@ -61,6 +61,42 @@ impl MvccState {
     #[allow(dead_code)]
     pub(super) fn chain_count(&self) -> usize {
         self.chains.len()
+    }
+
+    pub(super) fn keys_in_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Vec<Vec<u8>> {
+        let mut keys: Vec<Vec<u8>> = self.chains.keys().cloned().collect();
+        if start.is_some() || end.is_some() {
+            keys.retain(|key| {
+                let after_start = start.map_or(true, |s| key.as_slice() >= s);
+                let before_end = end.map_or(true, |e| key.as_slice() < e);
+                after_start && before_end
+            });
+        }
+        keys.sort();
+        keys
+    }
+
+    pub(super) fn latest_committed_entries(&self) -> Vec<(Vec<u8>, UpdateType, Vec<u8>)> {
+        let mut out = Vec::new();
+        for (key, chain) in self.chains.iter() {
+            for update in chain.iter() {
+                let is_aborted = update.time_window.stop_txn == TXN_ABORTED
+                    && update.time_window.stop_ts == TS_NONE;
+                if is_aborted {
+                    continue;
+                }
+                if update.time_window.start_ts == TS_NONE {
+                    continue;
+                }
+                match update.type_ {
+                    UpdateType::Standard => out.push((key.clone(), UpdateType::Standard, update.data.clone())),
+                    UpdateType::Tombstone => out.push((key.clone(), UpdateType::Tombstone, Vec::new())),
+                    UpdateType::Reserve => {}
+                }
+                break;
+            }
+        }
+        out
     }
 }
 

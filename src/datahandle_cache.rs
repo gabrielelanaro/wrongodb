@@ -18,10 +18,11 @@ impl DataHandleCache {
         }
     }
 
-    pub fn get_or_open_table(
+    pub fn get_or_open_primary(
         &self,
         uri: &str,
-        table_path: &Path,
+        collection: &str,
+        db_dir: &Path,
         wal_enabled: bool,
         global_txn: Arc<GlobalTxnState>,
     ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
@@ -34,12 +35,14 @@ impl DataHandleCache {
             return Ok(cached.clone());
         }
 
-        let table = Arc::new(RwLock::new(Table::open_or_create(
-            table_path,
+        let table = Arc::new(RwLock::new(Table::open_or_create_primary(
+            collection,
+            db_dir,
             wal_enabled,
             global_txn,
         )?));
         handles.insert(uri.to_string(), table.clone());
         Ok(table)
     }
+
 }

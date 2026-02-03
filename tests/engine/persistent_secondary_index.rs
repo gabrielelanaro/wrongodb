@@ -10,39 +10,44 @@ use serde_json::json;
 use std::fs;
 use tempfile::tempdir;
 
-use wrongodb::WrongoDB;
+use wrongodb::{decode_index_id, encode_range_bounds, WrongoDB};
 
 #[test]
 fn index_created_on_empty_collection() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test.db");
 
-    let mut db = WrongoDB::open(&path).unwrap();
+    let db = WrongoDB::open(&path).unwrap();
     {
-        let coll = db.collection("test").unwrap();
+        let coll = db.collection("test");
+        let mut session = db.open_session();
 
         // Create index
-        coll.create_index("username").unwrap();
+        coll.create_index(&mut session, "username").unwrap();
 
         // Insert documents
-        coll.insert_one(json!({"username": "alice", "age": 30}))
+        coll.insert_one(&mut session, json!({"username": "alice", "age": 30}))
             .unwrap();
-        coll.insert_one(json!({"username": "bob", "age": 25})).unwrap();
-        coll.insert_one(json!({"username": "alice", "age": 35}))
+        coll.insert_one(&mut session, json!({"username": "bob", "age": 25})).unwrap();
+        coll.insert_one(&mut session, json!({"username": "alice", "age": 35}))
             .unwrap(); // Duplicate username
 
         // Query by indexed field
-        let alices = coll.find(Some(json!({"username": "alice"}))).unwrap();
+        let alices = coll
+            .find(&mut session, Some(json!({"username": "alice"})))
+            .unwrap();
         assert_eq!(alices.len(), 2, "Expected 2 alices");
 
-        let bobs = coll.find(Some(json!({"username": "bob"}))).unwrap();
+        let bobs = coll
+            .find(&mut session, Some(json!({"username": "bob"})))
+            .unwrap();
         assert_eq!(bobs.len(), 1, "Expected 1 bob");
 
-        coll.checkpoint().unwrap();
+        coll.checkpoint(&mut session).unwrap();
     }
 
-    // Verify index file exists (collection "test" creates files with .test extension)
-    let index_path = tmp.path().join("test.db.test.username.idx.wt");
+    // Verify index file exists
+    let index_path = path.join("test.username.idx.wt");
     assert!(index_path.exists(), "Index file should exist after checkpoint");
 }
 
@@ -53,26 +58,28 @@ fn index_survives_database_restart() {
 
     // Create database and insert documents
     {
-        let mut db = WrongoDB::open(&path).unwrap();
+        let db = WrongoDB::open(&path).unwrap();
         {
-            let coll = db.collection("test").unwrap();
-            coll.create_index("email").unwrap();
-            coll.insert_one(json!({"email": "alice@example.com", "name": "Alice"}))
+            let coll = db.collection("test");
+            let mut session = db.open_session();
+            coll.create_index(&mut session, "email").unwrap();
+            coll.insert_one(&mut session, json!({"email": "alice@example.com", "name": "Alice"}))
                 .unwrap();
-            coll.insert_one(json!({"email": "bob@example.com", "name": "Bob"}))
+            coll.insert_one(&mut session, json!({"email": "bob@example.com", "name": "Bob"}))
                 .unwrap();
-            coll.checkpoint().unwrap();
+            coll.checkpoint(&mut session).unwrap();
         }
     }
 
     // Reopen database
     {
-        let mut db = WrongoDB::open(&path).unwrap();
+        let db = WrongoDB::open(&path).unwrap();
 
         // Query should work immediately without rebuilding
-        let coll = db.collection("test").unwrap();
+        let coll = db.collection("test");
+        let mut session = db.open_session();
         let results = coll
-            .find(Some(json!({"email": "alice@example.com"})))
+            .find(&mut session, Some(json!({"email": "alice@example.com"})))
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
@@ -89,24 +96,28 @@ fn index_builds_from_existing_documents() {
 
     // Create data without index
     {
-        let mut db = WrongoDB::open(&path).unwrap();
+        let db = WrongoDB::open(&path).unwrap();
         {
-            let coll = db.collection("test").unwrap();
-            coll.insert_one(json!({"city": "nyc", "name": "alice"}))
+            let coll = db.collection("test");
+            let mut session = db.open_session();
+            coll.insert_one(&mut session, json!({"city": "nyc", "name": "alice"}))
                 .unwrap();
-            coll.insert_one(json!({"city": "la", "name": "bob"})).unwrap();
-            coll.insert_one(json!({"city": "nyc", "name": "charlie"}))
+            coll.insert_one(&mut session, json!({"city": "la", "name": "bob"})).unwrap();
+            coll.insert_one(&mut session, json!({"city": "nyc", "name": "charlie"}))
                 .unwrap();
-            coll.checkpoint().unwrap();
+            coll.checkpoint(&mut session).unwrap();
         }
     }
 
     // Now create city index and query
     {
-        let mut db = WrongoDB::open(&path).unwrap();
-        let coll = db.collection("test").unwrap();
-        coll.create_index("city").unwrap();
-        let nyc_docs = coll.find(Some(json!({"city": "nyc"}))).unwrap();
+        let db = WrongoDB::open(&path).unwrap();
+        let coll = db.collection("test");
+        let mut session = db.open_session();
+        coll.create_index(&mut session, "city").unwrap();
+        let nyc_docs = coll
+            .find(&mut session, Some(json!({"city": "nyc"})))
+            .unwrap();
         assert_eq!(nyc_docs.len(), 2, "Expected 2 NYC docs");
     }
 }
@@ -116,30 +127,38 @@ fn index_maintenance_on_update() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test.db");
 
-    let mut db = WrongoDB::open(&path).unwrap();
+    let db = WrongoDB::open(&path).unwrap();
 
-    let coll = db.collection("test").unwrap();
-    coll.create_index("status").unwrap();
-    coll.insert_one(json!({"name": "alice", "status": "active"}))
+    let coll = db.collection("test");
+    let mut session = db.open_session();
+    coll.create_index(&mut session, "status").unwrap();
+    coll.insert_one(&mut session, json!({"name": "alice", "status": "active"}))
         .unwrap();
-    coll.insert_one(json!({"name": "bob", "status": "inactive"}))
+    coll.insert_one(&mut session, json!({"name": "bob", "status": "inactive"}))
         .unwrap();
 
     // Verify initial state
-    let active = coll.find(Some(json!({"status": "active"}))).unwrap();
+    let active = coll
+        .find(&mut session, Some(json!({"status": "active"})))
+        .unwrap();
     assert_eq!(active.len(), 1);
 
     // Update bob to active
     coll.update_one(
+        &mut session,
         Some(json!({"name": "bob"})),
         json!({"$set": {"status": "active"}}),
     )
     .unwrap();
 
-    let active = coll.find(Some(json!({"status": "active"}))).unwrap();
+    let active = coll
+        .find(&mut session, Some(json!({"status": "active"})))
+        .unwrap();
     assert_eq!(active.len(), 2, "Expected 2 active users after update");
 
-    let inactive = coll.find(Some(json!({"status": "inactive"}))).unwrap();
+    let inactive = coll
+        .find(&mut session, Some(json!({"status": "inactive"})))
+        .unwrap();
     assert_eq!(inactive.len(), 0, "Expected 0 inactive users after update");
 }
 
@@ -148,28 +167,30 @@ fn index_maintenance_on_delete() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test.db");
 
-    let mut db = WrongoDB::open(&path).unwrap();
+    let db = WrongoDB::open(&path).unwrap();
 
-    let coll = db.collection("test").unwrap();
-    coll.create_index("category").unwrap();
-    coll.insert_one(json!({"name": "item1", "category": "electronics"}))
+    let coll = db.collection("test");
+    let mut session = db.open_session();
+    coll.create_index(&mut session, "category").unwrap();
+    coll.insert_one(&mut session, json!({"name": "item1", "category": "electronics"}))
         .unwrap();
-    coll.insert_one(json!({"name": "item2", "category": "electronics"}))
+    coll.insert_one(&mut session, json!({"name": "item2", "category": "electronics"}))
         .unwrap();
-    coll.insert_one(json!({"name": "item3", "category": "clothing"}))
+    coll.insert_one(&mut session, json!({"name": "item3", "category": "clothing"}))
         .unwrap();
 
     // Verify initial state
     let electronics = coll
-        .find(Some(json!({"category": "electronics"})))
+        .find(&mut session, Some(json!({"category": "electronics"})))
         .unwrap();
     assert_eq!(electronics.len(), 2);
 
     // Delete one electronics item
-    coll.delete_one(Some(json!({"name": "item1"}))).unwrap();
+    coll.delete_one(&mut session, Some(json!({"name": "item1"})))
+        .unwrap();
 
     let electronics = coll
-        .find(Some(json!({"category": "electronics"})))
+        .find(&mut session, Some(json!({"category": "electronics"})))
         .unwrap();
     assert_eq!(electronics.len(), 1, "Expected 1 electronics item after delete");
 }
@@ -179,31 +200,34 @@ fn multiple_indexes_on_same_collection() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("test.db");
 
-    let mut db = WrongoDB::open(&path).unwrap();
+    let db = WrongoDB::open(&path).unwrap();
     {
-        let coll = db.collection("test").unwrap();
-        coll.create_index("dept").unwrap();
-        coll.create_index("role").unwrap();
-        coll.insert_one(json!({"name": "alice", "dept": "eng", "role": "dev"}))
+        let coll = db.collection("test");
+        let mut session = db.open_session();
+        coll.create_index(&mut session, "dept").unwrap();
+        coll.create_index(&mut session, "role").unwrap();
+        coll.insert_one(&mut session, json!({"name": "alice", "dept": "eng", "role": "dev"}))
             .unwrap();
-        coll.insert_one(json!({"name": "bob", "dept": "eng", "role": "manager"}))
+        coll.insert_one(&mut session, json!({"name": "bob", "dept": "eng", "role": "manager"}))
             .unwrap();
-        coll.insert_one(json!({"name": "charlie", "dept": "sales", "role": "manager"}))
+        coll.insert_one(&mut session, json!({"name": "charlie", "dept": "sales", "role": "manager"}))
             .unwrap();
 
         // Query by dept
-        let eng = coll.find(Some(json!({"dept": "eng"}))).unwrap();
+        let eng = coll.find(&mut session, Some(json!({"dept": "eng"}))).unwrap();
         assert_eq!(eng.len(), 2);
 
         // Query by role
-        let managers = coll.find(Some(json!({"role": "manager"}))).unwrap();
+        let managers = coll
+            .find(&mut session, Some(json!({"role": "manager"})))
+            .unwrap();
         assert_eq!(managers.len(), 2);
 
-        coll.checkpoint().unwrap();
+        coll.checkpoint(&mut session).unwrap();
     }
 
-    let dept_idx = tmp.path().join("test.db.test.dept.idx.wt");
-    let role_idx = tmp.path().join("test.db.test.role.idx.wt");
+    let dept_idx = path.join("test.dept.idx.wt");
+    let role_idx = path.join("test.role.idx.wt");
     assert!(dept_idx.exists(), "Dept index file should exist");
     assert!(role_idx.exists(), "Role index file should exist");
 }
@@ -215,28 +239,32 @@ fn index_persistence_with_checkpoint() {
 
     // Create and populate database
     {
-        let mut db = WrongoDB::open(&path).unwrap();
+        let db = WrongoDB::open(&path).unwrap();
         {
-            let coll = db.collection("test").unwrap();
-            coll.create_index("priority").unwrap();
-            coll.insert_one(json!({"task": "task1", "priority": 1}))
+            let coll = db.collection("test");
+            let mut session = db.open_session();
+            coll.create_index(&mut session, "priority").unwrap();
+            coll.insert_one(&mut session, json!({"task": "task1", "priority": 1}))
                 .unwrap();
-            coll.insert_one(json!({"task": "task2", "priority": 2}))
+            coll.insert_one(&mut session, json!({"task": "task2", "priority": 2}))
                 .unwrap();
-            coll.checkpoint().unwrap();
+            coll.checkpoint(&mut session).unwrap();
         }
     }
 
-    // Verify index file has content (collection "test" creates files with .test extension)
-    let index_path = tmp.path().join("test.db.test.priority.idx.wt");
+    // Verify index file has content
+    let index_path = path.join("test.priority.idx.wt");
     let metadata = fs::metadata(&index_path).unwrap();
     assert!(metadata.len() > 0, "Index file should have content");
 
     // Reopen and query
     {
-        let mut db = WrongoDB::open(&path).unwrap();
-        let coll = db.collection("test").unwrap();
-        let high_priority = coll.find(Some(json!({"priority": 2}))).unwrap();
+        let db = WrongoDB::open(&path).unwrap();
+        let coll = db.collection("test");
+        let mut session = db.open_session();
+        let high_priority = coll
+            .find(&mut session, Some(json!({"priority": 2})))
+            .unwrap();
         assert_eq!(high_priority.len(), 1);
         assert_eq!(
             high_priority[0].get("task").unwrap().as_str().unwrap(),
@@ -251,25 +279,119 @@ fn create_index_dynamically() {
     let path = tmp.path().join("test.db");
 
     // Create data without index
-    let mut db = WrongoDB::open(&path).unwrap();
+    let db = WrongoDB::open(&path).unwrap();
     {
-        let coll = db.collection("test").unwrap();
-        coll.insert_one(json!({"name": "alice", "country": "usa"}))
+        let coll = db.collection("test");
+        let mut session = db.open_session();
+        coll.insert_one(&mut session, json!({"name": "alice", "country": "usa"}))
             .unwrap();
-        coll.insert_one(json!({"name": "bob", "country": "uk"}))
+        coll.insert_one(&mut session, json!({"name": "bob", "country": "uk"}))
             .unwrap();
 
         // Create index dynamically
-        coll.create_index("country").unwrap();
+        coll.create_index(&mut session, "country").unwrap();
 
         // Query using new index
-        let usa_docs = coll.find(Some(json!({"country": "usa"}))).unwrap();
+        let usa_docs = coll
+            .find(&mut session, Some(json!({"country": "usa"})))
+            .unwrap();
         assert_eq!(usa_docs.len(), 1);
 
-        coll.checkpoint().unwrap();
+        coll.checkpoint(&mut session).unwrap();
     }
 
-    // Verify index file was created (collection "test" creates files with .test extension)
-    let index_path = tmp.path().join("test.db.test.country.idx.wt");
+    // Verify index file was created
+    let index_path = path.join("test.country.idx.wt");
     assert!(index_path.exists(), "Dynamically created index file should exist");
+}
+
+#[test]
+fn index_cursor_range_scan_returns_ids() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("test.db");
+
+    let db = WrongoDB::open(&path).unwrap();
+    let coll = db.collection("test");
+    let mut session = db.open_session();
+
+    coll.create_index(&mut session, "name").unwrap();
+    let doc1 = coll
+        .insert_one(&mut session, json!({"name": "alice"}))
+        .unwrap();
+    let doc2 = coll
+        .insert_one(&mut session, json!({"name": "alice"}))
+        .unwrap();
+    let _doc3 = coll
+        .insert_one(&mut session, json!({"name": "bob"}))
+        .unwrap();
+
+    let (start, end) = encode_range_bounds(&json!("alice")).unwrap();
+    let mut cursor = session.open_cursor("index:test:name").unwrap();
+    cursor.set_range(Some(start), Some(end));
+
+    let txn = session.transaction().unwrap();
+    let txn_id = txn.as_ref().id();
+
+    let mut ids = Vec::new();
+    while let Some((key, _)) = cursor.next(txn_id).unwrap() {
+        if let Some(id) = decode_index_id(&key).unwrap() {
+            ids.push(id);
+        }
+    }
+
+    txn.commit().unwrap();
+
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(doc1.get("_id").unwrap()));
+    assert!(ids.contains(doc2.get("_id").unwrap()));
+}
+
+#[test]
+fn index_cursor_is_read_only() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("test.db");
+
+    let db = WrongoDB::open(&path).unwrap();
+    let coll = db.collection("test");
+    let mut session = db.open_session();
+
+    coll.create_index(&mut session, "name").unwrap();
+    coll.insert_one(&mut session, json!({"name": "alice"}))
+        .unwrap();
+
+    let mut cursor = session.open_cursor("index:test:name").unwrap();
+    let txn = session.transaction().unwrap();
+    let txn_id = txn.as_ref().id();
+
+    let err = cursor.insert(b"bad", b"write", txn_id).unwrap_err();
+    assert!(err.to_string().contains("read-only"));
+
+    txn.abort().unwrap();
+}
+
+#[test]
+fn catalog_rebuilds_from_index_files() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("test.db");
+
+    {
+        let db = WrongoDB::open(&path).unwrap();
+        let coll = db.collection("test");
+        let mut session = db.open_session();
+        coll.create_index(&mut session, "name").unwrap();
+        coll.insert_one(&mut session, json!({"name": "alice"}))
+            .unwrap();
+        coll.checkpoint(&mut session).unwrap();
+
+        let meta_path = path.join("test.meta.json");
+        assert!(meta_path.exists());
+        std::fs::remove_file(&meta_path).unwrap();
+    }
+
+    let db2 = WrongoDB::open(&path).unwrap();
+    let coll2 = db2.collection("test");
+    let mut session2 = db2.open_session();
+    let indexes = coll2.list_indexes(&mut session2).unwrap();
+    assert_eq!(indexes.len(), 1);
+    assert_eq!(indexes[0].field, "name");
 }

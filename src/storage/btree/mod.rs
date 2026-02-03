@@ -20,7 +20,7 @@ use self::mvcc::MvccState;
 use self::wal::Wal;
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::block::file::NONE_BLOCK_ID;
-use crate::txn::{GlobalTxnState, TxnId, TXN_NONE};
+use crate::txn::{GlobalTxnState, TxnId, UpdateType, TXN_NONE};
 use page::{InternalPage, LeafPage, LeafPageError};
 
 // Type aliases for B-tree operations to clarify intent and reduce complexity
@@ -247,6 +247,7 @@ impl BTree {
     /// After this returns, all previous mutations are durable.
     ///
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
+        self.materialize_committed_updates()?;
         // Log checkpoint record BEFORE preparing checkpoint (if WAL is enabled)
         let root = self.pager.checkpoint_prepare();
 
@@ -429,6 +430,32 @@ impl BTree {
             return Ok(BTreeRangeIter::empty());
         }
         BTreeRangeIter::new(self.pager.as_mut() as &mut dyn PageRead, root, start, end)
+    }
+
+    pub fn mvcc_keys_in_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Vec<Vec<u8>> {
+        self.mvcc.keys_in_range(start, end)
+    }
+
+    pub fn materialize_committed_updates(&mut self) -> Result<(), WrongoDBError> {
+        let entries = self.mvcc.latest_committed_entries();
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let saved_wal = self.wal.take();
+        for (key, update_type, data) in entries {
+            match update_type {
+                UpdateType::Standard => {
+                    self.put(&key, &data)?;
+                }
+                UpdateType::Tombstone => {
+                    let _ = self.delete(&key)?;
+                }
+                UpdateType::Reserve => {}
+            }
+        }
+        self.wal = saved_wal;
+        Ok(())
     }
 
     /// Delete a key from the subtree rooted at `node_id`.

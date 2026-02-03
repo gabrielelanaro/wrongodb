@@ -13,13 +13,16 @@ fn is_lower_hex_24(s: &str) -> bool {
 #[test]
 fn auto_id_generation() {
     let tmp = tempdir().unwrap();
-    let log_path = tmp.path().join("db.log");
+    let db_dir = tmp.path().join("db");
 
-    let mut db = WrongoDB::open(&log_path).unwrap();
-    let coll = db.collection("test").unwrap();
+    let db = WrongoDB::open(&db_dir).unwrap();
+    let coll = db.collection("test");
+    let mut session = db.open_session();
 
     // Default `_id` is ObjectId-like (24 lowercase hex chars).
-    let auto = coll.insert_one(json!({"name": "auto"})).unwrap();
+    let auto = coll
+        .insert_one(&mut session, json!({"name": "auto"}))
+        .unwrap();
     let auto_id = auto.get("_id").unwrap().as_str().unwrap();
     assert!(is_lower_hex_24(auto_id));
 }
@@ -27,13 +30,14 @@ fn auto_id_generation() {
 #[test]
 fn primary_btree_file_created() {
     let tmp = tempdir().unwrap();
-    let log_path = tmp.path().join("db.log");
-    let main_table_path = tmp.path().join("db.log.test.main.wt");
+    let db_dir = tmp.path().join("db");
+    let main_table_path = db_dir.join("test.main.wt");
 
-    let mut db = WrongoDB::open(&log_path).unwrap();
-    let coll = db.collection("test").unwrap();
+    let db = WrongoDB::open(&db_dir).unwrap();
+    let coll = db.collection("test");
+    let mut session = db.open_session();
 
-    coll.insert_one(json!({"name": "auto"})).unwrap();
+    coll.insert_one(&mut session, json!({"name": "auto"})).unwrap();
 
     // Primary B+tree file is created and non-empty.
     let meta = std::fs::metadata(&main_table_path).unwrap();
@@ -43,17 +47,18 @@ fn primary_btree_file_created() {
 #[test]
 fn duplicate_key_rejection() {
     let tmp = tempdir().unwrap();
-    let log_path = tmp.path().join("db.log");
+    let db_dir = tmp.path().join("db");
 
-    let mut db = WrongoDB::open(&log_path).unwrap();
-    let coll = db.collection("test").unwrap();
+    let db = WrongoDB::open(&db_dir).unwrap();
+    let coll = db.collection("test");
+    let mut session = db.open_session();
 
     // Uniqueness enforcement: duplicate `_id` insert fails.
     let first = coll
-        .insert_one(json!({"_id": "dup", "name": "first"}))
+        .insert_one(&mut session, json!({"_id": "dup", "name": "first"}))
         .unwrap();
     let dup_id = first.get("_id").unwrap().clone();
-    let dup_attempt = coll.insert_one(json!({"_id": dup_id, "name": "second"}));
+    let dup_attempt = coll.insert_one(&mut session, json!({"_id": dup_id, "name": "second"}));
     assert!(dup_attempt.is_err());
     let msg = dup_attempt.err().unwrap().to_string();
     assert!(
@@ -65,26 +70,27 @@ fn duplicate_key_rejection() {
 #[test]
 fn embedded_id_field_ordering() {
     let tmp = tempdir().unwrap();
-    let log_path = tmp.path().join("db.log");
+    let db_dir = tmp.path().join("db");
 
-    let mut db = WrongoDB::open(&log_path).unwrap();
-    let coll = db.collection("test").unwrap();
+    let db = WrongoDB::open(&db_dir).unwrap();
+    let coll = db.collection("test");
+    let mut session = db.open_session();
 
     // Embedded-doc field order matters for `_id` (Mongo-like):
     // `{a:1,b:2}` and `{b:2,a:1}` should be treated as distinct ids.
-    coll.insert_one(json!({"_id": {"a": 1, "b": 2}, "name": "order1"}))
+    coll.insert_one(&mut session, json!({"_id": {"a": 1, "b": 2}, "name": "order1"}))
         .unwrap();
-    coll.insert_one(json!({"_id": {"b": 2, "a": 1}, "name": "order2"}))
+    coll.insert_one(&mut session, json!({"_id": {"b": 2, "a": 1}, "name": "order2"}))
         .unwrap();
 
     let got_order1 = coll
-        .find_one(Some(json!({"_id": {"a": 1, "b": 2}})))
+        .find_one(&mut session, Some(json!({"_id": {"a": 1, "b": 2}})))
         .unwrap()
         .unwrap();
     assert_eq!(got_order1.get("name").unwrap().as_str().unwrap(), "order1");
 
     let got_order2 = coll
-        .find_one(Some(json!({"_id": {"b": 2, "a": 1}})))
+        .find_one(&mut session, Some(json!({"_id": {"b": 2, "a": 1}})))
         .unwrap()
         .unwrap();
     assert_eq!(got_order2.get("name").unwrap().as_str().unwrap(), "order2");
@@ -93,21 +99,23 @@ fn embedded_id_field_ordering() {
 #[test]
 fn persistence_across_reopen() {
     let tmp = tempdir().unwrap();
-    let log_path = tmp.path().join("db.log");
+    let db_dir = tmp.path().join("db");
 
-    let mut db = WrongoDB::open(&log_path).unwrap();
+    let db = WrongoDB::open(&db_dir).unwrap();
     {
-        let coll = db.collection("test").unwrap();
-        coll.insert_one(json!({"_id": {"b": 2, "a": 1}, "name": "order2"}))
+        let coll = db.collection("test");
+        let mut session = db.open_session();
+        coll.insert_one(&mut session, json!({"_id": {"b": 2, "a": 1}, "name": "order2"}))
             .unwrap();
     }
 
-    // Re-open and verify primary lookups still work (index rebuild on open).
+    // Re-open and verify primary lookups still work.
     drop(db);
-    let mut db2 = WrongoDB::open(&log_path).unwrap();
-    let coll = db2.collection("test").unwrap();
+    let db2 = WrongoDB::open(&db_dir).unwrap();
+    let coll = db2.collection("test");
+    let mut session = db2.open_session();
     let got = coll
-        .find_one(Some(json!({"_id": {"b": 2, "a": 1}})))
+        .find_one(&mut session, Some(json!({"_id": {"b": 2, "a": 1}})))
         .unwrap()
         .unwrap();
     assert_eq!(got.get("name").unwrap().as_str().unwrap(), "order2");

@@ -36,7 +36,7 @@ impl Command for ListCollectionsCommand {
     }
 
     fn execute(&self, _doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
-        let collections = db.list_collections();
+        let collections = db.list_collections()?;
         let collections_bson: Vec<Bson> = collections
             .into_iter()
             .enumerate()
@@ -86,7 +86,7 @@ impl Command for DbStatsCommand {
     }
 
     fn execute(&self, _doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
-        let stats = db.stats();
+        let stats = db.stats()?;
         Ok(doc! {
             "ok": Bson::Double(1.0),
             "db": "test",
@@ -111,9 +111,10 @@ impl Command for CollStatsCommand {
 
     fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("collStats").unwrap_or("test");
-        let coll = db.collection(coll_name)?;
+        let coll = db.collection(coll_name);
+        let mut session = db.open_session();
 
-        let count = coll.count(None)?;
+        let count = coll.count(&mut session, None)?;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),

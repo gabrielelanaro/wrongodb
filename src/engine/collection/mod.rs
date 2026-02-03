@@ -1,74 +1,92 @@
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use parking_lot::RwLock;
 use serde_json::Value;
 
+use crate::core::bson::{decode_document, encode_document, encode_id_value};
 use crate::core::document::{normalize_document_in_place, validate_is_object};
 use crate::cursor::Cursor;
-use crate::txn::GlobalTxnState;
-
-pub mod update;
-mod txn;
-
-pub use self::txn::{CollectionTxn, IndexOp};
-use self::update::apply_update;
-use crate::core::bson::{decode_document, encode_document, encode_id_value};
-use crate::index::SecondaryIndexManager;
-use crate::storage::table::Table;
-use crate::txn::{Transaction, TXN_NONE};
+use crate::index::{decode_index_id, encode_range_bounds};
+use crate::session::Session;
+use crate::txn::TxnId;
 use crate::{Document, WrongoDBError};
 
+pub mod update;
+
+use self::update::apply_update;
+
 /// Represents a single collection within the database
-/// NOTE: refactoring in progress, we should use Session/Cursor based transactions instead of this crap
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Collection {
-    main_table: Arc<RwLock<Table>>,
-    secondary_indexes: SecondaryIndexManager,
-    doc_count: usize,
-    checkpoint_after_updates: Option<usize>,
-    updates_since_checkpoint: usize,
-    global_txn: Arc<GlobalTxnState>,
+    name: String,
 }
 
 impl Collection {
-    pub(crate) fn new(
-        path: &Path,
-        wal_enabled: bool,
-        checkpoint_after_updates: Option<usize>,
-        global_txn: Arc<GlobalTxnState>,
-    ) -> Result<Self, WrongoDBError> {
-        let main_table_path = PathBuf::from(format!("{}.main.wt", path.display()));
-        let main_table = Arc::new(RwLock::new(Table::open_or_create(&main_table_path, wal_enabled, global_txn.clone())?));
-
-        // Start with empty manager - indexes can be created via create_index()
-        let secondary_indexes = SecondaryIndexManager::empty(path, wal_enabled, global_txn.clone());
-
-        let mut coll = Self {
-            main_table,
-            secondary_indexes,
-            doc_count: 0,
-            checkpoint_after_updates,
-            updates_since_checkpoint: 0,
-            global_txn,
-        };
-        coll.load_existing(path)?;
-        Ok(coll)
+    pub(crate) fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+        }
     }
 
-    fn begin_snapshot_txn(&self) -> Transaction {
-        self.global_txn.begin_snapshot_txn()
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
-    fn load_existing(&mut self, _path: &Path) -> Result<(), WrongoDBError> {
-        let entries = self.main_table.write().scan(TXN_NONE)?;
-        self.doc_count = entries.len();
+    fn with_txn<R, F>(&self, session: &mut Session, f: F) -> Result<R, WrongoDBError>
+    where
+        F: FnOnce(&mut Session) -> Result<R, WrongoDBError>,
+    {
+        if session.current_txn().is_some() {
+            return f(session);
+        }
 
+        let mut txn = session.transaction()?;
+        let result = f(txn.session_mut());
+        match result {
+            Ok(value) => {
+                txn.commit()?;
+                Ok(value)
+            }
+            Err(e) => {
+                let _ = txn.abort();
+                Err(e)
+            }
+        }
+    }
+
+    fn require_txn_id(&self, session: &Session) -> Result<TxnId, WrongoDBError> {
+        session
+            .current_txn()
+            .map(|txn| txn.id())
+            .ok_or(WrongoDBError::NoActiveTransaction)
+    }
+
+    fn apply_index_add(&self, session: &mut Session, doc: &Document) -> Result<(), WrongoDBError> {
+        let table = session.table_handle(&self.name, false)?;
+        let mut table_guard = table.write();
+        let catalog = table_guard
+            .index_catalog_mut()
+            .ok_or_else(|| crate::core::errors::StorageError("missing index catalog".into()))?;
+        let ops = catalog.add_doc(doc)?;
+        session.record_index_ops(ops)?;
         Ok(())
     }
 
-    pub fn insert_one(&mut self, doc: Value) -> Result<Document, WrongoDBError> {
+    fn apply_index_remove(&self, session: &mut Session, doc: &Document) -> Result<(), WrongoDBError> {
+        let table = session.table_handle(&self.name, false)?;
+        let mut table_guard = table.write();
+        let catalog = table_guard
+            .index_catalog_mut()
+            .ok_or_else(|| crate::core::errors::StorageError("missing index catalog".into()))?;
+        let ops = catalog.remove_doc(doc)?;
+        session.record_index_ops(ops)?;
+        Ok(())
+    }
+
+    pub fn insert_one(&self, session: &mut Session, doc: Value) -> Result<Document, WrongoDBError> {
+        self.with_txn(session, |session| self.insert_one_in_txn(session, doc))
+    }
+
+    fn insert_one_in_txn(&self, session: &mut Session, doc: Value) -> Result<Document, WrongoDBError> {
         validate_is_object(&doc)?;
         let mut obj = doc.as_object().expect("validated object").clone();
         normalize_document_in_place(&mut obj)?;
@@ -79,23 +97,26 @@ impl Collection {
         let key = encode_id_value(id)?;
         let value = encode_document(&obj)?;
 
-        self.main_table.write().insert(&key, &value)?;
-        self.secondary_indexes.add(&obj)?;
-        self.doc_count = self.doc_count.saturating_add(1);
-        self.maybe_checkpoint_after_updates(1)?;
+        let txn_id = self.require_txn_id(session)?;
+        let mut cursor = session.open_cursor(&format!("table:{}", self.name))?;
+        cursor.insert(&key, &value, txn_id)?;
+
+        self.apply_index_add(session, &obj)?;
         Ok(obj)
     }
 
-    pub fn find(&mut self, filter: Option<Value>) -> Result<Vec<Document>, WrongoDBError> {
-        let txn = self.begin_snapshot_txn();
-        self.find_with_txn(filter, &txn)
+    pub fn find(&self, session: &mut Session, filter: Option<Value>) -> Result<Vec<Document>, WrongoDBError> {
+        self.with_txn(session, |session| {
+            let txn_id = self.require_txn_id(session)?;
+            self.find_with_txn(session, filter, txn_id)
+        })
     }
 
-    /// Shared query implementation used by both Collection and CollectionTxn.
-    pub(crate) fn find_with_txn(
-        &mut self,
+    fn find_with_txn(
+        &self,
+        session: &mut Session,
         filter: Option<Value>,
-        txn: &Transaction,
+        txn_id: TxnId,
     ) -> Result<Vec<Document>, WrongoDBError> {
         let filter_doc = match filter {
             None => Document::new(),
@@ -105,12 +126,14 @@ impl Collection {
             }
         };
 
+        let mut table_cursor = session.open_cursor(&format!("table:{}", self.name))?;
+
         if filter_doc.is_empty() {
-            let entries = self.main_table.write().scan(txn.id())?;
-            return entries
-                .into_iter()
-                .map(|(_, v)| decode_document(&v))
-                .collect();
+            let mut results = Vec::new();
+            while let Some((_, bytes)) = table_cursor.next(txn_id)? {
+                results.push(decode_document(&bytes)?);
+            }
+            return Ok(results);
         }
 
         let matches_filter = |doc: &Document| {
@@ -126,7 +149,7 @@ impl Collection {
 
         if let Some(id_value) = filter_doc.get("_id") {
             let key = encode_id_value(id_value)?;
-            let doc_bytes = self.main_table.write().get(&key, txn.id())?;
+            let doc_bytes = table_cursor.get(&key, txn_id)?;
             return Ok(match doc_bytes {
                 Some(bytes) => {
                     let doc = decode_document(&bytes)?;
@@ -140,18 +163,36 @@ impl Collection {
             });
         }
 
-        let indexed_field = filter_doc
-            .keys()
-            .find(|k| self.secondary_indexes.fields.contains(*k))
-            .cloned();
+        let indexed_field = {
+            let table_handle = session.table_handle(&self.name, false)?;
+            let table_guard = table_handle.read();
+            let catalog = match table_guard.index_catalog() {
+                Some(c) => c,
+                None => {
+                    return self.scan_with_cursor(table_cursor, txn_id, &matches_filter);
+                }
+            };
+            filter_doc
+                .keys()
+                .find(|k| catalog.has_index(*k))
+                .cloned()
+        };
 
         if let Some(field) = indexed_field {
             let value = filter_doc.get(&field).unwrap();
-            let ids = self.secondary_indexes.lookup(&field, value)?;
+            let Some((start_key, end_key)) = encode_range_bounds(value) else {
+                return Ok(Vec::new());
+            };
+            let mut index_cursor = session.open_cursor(&format!("index:{}:{}", self.name, field))?;
+            index_cursor.set_range(Some(start_key), Some(end_key));
+
             let mut results = Vec::new();
-            for id in ids {
+            while let Some((key, _)) = index_cursor.next(txn_id)? {
+                let Some(id) = decode_index_id(&key)? else {
+                    continue;
+                };
                 let key = encode_id_value(&id)?;
-                if let Some(bytes) = self.main_table.write().get(&key, txn.id())? {
+                if let Some(bytes) = table_cursor.get(&key, txn_id)? {
                     let doc = decode_document(&bytes)?;
                     if matches_filter(&doc) {
                         results.push(doc);
@@ -161,9 +202,20 @@ impl Collection {
             return Ok(results);
         }
 
-        let entries = self.main_table.write().scan(txn.id())?;
+        self.scan_with_cursor(table_cursor, txn_id, &matches_filter)
+    }
+
+    fn scan_with_cursor<F>(
+        &self,
+        mut cursor: Cursor,
+        txn_id: TxnId,
+        matches_filter: &F,
+    ) -> Result<Vec<Document>, WrongoDBError>
+    where
+        F: Fn(&Document) -> bool,
+    {
         let mut results = Vec::new();
-        for (_, bytes) in entries {
+        while let Some((_, bytes)) = cursor.next(txn_id)? {
             let doc = decode_document(&bytes)?;
             if matches_filter(&doc) {
                 results.push(doc);
@@ -172,16 +224,16 @@ impl Collection {
         Ok(results)
     }
 
-    pub fn find_one(&mut self, filter: Option<Value>) -> Result<Option<Document>, WrongoDBError> {
-        Ok(self.find(filter)?.into_iter().next())
+    pub fn find_one(&self, session: &mut Session, filter: Option<Value>) -> Result<Option<Document>, WrongoDBError> {
+        Ok(self.find(session, filter)?.into_iter().next())
     }
 
-    pub fn count(&mut self, filter: Option<Value>) -> Result<usize, WrongoDBError> {
-        Ok(self.find(filter)?.len())
+    pub fn count(&self, session: &mut Session, filter: Option<Value>) -> Result<usize, WrongoDBError> {
+        Ok(self.find(session, filter)?.len())
     }
 
-    pub fn distinct(&mut self, key: &str, filter: Option<Value>) -> Result<Vec<Value>, WrongoDBError> {
-        let docs = self.find(filter)?;
+    pub fn distinct(&self, session: &mut Session, key: &str, filter: Option<Value>) -> Result<Vec<Value>, WrongoDBError> {
+        let docs = self.find(session, filter)?;
         let mut seen = HashSet::new();
         let mut values = Vec::new();
 
@@ -198,54 +250,20 @@ impl Collection {
     }
 
     pub fn update_one(
-        &mut self,
+        &self,
+        session: &mut Session,
         filter: Option<Value>,
         update: Value,
     ) -> Result<UpdateResult, WrongoDBError> {
-        let docs = self.find(filter)?;
-        if docs.is_empty() {
-            return Ok(UpdateResult {
-                matched: 0,
-                modified: 0,
-            });
-        }
+        self.with_txn(session, |session| {
+            let txn_id = self.require_txn_id(session)?;
+            let docs = self.find_with_txn(session, filter, txn_id)?;
+            if docs.is_empty() {
+                return Ok(UpdateResult { matched: 0, modified: 0 });
+            }
 
-        let doc = &docs[0];
-        let updated_doc = apply_update(doc, &update)?;
-
-        let id = doc
-            .get("_id")
-            .ok_or_else(|| crate::core::errors::DocumentValidationError("missing _id".into()))?;
-        let key = encode_id_value(id)?;
-        let value = encode_document(&updated_doc)?;
-
-        self.secondary_indexes.remove(doc)?;
-        self.main_table.write().update(&key, &value)?;
-        self.secondary_indexes.add(&updated_doc)?;
-        self.maybe_checkpoint_after_updates(1)?;
-
-        Ok(UpdateResult {
-            matched: 1,
-            modified: 1,
-        })
-    }
-
-    pub fn update_many(
-        &mut self,
-        filter: Option<Value>,
-        update: Value,
-    ) -> Result<UpdateResult, WrongoDBError> {
-        let docs = self.find(filter)?;
-        if docs.is_empty() {
-            return Ok(UpdateResult {
-                matched: 0,
-                modified: 0,
-            });
-        }
-
-        let mut modified = 0;
-        for doc in docs {
-            let updated_doc = apply_update(&doc, &update)?;
+            let doc = &docs[0];
+            let updated_doc = apply_update(doc, &update)?;
 
             let id = doc
                 .get("_id")
@@ -253,220 +271,134 @@ impl Collection {
             let key = encode_id_value(id)?;
             let value = encode_document(&updated_doc)?;
 
-            self.secondary_indexes.remove(&doc)?;
-            self.main_table.write().update(&key, &value)?;
-            self.secondary_indexes.add(&updated_doc)?;
-            modified += 1;
-        }
+            let txn_id = self.require_txn_id(session)?;
+            let mut cursor = session.open_cursor(&format!("table:{}", self.name))?;
+            cursor.update(&key, &value, txn_id)?;
 
-        self.maybe_checkpoint_after_updates(modified)?;
+            self.apply_index_remove(session, doc)?;
+            self.apply_index_add(session, &updated_doc)?;
 
-        Ok(UpdateResult {
-            matched: modified,
-            modified,
+            Ok(UpdateResult { matched: 1, modified: 1 })
         })
     }
 
-    pub fn delete_one(&mut self, filter: Option<Value>) -> Result<usize, WrongoDBError> {
-        let docs = self.find(filter)?;
-        if docs.is_empty() {
-            return Ok(0);
-        }
+    pub fn update_many(
+        &self,
+        session: &mut Session,
+        filter: Option<Value>,
+        update: Value,
+    ) -> Result<UpdateResult, WrongoDBError> {
+        self.with_txn(session, |session| {
+            let txn_id = self.require_txn_id(session)?;
+            let docs = self.find_with_txn(session, filter, txn_id)?;
+            if docs.is_empty() {
+                return Ok(UpdateResult { matched: 0, modified: 0 });
+            }
 
-        let doc = &docs[0];
-        let Some(id) = doc.get("_id") else {
-            return Ok(0);
-        };
-        let key = encode_id_value(id)?;
+            let mut modified = 0;
+            for doc in docs {
+                let updated_doc = apply_update(&doc, &update)?;
 
-        self.secondary_indexes.remove(doc)?;
-        if self.main_table.write().delete(&key)? {
-            self.doc_count = self.doc_count.saturating_sub(1);
-            self.maybe_checkpoint_after_updates(1)?;
-            return Ok(1);
-        }
-        Ok(0)
+                let id = doc
+                    .get("_id")
+                    .ok_or_else(|| crate::core::errors::DocumentValidationError("missing _id".into()))?;
+                let key = encode_id_value(id)?;
+                let value = encode_document(&updated_doc)?;
+
+                let txn_id = self.require_txn_id(session)?;
+                let mut cursor = session.open_cursor(&format!("table:{}", self.name))?;
+                cursor.update(&key, &value, txn_id)?;
+
+                self.apply_index_remove(session, &doc)?;
+                self.apply_index_add(session, &updated_doc)?;
+                modified += 1;
+            }
+
+            Ok(UpdateResult { matched: modified, modified })
+        })
     }
 
-    pub fn delete_many(&mut self, filter: Option<Value>) -> Result<usize, WrongoDBError> {
-        let docs = self.find(filter)?;
-        if docs.is_empty() {
-            return Ok(0);
-        }
+    pub fn delete_one(&self, session: &mut Session, filter: Option<Value>) -> Result<usize, WrongoDBError> {
+        self.with_txn(session, |session| {
+            let txn_id = self.require_txn_id(session)?;
+            let docs = self.find_with_txn(session, filter, txn_id)?;
+            if docs.is_empty() {
+                return Ok(0);
+            }
 
-        let mut deleted = 0;
-        for doc in docs {
+            let doc = &docs[0];
             let Some(id) = doc.get("_id") else {
-                continue;
+                return Ok(0);
             };
             let key = encode_id_value(id)?;
 
-            self.secondary_indexes.remove(&doc)?;
-            if self.main_table.write().delete(&key)? {
+            let txn_id = self.require_txn_id(session)?;
+            let mut cursor = session.open_cursor(&format!("table:{}", self.name))?;
+            cursor.delete(&key, txn_id)?;
+
+            self.apply_index_remove(session, doc)?;
+            Ok(1)
+        })
+    }
+
+    pub fn delete_many(&self, session: &mut Session, filter: Option<Value>) -> Result<usize, WrongoDBError> {
+        self.with_txn(session, |session| {
+            let txn_id = self.require_txn_id(session)?;
+            let docs = self.find_with_txn(session, filter, txn_id)?;
+            if docs.is_empty() {
+                return Ok(0);
+            }
+
+            let mut deleted = 0;
+            for doc in docs {
+                let Some(id) = doc.get("_id") else {
+                    continue;
+                };
+                let key = encode_id_value(id)?;
+
+                let txn_id = self.require_txn_id(session)?;
+                let mut cursor = session.open_cursor(&format!("table:{}", self.name))?;
+                cursor.delete(&key, txn_id)?;
+
+                self.apply_index_remove(session, &doc)?;
                 deleted += 1;
             }
-        }
 
-        if deleted > 0 {
-            self.doc_count = self.doc_count.saturating_sub(deleted);
-            self.maybe_checkpoint_after_updates(deleted)?;
-        }
-
-        Ok(deleted)
+            Ok(deleted)
+        })
     }
 
-    pub fn list_indexes(&self) -> Vec<IndexInfo> {
-        self.secondary_indexes
-            .fields
-            .iter()
-            .map(|f| IndexInfo { field: f.clone() })
-            .collect()
-    }
-
-    pub fn create_index(&mut self, field: &str) -> Result<(), WrongoDBError> {
-        let entries = self.main_table.write().scan(TXN_NONE)?;
-        let existing_docs: Vec<Document> = entries
+    pub fn list_indexes(&self, session: &mut Session) -> Result<Vec<IndexInfo>, WrongoDBError> {
+        let table = session.table_handle(&self.name, false)?;
+        let table_guard = table.read();
+        let catalog = table_guard
+            .index_catalog()
+            .ok_or_else(|| crate::core::errors::StorageError("missing index catalog".into()))?;
+        Ok(catalog
+            .index_names()
             .into_iter()
-            .map(|(_, v)| decode_document(&v))
-            .collect::<Result<_, _>>()?;
-
-        let was_indexed = self.secondary_indexes.fields.contains(field);
-        self.secondary_indexes.add_field(field, &existing_docs)?;
-        if !was_indexed {
-            self.maybe_checkpoint_after_updates(existing_docs.len())?;
-        }
-        Ok(())
+            .map(|f| IndexInfo { field: f })
+            .collect())
     }
 
-    pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
-        self.main_table.write().checkpoint()?;
-        self.secondary_indexes.checkpoint()?;
-
-        // Run GC on the main table's MVCC update chains
-        let (main_chains, main_updates, main_dropped) = self.main_table.write().run_gc();
-
-        // Run GC on secondary indexes' MVCC update chains
-        let (idx_chains, idx_updates, idx_dropped) = self.secondary_indexes.run_gc();
-
-        let total_chains = main_chains + idx_chains;
-        let total_updates = main_updates + idx_updates;
-        let total_dropped = main_dropped + idx_dropped;
-
-        if total_chains > 0 || total_dropped > 0 {
-            eprintln!(
-                "GC complete: {} chains cleaned, {} updates removed, {} chains dropped",
-                total_chains, total_updates, total_dropped
-            );
-        }
-
-        self.updates_since_checkpoint = 0;
-        Ok(())
+    pub fn create_index(&self, session: &mut Session, field: &str) -> Result<(), WrongoDBError> {
+        self.with_txn(session, |session| {
+            let txn_id = self.require_txn_id(session)?;
+            let docs = self.find_with_txn(session, None, txn_id)?;
+            let table = session.table_handle(&self.name, false)?;
+            let mut table_guard = table.write();
+            let catalog = table_guard
+                .index_catalog_mut()
+                .ok_or_else(|| crate::core::errors::StorageError("missing index catalog".into()))?;
+            catalog.add_index(field, vec![field.to_string()], &docs)?;
+            Ok(())
+        })
     }
 
-    fn maybe_checkpoint_after_updates(&mut self, updates: usize) -> Result<(), WrongoDBError> {
-        if updates == 0 {
-            return Ok(());
-        }
-        self.updates_since_checkpoint = self.updates_since_checkpoint.saturating_add(updates);
-        if let Some(threshold) = self.checkpoint_after_updates {
-            if self.updates_since_checkpoint >= threshold {
-                self.checkpoint()?;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn doc_count(&self) -> usize {
-        self.doc_count
-    }
-
-    pub fn index_count(&self) -> usize {
-        self.secondary_indexes.fields.len()
-    }
-
-    // ========================================================================
-    // Internal methods for MultiCollectionTxn
-    // ========================================================================
-
-    /// Get a cursor for the main table.
-    pub(crate) fn main_table_cursor(&self) -> Cursor {
-        Cursor::new(self.main_table.clone())
-    }
-
-    /// Get mutable access to the main table for internal operations.
-    pub(crate) fn main_table(&self) -> parking_lot::RwLockWriteGuard<'_, Table> {
-        self.main_table.write()
-    }
-
-    /// Get access to the secondary indexes.
-    pub(crate) fn secondary_indexes(&mut self) -> &mut SecondaryIndexManager {
-        &mut self.secondary_indexes
-    }
-
-    /// Increment the document count.
-    pub(crate) fn increment_doc_count(&mut self) {
-        self.doc_count = self.doc_count.saturating_add(1);
-    }
-
-    /// Decrement the document count.
-    pub(crate) fn decrement_doc_count(&mut self) {
-        self.doc_count = self.doc_count.saturating_sub(1);
-    }
-
-    /// Decrement the document count by a specific amount.
-    pub(crate) fn decrement_doc_count_by(&mut self, count: usize) {
-        self.doc_count = self.doc_count.saturating_sub(count);
-    }
-
-    /// Begin a new transaction on this collection.
-    ///
-    /// # Example
-    /// ```
-    /// # use wrongodb::WrongoDB;
-    /// # use serde_json::json;
-    /// # let tmp = tempfile::tempdir().unwrap();
-    /// # let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
-    /// # let coll = db.collection("test").unwrap();
-    /// let mut txn = coll.begin_txn().unwrap();
-    /// let doc = txn.insert_one(json!({"name": "alice"})).unwrap();
-    /// txn.commit().unwrap();
-    /// ```
-    pub fn begin_txn(&mut self) -> Result<CollectionTxn<'_>, WrongoDBError> {
-        Ok(CollectionTxn::new(self))
-    }
-
-    /// Run a function in a transaction, automatically committing or aborting.
-    ///
-    /// If the function returns Ok, the transaction is committed.
-    /// If the function returns Err, the transaction is aborted.
-    ///
-    /// # Example
-    /// ```
-    /// # use wrongodb::WrongoDB;
-    /// # use serde_json::json;
-    /// # let tmp = tempfile::tempdir().unwrap();
-    /// # let mut db = WrongoDB::open(tmp.path().join("test.db")).unwrap();
-    /// # let coll = db.collection("test").unwrap();
-    /// let result = coll.with_txn(|txn| {
-    ///     let doc = txn.insert_one(json!({"name": "alice"}))?;
-    ///     Ok(doc)
-    /// }).unwrap();
-    /// ```
-    pub fn with_txn<F, R>(&mut self, f: F) -> Result<R, WrongoDBError>
-    where
-        F: FnOnce(&mut CollectionTxn<'_>) -> Result<R, WrongoDBError>,
-    {
-        let mut txn = self.begin_txn()?;
-        match f(&mut txn) {
-            Ok(result) => {
-                txn.commit()?;
-                Ok(result)
-            }
-            Err(e) => {
-                let _ = txn.abort();
-                Err(e)
-            }
-        }
+    pub fn checkpoint(&self, session: &mut Session) -> Result<(), WrongoDBError> {
+        let table = session.table_handle(&self.name, false)?;
+        let mut guard = table.write();
+        guard.checkpoint()
     }
 }
 

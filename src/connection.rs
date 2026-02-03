@@ -1,3 +1,5 @@
+use std::fs;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -12,9 +14,7 @@ pub struct ConnectionConfig {
 
 impl Default for ConnectionConfig {
     fn default() -> Self {
-        Self {
-            wal_enabled: true,
-        }
+        Self { wal_enabled: true }
     }
 }
 
@@ -36,12 +36,22 @@ pub struct Connection {
     global_txn: Arc<GlobalTxnState>,
 }
 
+impl fmt::Debug for Connection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Connection")
+            .field("base_path", &self.base_path)
+            .field("wal_enabled", &self.wal_enabled)
+            .finish()
+    }
+}
+
 impl Connection {
     pub fn open<P>(path: P, config: ConnectionConfig) -> Result<Self, WrongoDBError>
     where
         P: AsRef<Path>,
     {
         let base_path = path.as_ref().to_path_buf();
+        fs::create_dir_all(&base_path)?;
         let global_txn = Arc::new(GlobalTxnState::new());
 
         Ok(Self {
@@ -59,5 +69,9 @@ impl Connection {
             self.wal_enabled,
             self.global_txn.clone(),
         )
+    }
+
+    pub fn base_path(&self) -> &Path {
+        &self.base_path
     }
 }

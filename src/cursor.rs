@@ -1,37 +1,59 @@
 use std::sync::Arc;
+
 use parking_lot::RwLock;
+
 use crate::storage::table::Table;
-use crate::txn::Transaction;
+use crate::txn::TxnId;
 use crate::WrongoDBError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorKind {
+    Table,
+    Index,
+}
 
 pub struct Cursor {
     table: Arc<RwLock<Table>>,
+    kind: CursorKind,
     buffered_entries: Vec<(Vec<u8>, Vec<u8>)>,
     buffer_pos: usize,
     exhausted: bool,
+    range_start: Option<Vec<u8>>,
+    range_end: Option<Vec<u8>>,
 }
 
 impl Cursor {
-    pub(crate) fn new(table: Arc<RwLock<Table>>) -> Self {
+    pub(crate) fn new(table: Arc<RwLock<Table>>, kind: CursorKind) -> Self {
         Self {
             table,
+            kind,
             buffered_entries: Vec::new(),
             buffer_pos: 0,
             exhausted: false,
+            range_start: None,
+            range_end: None,
         }
     }
 
-    pub fn insert(&mut self, key: &[u8], value: &[u8], txn: &mut Transaction) -> Result<(), WrongoDBError> {
+    pub fn set_range(&mut self, start: Option<Vec<u8>>, end: Option<Vec<u8>>) {
+        self.range_start = start;
+        self.range_end = end;
+        self.reset();
+    }
+
+    pub fn insert(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+        self.ensure_writable()?;
         let mut table = self.table.write();
-        if table.get_version(key, txn.id())?.is_some() {
+        if table.get_version(key, txn_id)?.is_some() {
             return Err(crate::core::errors::DocumentValidationError("duplicate key error".into()).into());
         }
-        table.insert_mvcc(key, value, txn.id())
+        table.insert_mvcc(key, value, txn_id)
     }
 
-    pub fn update(&mut self, key: &[u8], value: &[u8], txn: &mut Transaction) -> Result<(), WrongoDBError> {
+    pub fn update(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+        self.ensure_writable()?;
         let mut table = self.table.write();
-        let result = table.update_mvcc(key, value, txn.id())?;
+        let result = table.update_mvcc(key, value, txn_id)?;
         if !result {
             return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
                 "key not found for update".to_string(),
@@ -40,9 +62,10 @@ impl Cursor {
         Ok(())
     }
 
-    pub fn delete(&mut self, key: &[u8], txn: &mut Transaction) -> Result<(), WrongoDBError> {
+    pub fn delete(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+        self.ensure_writable()?;
         let mut table = self.table.write();
-        let result = table.delete_mvcc(key, txn.id())?;
+        let result = table.delete_mvcc(key, txn_id)?;
         if !result {
             return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
                 "key not found for delete".to_string(),
@@ -51,18 +74,18 @@ impl Cursor {
         Ok(())
     }
 
-    pub fn get(&mut self, key: &[u8], txn: &Transaction) -> Result<Option<Vec<u8>>, WrongoDBError> {
+    pub fn get(&mut self, key: &[u8], txn_id: TxnId) -> Result<Option<Vec<u8>>, WrongoDBError> {
         let mut table = self.table.write();
-        table.get_version(key, txn.id())
+        table.get_version(key, txn_id)
     }
 
-    pub fn next(&mut self, txn: &Transaction) -> Result<Option<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
+    pub fn next(&mut self, txn_id: TxnId) -> Result<Option<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
         if self.exhausted {
             return Ok(None);
         }
 
         if self.buffer_pos >= self.buffered_entries.len() {
-            self.refill_buffer(txn)?;
+            self.refill_buffer(txn_id)?;
 
             if self.buffered_entries.is_empty() {
                 self.exhausted = true;
@@ -82,18 +105,40 @@ impl Cursor {
         }
     }
 
-    fn refill_buffer(&mut self, txn: &Transaction) -> Result<(), WrongoDBError> {
+    fn refill_buffer(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
         let mut table = self.table.write();
 
-        let start_key = if !self.buffered_entries.is_empty() {
-            self.buffered_entries.last().map(|(k, _)| k.as_slice())
+        let mut start_key = self.range_start.as_deref();
+        let mut skip_start = false;
+        if let Some((last_key, _)) = self.buffered_entries.last() {
+            start_key = Some(last_key.as_slice());
+            skip_start = true;
+        }
+
+        let entries = table.scan_range(start_key, self.range_end.as_deref(), txn_id)?;
+
+        if skip_start && !entries.is_empty() {
+            if let Some(start) = start_key {
+                let mut iter = entries.into_iter();
+                let first = iter.next();
+                self.buffered_entries = if let Some((key, value)) = first {
+                    if key.as_slice() == start {
+                        iter.collect()
+                    } else {
+                        let mut out = Vec::new();
+                        out.push((key, value));
+                        out.extend(iter);
+                        out
+                    }
+                } else {
+                    Vec::new()
+                };
+            } else {
+                self.buffered_entries = entries;
+            }
         } else {
-            None
-        };
-
-        let entries = table.scan_from(start_key, txn.id())?;
-
-        self.buffered_entries = entries;
+            self.buffered_entries = entries;
+        }
         self.buffer_pos = 0;
 
         Ok(())
@@ -104,5 +149,14 @@ impl Cursor {
         self.buffered_entries.clear();
         self.buffer_pos = 0;
         self.exhausted = false;
+    }
+
+    fn ensure_writable(&self) -> Result<(), WrongoDBError> {
+        if self.kind == CursorKind::Index {
+            return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
+                "index cursors are read-only".to_string(),
+            )));
+        }
+        Ok(())
     }
 }
