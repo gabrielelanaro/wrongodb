@@ -620,31 +620,6 @@ impl WalFile {
         self.append_record(record)
     }
 
-    /// Log a logical delete operation.
-    #[cfg(test)]
-    pub fn log_delete(&mut self, uri: &str, key: &[u8], txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
-        let record = WalRecord::Delete {
-            uri: uri.to_string(),
-            key: key.to_vec(),
-            txn_id,
-        };
-        self.append_record(record)
-    }
-
-    /// Log a transaction commit marker.
-    #[cfg(test)]
-    pub fn log_txn_commit(&mut self, txn_id: TxnId, commit_ts: Timestamp) -> Result<Lsn, WrongoDBError> {
-        let record = WalRecord::TxnCommit { txn_id, commit_ts };
-        self.append_record(record)
-    }
-
-    /// Log a transaction abort marker.
-    #[cfg(test)]
-    pub fn log_txn_abort(&mut self, txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
-        let record = WalRecord::TxnAbort { txn_id };
-        self.append_record(record)
-    }
-
     /// Log a checkpoint operation.
     pub fn log_checkpoint(&mut self, root_block_id: u64, generation: u64) -> Result<Lsn, WrongoDBError> {
         let record = WalRecord::Checkpoint {
