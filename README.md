@@ -38,6 +38,16 @@ The codebase is organized by domain to keep storage, engine, and server concerns
 
 Integration tests are grouped under `tests/` with entry points (e.g. `tests/storage.rs`) that include submodules in `tests/storage/`, `tests/engine/`, etc.
 
+## Install
+
+Download and install the prebuilt server binary from GitHub Releases (Linux/macOS):
+
+```bash
+curl -sSL https://github.com/gabrielelanaro/wrongodb/releases/latest/download/wrongodb-installer.sh | sh
+```
+
+This installer installs the `wrongodb-server` binary.
+
 ### Quickstart
 
 #### As a Library
@@ -69,7 +79,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #### As a Server
 For interactive usage with mongosh, see [Server Documentation](docs/server.md).
 
+Run the server directly:
+
+```bash
+wrongodb-server
+```
+
+You can also set the listen address with `--addr`, `--port`, `WRONGO_ADDR`, or `WRONGO_PORT`.
+
 Run tests with `cargo test`.
+
+## Release
+
+Create a version tag and push it to trigger the GitHub Actions release workflow:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow builds artifacts and publishes them to GitHub Releases.
 
 ## License
 

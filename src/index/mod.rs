@@ -25,11 +25,11 @@ pub use key::{decode_index_id, encode_index_key, encode_range_bounds, encode_sca
 /// The value stored is always empty since the _id is embedded in the key.
 /// This allows duplicate values (different _id values = different keys).
 #[derive(Debug)]
-pub struct PersistentIndex {
+pub struct Index {
     table: Arc<RwLock<Table>>,
 }
 
-impl PersistentIndex {
+impl Index {
     /// Open an existing index BTree or create a new one if it doesn't exist.
     fn open_or_create(
         uri: &str,
@@ -123,7 +123,7 @@ pub struct IndexCatalog {
     collection: String,
     db_dir: PathBuf,
     definitions: BTreeMap<String, IndexDefinition>,
-    indexes: BTreeMap<String, PersistentIndex>,
+    indexes: BTreeMap<String, Index>,
     wal: Option<Arc<GlobalWal>>,
     global_txn: Arc<GlobalTxnState>,
 }
@@ -194,7 +194,7 @@ impl IndexCatalog {
             let index_path = db_dir.join(&def.source);
             let uri = format!("index:{}:{}", collection, def.name);
             let (index, _created) =
-                PersistentIndex::open_or_create(&uri, &index_path, wal.clone(), global_txn.clone())?;
+                Index::open_or_create(&uri, &index_path, wal.clone(), global_txn.clone())?;
             indexes.insert(def.name.clone(), index);
         }
 
@@ -275,7 +275,7 @@ impl IndexCatalog {
 
         let uri = format!("index:{}:{}", self.collection, name);
         let (mut index, created) =
-            PersistentIndex::open_or_create(&uri, &index_path, self.wal.clone(), self.global_txn.clone())?;
+            Index::open_or_create(&uri, &index_path, self.wal.clone(), self.global_txn.clone())?;
 
         if !index_exists || created {
             let field = &columns[0];
@@ -411,13 +411,13 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn persistent_index_insert_and_lookup() {
+    fn index_insert_and_lookup() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("test.idx.wt");
         let global_txn = Arc::new(GlobalTxnState::new());
 
         let (mut index, _created) =
-            PersistentIndex::open_or_create("index:test:name", &path, None, global_txn).unwrap();
+            Index::open_or_create("index:test:name", &path, None, global_txn).unwrap();
 
         index.insert(&json!("alice"), &json!("id1"), crate::txn::TXN_NONE).unwrap();
         index.insert(&json!("bob"), &json!("id2"), crate::txn::TXN_NONE).unwrap();

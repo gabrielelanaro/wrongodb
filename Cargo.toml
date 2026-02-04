@@ -2,6 +2,18 @@
 name = "wrongodb"
 version = "0.1.0"
 edition = "2021"
+description = "A learning-oriented MongoDB-like database that evolves from wrong to right"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/gabrielelanaro/wrongodb"
+homepage = "https://github.com/gabrielelanaro/wrongodb"
+keywords = ["database", "mongodb", "learning"]
+categories = ["database"]
+default-run = "wrongodb-server"
+
+[[bin]]
+name = "wrongodb-server"
+path = "src/bin/server.rs"
 
 [dependencies]
 bson = "2"
@@ -24,3 +36,8 @@ rand = "0.8"
 [[bench]]
 name = "insert_latency"
 harness = false
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
