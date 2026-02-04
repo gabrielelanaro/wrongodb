@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use crate::storage::btree::wal::WalRecord;
+use crate::storage::wal::WalRecord;
 use crate::txn::{TxnId, TXN_NONE};
 
 /// Transaction table built during WAL recovery.
@@ -177,6 +177,7 @@ mod tests {
 
         // First, add a pending operation
         table.process_record(&WalRecord::Put {
+            uri: "table:test".to_string(),
             key: b"key".to_vec(),
             value: b"value".to_vec(),
             txn_id: 42,
@@ -192,6 +193,7 @@ mod tests {
         assert!(table.is_committed(42));
         assert!(!table.is_pending(42));
         assert!(table.should_apply(&WalRecord::Put {
+            uri: "table:test".to_string(),
             key: b"key".to_vec(),
             value: b"value".to_vec(),
             txn_id: 42,
@@ -203,6 +205,7 @@ mod tests {
         let mut table = RecoveryTxnTable::new();
 
         table.process_record(&WalRecord::Put {
+            uri: "table:test".to_string(),
             key: b"key".to_vec(),
             value: b"value".to_vec(),
             txn_id: 42,
@@ -213,6 +216,7 @@ mod tests {
         assert!(table.is_aborted(42));
         assert!(!table.is_pending(42));
         assert!(!table.should_apply(&WalRecord::Put {
+            uri: "table:test".to_string(),
             key: b"key".to_vec(),
             value: b"value".to_vec(),
             txn_id: 42,
@@ -224,6 +228,7 @@ mod tests {
         let table = RecoveryTxnTable::new();
 
         assert!(table.should_apply(&WalRecord::Put {
+            uri: "table:test".to_string(),
             key: b"key".to_vec(),
             value: b"value".to_vec(),
             txn_id: TXN_NONE,
@@ -236,6 +241,7 @@ mod tests {
 
         // Add operations without commit/abort
         table.process_record(&WalRecord::Put {
+            uri: "table:test".to_string(),
             key: b"key".to_vec(),
             value: b"value".to_vec(),
             txn_id: 42,
@@ -294,6 +300,7 @@ mod tests {
 
         // Transaction 1: committed
         table.process_record(&WalRecord::Put {
+            uri: "table:test".to_string(),
             key: b"k1".to_vec(),
             value: b"v1".to_vec(),
             txn_id: 1,
@@ -305,6 +312,7 @@ mod tests {
 
         // Transaction 2: aborted
         table.process_record(&WalRecord::Put {
+            uri: "table:test".to_string(),
             key: b"k2".to_vec(),
             value: b"v2".to_vec(),
             txn_id: 2,
@@ -313,6 +321,7 @@ mod tests {
 
         // Transaction 3: pending (incomplete)
         table.process_record(&WalRecord::Put {
+            uri: "table:test".to_string(),
             key: b"k3".to_vec(),
             value: b"v3".to_vec(),
             txn_id: 3,
@@ -324,16 +333,19 @@ mod tests {
 
         // Only tx 1 should apply
         assert!(table.should_apply(&WalRecord::Put {
+            uri: "table:test".to_string(),
             key: b"k1".to_vec(),
             value: b"v1".to_vec(),
             txn_id: 1,
         }));
         assert!(!table.should_apply(&WalRecord::Put {
+            uri: "table:test".to_string(),
             key: b"k2".to_vec(),
             value: b"v2".to_vec(),
             txn_id: 2,
         }));
         assert!(!table.should_apply(&WalRecord::Put {
+            uri: "table:test".to_string(),
             key: b"k3".to_vec(),
             value: b"v3".to_vec(),
             txn_id: 3,

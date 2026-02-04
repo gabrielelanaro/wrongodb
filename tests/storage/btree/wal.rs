@@ -1,149 +1,71 @@
-//! WAL integration tests for BTree operations.
+//! WAL integration tests for DB-level operations.
 
-use std::sync::Arc;
+use std::fs;
+use std::path::{Path, PathBuf};
+
 use tempfile::tempdir;
-use wrongodb::{BTree, GlobalTxnState};
+use wrongodb::{Connection, ConnectionConfig};
 
-#[test]
-fn btree_creates_with_wal_enabled() {
-    let tmp = tempdir().unwrap();
-    let path = tmp.path().join("test.wt");
-
-    let _tree = BTree::create(&path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
-
-    // Verify WAL file exists
-    let wal_path = path.with_extension("wt.wal");
-    assert!(wal_path.exists());
+fn wal_path(base_path: &Path) -> PathBuf {
+    base_path.join("wrongo.wal")
 }
 
 #[test]
-fn btree_creates_without_wal() {
+fn wal_created_when_enabled() {
     let tmp = tempdir().unwrap();
-    let path = tmp.path().join("test.wt");
+    let db_path = tmp.path().join("wal-enabled");
 
-    let _tree = BTree::create(&path, 512, false, Arc::new(GlobalTxnState::new())).unwrap();
+    let conn = Connection::open(&db_path, ConnectionConfig::default().disable_auto_checkpoint())
+        .unwrap();
+    drop(conn);
 
-    // Verify WAL file does NOT exist
-    let wal_path = path.with_extension("wt.wal");
-    assert!(!wal_path.exists());
-}
-
-#[test]
-fn leaf_insert_logs_wal_record() {
-    let tmp = tempdir().unwrap();
-    let path = tmp.path().join("test.wt");
-
-    let mut tree = BTree::create(&path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
-    tree.put(b"key1", b"value1").unwrap();
-    // Sync WAL to flush the buffer
-    tree.sync_wal().unwrap();
-
-    // Verify WAL file has content beyond header
-    let wal_path = path.with_extension("wt.wal");
-    let metadata = std::fs::metadata(&wal_path).unwrap();
-    assert!(metadata.len() > 512);  // More than header size
-}
-
-#[test]
-fn multiple_inserts_log_wal_records() {
-    let tmp = tempdir().unwrap();
-    let path = tmp.path().join("test_split.wt");
-
-    // Use small page size to create multiple updates
-    let mut tree = BTree::create(&path, 256, true, Arc::new(GlobalTxnState::new())).unwrap();
-
-    // Insert many keys to generate multiple WAL records
-    for i in 0..20 {
-        let key = format!("key{:05}", i);
-        let value = vec![i as u8; 100];
-        tree.put(key.as_bytes(), &value).unwrap();
-    }
-    // Sync WAL to flush the buffer
-    tree.sync_wal().unwrap();
-
-    // Verify WAL file grew
-    let wal_path = path.with_extension("wt.wal");
-    let metadata = std::fs::metadata(&wal_path).unwrap();
-    assert!(metadata.len() > 2000);  // Should have multiple records
-}
-
-#[test]
-fn batch_sync_threshold() {
-    let tmp = tempdir().unwrap();
-    let path = tmp.path().join("test_batch.wt");
-
-    let mut tree = BTree::create(&path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
-    tree.set_wal_sync_threshold(5);  // Sync every 5 operations
-
-    // Insert 10 keys (should trigger 2 syncs)
-    for i in 0..10 {
-        let key = format!("key{:02}", i);
-        tree.put(key.as_bytes(), b"value").unwrap();
-    }
-
-    // Force explicit sync
-    tree.sync_wal().unwrap();
-
-    // Verify WAL exists
-    let wal_path = path.with_extension("wt.wal");
-    assert!(wal_path.exists());
-}
-
-#[test]
-fn checkpoint_logs_wal_record() {
-    let tmp = tempdir().unwrap();
-    let path = tmp.path().join("test_ckpt.wt");
-
-    let mut tree = BTree::create(&path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
-    tree.put(b"key", b"value").unwrap();
-    tree.checkpoint().unwrap();
-
-    // Verify WAL has checkpoint record
-    let wal_path = path.with_extension("wt.wal");
-    assert!(wal_path.exists());
-
-    // Note: Checkpoint record verification is done in recovery tests
+    assert!(wal_path(&db_path).exists());
 }
 
 #[test]
 fn wal_disabled_no_file_created() {
     let tmp = tempdir().unwrap();
-    let path = tmp.path().join("test_no_wal.wt");
+    let db_path = tmp.path().join("wal-disabled");
 
-    let mut tree = BTree::create(&path, 512, false, Arc::new(GlobalTxnState::new())).unwrap();
-    tree.put(b"key", b"value").unwrap();
-    tree.checkpoint().unwrap();
+    let conn = Connection::open(
+        &db_path,
+        ConnectionConfig::default()
+            .wal_enabled(false)
+            .disable_auto_checkpoint(),
+    )
+    .unwrap();
 
-    // Verify WAL file does NOT exist
-    let wal_path = path.with_extension("wt.wal");
-    assert!(!wal_path.exists());
+    {
+        let mut session = conn.open_session();
+        session.create("table:test").unwrap();
+    }
+
+    drop(conn);
+
+    assert!(!wal_path(&db_path).exists());
 }
 
 #[test]
-fn open_with_wal_reopens_existing_wal() {
+fn wal_records_written_for_committed_write() {
     let tmp = tempdir().unwrap();
-    let path = tmp.path().join("test_reopen.wt");
+    let db_path = tmp.path().join("wal-write");
 
-    // Create with WAL
+    let conn = Connection::open(&db_path, ConnectionConfig::default().disable_auto_checkpoint())
+        .unwrap();
+
     {
-        let mut tree = BTree::create(&path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
-        tree.put(b"key1", b"value1").unwrap();
-        // Checkpoint to persist data
-        tree.checkpoint().unwrap();
+        let mut session = conn.open_session();
+        session.create("table:test").unwrap();
+
+        let mut txn = session.transaction().unwrap();
+        let txn_id = txn.as_mut().id();
+        let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
+        cursor.insert(b"key1", b"value1", txn_id).unwrap();
+        txn.commit().unwrap();
     }
 
-    // Verify WAL exists
-    let wal_path = path.with_extension("wt.wal");
-    assert!(wal_path.exists());
+    drop(conn);
 
-    // Reopen with WAL enabled
-    {
-        let mut tree = BTree::open(&path, true, Arc::new(GlobalTxnState::new())).unwrap();
-        // Verify data is accessible
-        let value = tree.get(b"key1").unwrap();
-        assert_eq!(value, Some(b"value1".to_vec()));
-    }
-
-    // WAL should still exist
-    assert!(wal_path.exists());
+    let metadata = fs::metadata(wal_path(&db_path)).unwrap();
+    assert!(metadata.len() > 512);
 }

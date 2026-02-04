@@ -114,6 +114,7 @@ impl GlobalTxnState {
 
     pub fn take_snapshot(&self, my_txn_id: TxnId) -> Snapshot {
         let current = self.current_txn_id.load(Ordering::Acquire);
+        let snap_max = current.saturating_add(1);
         let active_guard = self
             .active_txns
             .read()
@@ -127,10 +128,10 @@ impl GlobalTxnState {
             .copied()
             .filter(|id| *id != my_txn_id && *id != TXN_NONE)
             .collect();
-        let snap_min = active.iter().copied().min().unwrap_or(current);
+        let snap_min = active.iter().copied().min().unwrap_or(snap_max);
         let aborted: HashSet<TxnId> = aborted_guard.clone();
         Snapshot {
-            snap_max: current,
+            snap_max,
             snap_min,
             active: {
                 active.sort_unstable();
@@ -139,6 +140,10 @@ impl GlobalTxnState {
             aborted,
             my_txn_id,
         }
+    }
+
+    pub fn checkpoint_snapshot(&self) -> Snapshot {
+        self.take_snapshot(TXN_NONE)
     }
 
     pub fn begin_snapshot_txn(&self) -> Transaction {

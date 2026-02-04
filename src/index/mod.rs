@@ -9,51 +9,13 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::txn::GlobalTxnState;
+use crate::storage::wal::GlobalWal;
+use crate::txn::snapshot::Snapshot;
+use crate::txn::{GlobalTxnState, TxnId};
 use crate::{Document, WrongoDBError};
 use crate::storage::table::Table;
 
 pub use key::{decode_index_id, encode_index_key, encode_range_bounds, encode_scalar_prefix};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IndexOpType {
-    Add,
-    Remove,
-}
-
-impl IndexOpType {
-    pub fn inverse(self) -> Self {
-        match self {
-            IndexOpType::Add => IndexOpType::Remove,
-            IndexOpType::Remove => IndexOpType::Add,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct IndexOpRecord {
-    pub index_uri: String,
-    pub key: Vec<u8>,
-    pub op: IndexOpType,
-}
-
-impl IndexOpRecord {
-    pub fn add(index_uri: String, key: Vec<u8>) -> Self {
-        Self {
-            index_uri,
-            key,
-            op: IndexOpType::Add,
-        }
-    }
-
-    pub fn remove(index_uri: String, key: Vec<u8>) -> Self {
-        Self {
-            index_uri,
-            key,
-            op: IndexOpType::Remove,
-        }
-    }
-}
 
 /// A persistent secondary index backed by a B+tree.
 ///
@@ -70,12 +32,13 @@ pub struct Index {
 impl Index {
     /// Open an existing index BTree or create a new one if it doesn't exist.
     fn open_or_create(
+        uri: &str,
         path: &Path,
-        wal_enabled: bool,
+        wal: Option<Arc<GlobalWal>>,
         global_txn: Arc<GlobalTxnState>,
     ) -> Result<(Self, bool), WrongoDBError> {
         let existed = path.exists();
-        let table = Table::open_or_create_index(path, wal_enabled, global_txn)?;
+        let table = Table::open_or_create_index(uri, path, wal, global_txn)?;
         Ok((
             Self {
                 table: Arc::new(RwLock::new(table)),
@@ -89,23 +52,31 @@ impl Index {
     }
 
     /// Insert a document's field value into the index.
-    fn insert(&mut self, value: &Value, id: &Value) -> Result<(), WrongoDBError> {
+    fn insert(&mut self, value: &Value, id: &Value, txn_id: TxnId) -> Result<(), WrongoDBError> {
         if let Some(key) = encode_index_key(value, id)? {
             let mut table = self.table.write();
-            table.insert_raw(&key, &[])?;
+            table.insert_mvcc(&key, &[], txn_id)?;
+        }
+        Ok(())
+    }
+
+    fn remove(&mut self, value: &Value, id: &Value, txn_id: TxnId) -> Result<(), WrongoDBError> {
+        if let Some(key) = encode_index_key(value, id)? {
+            let mut table = self.table.write();
+            table.delete_mvcc(&key, txn_id)?;
         }
         Ok(())
     }
 
     /// Lookup all _id values matching a scalar value using range scan.
-    fn lookup(&mut self, value: &Value) -> Result<Vec<Value>, WrongoDBError> {
+    fn lookup(&mut self, value: &Value, txn_id: TxnId) -> Result<Vec<Value>, WrongoDBError> {
         let Some((start_key, end_key)) = encode_range_bounds(value) else {
             return Ok(Vec::new());
         };
 
         let entries = {
             let mut table = self.table.write();
-            table.scan_range(Some(&start_key), Some(&end_key), crate::txn::TXN_NONE)?
+            table.scan_range(Some(&start_key), Some(&end_key), txn_id)?
         };
 
         let mut ids = Vec::new();
@@ -118,21 +89,10 @@ impl Index {
         Ok(ids)
     }
 
-    fn insert_raw(&mut self, key: &[u8]) -> Result<(), WrongoDBError> {
-        let mut table = self.table.write();
-        table.insert_raw(key, &[])
-    }
-
-    fn remove_raw(&mut self, key: &[u8]) -> Result<(), WrongoDBError> {
-        let mut table = self.table.write();
-        table.delete_raw(key)?;
-        Ok(())
-    }
-
     /// Checkpoint the index to durable storage.
-    fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
+    fn checkpoint_with_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), WrongoDBError> {
         let mut table = self.table.write();
-        table.checkpoint()
+        table.checkpoint_with_snapshot(snapshot)
     }
 
     /// Run garbage collection on MVCC update chains.
@@ -164,7 +124,7 @@ pub struct IndexCatalog {
     db_dir: PathBuf,
     definitions: BTreeMap<String, IndexDefinition>,
     indexes: BTreeMap<String, Index>,
-    wal_enabled: bool,
+    wal: Option<Arc<GlobalWal>>,
     global_txn: Arc<GlobalTxnState>,
 }
 
@@ -172,7 +132,7 @@ impl IndexCatalog {
     pub fn load_or_init<P: AsRef<Path>>(
         collection: &str,
         db_dir: P,
-        wal_enabled: bool,
+        wal: Option<Arc<GlobalWal>>,
         global_txn: Arc<GlobalTxnState>,
     ) -> Result<Self, WrongoDBError> {
         let db_dir = db_dir.as_ref().to_path_buf();
@@ -232,8 +192,9 @@ impl IndexCatalog {
         let mut indexes = BTreeMap::new();
         for def in definitions.values() {
             let index_path = db_dir.join(&def.source);
+            let uri = format!("index:{}:{}", collection, def.name);
             let (index, _created) =
-                Index::open_or_create(&index_path, wal_enabled, global_txn.clone())?;
+                Index::open_or_create(&uri, &index_path, wal.clone(), global_txn.clone())?;
             indexes.insert(def.name.clone(), index);
         }
 
@@ -242,7 +203,7 @@ impl IndexCatalog {
             db_dir,
             definitions,
             indexes,
-            wal_enabled,
+            wal,
             global_txn,
         })
     }
@@ -250,7 +211,7 @@ impl IndexCatalog {
     pub fn empty<P: AsRef<Path>>(
         collection: &str,
         db_dir: P,
-        wal_enabled: bool,
+        wal: Option<Arc<GlobalWal>>,
         global_txn: Arc<GlobalTxnState>,
     ) -> Self {
         Self {
@@ -258,7 +219,7 @@ impl IndexCatalog {
             db_dir: db_dir.as_ref().to_path_buf(),
             definitions: BTreeMap::new(),
             indexes: BTreeMap::new(),
-            wal_enabled,
+            wal,
             global_txn,
         }
     }
@@ -295,6 +256,7 @@ impl IndexCatalog {
         name: &str,
         columns: Vec<String>,
         existing_docs: &[Document],
+        txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
         if self.definitions.contains_key(name) {
             return Ok(());
@@ -311,8 +273,9 @@ impl IndexCatalog {
         let index_path = self.db_dir.join(&index_file);
         let index_exists = index_path.exists();
 
+        let uri = format!("index:{}:{}", self.collection, name);
         let (mut index, created) =
-            Index::open_or_create(&index_path, self.wal_enabled, self.global_txn.clone())?;
+            Index::open_or_create(&uri, &index_path, self.wal.clone(), self.global_txn.clone())?;
 
         if !index_exists || created {
             let field = &columns[0];
@@ -321,7 +284,7 @@ impl IndexCatalog {
                     continue;
                 };
                 if let Some(value) = doc.get(field) {
-                    index.insert(value, id)?;
+                    index.insert(value, id, txn_id)?;
                 }
             }
         }
@@ -339,83 +302,72 @@ impl IndexCatalog {
         Ok(())
     }
 
-    pub fn lookup(&mut self, name: &str, value: &Value) -> Result<Vec<Value>, WrongoDBError> {
+    pub fn lookup(&mut self, name: &str, value: &Value, txn_id: TxnId) -> Result<Vec<Value>, WrongoDBError> {
         match self.indexes.get_mut(name) {
-            Some(index) => index.lookup(value),
+            Some(index) => index.lookup(value, txn_id),
             None => Ok(Vec::new()),
         }
     }
 
-    pub fn add_doc(&mut self, doc: &Document) -> Result<Vec<IndexOpRecord>, WrongoDBError> {
+    pub fn add_doc(&mut self, doc: &Document, txn_id: TxnId) -> Result<(), WrongoDBError> {
         let Some(id) = doc.get("_id") else {
-            return Ok(Vec::new());
-        };
-
-        let mut ops = Vec::new();
-        for (name, def) in &self.definitions {
-            let field = match def.columns.first() {
-                Some(field) => field,
-                None => continue,
-            };
-            let Some(value) = doc.get(field) else {
-                continue;
-            };
-            let Some(key) = encode_index_key(value, id)? else {
-                continue;
-            };
-            if let Some(index) = self.indexes.get_mut(name) {
-                index.insert_raw(&key)?;
-                let uri = self.index_uri(name);
-                ops.push(IndexOpRecord::add(uri, key));
-            }
-        }
-        Ok(ops)
-    }
-
-    pub fn remove_doc(&mut self, doc: &Document) -> Result<Vec<IndexOpRecord>, WrongoDBError> {
-        let Some(id) = doc.get("_id") else {
-            return Ok(Vec::new());
-        };
-
-        let mut ops = Vec::new();
-        for (name, def) in &self.definitions {
-            let field = match def.columns.first() {
-                Some(field) => field,
-                None => continue,
-            };
-            let Some(value) = doc.get(field) else {
-                continue;
-            };
-            let Some(key) = encode_index_key(value, id)? else {
-                continue;
-            };
-            if let Some(index) = self.indexes.get_mut(name) {
-                index.remove_raw(&key)?;
-                let uri = self.index_uri(name);
-                ops.push(IndexOpRecord::remove(uri, key));
-            }
-        }
-        Ok(ops)
-    }
-
-    pub fn apply_key_op(
-        &mut self,
-        index_name: &str,
-        key: &[u8],
-        op: IndexOpType,
-    ) -> Result<(), WrongoDBError> {
-        let Some(index) = self.indexes.get_mut(index_name) else {
             return Ok(());
         };
-        match op {
-            IndexOpType::Add => index.insert_raw(key),
-            IndexOpType::Remove => index.remove_raw(key),
+
+        for (name, def) in &self.definitions {
+            let field = match def.columns.first() {
+                Some(field) => field,
+                None => continue,
+            };
+            let Some(value) = doc.get(field) else {
+                continue;
+            };
+            if let Some(index) = self.indexes.get_mut(name) {
+                index.insert(value, id, txn_id)?;
+            }
         }
+        Ok(())
     }
 
-    pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
+    pub fn remove_doc(&mut self, doc: &Document, txn_id: TxnId) -> Result<(), WrongoDBError> {
+        let Some(id) = doc.get("_id") else {
+            return Ok(());
+        };
+
+        for (name, def) in &self.definitions {
+            let field = match def.columns.first() {
+                Some(field) => field,
+                None => continue,
+            };
+            let Some(value) = doc.get(field) else {
+                continue;
+            };
+            if let Some(index) = self.indexes.get_mut(name) {
+                index.remove(value, id, txn_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn checkpoint_with_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), WrongoDBError> {
         for index in self.indexes.values_mut() {
-            index.checkpoint()?;
+            index.checkpoint_with_snapshot(snapshot)?;
+        }
+        Ok(())
+    }
+
+    pub fn mark_updates_committed(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
+        for index in self.indexes.values_mut() {
+            let mut table = index.table.write();
+            table.mark_updates_committed(txn_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn mark_updates_aborted(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
+        for index in self.indexes.values_mut() {
+            let mut table = index.table.write();
+            table.mark_updates_aborted(txn_id)?;
         }
         Ok(())
     }
@@ -437,10 +389,6 @@ impl IndexCatalog {
             total_updates_removed,
             total_chains_dropped,
         )
-    }
-
-    fn index_uri(&self, index_name: &str) -> String {
-        format!("index:{}:{}", self.collection, index_name)
     }
 
     fn save(&self) -> Result<(), WrongoDBError> {
@@ -468,18 +416,19 @@ mod tests {
         let path = tmp.path().join("test.idx.wt");
         let global_txn = Arc::new(GlobalTxnState::new());
 
-        let (mut index, _created) = Index::open_or_create(&path, false, global_txn).unwrap();
+        let (mut index, _created) =
+            Index::open_or_create("index:test:name", &path, None, global_txn).unwrap();
 
-        index.insert(&json!("alice"), &json!("id1")).unwrap();
-        index.insert(&json!("bob"), &json!("id2")).unwrap();
-        index.insert(&json!("alice"), &json!("id3")).unwrap();
+        index.insert(&json!("alice"), &json!("id1"), crate::txn::TXN_NONE).unwrap();
+        index.insert(&json!("bob"), &json!("id2"), crate::txn::TXN_NONE).unwrap();
+        index.insert(&json!("alice"), &json!("id3"), crate::txn::TXN_NONE).unwrap();
 
-        let alice_ids = index.lookup(&json!("alice")).unwrap();
+        let alice_ids = index.lookup(&json!("alice"), crate::txn::TXN_NONE).unwrap();
         assert_eq!(alice_ids.len(), 2);
         assert!(alice_ids.contains(&json!("id1")));
         assert!(alice_ids.contains(&json!("id3")));
 
-        let bob_ids = index.lookup(&json!("bob")).unwrap();
+        let bob_ids = index.lookup(&json!("bob"), crate::txn::TXN_NONE).unwrap();
         assert_eq!(bob_ids.len(), 1);
         assert!(bob_ids.contains(&json!("id2")));
     }
@@ -488,7 +437,7 @@ mod tests {
     fn index_catalog_add_and_lookup() {
         let tmp = tempdir().unwrap();
         let global_txn = Arc::new(GlobalTxnState::new());
-        let mut catalog = IndexCatalog::empty("coll", tmp.path(), false, global_txn);
+        let mut catalog = IndexCatalog::empty("coll", tmp.path(), None, global_txn);
 
         let docs: Vec<Document> = vec![
             serde_json::from_value(json!({"_id": "a1", "name": "alice"})).unwrap(),
@@ -496,8 +445,8 @@ mod tests {
             serde_json::from_value(json!({"_id": "a2", "name": "alice"})).unwrap(),
         ];
 
-        catalog.add_index("name", vec!["name".to_string()], &docs).unwrap();
-        let ids = catalog.lookup("name", &json!("alice")).unwrap();
+        catalog.add_index("name", vec!["name".to_string()], &docs, crate::txn::TXN_NONE).unwrap();
+        let ids = catalog.lookup("name", &json!("alice"), crate::txn::TXN_NONE).unwrap();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&json!("a1")));
         assert!(ids.contains(&json!("a2")));

@@ -2,9 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::core::errors::WrongoDBError;
-use crate::txn::{
-    GlobalTxnState, TxnId, Update, UpdateChain, UpdateType, TS_NONE, TXN_ABORTED,
-};
+use crate::txn::snapshot::Snapshot;
+use crate::txn::{GlobalTxnState, TxnId, Update, UpdateChain, UpdateType, TS_NONE, TXN_ABORTED};
 
 use super::BTree;
 
@@ -76,7 +75,7 @@ impl MvccState {
         keys
     }
 
-    pub(super) fn latest_committed_entries(&self) -> Vec<(Vec<u8>, UpdateType, Vec<u8>)> {
+    pub(super) fn latest_committed_entries(&self, snapshot: &Snapshot) -> Vec<(Vec<u8>, UpdateType, Vec<u8>)> {
         let mut out = Vec::new();
         for (key, chain) in self.chains.iter() {
             for update in chain.iter() {
@@ -86,6 +85,9 @@ impl MvccState {
                     continue;
                 }
                 if update.time_window.start_ts == TS_NONE {
+                    continue;
+                }
+                if !snapshot.is_visible(update.txn_id) {
                     continue;
                 }
                 match update.type_ {
@@ -129,17 +131,17 @@ impl BTree {
         value: &[u8],
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
-        if let Some(wal) = self.wal.as_mut() {
-            wal.log_put(key, value, txn_id)?;
-        }
-
         let chain = self.mvcc.chain_mut_or_create(key);
 
         if let Some(head) = chain.head_mut() {
             head.mark_stopped(txn_id);
         }
 
-        let update = Update::new(txn_id, UpdateType::Standard, value.to_vec());
+        let mut update = Update::new(txn_id, UpdateType::Standard, value.to_vec());
+        if txn_id == crate::txn::TXN_NONE {
+            update.time_window.start_ts = txn_id;
+            update.time_window.stop_ts = u64::MAX;
+        }
         chain.prepend(update);
         Ok(())
     }
@@ -149,17 +151,17 @@ impl BTree {
         key: &[u8],
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
-        if let Some(wal) = self.wal.as_mut() {
-            wal.log_delete(key, txn_id)?;
-        }
-
         let chain = self.mvcc.chain_mut_or_create(key);
 
         if let Some(head) = chain.head_mut() {
             head.mark_stopped(txn_id);
         }
 
-        let update = Update::new(txn_id, UpdateType::Tombstone, Vec::new());
+        let mut update = Update::new(txn_id, UpdateType::Tombstone, Vec::new());
+        if txn_id == crate::txn::TXN_NONE {
+            update.time_window.start_ts = txn_id;
+            update.time_window.stop_ts = u64::MAX;
+        }
         chain.prepend(update);
         Ok(())
     }
@@ -168,12 +170,6 @@ impl BTree {
     /// and log the commit to WAL.
     /// Note: This does NOT update the transaction state - that's done by Session.
     pub fn mark_updates_committed(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        // Log commit to WAL first (for durability)
-        if let Some(wal) = self.wal.as_mut() {
-            let _commit_ts = wal.log_txn_commit(txn_id, txn_id)?;
-            wal.sync()?; // Ensure commit is durable
-        }
-
         // Update time windows for all modifications to mark them as committed
         // We scan all chains to find updates from this transaction
         for (_, chain) in self.mvcc.chains.iter_mut() {
@@ -193,11 +189,6 @@ impl BTree {
     /// and log the abort to WAL.
     /// Note: This does NOT update the transaction state - that's done by Session.
     pub fn mark_updates_aborted(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        // Log abort to WAL
-        if let Some(wal) = self.wal.as_mut() {
-            wal.log_txn_abort(txn_id)?;
-        }
-
         // Mark all updates in chains as aborted
         for (_, chain) in self.mvcc.chains.iter_mut() {
             chain.mark_aborted(txn_id);

@@ -1,26 +1,27 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
+use crate::connection::{checkpoint_all_with_context, CheckpointContext};
 use crate::core::errors::StorageError;
 use crate::cursor::{Cursor, CursorKind};
 use crate::datahandle_cache::DataHandleCache;
-use crate::index::{IndexOpRecord, IndexOpType};
 use crate::storage::table::Table;
+use crate::storage::wal::GlobalWal;
 use crate::txn::{GlobalTxnState, Transaction};
 use crate::WrongoDBError;
 
 struct SessionTxnContext {
     txn: Transaction,
-    index_ops: Vec<IndexOpRecord>,
 }
 
 pub struct Session {
     cache: Arc<DataHandleCache>,
     base_path: PathBuf,
-    wal_enabled: bool,
+    wal: Option<Arc<GlobalWal>>,
     global_txn: Arc<GlobalTxnState>,
+    checkpoint_mutex: Arc<Mutex<()>>,
     txn: Option<SessionTxnContext>,
 }
 
@@ -28,14 +29,16 @@ impl Session {
     pub(crate) fn new(
         cache: Arc<DataHandleCache>,
         base_path: PathBuf,
-        wal_enabled: bool,
+        wal: Option<Arc<GlobalWal>>,
         global_txn: Arc<GlobalTxnState>,
+        checkpoint_mutex: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             cache,
             base_path,
-            wal_enabled,
+            wal,
             global_txn,
+            checkpoint_mutex,
             txn: None,
         }
     }
@@ -53,7 +56,7 @@ impl Session {
             &uri,
             collection,
             &self.base_path,
-            self.wal_enabled,
+            self.wal.clone(),
             self.global_txn.clone(),
         )?;
         if mark_touched {
@@ -68,33 +71,6 @@ impl Session {
         mark_touched: bool,
     ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
         self.get_primary_table(collection, mark_touched)
-    }
-
-    pub(crate) fn record_index_ops(&mut self, ops: Vec<IndexOpRecord>) -> Result<(), WrongoDBError> {
-        if let Some(ref mut ctx) = self.txn {
-            ctx.index_ops.extend(ops);
-            Ok(())
-        } else {
-            Err(WrongoDBError::NoActiveTransaction)
-        }
-    }
-
-    fn rollback_index_ops(&mut self, ops: &[IndexOpRecord]) {
-        for op in ops.iter().rev() {
-            if let Err(e) = self.apply_index_op(op, op.op.inverse()) {
-                eprintln!("Warning: failed to rollback index op {}: {}", op.index_uri, e);
-            }
-        }
-    }
-
-    fn apply_index_op(&mut self, op: &IndexOpRecord, inverse: IndexOpType) -> Result<(), WrongoDBError> {
-        let (collection, index_name) = parse_index_uri(&op.index_uri)?;
-        let table = self.get_primary_table(collection, false)?;
-        let mut table_guard = table.write();
-        let catalog = table_guard
-            .index_catalog_mut()
-            .ok_or_else(|| StorageError("missing index catalog".into()))?;
-        catalog.apply_key_op(index_name, &op.key, inverse)
     }
 
     pub fn create(&mut self, uri: &str) -> Result<(), WrongoDBError> {
@@ -136,6 +112,17 @@ impl Session {
         )))
     }
 
+    pub fn checkpoint(&self) -> Result<(), WrongoDBError> {
+        let ctx = CheckpointContext::new(
+            self.base_path.clone(),
+            self.cache.clone(),
+            self.wal.clone(),
+            self.checkpoint_mutex.clone(),
+            self.global_txn.clone(),
+        );
+        checkpoint_all_with_context(&ctx)
+    }
+
     /// Begin a new transaction and return an RAII handle.
     /// 
     /// The transaction will auto-rollback if not explicitly committed or aborted.
@@ -163,7 +150,6 @@ impl Session {
         let txn = self.global_txn.begin_snapshot_txn();
         self.txn = Some(SessionTxnContext {
             txn,
-            index_ops: Vec::new(),
         });
         Ok(SessionTxn::new(self))
     }
@@ -207,6 +193,11 @@ impl<'a> SessionTxn<'a> {
 
             ctx.txn.commit(&self.session.global_txn)?;
 
+            if let Some(wal) = self.session.wal.as_ref() {
+                let _ = wal.log_txn_commit(txn_id, txn_id)?;
+                wal.sync()?;
+            }
+
             for uri in &touched_tables {
                 if !uri.starts_with("table:") {
                     continue;
@@ -215,6 +206,9 @@ impl<'a> SessionTxn<'a> {
                 let table = self.session.get_primary_table(collection, false)?;
                 let mut table_guard = table.write();
                 table_guard.mark_updates_committed(txn_id)?;
+                if let Some(catalog) = table_guard.index_catalog_mut() {
+                    catalog.mark_updates_committed(txn_id)?;
+                }
             }
         }
         self.committed = true;
@@ -227,12 +221,14 @@ impl<'a> SessionTxn<'a> {
     /// Aborts the transaction across all touched tables.
     pub fn abort(mut self) -> Result<(), WrongoDBError> {
         if let Some(mut ctx) = self.session.txn.take() {
-            self.session.rollback_index_ops(&ctx.index_ops);
-
             let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
             let txn_id = ctx.txn.id();
 
             ctx.txn.abort(&self.session.global_txn)?;
+
+            if let Some(wal) = self.session.wal.as_ref() {
+                let _ = wal.log_txn_abort(txn_id)?;
+            }
 
             for uri in &touched_tables {
                 if !uri.starts_with("table:") {
@@ -242,6 +238,9 @@ impl<'a> SessionTxn<'a> {
                 let table = self.session.get_primary_table(collection, false)?;
                 let mut table_guard = table.write();
                 table_guard.mark_updates_aborted(txn_id)?;
+                if let Some(catalog) = table_guard.index_catalog_mut() {
+                    catalog.mark_updates_aborted(txn_id)?;
+                }
             }
         }
         self.committed = true;
@@ -279,7 +278,6 @@ impl<'a> Drop for SessionTxn<'a> {
     fn drop(&mut self) {
         if !self.committed {
             if let Some(mut ctx) = self.session.txn.take() {
-                self.session.rollback_index_ops(&ctx.index_ops);
                 let touched_tables: Vec<String> =
                     ctx.txn.touched_tables().iter().cloned().collect();
                 let txn_id = ctx.txn.id();
@@ -293,6 +291,9 @@ impl<'a> Drop for SessionTxn<'a> {
                     if let Ok(table) = self.session.get_primary_table(collection, false) {
                         let mut table_guard = table.write();
                         let _ = table_guard.mark_updates_aborted(txn_id);
+                        if let Some(catalog) = table_guard.index_catalog_mut() {
+                            let _ = catalog.mark_updates_aborted(txn_id);
+                        }
                     }
                 }
             }

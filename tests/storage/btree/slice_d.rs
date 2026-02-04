@@ -8,7 +8,7 @@ fn splits_root_leaf_into_internal_root() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("btree.wt");
 
-    let mut tree = BTree::create(&path, 256, false, Arc::new(GlobalTxnState::new())).unwrap();
+    let mut tree = BTree::create(&path, 256, Arc::new(GlobalTxnState::new())).unwrap();
 
     for i in 0..20u32 {
         let k = format!("k{i:04}").into_bytes();
@@ -33,7 +33,7 @@ fn splits_root_leaf_into_internal_root() {
     bf.close().unwrap();
 
     // Reopen and confirm reads still work.
-    let mut tree2 = BTree::open(&path, false, Arc::new(GlobalTxnState::new())).unwrap();
+    let mut tree2 = BTree::open(&path, Arc::new(GlobalTxnState::new())).unwrap();
     for i in 0..20u32 {
         let k = format!("k{i:04}").into_bytes();
         assert!(tree2.get(&k).unwrap().is_some());
@@ -46,7 +46,7 @@ fn multiple_leaf_splits_update_root_separators() {
     let path = tmp.path().join("btree2.wt");
 
     // Slightly larger pages to ensure the root internal node has room for multiple separators.
-    let mut tree = BTree::create(&path, 512, false, Arc::new(GlobalTxnState::new())).unwrap();
+    let mut tree = BTree::create(&path, 512, Arc::new(GlobalTxnState::new())).unwrap();
     for i in 0..60u32 {
         let k = format!("k{i:04}").into_bytes();
         let v = vec![b'x'; 16];

@@ -4,16 +4,20 @@
 //! not full page images. This provides ~100x smaller WAL size.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
 use crc32fast::Hasher;
+use parking_lot::{Condvar, Mutex};
 
 use crate::{StorageError, WrongoDBError};
 
 /// WAL file magic bytes (8 bytes)
 const WAL_MAGIC: &[u8; 8] = b"WAL0001\0";
 /// WAL file format version
-const WAL_VERSION: u16 = 2;
+const WAL_VERSION: u16 = 3;
 /// WAL file header size (512 bytes)
 const WAL_HEADER_SIZE: usize = 512;
 /// WAL record header size (32 bytes)
@@ -74,11 +78,13 @@ use crate::txn::{TxnId, Timestamp};
 #[derive(Debug, Clone, PartialEq)]
 pub enum WalRecord {
     Put {
+        uri: String,
         key: Vec<u8>,
         value: Vec<u8>,
         txn_id: TxnId,
     },
     Delete {
+        uri: String,
         key: Vec<u8>,
         txn_id: TxnId,
     },
@@ -112,9 +118,12 @@ impl WalRecord {
         let mut buf = Vec::new();
 
         match self {
-            WalRecord::Put { key, value, txn_id } => {
+            WalRecord::Put { uri, key, value, txn_id } => {
                 // txn_id (8 bytes)
                 buf.extend_from_slice(&txn_id.to_le_bytes());
+                // uri_len (4 bytes) + uri
+                buf.extend_from_slice(&(uri.len() as u32).to_le_bytes());
+                buf.extend_from_slice(uri.as_bytes());
                 // key_len (4 bytes) + key
                 buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
                 buf.extend_from_slice(key);
@@ -123,9 +132,12 @@ impl WalRecord {
                 buf.extend_from_slice(value);
             }
 
-            WalRecord::Delete { key, txn_id } => {
+            WalRecord::Delete { uri, key, txn_id } => {
                 // txn_id (8 bytes)
                 buf.extend_from_slice(&txn_id.to_le_bytes());
+                // uri_len (4 bytes) + uri
+                buf.extend_from_slice(&(uri.len() as u32).to_le_bytes());
+                buf.extend_from_slice(uri.as_bytes());
                 // key_len (4 bytes) + key
                 buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
                 buf.extend_from_slice(key);
@@ -194,20 +206,28 @@ impl WalRecord {
         match record_type {
             WalRecordType::Put => {
                 let txn_id = read_u64(data, &mut cursor)?;
+                let uri_len = read_u32(data, &mut cursor)? as usize;
+                let uri_bytes = read_bytes(data, &mut cursor, uri_len)?;
+                let uri = String::from_utf8(uri_bytes)
+                    .map_err(|_| StorageError("invalid WAL uri encoding".into()))?;
                 let key_len = read_u32(data, &mut cursor)? as usize;
                 let key = read_bytes(data, &mut cursor, key_len)?;
                 let value_len = read_u32(data, &mut cursor)? as usize;
                 let value = read_bytes(data, &mut cursor, value_len)?;
 
-                Ok(WalRecord::Put { key, value, txn_id })
+                Ok(WalRecord::Put { uri, key, value, txn_id })
             }
 
             WalRecordType::Delete => {
                 let txn_id = read_u64(data, &mut cursor)?;
+                let uri_len = read_u32(data, &mut cursor)? as usize;
+                let uri_bytes = read_bytes(data, &mut cursor, uri_len)?;
+                let uri = String::from_utf8(uri_bytes)
+                    .map_err(|_| StorageError("invalid WAL uri encoding".into()))?;
                 let key_len = read_u32(data, &mut cursor)? as usize;
                 let key = read_bytes(data, &mut cursor, key_len)?;
 
-                Ok(WalRecord::Delete { key, txn_id })
+                Ok(WalRecord::Delete { uri, key, txn_id })
             }
 
             WalRecordType::Checkpoint => {
@@ -571,6 +591,8 @@ impl WalFile {
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(&header_bytes)?;
         self.file.sync_all()?;
+        // Ensure subsequent appends start at the end of the truncated WAL.
+        self.file.seek(SeekFrom::Start(self.last_lsn.offset))?;
 
         Ok(())
     }
@@ -582,31 +604,19 @@ impl WalFile {
         Ok(())
     }
 
+    pub fn last_offset(&self) -> u64 {
+        self.last_lsn.offset
+    }
+
     /// Log a logical put (upsert) operation.
-    pub fn log_put(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
+    #[cfg(test)]
+    pub fn log_put(&mut self, uri: &str, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
         let record = WalRecord::Put {
+            uri: uri.to_string(),
             key: key.to_vec(),
             value: value.to_vec(),
             txn_id,
         };
-        self.append_record(record)
-    }
-
-    /// Log a logical delete operation.
-    pub fn log_delete(&mut self, key: &[u8], txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
-        let record = WalRecord::Delete { key: key.to_vec(), txn_id };
-        self.append_record(record)
-    }
-
-    /// Log a transaction commit marker.
-    pub fn log_txn_commit(&mut self, txn_id: TxnId, commit_ts: Timestamp) -> Result<Lsn, WrongoDBError> {
-        let record = WalRecord::TxnCommit { txn_id, commit_ts };
-        self.append_record(record)
-    }
-
-    /// Log a transaction abort marker.
-    pub fn log_txn_abort(&mut self, txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
-        let record = WalRecord::TxnAbort { txn_id };
         self.append_record(record)
     }
 
@@ -703,95 +713,238 @@ impl Drop for WalFile {
     }
 }
 
-/// Helper to generate WAL file path from data file path.
-pub fn wal_path_from_data_path(data_path: &Path) -> PathBuf {
-    let mut wal_path = data_path.as_os_str().to_owned();
-    wal_path.push(".wal");
-    PathBuf::from(wal_path)
+/// Helper to generate WAL file path from base database path.
+pub fn wal_path_from_base_path(base_path: &Path) -> PathBuf {
+    base_path.join("wrongo.wal")
 }
 
-/// WAL handle with batching/sync policy.
+#[derive(Clone, Debug)]
+pub struct CheckpointSignal {
+    inner: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl CheckpointSignal {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    pub fn notify(&self) {
+        let (lock, cv) = &*self.inner;
+        let mut flag = lock.lock();
+        *flag = true;
+        cv.notify_all();
+    }
+
+    pub fn wait_timeout(&self, timeout: Duration) -> bool {
+        let (lock, cv) = &*self.inner;
+        let mut flag = lock.lock();
+        if !*flag {
+            let _ = cv.wait_for(&mut flag, timeout);
+        }
+        let signaled = *flag;
+        *flag = false;
+        signaled
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WalHandle {
+    wal: Arc<GlobalWal>,
+    uri: String,
+}
+
+impl WalHandle {
+    pub fn log_put(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+        let _ = self.wal.log_put(&self.uri, key, value, txn_id)?;
+        Ok(())
+    }
+
+    pub fn log_delete(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+        let _ = self.wal.log_delete(&self.uri, key, txn_id)?;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
-pub struct Wal {
+struct WalState {
     file: WalFile,
     sync_threshold: Option<usize>,
     operations_since_sync: usize,
+    bytes_since_checkpoint: u64,
+    log_size_threshold: Option<u64>,
 }
 
-impl Wal {
-    pub fn create<P: AsRef<Path>>(data_path: P, page_size: usize) -> Result<Self, WrongoDBError> {
-        let wal_path = wal_path_from_data_path(data_path.as_ref());
+/// Global WAL handle with batching/sync policy.
+#[derive(Debug)]
+pub struct GlobalWal {
+    state: Mutex<WalState>,
+    checkpoint_signal: CheckpointSignal,
+}
+
+impl GlobalWal {
+    pub fn create<P: AsRef<Path>>(base_path: P, page_size: usize) -> Result<Self, WrongoDBError> {
+        let wal_path = wal_path_from_base_path(base_path.as_ref());
         let file = WalFile::create(&wal_path, page_size as u32)?;
         Ok(Self {
-            file,
-            sync_threshold: None,
-            operations_since_sync: 0,
+            state: Mutex::new(WalState {
+                file,
+                sync_threshold: None,
+                operations_since_sync: 0,
+                bytes_since_checkpoint: 0,
+                log_size_threshold: None,
+            }),
+            checkpoint_signal: CheckpointSignal::new(),
         })
     }
 
-    pub fn open_or_create<P: AsRef<Path>>(data_path: P, page_size: usize) -> Result<Self, WrongoDBError> {
-        let wal_path = wal_path_from_data_path(data_path.as_ref());
+    pub fn open_or_create<P: AsRef<Path>>(base_path: P, page_size: usize) -> Result<Self, WrongoDBError> {
+        let wal_path = wal_path_from_base_path(base_path.as_ref());
         let file = if wal_path.exists() {
             WalFile::open(&wal_path)?
         } else {
             WalFile::create(&wal_path, page_size as u32)?
         };
         Ok(Self {
-            file,
-            sync_threshold: None,
-            operations_since_sync: 0,
+            state: Mutex::new(WalState {
+                file,
+                sync_threshold: None,
+                operations_since_sync: 0,
+                bytes_since_checkpoint: 0,
+                log_size_threshold: None,
+            }),
+            checkpoint_signal: CheckpointSignal::new(),
         })
     }
 
-    pub fn log_put(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
-        self.file.log_put(key, value, txn_id)
+    pub fn handle(self: &Arc<Self>, uri: &str) -> WalHandle {
+        WalHandle {
+            wal: Arc::clone(self),
+            uri: uri.to_string(),
+        }
     }
 
-    pub fn log_delete(&mut self, key: &[u8], txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
-        self.file.log_delete(key, txn_id)
+    pub fn checkpoint_signal(&self) -> CheckpointSignal {
+        self.checkpoint_signal.clone()
     }
 
-    pub fn log_checkpoint(&mut self, root_block_id: u64, generation: u64) -> Result<Lsn, WrongoDBError> {
-        self.file.log_checkpoint(root_block_id, generation)
+    pub fn set_sync_threshold(&self, threshold: usize) {
+        let mut state = self.state.lock();
+        state.sync_threshold = Some(threshold);
     }
 
-    pub fn log_txn_commit(&mut self, txn_id: TxnId, commit_ts: Timestamp) -> Result<Lsn, WrongoDBError> {
-        self.file.log_txn_commit(txn_id, commit_ts)
+    pub fn set_log_size_threshold(&self, threshold: Option<u64>) {
+        let mut state = self.state.lock();
+        state.log_size_threshold = threshold;
     }
 
-    pub fn log_txn_abort(&mut self, txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
-        self.file.log_txn_abort(txn_id)
+    pub fn reset_bytes_since_checkpoint(&self) {
+        let mut state = self.state.lock();
+        state.bytes_since_checkpoint = 0;
     }
 
-    pub fn set_checkpoint_lsn(&mut self, lsn: Lsn) -> Result<(), WrongoDBError> {
-        self.file.set_checkpoint_lsn(lsn)
+    pub fn last_offset(&self) -> u64 {
+        let state = self.state.lock();
+        state.file.last_offset()
     }
 
-    pub fn truncate_to_checkpoint(&mut self) -> Result<(), WrongoDBError> {
-        self.file.truncate_to_checkpoint()
+    pub fn log_put(&self, uri: &str, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
+        self.log_record(WalRecord::Put {
+            uri: uri.to_string(),
+            key: key.to_vec(),
+            value: value.to_vec(),
+            txn_id,
+        })
     }
 
-    pub fn set_sync_threshold(&mut self, threshold: usize) {
-        self.sync_threshold = Some(threshold);
+    pub fn log_delete(&self, uri: &str, key: &[u8], txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
+        self.log_record(WalRecord::Delete {
+            uri: uri.to_string(),
+            key: key.to_vec(),
+            txn_id,
+        })
     }
 
-    pub fn sync(&mut self) -> Result<(), WrongoDBError> {
-        self.file.sync()?;
-        self.operations_since_sync = 0;
+    pub fn log_txn_commit(&self, txn_id: TxnId, commit_ts: Timestamp) -> Result<Lsn, WrongoDBError> {
+        self.log_record(WalRecord::TxnCommit { txn_id, commit_ts })
+    }
+
+    pub fn log_txn_abort(&self, txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
+        self.log_record(WalRecord::TxnAbort { txn_id })
+    }
+
+    pub fn log_checkpoint(&self, root_block_id: u64, generation: u64) -> Result<Lsn, WrongoDBError> {
+        let mut state = self.state.lock();
+        let before = state.file.last_offset();
+        let lsn_after = state.file.log_checkpoint(root_block_id, generation)?;
+        let after = state.file.last_offset();
+        let bytes = after.saturating_sub(before);
+        state.bytes_since_checkpoint = state.bytes_since_checkpoint.saturating_add(bytes);
+        Ok(lsn_after)
+    }
+
+    pub fn try_advance_checkpoint(&self, expected_offset: u64) -> Result<bool, WrongoDBError> {
+        let mut state = self.state.lock();
+        if state.file.last_offset() != expected_offset {
+            return Ok(false);
+        }
+
+        let before = state.file.last_offset();
+        let checkpoint_lsn = state.file.log_checkpoint(0, 0)?;
+        let after = state.file.last_offset();
+        let bytes = after.saturating_sub(before);
+        state.bytes_since_checkpoint = state.bytes_since_checkpoint.saturating_add(bytes);
+
+        state.file.set_checkpoint_lsn(checkpoint_lsn)?;
+        state.file.sync()?;
+        state.file.truncate_to_checkpoint()?;
+        state.bytes_since_checkpoint = 0;
+        state.operations_since_sync = 0;
+        Ok(true)
+    }
+
+    pub fn set_checkpoint_lsn(&self, lsn: Lsn) -> Result<(), WrongoDBError> {
+        let mut state = self.state.lock();
+        state.file.set_checkpoint_lsn(lsn)
+    }
+
+    pub fn truncate_to_checkpoint(&self) -> Result<(), WrongoDBError> {
+        let mut state = self.state.lock();
+        state.file.truncate_to_checkpoint()
+    }
+
+    pub fn sync(&self) -> Result<(), WrongoDBError> {
+        let mut state = self.state.lock();
+        state.file.sync()?;
+        state.operations_since_sync = 0;
         Ok(())
     }
 
-    pub fn log_wal_operation(&mut self) -> Result<bool, WrongoDBError> {
-        self.operations_since_sync = self.operations_since_sync.saturating_add(1);
+    fn log_record(&self, record: WalRecord) -> Result<Lsn, WrongoDBError> {
+        let mut state = self.state.lock();
+        let before = state.file.last_offset();
+        let lsn = state.file.append_record(record)?;
+        let after = state.file.last_offset();
+        let bytes = after.saturating_sub(before);
+        state.bytes_since_checkpoint = state.bytes_since_checkpoint.saturating_add(bytes);
 
-        if let Some(threshold) = self.sync_threshold {
-            if self.operations_since_sync >= threshold {
-                self.sync()?;
-                return Ok(true);
+        state.operations_since_sync = state.operations_since_sync.saturating_add(1);
+        if let Some(threshold) = state.sync_threshold {
+            if state.operations_since_sync >= threshold {
+                state.file.sync()?;
+                state.operations_since_sync = 0;
             }
         }
 
-        Ok(false)
+        if let Some(threshold) = state.log_size_threshold {
+            if state.bytes_since_checkpoint >= threshold {
+                drop(state);
+                self.checkpoint_signal.notify();
+            }
+        }
+
+        Ok(lsn)
     }
 }
 
@@ -869,7 +1022,6 @@ impl From<std::io::Error> for RecoveryError {
 /// Validates checksums and LSN chains.
 pub struct WalReader {
     file: File,
-    header: WalFileHeader,
     current_offset: u64,
     last_valid_lsn: Lsn,
 }
@@ -910,7 +1062,6 @@ impl WalReader {
 
         Ok(Self {
             file,
-            header,
             current_offset,
             last_valid_lsn: Lsn::new(0, 0),
         })
@@ -1005,10 +1156,6 @@ impl WalReader {
         Ok(Some((header, record)))
     }
 
-    /// Get the checkpoint LSN from the WAL header.
-    pub fn checkpoint_lsn(&self) -> Lsn {
-        self.header.checkpoint_lsn
-    }
 }
 
 #[cfg(test)]
@@ -1092,14 +1239,15 @@ mod tests {
 
     #[test]
     fn wal_path_helper() {
-        let data_path = Path::new("/tmp/test.wt");
-        let wal_path = wal_path_from_data_path(data_path);
-        assert_eq!(wal_path, PathBuf::from("/tmp/test.wt.wal"));
+        let base_path = Path::new("/tmp");
+        let wal_path = wal_path_from_base_path(base_path);
+        assert_eq!(wal_path, PathBuf::from("/tmp/wrongo.wal"));
     }
 
     #[test]
     fn wal_record_serialize_put() {
         let record = WalRecord::Put {
+            uri: "table:test".to_string(),
             key: b"test_key".to_vec(),
             value: b"test_value".to_vec(),
             txn_id: 42,
@@ -1115,6 +1263,7 @@ mod tests {
     #[test]
     fn wal_record_serialize_delete() {
         let record = WalRecord::Delete {
+            uri: "table:test".to_string(),
             key: b"test_key".to_vec(),
             txn_id: 42,
         };
@@ -1148,7 +1297,7 @@ mod tests {
         let mut wal = WalFile::create(&path, 4096).unwrap();
 
         // Log a put
-        let lsn = wal.log_put(b"my_key", b"my_value", 0).unwrap();
+        let lsn = wal.log_put("table:test", b"my_key", b"my_value", 0).unwrap();
 
         assert_eq!(lsn.offset, WAL_HEADER_SIZE as u64);
 
@@ -1168,9 +1317,9 @@ mod tests {
         let mut wal = WalFile::create(&path, 4096).unwrap();
 
         // Write multiple records - should buffer
-        wal.log_put(b"key1", b"value1", 0).unwrap();
-        wal.log_put(b"key2", b"value2", 0).unwrap();
-        wal.log_put(b"key3", b"value3", 0).unwrap();
+        wal.log_put("table:test", b"key1", b"value1", 0).unwrap();
+        wal.log_put("table:test", b"key2", b"value2", 0).unwrap();
+        wal.log_put("table:test", b"key3", b"value3", 0).unwrap();
 
         // Now sync - should flush buffer
         wal.sync().unwrap();
@@ -1186,9 +1335,9 @@ mod tests {
 
         let mut wal = WalFile::create(&path, 4096).unwrap();
 
-        let lsn1 = wal.log_put(b"key1", b"value1", 0).unwrap();
-        let lsn2 = wal.log_put(b"key2", b"value2", 0).unwrap();
-        let lsn3 = wal.log_put(b"key3", b"value3", 0).unwrap();
+        let lsn1 = wal.log_put("table:test", b"key1", b"value1", 0).unwrap();
+        let lsn2 = wal.log_put("table:test", b"key2", b"value2", 0).unwrap();
+        let lsn3 = wal.log_put("table:test", b"key3", b"value3", 0).unwrap();
 
         // LSNs should be sequential
         assert!(lsn1.offset < lsn2.offset);
