@@ -115,6 +115,7 @@ impl CheckpointContext {
 pub(crate) fn checkpoint_all_with_context(ctx: &CheckpointContext) -> Result<(), WrongoDBError> {
     let _guard = ctx.checkpoint_mutex.lock();
     let snapshot = ctx.global_txn.checkpoint_snapshot();
+    let expected_offset = ctx.wal.as_ref().map(|wal| wal.last_offset());
     let collection_names = list_collections(&ctx.base_path)?;
 
     for name in collection_names {
@@ -132,11 +133,9 @@ pub(crate) fn checkpoint_all_with_context(ctx: &CheckpointContext) -> Result<(),
 
     if let Some(wal) = ctx.wal.as_ref() {
         if snapshot.active.is_empty() {
-            let checkpoint_lsn = wal.log_checkpoint(0, 0)?;
-            wal.set_checkpoint_lsn(checkpoint_lsn)?;
-            wal.sync()?;
-            wal.truncate_to_checkpoint()?;
-            wal.reset_bytes_since_checkpoint();
+            if let Some(expected) = expected_offset {
+                let _ = wal.try_advance_checkpoint(expected)?;
+            }
         }
     }
 

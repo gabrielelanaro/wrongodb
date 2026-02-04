@@ -1,5 +1,18 @@
 # Decisions
 
+## 2026-02-04: Guard checkpoint LSN advancement by WAL growth
+
+**Decision**
+- Only advance `checkpoint_lsn` and truncate WAL when no new WAL records were appended since the checkpoint snapshot was taken (compare WAL end offset).
+- If WAL grew during checkpoint, skip LSN advancement; checkpointed data remains valid but WAL trimming is deferred.
+
+**Why**
+- Prevents losing committed updates that were written after the snapshot but before the checkpoint record.
+- Keeps checkpointing non-blocking while preserving crash recovery correctness.
+
+**Notes**
+- Single-file WAL cannot drop the log prefix; constant-write workloads require log rotation or compaction to reclaim space.
+
 ## 2026-02-02: Table-owned index catalog + Session-only transactions
 
 **Decision**

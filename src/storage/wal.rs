@@ -844,6 +844,11 @@ impl GlobalWal {
         state.bytes_since_checkpoint = 0;
     }
 
+    pub fn last_offset(&self) -> u64 {
+        let state = self.state.lock();
+        state.file.last_offset()
+    }
+
     pub fn log_put(&self, uri: &str, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
         self.log_record(WalRecord::Put {
             uri: uri.to_string(),
@@ -877,6 +882,26 @@ impl GlobalWal {
         let bytes = after.saturating_sub(before);
         state.bytes_since_checkpoint = state.bytes_since_checkpoint.saturating_add(bytes);
         Ok(lsn_after)
+    }
+
+    pub fn try_advance_checkpoint(&self, expected_offset: u64) -> Result<bool, WrongoDBError> {
+        let mut state = self.state.lock();
+        if state.file.last_offset() != expected_offset {
+            return Ok(false);
+        }
+
+        let before = state.file.last_offset();
+        let checkpoint_lsn = state.file.log_checkpoint(0, 0)?;
+        let after = state.file.last_offset();
+        let bytes = after.saturating_sub(before);
+        state.bytes_since_checkpoint = state.bytes_since_checkpoint.saturating_add(bytes);
+
+        state.file.set_checkpoint_lsn(checkpoint_lsn)?;
+        state.file.sync()?;
+        state.file.truncate_to_checkpoint()?;
+        state.bytes_since_checkpoint = 0;
+        state.operations_since_sync = 0;
+        Ok(true)
     }
 
     pub fn set_checkpoint_lsn(&self, lsn: Lsn) -> Result<(), WrongoDBError> {
