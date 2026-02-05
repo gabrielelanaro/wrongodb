@@ -1,6 +1,6 @@
 ---
 name: wrongodb-blogging
-description: Plan and write WrongoDB devlog posts in this repo. Use when asked to plan, outline, draft, or revise posts under blog/, generate blog images, or follow the series structure for WrongoDB. This skill embeds the canonical planning and writing prompts and uses blog/generate_image.py for image generation.
+description: Plan and write WrongoDB devlog posts in this repo. Use when asked to plan, outline, draft, or revise posts under blog/, generate blog images, or follow the series structure for WrongoDB. This skill embeds the canonical planning and writing prompts and uses blog/generate_image.py for image generation (including structured diagrams via --structured flag).
 ---
 
 # WrongoDB Blogging
@@ -69,10 +69,65 @@ Create blog post plans and drafts for the WrongoDB series without re-reading or 
 - If an image prompt is unclear, revise the prompt text first (do not guess).
 - Agentic mode writes a sidecar JSON file next to the image with draft/final prompts and critique summaries; use it to judge story effectiveness, visual consistency, and pleasing aesthetics.
 
+### 4) Generating diagrams with HTML intermediate (RECOMMENDED for structured diagrams)
+
+When diagrams have structural quirks (misaligned elements, wrong layouts), use the **HTML-intermediate approach**. This generates HTML/CSS representing the diagram structure, renders it via Playwright, and uses the result as a visual reference for final image generation.
+
+**Why this helps:**
+- CSS Grid/Flexbox provides reliable, predictable layouts
+- AI models are extensively trained on HTML/CSS
+- Multi-panel diagrams work correctly with CSS Grid
+- The image model sees a concrete layout reference instead of inferring from text
+- Reduces "hallucinated" layouts and misaligned elements
+
+**Workflow:**
+```bash
+# Generate diagram using HTML intermediate
+python blog/generate_image.py "<diagram description>" --post <post-dir> --out blog/<post-dir>/images/<NN-name>.png --structured --save-html
+
+# Multi-panel diagram (auto-detected from description)
+python blog/generate_image.py "4-panel diagram showing Panel 1) ..., Panel 2) ..., Panel 3) ..., Panel 4) ..." \
+  --post <post-dir> --out blog/<post-dir>/images/<NN-name>.png --structured --save-html
+
+# Use different models for HTML vs final image (faster/cheaper HTML generation)
+python blog/generate_image.py "<diagram description>" --post <post-dir> --out blog/<post-dir>/images/<NN-name>.png \
+  --structured --html-model gemini-2.5-pro --save-html
+```
+
+**Options:**
+- `--structured`: Enable HTML/CSS intermediate mode for structured diagrams
+- `--save-html`: Save intermediate HTML and its rendered PNG reference
+- `--html-model <model>`: Model for HTML generation (defaults to --model, use gemini-2.5-pro for faster/cheaper HTML)
+- `--aspect 4:3`, `16:9`, or `1:1`: Diagram aspect ratio (default: 16:9)
+- `--size 1K`, `2K`, or `4K`: Output size (default: 2K)
+
+**Prerequisites:**
+```bash
+pip install playwright google-genai
+playwright install chromium
+```
+
+**How it works:**
+1. Generate HTML/CSS from the prompt (structural layout with labels, boxes, arrows)
+2. For multi-panel: generate separate HTML for each panel, combine in CSS Grid
+3. Render HTML via Playwright (this is the "reference" layout)
+4. Generate final image using the reference as a visual guide
+5. (Optional) Critique final image against reference for structural accuracy
+
+**When to use:**
+- Complex structural diagrams (B-tree pages, memory layouts, flowcharts)
+- Multi-panel progression diagrams (before/after, step-by-step)
+- When standard agentic mode produces misaligned elements
+- Diagrams with specific spatial relationships that matter
+
+**When NOT to use:**
+- Hero images, photos, or conceptual art (use `generate_image.py` instead)
+- Simple diagrams where structure is less critical
+
 ## QA checklist
 - Keep **TO VERIFY** tags until verified against code or notes.
 - Confirm the plan matches the thin-slice scope.
-- Ensure images were generated with `blog/generate_image.py`, stored under `blog/<post-dir>/images/`, and filenames match the post markdown.
+- Ensure images were generated with `blog/generate_image.py` (photos/heroes, diagrams with `--structured`), stored under `blog/<post-dir>/images/`, and filenames match the post markdown.
 
 ---
 
@@ -185,7 +240,8 @@ Produce a complete markdown post that follows the plan exactly, in the establish
 - Do not add new topics or extra slices.
 - Include 2–4 inline images as markdown: `![Alt](images/<NN-filename>.png)`.
 - Image filenames must be prefixed in order of appearance: `01-`, `02-`, `03-`, ...
-- Generate images by running `python blog/generate_image.py "<prompt>" --post <post-dir> --out blog/<post-dir>/images/<NN-short-name>.png`.
+- For photos/hero images: `python blog/generate_image.py "<prompt>" --post <post-dir> --out blog/<post-dir>/images/<NN-short-name>.png`
+- For technical diagrams (especially trees or multi-panel): `python blog/generate_image.py "<prompt>" --post <post-dir> --out blog/<post-dir>/images/<NN-short-name>.png --structured --save-html`
 - If a fact is uncertain, mark it inline as **TO VERIFY** and keep going.
 - Do not invent code details; only reference file paths or structs if the plan says they exist.
 - Avoid markdown links unless the plan explicitly provides them.
@@ -234,5 +290,5 @@ Return a single markdown document with:
 ## After writing
 - Ensure all **TO VERIFY** flags are still present (do not resolve them).
 - Ensure all images mentioned in the plan are included.
-- Ensure each image was generated with `blog/generate_image.py`, stored under `blog/<post-dir>/images/`, and matches the prompt.
+- Ensure each image was generated with `blog/generate_image.py` (photos/heroes, diagrams with `--structured`), stored under `blog/<post-dir>/images/`, and matches the prompt.
 - Ensure the post matches the thin-slice scope.
