@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::core::errors::WrongoDBError;
 use crate::txn::{
-    GlobalTxnState, TxnId, Update, UpdateChain, UpdateType, TS_NONE, TXN_ABORTED,
+    GlobalTxnState, Transaction, TxnId, Update, UpdateChain, UpdateType, TS_NONE, TXN_ABORTED,
 };
 
 use super::BTree;
@@ -101,7 +101,11 @@ impl MvccState {
 }
 
 impl BTree {
-    pub fn get_version(&mut self, key: &[u8], txn_id: TxnId) -> Result<Option<Vec<u8>>, WrongoDBError> {
+    pub fn get_version(
+        &mut self,
+        key: &[u8],
+        txn: Option<&Transaction>,
+    ) -> Result<Option<Vec<u8>>, WrongoDBError> {
         if let Some(chain) = self.mvcc.chain(key) {
             for update in chain.iter() {
                 let is_aborted = update.time_window.stop_txn == crate::txn::TXN_ABORTED
@@ -110,12 +114,19 @@ impl BTree {
                     continue;
                 }
 
-                if update.txn_id <= txn_id {
-                    if update.type_ == UpdateType::Standard {
-                        return Ok(Some(update.data.clone()));
-                    } else if update.type_ == UpdateType::Tombstone {
-                        return Ok(None);
-                    }
+                let visible = match txn {
+                    Some(txn) => txn.can_see(update),
+                    // Non-transactional readers only see committed updates.
+                    None => update.time_window.start_ts != TS_NONE,
+                };
+                if !visible {
+                    continue;
+                }
+
+                if update.type_ == UpdateType::Standard {
+                    return Ok(Some(update.data.clone()));
+                } else if update.type_ == UpdateType::Tombstone {
+                    return Ok(None);
                 }
             }
         }

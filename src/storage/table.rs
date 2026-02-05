@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::index::IndexCatalog;
 use crate::storage::btree::BTree;
-use crate::txn::{GlobalTxnState, TxnId};
+use crate::txn::{GlobalTxnState, Transaction};
 use crate::WrongoDBError;
 
 /// A low-level storage table, wrapping a BTree.
@@ -65,7 +65,7 @@ impl Table {
         &mut self,
         start_key: Option<&[u8]>,
         end_key: Option<&[u8]>,
-        txn_id: TxnId,
+        txn: Option<&Transaction>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
         let entries = self
             .btree
@@ -80,7 +80,7 @@ impl Table {
 
         let mut out = Vec::new();
         for key in keys {
-            if let Some(bytes) = self.btree.get_version(&key, txn_id)? {
+            if let Some(bytes) = self.btree.get_version(&key, txn)? {
                 out.push((key, bytes));
             }
         }
@@ -134,8 +134,12 @@ impl Table {
         Ok(true)
     }
 
-    pub fn get_version(&mut self, key: &[u8], txn_id: TxnId) -> Result<Option<Vec<u8>>, WrongoDBError> {
-        self.btree.get_version(key, txn_id)
+    pub fn get_version(
+        &mut self,
+        key: &[u8],
+        txn: Option<&Transaction>,
+    ) -> Result<Option<Vec<u8>>, WrongoDBError> {
+        self.btree.get_version(key, txn)
     }
 
     #[allow(dead_code)]

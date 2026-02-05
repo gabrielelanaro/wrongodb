@@ -330,10 +330,9 @@ fn index_cursor_range_scan_returns_ids() {
     cursor.set_range(Some(start), Some(end));
 
     let txn = session.transaction().unwrap();
-    let txn_id = txn.as_ref().id();
 
     let mut ids = Vec::new();
-    while let Some((key, _)) = cursor.next(txn_id).unwrap() {
+    while let Some((key, _)) = cursor.next(Some(txn.as_ref())).unwrap() {
         if let Some(id) = decode_index_id(&key).unwrap() {
             ids.push(id);
         }
@@ -361,9 +360,8 @@ fn index_cursor_is_read_only() {
 
     let mut cursor = session.open_cursor("index:test:name").unwrap();
     let txn = session.transaction().unwrap();
-    let txn_id = txn.as_ref().id();
 
-    let err = cursor.insert(b"bad", b"write", txn_id).unwrap_err();
+    let err = cursor.insert(b"bad", b"write", txn.as_ref()).unwrap_err();
     assert!(err.to_string().contains("read-only"));
 
     txn.abort().unwrap();

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::storage::table::Table;
-use crate::txn::TxnId;
+use crate::txn::Transaction;
 use crate::WrongoDBError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,17 +41,19 @@ impl Cursor {
         self.reset();
     }
 
-    pub fn insert(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+    pub fn insert(&mut self, key: &[u8], value: &[u8], txn: &Transaction) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
+        let txn_id = txn.id();
         let mut table = self.table.write();
-        if table.get_version(key, txn_id)?.is_some() {
+        if table.get_version(key, Some(txn))?.is_some() {
             return Err(crate::core::errors::DocumentValidationError("duplicate key error".into()).into());
         }
         table.insert_mvcc(key, value, txn_id)
     }
 
-    pub fn update(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+    pub fn update(&mut self, key: &[u8], value: &[u8], txn: &Transaction) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
+        let txn_id = txn.id();
         let mut table = self.table.write();
         let result = table.update_mvcc(key, value, txn_id)?;
         if !result {
@@ -62,8 +64,9 @@ impl Cursor {
         Ok(())
     }
 
-    pub fn delete(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+    pub fn delete(&mut self, key: &[u8], txn: &Transaction) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
+        let txn_id = txn.id();
         let mut table = self.table.write();
         let result = table.delete_mvcc(key, txn_id)?;
         if !result {
@@ -74,18 +77,18 @@ impl Cursor {
         Ok(())
     }
 
-    pub fn get(&mut self, key: &[u8], txn_id: TxnId) -> Result<Option<Vec<u8>>, WrongoDBError> {
+    pub fn get(&mut self, key: &[u8], txn: Option<&Transaction>) -> Result<Option<Vec<u8>>, WrongoDBError> {
         let mut table = self.table.write();
-        table.get_version(key, txn_id)
+        table.get_version(key, txn)
     }
 
-    pub fn next(&mut self, txn_id: TxnId) -> Result<Option<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
+    pub fn next(&mut self, txn: Option<&Transaction>) -> Result<Option<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
         if self.exhausted {
             return Ok(None);
         }
 
         if self.buffer_pos >= self.buffered_entries.len() {
-            self.refill_buffer(txn_id)?;
+            self.refill_buffer(txn)?;
 
             if self.buffered_entries.is_empty() {
                 self.exhausted = true;
@@ -105,7 +108,7 @@ impl Cursor {
         }
     }
 
-    fn refill_buffer(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
+    fn refill_buffer(&mut self, txn: Option<&Transaction>) -> Result<(), WrongoDBError> {
         let mut table = self.table.write();
 
         let mut start_key = self.range_start.as_deref();
@@ -115,7 +118,7 @@ impl Cursor {
             skip_start = true;
         }
 
-        let entries = table.scan_range(start_key, self.range_end.as_deref(), txn_id)?;
+        let entries = table.scan_range(start_key, self.range_end.as_deref(), txn)?;
 
         if skip_start && !entries.is_empty() {
             if let Some(start) = start_key {

@@ -1,5 +1,21 @@
 # Decisions
 
+## 2026-02-05: Enforce snapshot visibility on read path
+
+**Decision**
+- Change MVCC read APIs to accept a transaction read context (`Option<&Transaction>`) instead of only `TxnId`.
+- Apply visibility checks via `Transaction::can_see(...)` in `BTree::get_version`.
+- Treat non-transactional reads as committed-only for in-memory MVCC updates (`start_ts != TS_NONE`).
+
+**Why**
+- The prior read path used `update.txn_id <= reader_txn_id`, which leaked uncommitted writes across sessions.
+- Snapshot metadata already existed but was effectively bypassed by storage reads.
+
+**Notes**
+- Read context now flows through `Collection -> Cursor -> Table -> BTree`.
+- Write APIs continue to use transaction IDs for WAL/MVCC write records.
+- Added a regression test to ensure uncommitted writes are not visible from other sessions.
+
 ## 2026-02-02: Table-owned index catalog + Session-only transactions
 
 **Decision**

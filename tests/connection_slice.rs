@@ -12,10 +12,9 @@ fn test_connection_basic() {
     let mut cursor = session.open_cursor("table:test").unwrap();
     {
         let txn = session.transaction().unwrap();
-        let txn_id = txn.as_ref().id();
-        cursor.insert(b"key1", b"value1", txn_id).unwrap();
+        cursor.insert(b"key1", b"value1", txn.as_ref()).unwrap();
 
-        let value = cursor.get(b"key1", txn_id).unwrap().unwrap();
+        let value = cursor.get(b"key1", Some(txn.as_ref())).unwrap().unwrap();
         assert_eq!(value, b"value1");
 
         txn.commit().unwrap();
@@ -35,14 +34,13 @@ fn test_connection_with_config() {
     let mut cursor = session.open_cursor("table:users").unwrap();
     {
         let txn = session.transaction().unwrap();
-        let txn_id = txn.as_ref().id();
-        cursor.insert(b"user1", b"alice", txn_id).unwrap();
-        cursor.insert(b"user2", b"bob", txn_id).unwrap();
+        cursor.insert(b"user1", b"alice", txn.as_ref()).unwrap();
+        cursor.insert(b"user2", b"bob", txn.as_ref()).unwrap();
 
-        let value = cursor.get(b"user1", txn_id).unwrap().unwrap();
+        let value = cursor.get(b"user1", Some(txn.as_ref())).unwrap().unwrap();
         assert_eq!(value, b"alice");
 
-        let value = cursor.get(b"user2", txn_id).unwrap().unwrap();
+        let value = cursor.get(b"user2", Some(txn.as_ref())).unwrap().unwrap();
         assert_eq!(value, b"bob");
 
         txn.commit().unwrap();
@@ -61,18 +59,17 @@ fn test_cursor_delete() {
     let mut cursor = session.open_cursor("table:items").unwrap();
     {
         let txn = session.transaction().unwrap();
-        let txn_id = txn.as_ref().id();
-        cursor.insert(b"item1", b"apple", txn_id).unwrap();
-        cursor.insert(b"item2", b"banana", txn_id).unwrap();
+        cursor.insert(b"item1", b"apple", txn.as_ref()).unwrap();
+        cursor.insert(b"item2", b"banana", txn.as_ref()).unwrap();
 
-        let value = cursor.get(b"item1", txn_id).unwrap().unwrap();
+        let value = cursor.get(b"item1", Some(txn.as_ref())).unwrap().unwrap();
         assert_eq!(value, b"apple");
 
-        cursor.delete(b"item1", txn_id).unwrap();
+        cursor.delete(b"item1", txn.as_ref()).unwrap();
 
-        assert!(cursor.get(b"item1", txn_id).unwrap().is_none());
+        assert!(cursor.get(b"item1", Some(txn.as_ref())).unwrap().is_none());
 
-        let value = cursor.get(b"item2", txn_id).unwrap().unwrap();
+        let value = cursor.get(b"item2", Some(txn.as_ref())).unwrap().unwrap();
         assert_eq!(value, b"banana");
 
         txn.commit().unwrap();

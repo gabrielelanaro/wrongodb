@@ -151,8 +151,7 @@ impl Session {
     /// let mut cursor = session.open_cursor("table:test").unwrap();
     /// {
     ///     let mut txn = session.transaction().unwrap();
-    ///     let txn_id = txn.as_ref().id();
-    ///     cursor.insert(b"key", b"value", txn_id).unwrap();
+    ///     cursor.insert(b"key", b"value", txn.as_ref()).unwrap();
     ///     txn.commit().unwrap();
     /// }
     /// ```

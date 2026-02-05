@@ -105,7 +105,7 @@ impl PersistentIndex {
 
         let entries = {
             let mut table = self.table.write();
-            table.scan_range(Some(&start_key), Some(&end_key), crate::txn::TXN_NONE)?
+            table.scan_range(Some(&start_key), Some(&end_key), None)?
         };
 
         let mut ids = Vec::new();

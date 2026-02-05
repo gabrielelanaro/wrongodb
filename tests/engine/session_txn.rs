@@ -75,6 +75,35 @@ fn session_txn_read_your_own_writes() {
 }
 
 #[test]
+fn session_txn_uncommitted_write_not_visible_across_sessions() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("db");
+
+    let db = WrongoDB::open(&path).unwrap();
+    let coll = db.collection("test");
+
+    let mut session1 = db.open_session();
+    let mut txn1 = session1.transaction().unwrap();
+    let doc = coll
+        .insert_one(txn1.session_mut(), json!({"_id": "x", "name": "alice"}))
+        .unwrap();
+    let id = doc.get("_id").unwrap().clone();
+
+    let mut session2 = db.open_session();
+    let before_commit = coll
+        .find_one(&mut session2, Some(json!({"_id": id.clone()})))
+        .unwrap();
+    assert!(before_commit.is_none());
+
+    txn1.commit().unwrap();
+
+    let after_commit = coll
+        .find_one(&mut session2, Some(json!({"_id": id})))
+        .unwrap();
+    assert!(after_commit.is_some());
+}
+
+#[test]
 fn session_txn_update_and_commit() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("db");
