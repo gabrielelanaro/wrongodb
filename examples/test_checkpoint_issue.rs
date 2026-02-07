@@ -21,7 +21,9 @@ fn main() {
             let key = format!("key{}", i);
             let value = format!("value{}", i);
             println!("Inserting: {}", key);
-            cursor.insert(key.as_bytes(), value.as_bytes(), txn_id).unwrap();
+            cursor
+                .insert(key.as_bytes(), value.as_bytes(), txn_id)
+                .unwrap();
         }
 
         txn.commit().unwrap();
@@ -40,7 +42,9 @@ fn main() {
             let key = format!("key{}", i);
             let value = format!("value{}", i);
             println!("Inserting: {}", key);
-            cursor.insert(key.as_bytes(), value.as_bytes(), txn_id).unwrap();
+            cursor
+                .insert(key.as_bytes(), value.as_bytes(), txn_id)
+                .unwrap();
         }
 
         txn.commit().unwrap();

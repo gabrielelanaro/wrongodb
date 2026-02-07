@@ -1,5 +1,5 @@
 mod collection;
-mod db;
+mod database;
 
 pub use collection::{Collection, IndexInfo, UpdateResult};
-pub use db::{DbStats, WrongoDB, WrongoDBConfig};
+pub use database::{DbStats, WrongoDB, WrongoDBConfig};

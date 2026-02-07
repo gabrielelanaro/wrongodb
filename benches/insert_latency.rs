@@ -42,17 +42,20 @@ fn sequential_key(i: usize) -> String {
     format!("key_{:010}", i)
 }
 
-fn pre_populate(db: &mut WrongoDB, count: usize) {
+fn pre_populate(db: &WrongoDB, count: usize) {
     let data = generate_data(VALUE_SIZE);
-    let coll = db.collection("test").expect("Failed to open collection");
+    let coll = db.collection("test");
+    let mut session = db.open_session();
     for i in 0..count {
         let key = sequential_key(i);
         let doc = json!({
             "_id": key,
             "data": &data
         });
-        coll.insert_one(doc).expect("Failed to insert");
+        coll.insert_one(&mut session, doc)
+            .expect("Failed to insert");
     }
+    coll.checkpoint(&mut session).expect("Failed to checkpoint");
 }
 
 fn insert_latency(c: &mut Criterion) {
@@ -69,8 +72,8 @@ fn insert_latency(c: &mut Criterion) {
         let db_name = format!("bench_{}_entries", db_size);
 
         // Setup: Create database and pre-populate
-        let mut db = create_db(&db_name);
-        pre_populate(&mut db, *db_size);
+        let db = create_db(&db_name);
+        pre_populate(&db, *db_size);
 
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{}_entries", db_size)),
@@ -87,8 +90,9 @@ fn insert_latency(c: &mut Criterion) {
                         "data": &data
                     });
                     {
-                        let coll = db.collection("test").expect("Failed to open collection");
-                        coll.insert_one(doc).expect("Insert failed");
+                        let coll = db.collection("test");
+                        let mut session = db.open_session();
+                        coll.insert_one(&mut session, doc).expect("Insert failed");
                     }
                     black_box(&db);
                 });

@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
-use crate::storage::global_wal::GlobalWal;
 use crate::storage::table::Table;
+use crate::storage::wal::GlobalWal;
 use crate::txn::GlobalTxnState;
 use crate::WrongoDBError;
 

@@ -30,13 +30,17 @@ This repo evolves step by step. Check [PLAN.md](PLAN.md) to see where we are goi
 
 The codebase is organized by domain to keep storage, engine, and server concerns separate:
 
+- `src/api/`: connection/session/cursor APIs and handle cache.
 - `src/core/`: shared types/utilities (BSON codec, document helpers, errors).
 - `src/storage/`: on-disk storage (block file, B-tree, WAL, main table).
 - `src/index/`: secondary index implementation and key encoding.
 - `src/engine/`: database API and collection logic.
 - `src/server/`: MongoDB wire-protocol server and command handlers.
 
-Integration tests are grouped under `tests/` with entry points (e.g. `tests/storage.rs`) that include submodules in `tests/storage/`, `tests/engine/`, etc.
+Integration tests are grouped under `tests/` with explicit suite entrypoints:
+`tests/engine_suite.rs`, `tests/storage_suite.rs`, `tests/server_suite.rs`,
+`tests/smoke_suite.rs`, and `tests/connection_suite.rs`.
+Each suite loads domain folders such as `tests/engine/` and `tests/storage/`.
 
 ## Install
 
@@ -57,21 +61,22 @@ use wrongodb::WrongoDB;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Open database (WAL enabled by default)
-    let mut db = WrongoDB::open("data/db.log")?;
+    let db = WrongoDB::open("data/db")?;
 
     // Get collection
-    let mut coll = db.collection("test")?;
+    let coll = db.collection("test");
+    let mut session = db.open_session();
 
     // Create indexes for faster queries (optional)
-    coll.create_index("name")?;
+    coll.create_index(&mut session, "name")?;
 
     // Insert documents
-    coll.insert_one(json!({"name": "alice", "age": 30}))?;
-    coll.insert_one(json!({"name": "bob", "age": 25}))?;
+    coll.insert_one(&mut session, json!({"name": "alice", "age": 30}))?;
+    coll.insert_one(&mut session, json!({"name": "bob", "age": 25}))?;
 
     // Query (uses index if available, otherwise scans)
-    println!("{:?}", coll.find(None)?); // all docs
-    println!("{:?}", coll.find(Some(json!({"name": "bob"})))?);
+    println!("{:?}", coll.find(&mut session, None)?); // all docs
+    println!("{:?}", coll.find(&mut session, Some(json!({"name": "bob"})))?);
     Ok(())
 }
 ```

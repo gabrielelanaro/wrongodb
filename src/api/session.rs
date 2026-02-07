@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
+use crate::api::cursor::{Cursor, CursorKind};
+use crate::api::data_handle_cache::DataHandleCache;
 use crate::core::errors::StorageError;
-use crate::cursor::{Cursor, CursorKind};
-use crate::datahandle_cache::DataHandleCache;
-use crate::storage::global_wal::GlobalWal;
 use crate::storage::table::Table;
+use crate::storage::wal::GlobalWal;
 use crate::txn::{GlobalTxnState, Transaction};
 use crate::WrongoDBError;
 

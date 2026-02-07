@@ -9,8 +9,8 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::storage::global_wal::GlobalWal;
 use crate::storage::table::Table;
+use crate::storage::wal::GlobalWal;
 use crate::txn::{GlobalTxnState, TxnId, TXN_NONE};
 use crate::{Document, WrongoDBError};
 

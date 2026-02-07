@@ -31,8 +31,8 @@ fn range_scan_works_with_cache_eviction() {
 
     // Now iterate over all keys - this should work even with eviction
     let mut count = 0;
-    let mut iter = btree.range(None, None).unwrap();
-    while let Some(result) = iter.next() {
+    let iter = btree.range(None, None).unwrap();
+    for result in iter {
         let (k, v): (Vec<u8>, Vec<u8>) = result.unwrap();
         assert!(k.starts_with(b"key"));
         assert!(v.starts_with(b"value"));
