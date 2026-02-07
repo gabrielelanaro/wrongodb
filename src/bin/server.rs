@@ -5,24 +5,36 @@ use wrongodb::{start_server, WrongoDB};
 
 fn print_usage_and_exit(exit_code: i32) -> ! {
     eprintln!(
-        "Usage: wrongodb-server [--addr <HOST:PORT>] [--port <PORT>] [ADDR]\n\
+        "Usage: wrongodb-server [--addr <HOST:PORT>] [--port <PORT>] [--db-path <PATH>] [ADDR]\n\
          \n\
          Options:\n\
            --addr, -a   Full address to bind, e.g. 127.0.0.1:27017\n\
            --port, -p   Port to bind on 127.0.0.1\n\
+           --db-path    Database directory path (default: test.db)\n\
            --help, -h   Show this help message\n\
          \n\
          Notes:\n\
            * If both --addr and --port are provided, --addr wins.\n\
-           * Legacy positional ADDR is still supported."
+           * Legacy positional ADDR is still supported.\n\
+           * DB path can also be set via WRONGO_DB_PATH."
     );
     std::process::exit(exit_code);
 }
 
-fn parse_args() -> (Option<String>, Option<String>, Option<String>) {
-    let mut addr_flag: Option<String> = None;
-    let mut port_flag: Option<String> = None;
-    let mut positional_addr: Option<String> = None;
+struct ParsedArgs {
+    addr_flag: Option<String>,
+    port_flag: Option<String>,
+    db_path_flag: Option<String>,
+    positional_addr: Option<String>,
+}
+
+fn parse_args() -> ParsedArgs {
+    let mut parsed = ParsedArgs {
+        addr_flag: None,
+        port_flag: None,
+        db_path_flag: None,
+        positional_addr: None,
+    };
 
     let mut iter = std::env::args().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -33,28 +45,38 @@ fn parse_args() -> (Option<String>, Option<String>, Option<String>) {
                     eprintln!("error: --addr requires a value");
                     print_usage_and_exit(2);
                 });
-                addr_flag = Some(value);
+                parsed.addr_flag = Some(value);
             }
             "--port" | "-p" => {
                 let value = iter.next().unwrap_or_else(|| {
                     eprintln!("error: --port requires a value");
                     print_usage_and_exit(2);
                 });
-                port_flag = Some(value);
+                parsed.port_flag = Some(value);
+            }
+            "--db-path" => {
+                let value = iter.next().unwrap_or_else(|| {
+                    eprintln!("error: --db-path requires a value");
+                    print_usage_and_exit(2);
+                });
+                parsed.db_path_flag = Some(value);
             }
             _ if arg.starts_with("--addr=") => {
-                addr_flag = Some(arg["--addr=".len()..].to_string());
+                parsed.addr_flag = Some(arg["--addr=".len()..].to_string());
             }
             _ if arg.starts_with("--port=") => {
-                port_flag = Some(arg["--port=".len()..].to_string());
+                parsed.port_flag = Some(arg["--port=".len()..].to_string());
+            }
+            _ if arg.starts_with("--db-path=") => {
+                parsed.db_path_flag = Some(arg["--db-path=".len()..].to_string());
             }
             _ if arg.starts_with('-') => {
                 eprintln!("error: unknown option '{arg}'");
                 print_usage_and_exit(2);
             }
             _ => {
-                if positional_addr.is_none() {
-                    positional_addr = Some(arg);
+                if parsed.positional_addr.is_none() {
+                    parsed.positional_addr = Some(arg);
                 } else {
                     eprintln!("error: unexpected extra argument '{arg}'");
                     print_usage_and_exit(2);
@@ -63,19 +85,17 @@ fn parse_args() -> (Option<String>, Option<String>, Option<String>) {
         }
     }
 
-    (addr_flag, port_flag, positional_addr)
+    parsed
 }
 
-fn server_addr() -> String {
-    let (addr_flag, port_flag, positional_addr) = parse_args();
-
-    if let Some(addr) = addr_flag {
+fn server_addr(parsed: &ParsedArgs) -> String {
+    if let Some(addr) = parsed.addr_flag.clone() {
         return addr;
     }
-    if let Some(port) = port_flag {
+    if let Some(port) = parsed.port_flag.clone() {
         return format!("127.0.0.1:{port}");
     }
-    if let Some(addr) = positional_addr {
+    if let Some(addr) = parsed.positional_addr.clone() {
         return addr;
     }
     if let Ok(addr) = std::env::var("WRONGO_ADDR") {
@@ -91,11 +111,24 @@ fn server_addr() -> String {
     "127.0.0.1:27017".to_string()
 }
 
+fn db_path(parsed: &ParsedArgs) -> String {
+    if let Some(path) = parsed.db_path_flag.clone() {
+        return path;
+    }
+    if let Ok(path) = std::env::var("WRONGO_DB_PATH") {
+        if !path.is_empty() {
+            return path;
+        }
+    }
+    "test.db".to_string()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let db = WrongoDB::open("test.db")?;
+    let parsed = parse_args();
+    let db = WrongoDB::open(db_path(&parsed))?;
     let db = Arc::new(Mutex::new(db));
-    let addr = server_addr();
+    let addr = server_addr(&parsed);
     start_server(&addr, db).await?;
     Ok(())
 }

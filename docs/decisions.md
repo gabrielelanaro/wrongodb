@@ -1,5 +1,33 @@
 # Decisions
 
+## 2026-02-07: Wire-protocol A/B benchmark gate for concurrency refactor decisions
+
+**Decision**
+- Add a dedicated benchmark binary `bench_wire_ab` that drives both WrongoDB and MongoDB through the MongoDB wire protocol.
+- Run MongoDB in Docker (pinned image default `mongo:7.0`) and WrongoDB as `wrongodb-server` with isolated `--db-path`.
+- Standardize MVP workload defaults:
+  - scenarios: `insert_unique`, `update_hotspot`
+  - concurrencies: `1,4,8,16,32,64`
+  - warmup/measure: `15s/60s`
+  - repetitions: `3`
+- Emit benchmark artifacts in `target/benchmarks/wire_ab/`:
+  - `results.csv` (per-point latency/throughput/error rows)
+  - `gate.json` (classification + scaling metrics)
+  - `summary.md` (human-readable table and rationale)
+- Classify with a scaling-based gate from `insert_unique` medians:
+  - `RECOMMEND_REFACTOR` when WrongoDB scaling is flat while MongoDB scales and Wrongo p95 grows sharply
+  - `DEFER_REFACTOR` when Wrongo scales adequately or scale gap is small
+  - `INCONCLUSIVE` for missing required points or elevated error rates
+
+**Why**
+- We need data before paying complexity cost for lock-granularity refactors.
+- A wire-protocol benchmark isolates server + concurrency behavior in the exact path clients use.
+- Structured outputs make decisions reproducible and comparable across iterations.
+
+**Notes**
+- This benchmark is local-first and not CI-gated in the MVP phase.
+- Durability remains backend-default for now; relaxed durability comparisons can be added later if needed.
+
 ## 2026-02-07: Normalize repository layout around domain modules and suite entrypoints
 
 **Decision**

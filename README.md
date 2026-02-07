@@ -91,8 +91,32 @@ wrongodb-server
 ```
 
 You can also set the listen address with `--addr`, `--port`, `WRONGO_ADDR`, or `WRONGO_PORT`.
+For benchmark isolation, you can set data path with `--db-path` or `WRONGO_DB_PATH`.
 
 Run tests with `cargo test`.
+
+## Benchmarking
+
+Run wire-protocol A/B benchmarks (WrongoDB vs MongoDB via Docker):
+
+```bash
+just bench-wire-ab
+```
+
+This runs `bench_wire_ab` with defaults:
+
+- warmup: `15s`
+- measure: `60s`
+- concurrency: `1,4,8,16,32,64`
+- scenario: `all` (`insert_unique` and `update_hotspot`)
+- repetitions: `3`
+- mongo image: `mongo:7.0`
+
+Artifacts are written to:
+
+- `target/benchmarks/wire_ab/results.csv`
+- `target/benchmarks/wire_ab/gate.json`
+- `target/benchmarks/wire_ab/summary.md`
 
 ## Release
 
