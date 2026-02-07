@@ -301,6 +301,10 @@ impl IndexCatalog {
         self.definitions.contains_key(name)
     }
 
+    pub fn has_indexes(&self) -> bool {
+        !self.definitions.is_empty()
+    }
+
     pub fn index_definition(&self, name: &str) -> Option<&IndexDefinition> {
         self.definitions.get(name)
     }

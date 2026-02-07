@@ -1,5 +1,7 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
 
@@ -19,6 +21,8 @@ pub struct Session {
     cache: Arc<DataHandleCache>,
     base_path: PathBuf,
     wal_enabled: bool,
+    wal_sync_interval_ms: u64,
+    wal_last_sync_ms: Arc<AtomicU64>,
     global_wal: Option<Arc<Mutex<GlobalWal>>>,
     global_txn: Arc<GlobalTxnState>,
     txn: Option<SessionTxnContext>,
@@ -29,6 +33,8 @@ impl Session {
         cache: Arc<DataHandleCache>,
         base_path: PathBuf,
         wal_enabled: bool,
+        wal_sync_interval_ms: u64,
+        wal_last_sync_ms: Arc<AtomicU64>,
         global_wal: Option<Arc<Mutex<GlobalWal>>>,
         global_txn: Arc<GlobalTxnState>,
     ) -> Self {
@@ -36,6 +42,8 @@ impl Session {
             cache,
             base_path,
             wal_enabled,
+            wal_sync_interval_ms,
+            wal_last_sync_ms,
             global_wal,
             global_txn,
             txn: None,
@@ -205,31 +213,41 @@ impl<'a> SessionTxn<'a> {
     /// Commits the transaction across all touched tables.
     pub fn commit(mut self) -> Result<(), WrongoDBError> {
         if let Some(mut ctx) = self.session.txn.take() {
-            let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
             let txn_id = ctx.txn.id();
 
             if self.session.wal_enabled {
                 if let Some(global_wal) = self.session.global_wal.as_ref() {
                     let mut wal = global_wal.lock();
                     wal.log_txn_commit(txn_id, txn_id)?;
-                    wal.sync()?;
+                    if self.session.wal_sync_interval_ms == 0 {
+                        wal.sync()?;
+                    } else {
+                        let now = now_millis();
+                        let last_sync = self.session.wal_last_sync_ms.load(Ordering::Acquire);
+                        if now.saturating_sub(last_sync) >= self.session.wal_sync_interval_ms
+                            && self
+                                .session
+                                .wal_last_sync_ms
+                                .compare_exchange(
+                                    last_sync,
+                                    now,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_ok()
+                        {
+                            if let Err(err) = wal.sync() {
+                                self.session
+                                    .wal_last_sync_ms
+                                    .store(last_sync, Ordering::Release);
+                                return Err(err);
+                            }
+                        }
+                    }
                 }
             }
 
             ctx.txn.commit(&self.session.global_txn)?;
-
-            for uri in &touched_tables {
-                if !uri.starts_with("table:") {
-                    continue;
-                }
-                let collection = &uri[6..];
-                let table = self.session.get_primary_table(collection, false)?;
-                let mut table_guard = table.write();
-                table_guard.mark_updates_committed(txn_id)?;
-                if let Some(catalog) = table_guard.index_catalog_mut() {
-                    catalog.mark_updates_committed(txn_id)?;
-                }
-            }
         }
         self.committed = true;
         Ok(())
@@ -348,6 +366,13 @@ fn parse_index_uri(uri: &str) -> Result<(&str, &str), WrongoDBError> {
         ))));
     }
     Ok((collection, index))
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 // SAFETY: SessionTxn holds &mut Session, so it's !Send by default.

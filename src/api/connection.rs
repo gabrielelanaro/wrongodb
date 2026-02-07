@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 
@@ -18,11 +20,18 @@ use crate::WrongoDBError;
 
 pub struct ConnectionConfig {
     pub wal_enabled: bool,
+    /// WAL fsync policy:
+    /// - 0 = sync on every commit (strict durability)
+    /// - N > 0 = at most one sync every N milliseconds (group sync)
+    pub wal_sync_interval_ms: u64,
 }
 
 impl Default for ConnectionConfig {
     fn default() -> Self {
-        Self { wal_enabled: true }
+        Self {
+            wal_enabled: true,
+            wal_sync_interval_ms: 100,
+        }
     }
 }
 
@@ -35,12 +44,24 @@ impl ConnectionConfig {
         self.wal_enabled = enabled;
         self
     }
+
+    pub fn wal_sync_interval_ms(mut self, interval_ms: u64) -> Self {
+        self.wal_sync_interval_ms = interval_ms;
+        self
+    }
+
+    pub fn wal_sync_immediate(mut self) -> Self {
+        self.wal_sync_interval_ms = 0;
+        self
+    }
 }
 
 pub struct Connection {
     base_path: PathBuf,
     dhandle_cache: Arc<DataHandleCache>,
     wal_enabled: bool,
+    wal_sync_interval_ms: u64,
+    wal_last_sync_ms: Arc<AtomicU64>,
     global_wal: Option<Arc<Mutex<GlobalWal>>>,
     global_txn: Arc<GlobalTxnState>,
 }
@@ -50,6 +71,7 @@ impl fmt::Debug for Connection {
         f.debug_struct("Connection")
             .field("base_path", &self.base_path)
             .field("wal_enabled", &self.wal_enabled)
+            .field("wal_sync_interval_ms", &self.wal_sync_interval_ms)
             .finish()
     }
 }
@@ -74,6 +96,8 @@ impl Connection {
             base_path,
             dhandle_cache: Arc::new(DataHandleCache::new(global_wal.clone())),
             wal_enabled: config.wal_enabled,
+            wal_sync_interval_ms: config.wal_sync_interval_ms,
+            wal_last_sync_ms: Arc::new(AtomicU64::new(now_millis())),
             global_wal,
             global_txn,
         })
@@ -84,6 +108,8 @@ impl Connection {
             self.dhandle_cache.clone(),
             self.base_path.clone(),
             self.wal_enabled,
+            self.wal_sync_interval_ms,
+            self.wal_last_sync_ms.clone(),
             self.global_wal.clone(),
             self.global_txn.clone(),
         )
@@ -235,4 +261,11 @@ fn ensure_replay_tree<'a>(
     replay_trees
         .get_mut(store_name)
         .ok_or_else(|| StorageError(format!("replay tree missing for store {store_name}")).into())
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }

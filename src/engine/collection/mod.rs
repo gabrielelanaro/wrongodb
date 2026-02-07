@@ -67,6 +67,16 @@ impl Collection {
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
         let table = session.table_handle(&self.name, false)?;
+        let has_indexes = {
+            let table_guard = table.read();
+            table_guard
+                .index_catalog()
+                .map(|catalog| catalog.has_indexes())
+                .unwrap_or(false)
+        };
+        if !has_indexes {
+            return Ok(());
+        }
         let mut table_guard = table.write();
         let catalog = table_guard
             .index_catalog_mut()
@@ -82,6 +92,16 @@ impl Collection {
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
         let table = session.table_handle(&self.name, false)?;
+        let has_indexes = {
+            let table_guard = table.read();
+            table_guard
+                .index_catalog()
+                .map(|catalog| catalog.has_indexes())
+                .unwrap_or(false)
+        };
+        if !has_indexes {
+            return Ok(());
+        }
         let mut table_guard = table.write();
         let catalog = table_guard
             .index_catalog_mut()

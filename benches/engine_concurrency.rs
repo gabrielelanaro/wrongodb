@@ -11,8 +11,10 @@ use wrongodb::{WrongoDB, WrongoDBConfig};
 
 const CONCURRENCY_LEVELS: &[usize] = &[1, 4, 8, 16];
 const PAYLOAD_SIZE: usize = 1024;
-const INSERTS_PER_WORKER: usize = 32;
-const UPDATES_PER_WORKER: usize = 8;
+// Keep per-iteration work large enough that benchmark results are dominated by DB work,
+// not thread spawn/join overhead from the harness.
+const INSERTS_PER_WORKER: usize = 512;
+const UPDATES_PER_WORKER: usize = 4096;
 
 static NEXT_DOC_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_DB_ID: AtomicU64 = AtomicU64::new(0);

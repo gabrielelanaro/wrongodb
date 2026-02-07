@@ -91,6 +91,15 @@ impl GlobalTxnState {
         !guard.is_empty()
     }
 
+    /// Check if a transaction is currently active.
+    pub fn is_active(&self, txn_id: TxnId) -> bool {
+        if txn_id == TXN_NONE {
+            return false;
+        }
+        let guard = self.active_txns.read().expect("active_txns lock poisoned");
+        guard.contains(&txn_id)
+    }
+
     /// Mark a transaction as aborted
     pub fn mark_aborted(&self, txn_id: TxnId) {
         let mut guard = self

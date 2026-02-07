@@ -1,5 +1,47 @@
 # Decisions
 
+## 2026-02-07: MVCC commit visibility is derived from global txn state
+
+**Decision**
+- Remove per-commit MVCC chain marking from the hot commit path.
+- `SessionTxn::commit` now commits only global txn state (plus WAL commit marker/sync policy), without scanning touched tables/chains.
+- `latest_committed_entries` derives committed visibility from `GlobalTxnState` (`is_active` / `is_aborted`) instead of `start_ts` mutation during commit.
+
+**Why**
+- Per-operation transactions were paying extra lock-heavy table passes on commit.
+- Commit visibility is already represented by global transaction state, so chain mutation at commit was redundant for this implementation.
+
+**Notes**
+- `mark_updates_aborted` remains as a chain scan for abort cleanup (abort path is rare).
+
+## 2026-02-07: Default WAL commit sync uses interval group-sync
+
+**Decision**
+- Add configurable WAL sync interval (`wal_sync_interval_ms`) to `ConnectionConfig` and `WrongoDBConfig`.
+- Set default to `100ms` (`0` keeps strict per-commit sync).
+- Commit path now:
+  - always writes `TxnCommit` to global WAL
+  - syncs immediately only when `wal_sync_interval_ms == 0`
+  - otherwise syncs at most once per interval using a shared connection-level clock.
+
+**Why**
+- Per-operation `fsync` dominated runtime and collapsed concurrency scaling.
+- MongoDB-style interval group-sync preserves journaling while amortizing sync cost across many commits.
+
+**Notes**
+- This is a durability/latency tradeoff: commits acknowledged within the interval may be lost on crash.
+- Users can opt into strict durability via `wal_sync_immediate()` / `wal_sync_interval_ms(0)`.
+
+## 2026-02-07: Skip index mutation lock path when collection has no indexes
+
+**Decision**
+- In `Collection::apply_index_add` / `apply_index_remove`, check `IndexCatalog::has_indexes()` first under a shared table lock.
+- If no secondary indexes exist, return early and avoid acquiring the table write lock for index maintenance.
+
+**Why**
+- Write-heavy no-index workloads were paying an avoidable second table lock per operation.
+- Early return reduces lock contention in deep engine-level concurrency benchmarks.
+
 ## 2026-02-07: Add engine-level Criterion concurrency benchmark for fast inner-loop diagnosis
 
 **Decision**

@@ -83,7 +83,13 @@ impl MvccState {
                 if is_aborted {
                     continue;
                 }
-                if update.time_window.start_ts == TS_NONE {
+
+                // A version is durable-materializable if its writer transaction is committed
+                // (i.e. not active and not aborted). TXN_NONE is always committed.
+                if update.txn_id != crate::txn::TXN_NONE
+                    && (self.global.is_aborted(update.txn_id)
+                        || self.global.is_active(update.txn_id))
+                {
                     continue;
                 }
                 match update.type_ {
@@ -162,28 +168,18 @@ impl BTree {
         Ok(())
     }
 
-    /// Mark all updates from this transaction as committed in MVCC chains.
-    /// Note: This does NOT update the transaction state - that's done by Session.
+    /// Commit visibility is derived from global transaction state, so there is
+    /// no per-chain commit mark pass on the hot path.
     pub fn mark_updates_committed(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        // Update time windows for all modifications to mark them as committed
-        // We scan all chains to find updates from this transaction
-        for (_, chain) in self.mvcc.chains.iter_mut() {
-            // The head of the chain is our most recent update
-            if let Some(head) = chain.head_mut() {
-                if head.txn_id == txn_id {
-                    head.time_window.start_ts = txn_id;
-                    head.time_window.stop_ts = u64::MAX;
-                }
-            }
-        }
-
+        let _ = txn_id;
         Ok(())
     }
 
     /// Mark all updates from this transaction as aborted in MVCC chains.
     /// Note: This does NOT update the transaction state - that's done by Session.
     pub fn mark_updates_aborted(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        // Mark all updates in chains as aborted
+        // Abort is relatively rare, so we keep a full scan here and avoid tracking
+        // per-transaction touched keys on every write.
         for (_, chain) in self.mvcc.chains.iter_mut() {
             chain.mark_aborted(txn_id);
         }
