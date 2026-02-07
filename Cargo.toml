@@ -37,6 +37,10 @@ rand = "0.8"
 name = "insert_latency"
 harness = false
 
+[[bench]]
+name = "main_table_vs_append_only"
+harness = false
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

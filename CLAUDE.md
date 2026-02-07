@@ -28,11 +28,11 @@ just test
 
 # Run a specific test
 cargo test insert_and_find_roundtrip
-cargo test storage_tests::blockfile
+cargo test storage::block_file
 
 # Run tests in a specific file
-cargo test --test storage
-cargo test --test engine
+cargo test --test storage_suite
+cargo test --test engine_suite
 ```
 
 ### Lint and Format
@@ -88,14 +88,16 @@ bacon clippy
 
 ```
 src/
+├── api/         # Connection/session/cursor APIs and handle cache
 ├── core/        # Shared types: BSON codec, document helpers, errors
 ├── storage/     # On-disk storage engine (WiredTiger-inspired)
 │   ├── block/   # Block file I/O, allocation, free lists
 │   ├── btree/   # B+tree implementation, page cache, WAL
-│   └── main_table.rs  # Document storage via BTree
+│   ├── table.rs # Document storage via BTree
+│   └── wal.rs   # Connection-level global WAL
 ├── index/       # Secondary indexes, key encoding
 ├── engine/      # Database API and collection logic
-│   ├── db.rs    # WrongoDB handle, config
+│   ├── database.rs    # WrongoDB handle, config
 │   └── collection/  # Collection operations, checkpointing
 ├── server/      # MongoDB wire-protocol server
 │   └── commands/    # Command handlers (find, insert, update, delete)
@@ -113,13 +115,13 @@ The storage layer follows WiredTiger's design patterns:
 
 **BTree** (`storage/btree/mod.rs`): B+tree with leaf/internal pages, splits, and range scans. Owns the WAL handle and orchestrates recovery.
 
-**WAL** (`storage/btree/wal.rs`): Logical logging (put/delete operations, not pages). Recovery replays through normal BTree writes.
+**WAL** (`storage/wal.rs`): Connection-level logical logging (put/delete operations, not pages). Recovery replays through normal BTree writes.
 
-**MainTable** (`storage/main_table.rs`): Document storage layer. Encodes documents as BSON, uses `_id` as BTree key.
+**MainTable** (`storage/table.rs`): Document storage layer. Encodes documents as BSON, uses `_id` as BTree key.
 
 ### Engine Layer
 
-**WrongoDB** (`engine/db.rs`): Database handle. Manages multiple collections. Configuration via `WrongoDBConfig`.
+**WrongoDB** (`engine/database.rs`): Database handle. Manages multiple collections. Configuration via `WrongoDBConfig`.
 
 **Collection** (`engine/collection/mod.rs`): Primary API for CRUD operations. Owns:
 - One `MainTable` for document storage (BTree-based)
@@ -153,20 +155,29 @@ WRONGO_PREALLOC_PAGES=20000
 
 ```
 tests/
-├── storage.rs      # Entry point for storage tests
+├── storage_suite.rs
+├── engine_suite.rs
+├── server_suite.rs
+├── smoke_suite.rs
+├── connection_suite.rs
 ├── storage/
-│   ├── mod.rs      # Re-exports as `storage_tests`
-│   ├── blockfile.rs
+│   ├── mod.rs
+│   ├── block_file.rs
 │   ├── iterator_safety.rs
 │   └── btree/      # BTree-specific tests
-├── engine.rs       # Entry point for engine tests
-└── engine/
-    ├── mod.rs      # Integration tests for Collection/WrongoDB
-    ├── collection_checkpoint.rs
-    └── persistent_secondary_index.rs
+├── engine/
+│   ├── mod.rs
+│   ├── crud.rs
+│   ├── checkpoint.rs
+│   ├── indexes.rs
+│   └── transactions.rs
+├── server/
+│   └── protocol.rs
+└── connection/
+    └── basic.rs
 ```
 
-Tests use `tempfile::tempdir()` for isolation. See `tests/engine/mod.rs` for examples of roundtrip tests.
+Tests use `tempfile::tempdir()` for isolation. See `tests/engine/crud.rs` for roundtrip examples.
 
 ## Design Decisions
 

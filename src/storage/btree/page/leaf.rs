@@ -488,9 +488,9 @@ mod tests {
         assert_eq!(page.get(b"c").unwrap(), Some(b"three".to_vec()));
         assert_eq!(page.get(b"nope").unwrap(), None);
 
-        assert_eq!(page.delete(b"b").unwrap(), true);
+        assert!(page.delete(b"b").unwrap());
         assert_eq!(page.get(b"b").unwrap(), None);
-        assert_eq!(page.delete(b"b").unwrap(), false);
+        assert!(!page.delete(b"b").unwrap());
 
         page.put(b"b", b"two-again").unwrap();
         assert_eq!(page.get(b"b").unwrap(), Some(b"two-again".to_vec()));
@@ -501,14 +501,14 @@ mod tests {
         let mut buf = vec![0u8; 128];
         let mut page = LeafPage::init(&mut buf).unwrap();
 
-        page.put(b"a", &vec![b'x'; 30]).unwrap();
-        page.put(b"b", &vec![b'y'; 30]).unwrap();
-        page.put(b"c", &vec![b'z'; 30]).unwrap();
+        page.put(b"a", &[b'x'; 30]).unwrap();
+        page.put(b"b", &[b'y'; 30]).unwrap();
+        page.put(b"c", &[b'z'; 30]).unwrap();
 
         page.delete(b"b").unwrap();
 
         // This should succeed by compacting and reclaiming the deleted record space.
-        page.put(b"d", &vec![b'w'; 30]).unwrap();
+        page.put(b"d", &[b'w'; 30]).unwrap();
         assert_eq!(page.get(b"d").unwrap().unwrap().len(), 30);
     }
 
@@ -517,8 +517,8 @@ mod tests {
         let mut buf = vec![0u8; 96];
         let mut page = LeafPage::init(&mut buf).unwrap();
 
-        page.put(b"a", &vec![b'x'; 40]).unwrap();
-        let err = page.put(b"b", &vec![b'y'; 40]).unwrap_err();
+        page.put(b"a", &[b'x'; 40]).unwrap();
+        let err = page.put(b"b", &[b'y'; 40]).unwrap_err();
         assert_eq!(err, LeafPageError::PageFull);
     }
 

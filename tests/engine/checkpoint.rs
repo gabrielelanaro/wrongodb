@@ -7,9 +7,7 @@ use wrongodb::{WrongoDB, WrongoDBConfig};
 fn explicit_checkpoint_persists_without_wal() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("collection_checkpoint.db");
-    let config = WrongoDBConfig::new()
-        .wal_enabled(false)
-        .disable_auto_checkpoint();
+    let config = WrongoDBConfig::new().wal_enabled(false);
 
     // First run: write without checkpoint
     {

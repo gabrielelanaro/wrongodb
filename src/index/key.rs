@@ -208,7 +208,9 @@ mod tests {
     #[test]
     fn encode_number() {
         let id = json!("abc");
-        let key = encode_index_key(&json!(3.14159), &id).unwrap().unwrap();
+        let key = encode_index_key(&json!(std::f64::consts::PI), &id)
+            .unwrap()
+            .unwrap();
         assert!(key.len() > 9); // type + f64 + len + id bytes
         assert_eq!(key[0], TAG_NUMBER);
         assert_eq!(decode_index_id(&key).unwrap(), Some(id));

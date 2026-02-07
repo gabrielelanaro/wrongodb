@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use crate::storage::global_wal::WalRecord;
+use crate::storage::wal::WalRecord;
 use crate::txn::{TxnId, TXN_NONE};
 
 /// Transaction table built during WAL recovery.

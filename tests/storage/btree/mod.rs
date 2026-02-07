@@ -1,6 +1,6 @@
 mod checkpoint;
 mod cow;
+mod multi_level_range;
 mod recovery;
-mod slice_d;
-mod slice_e;
+mod split_root;
 mod wal;

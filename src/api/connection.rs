@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use crate::api::data_handle_cache::DataHandleCache;
+use crate::api::session::Session;
 use crate::core::errors::StorageError;
-use crate::datahandle_cache::DataHandleCache;
-use crate::session::Session;
 use crate::storage::btree::BTree;
-use crate::storage::global_wal::{GlobalWal, RecoveryError, WalReader, WalRecord};
+use crate::storage::wal::{GlobalWal, RecoveryError, WalReader, WalRecord};
 use crate::txn::GlobalTxnState;
 use crate::txn::RecoveryTxnTable;
 use crate::txn::TXN_NONE;

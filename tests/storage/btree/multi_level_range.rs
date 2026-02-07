@@ -28,7 +28,7 @@ fn internal_levels(path: &std::path::Path) -> usize {
 #[test]
 fn grows_tree_height_past_two_levels_and_survives_reopen() {
     let tmp = tempdir().unwrap();
-    let path = tmp.path().join("btree_slice_e_height.wt");
+    let path = tmp.path().join("btree_multi_level_height.wt");
 
     let mut tree = BTree::create(&path, 256, false, Arc::new(GlobalTxnState::new())).unwrap();
     for i in 0..800u32 {
@@ -61,7 +61,7 @@ fn grows_tree_height_past_two_levels_and_survives_reopen() {
 #[test]
 fn ordered_range_scan_is_sorted_and_respects_bounds() {
     let tmp = tempdir().unwrap();
-    let path = tmp.path().join("btree_slice_e_scan.wt");
+    let path = tmp.path().join("btree_multi_level_scan.wt");
 
     let mut tree = BTree::create(&path, 384, false, Arc::new(GlobalTxnState::new())).unwrap();
     for i in 0..500u32 {

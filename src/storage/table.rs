@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 
 use crate::index::IndexCatalog;
 use crate::storage::btree::BTree;
-use crate::storage::global_wal::GlobalWal;
+use crate::storage::wal::GlobalWal;
 use crate::txn::{GlobalTxnState, TxnId};
 use crate::WrongoDBError;
 
