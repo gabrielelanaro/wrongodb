@@ -14,24 +14,34 @@ NOTE: This requires cargo-watch as a dependency to run
 
 ## Custom Address / Port
 
-You can override the listen address in three ways (highest priority first):
+You can override the listen address in four ways (highest priority first):
 
-1) CLI arg:
+1) CLI flags:
 
 ```bash
-cargo run --bin server -- 127.0.0.1:27019
+cargo run --bin wrongodb-server -- --addr 127.0.0.1:27019
 ```
 
-2) Environment variable `WRONGO_ADDR`:
-
 ```bash
-WRONGO_ADDR=127.0.0.1:27019 cargo run --bin server
+cargo run --bin wrongodb-server -- --port 27019
 ```
 
-3) Environment variable `WRONGO_PORT` (binds on `127.0.0.1`):
+2) Legacy positional CLI arg:
 
 ```bash
-WRONGO_PORT=27019 cargo run --bin server
+cargo run --bin wrongodb-server -- 127.0.0.1:27019
+```
+
+3) Environment variable `WRONGO_ADDR`:
+
+```bash
+WRONGO_ADDR=127.0.0.1:27019 cargo run --bin wrongodb-server
+```
+
+4) Environment variable `WRONGO_PORT` (binds on `127.0.0.1`):
+
+```bash
+WRONGO_PORT=27019 cargo run --bin wrongodb-server
 ```
 
 ## MongoDB Shell (mongosh)
