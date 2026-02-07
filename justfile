@@ -34,3 +34,7 @@ dev-server:
 # Run wire-protocol A/B benchmark (WrongoDB vs MongoDB)
 bench-wire-ab:
     cargo run --release --bin bench_wire_ab --
+
+# Run engine-level concurrency scaling benchmark (no wire protocol)
+bench-engine:
+    cargo bench --bench engine_concurrency

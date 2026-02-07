@@ -41,6 +41,10 @@ harness = false
 name = "main_table_vs_append_only"
 harness = false
 
+[[bench]]
+name = "engine_concurrency"
+harness = false
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

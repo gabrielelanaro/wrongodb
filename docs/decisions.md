@@ -1,5 +1,21 @@
 # Decisions
 
+## 2026-02-07: Add engine-level Criterion concurrency benchmark for fast inner-loop diagnosis
+
+**Decision**
+- Add `benches/engine_concurrency.rs` with two direct API workloads:
+  - `engine_insert_unique_scaling`
+  - `engine_update_hotspot_scaling`
+- Run with fixed concurrency levels (`1,4,8,16`) against `WrongoDB` engine APIs (no wire protocol).
+- Keep wire A/B benchmark as comparison/gate benchmark, but use this bench for fast local bottleneck iteration.
+
+**Why**
+- Wire-protocol A/B benchmarks include protocol, client, runtime, and container overhead that slow down profiling iteration.
+- Direct engine-level benchmarks isolate storage/transaction/locking behavior where scaling regressions are most likely.
+
+**Notes**
+- Each workload runs on dedicated benchmark databases under `target/bench-data-engine-concurrency/`.
+
 ## 2026-02-07: Wire-protocol A/B benchmark gate for concurrency refactor decisions
 
 **Decision**
