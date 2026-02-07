@@ -52,7 +52,12 @@ impl WrongoDB {
     {
         let base_path = path.as_ref();
         fs::create_dir_all(base_path)?;
-        let conn = Connection::open(base_path, ConnectionConfig { wal_enabled: config.wal_enabled })?;
+        let conn = Connection::open(
+            base_path,
+            ConnectionConfig {
+                wal_enabled: config.wal_enabled,
+            },
+        )?;
         Ok(Self { connection: conn })
     }
 

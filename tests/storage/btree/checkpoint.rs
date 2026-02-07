@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tempfile::tempdir;
 
-use wrongodb::{BlockFile, BTree, GlobalTxnState};
+use wrongodb::{BTree, BlockFile, GlobalTxnState};
 
 #[test]
 fn checkpoint_commit_selects_new_root_on_reopen() {

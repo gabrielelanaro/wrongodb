@@ -6,6 +6,8 @@ use crate::storage::table::Table;
 use crate::txn::TxnId;
 use crate::WrongoDBError;
 
+type CursorEntry = (Vec<u8>, Vec<u8>);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CursorKind {
     Table,
@@ -15,7 +17,7 @@ pub enum CursorKind {
 pub struct Cursor {
     table: Arc<RwLock<Table>>,
     kind: CursorKind,
-    buffered_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    buffered_entries: Vec<CursorEntry>,
     buffer_pos: usize,
     exhausted: bool,
     range_start: Option<Vec<u8>>,
@@ -45,7 +47,9 @@ impl Cursor {
         self.ensure_writable()?;
         let mut table = self.table.write();
         if table.get_version(key, txn_id)?.is_some() {
-            return Err(crate::core::errors::DocumentValidationError("duplicate key error".into()).into());
+            return Err(
+                crate::core::errors::DocumentValidationError("duplicate key error".into()).into(),
+            );
         }
         table.insert_mvcc(key, value, txn_id)
     }
@@ -79,7 +83,7 @@ impl Cursor {
         table.get_version(key, txn_id)
     }
 
-    pub fn next(&mut self, txn_id: TxnId) -> Result<Option<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
+    pub fn next(&mut self, txn_id: TxnId) -> Result<Option<CursorEntry>, WrongoDBError> {
         if self.exhausted {
             return Ok(None);
         }

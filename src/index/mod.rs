@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::storage::global_wal::GlobalWal;
+use crate::storage::table::Table;
 use crate::txn::GlobalTxnState;
 use crate::{Document, WrongoDBError};
-use crate::storage::table::Table;
 
 pub use key::{decode_index_id, encode_index_key, encode_range_bounds, encode_scalar_prefix};
 
@@ -236,13 +236,12 @@ impl IndexCatalog {
         let mut indexes = BTreeMap::new();
         for def in definitions.values() {
             let index_path = db_dir.join(&def.source);
-            let (index, _created) =
-                PersistentIndex::open_or_create(
-                    &index_path,
-                    wal_enabled,
-                    global_txn.clone(),
-                    global_wal.clone(),
-                )?;
+            let (index, _created) = PersistentIndex::open_or_create(
+                &index_path,
+                wal_enabled,
+                global_txn.clone(),
+                global_wal.clone(),
+            )?;
             indexes.insert(def.name.clone(), index);
         }
 
@@ -323,13 +322,12 @@ impl IndexCatalog {
         let index_path = self.db_dir.join(&index_file);
         let index_exists = index_path.exists();
 
-        let (mut index, created) =
-            PersistentIndex::open_or_create(
-                &index_path,
-                self.wal_enabled,
-                self.global_txn.clone(),
-                self.global_wal.clone(),
-            )?;
+        let (mut index, created) = PersistentIndex::open_or_create(
+            &index_path,
+            self.wal_enabled,
+            self.global_txn.clone(),
+            self.global_wal.clone(),
+        )?;
 
         if !index_exists || created {
             let field = &columns[0];
@@ -471,7 +469,9 @@ impl IndexCatalog {
 
     fn save(&self) -> Result<(), WrongoDBError> {
         let meta_path = self.db_dir.join(format!("{}.meta.json", self.collection));
-        let tmp_path = self.db_dir.join(format!("{}.meta.json.tmp", self.collection));
+        let tmp_path = self
+            .db_dir
+            .join(format!("{}.meta.json.tmp", self.collection));
         let file = IndexCatalogFile {
             collection: self.collection.clone(),
             indexes: self.index_defs(),
@@ -523,7 +523,9 @@ mod tests {
             serde_json::from_value(json!({"_id": "a2", "name": "alice"})).unwrap(),
         ];
 
-        catalog.add_index("name", vec!["name".to_string()], &docs).unwrap();
+        catalog
+            .add_index("name", vec!["name".to_string()], &docs)
+            .unwrap();
         let ids = catalog.lookup("name", &json!("alice")).unwrap();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&json!("a1")));

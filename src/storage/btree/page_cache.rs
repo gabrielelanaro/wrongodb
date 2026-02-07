@@ -146,7 +146,11 @@ impl PageCache {
     }
 
     /// Load a page from storage into cache and pin it.
-    pub fn load_and_pin<F>(&mut self, page_id: u64, mut read_fn: F) -> Result<Vec<u8>, WrongoDBError>
+    pub fn load_and_pin<F>(
+        &mut self,
+        page_id: u64,
+        mut read_fn: F,
+    ) -> Result<Vec<u8>, WrongoDBError>
     where
         F: FnMut(u64) -> Result<Vec<u8>, WrongoDBError>,
     {
@@ -167,7 +171,11 @@ impl PageCache {
     }
 
     /// Load payload for CoW without pinning.
-    pub fn load_cow_payload<F>(&mut self, page_id: u64, mut read_fn: F) -> Result<Vec<u8>, WrongoDBError>
+    pub fn load_cow_payload<F>(
+        &mut self,
+        page_id: u64,
+        mut read_fn: F,
+    ) -> Result<Vec<u8>, WrongoDBError>
     where
         F: FnMut(u64) -> Result<Vec<u8>, WrongoDBError>,
     {
@@ -208,10 +216,11 @@ impl PageCache {
                 continue;
             }
             if entry.pin_count > 0 {
-                return Err(
-                    StorageError(format!("cannot flush dirty pinned page {}", entry.page_id))
-                        .into(),
-                );
+                return Err(StorageError(format!(
+                    "cannot flush dirty pinned page {}",
+                    entry.page_id
+                ))
+                .into());
             }
             write_fn(entry.page_id, &entry.payload)?;
             entry.dirty = false;
@@ -226,9 +235,7 @@ mod tests {
 
     #[test]
     fn lru_skips_pinned_pages() {
-        let mut cache = PageCache::new(PageCacheConfig {
-            capacity_pages: 3,
-        });
+        let mut cache = PageCache::new(PageCacheConfig { capacity_pages: 3 });
         cache.insert(1, vec![1]);
         cache.insert(2, vec![2]);
         cache.insert(3, vec![3]);
@@ -242,9 +249,7 @@ mod tests {
 
     #[test]
     fn evict_lru_errors_when_all_pinned() {
-        let mut cache = PageCache::new(PageCacheConfig {
-            capacity_pages: 2,
-        });
+        let mut cache = PageCache::new(PageCacheConfig { capacity_pages: 2 });
         cache.insert(1, vec![1]).pin_count = 1;
         cache.insert(2, vec![2]).pin_count = 1;
 

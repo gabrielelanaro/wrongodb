@@ -78,7 +78,10 @@ fn insert_latency(c: &mut Criterion) {
             |b, _| {
                 b.iter(|| {
                     // Generate a unique key for each iteration to avoid duplicate key errors
-                    let key = format!("bench_key_{:016x}", KEY_COUNTER.fetch_add(1, Ordering::SeqCst));
+                    let key = format!(
+                        "bench_key_{:016x}",
+                        KEY_COUNTER.fetch_add(1, Ordering::SeqCst)
+                    );
                     let doc = json!({
                         "_id": key,
                         "data": &data

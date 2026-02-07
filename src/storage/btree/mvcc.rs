@@ -2,9 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::core::errors::WrongoDBError;
-use crate::txn::{
-    GlobalTxnState, TxnId, Update, UpdateChain, UpdateType, TS_NONE, TXN_ABORTED,
-};
+use crate::txn::{GlobalTxnState, TxnId, Update, UpdateChain, UpdateType, TS_NONE, TXN_ABORTED};
 
 use super::BTree;
 
@@ -89,8 +87,12 @@ impl MvccState {
                     continue;
                 }
                 match update.type_ {
-                    UpdateType::Standard => out.push((key.clone(), UpdateType::Standard, update.data.clone())),
-                    UpdateType::Tombstone => out.push((key.clone(), UpdateType::Tombstone, Vec::new())),
+                    UpdateType::Standard => {
+                        out.push((key.clone(), UpdateType::Standard, update.data.clone()))
+                    }
+                    UpdateType::Tombstone => {
+                        out.push((key.clone(), UpdateType::Tombstone, Vec::new()))
+                    }
                     UpdateType::Reserve => {}
                 }
                 break;
@@ -101,7 +103,11 @@ impl MvccState {
 }
 
 impl BTree {
-    pub fn get_version(&mut self, key: &[u8], txn_id: TxnId) -> Result<Option<Vec<u8>>, WrongoDBError> {
+    pub fn get_version(
+        &mut self,
+        key: &[u8],
+        txn_id: TxnId,
+    ) -> Result<Option<Vec<u8>>, WrongoDBError> {
         if let Some(chain) = self.mvcc.chain(key) {
             for update in chain.iter() {
                 let is_aborted = update.time_window.stop_txn == crate::txn::TXN_ABORTED
@@ -142,11 +148,7 @@ impl BTree {
         Ok(())
     }
 
-    pub fn delete_version(
-        &mut self,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
+    pub fn delete_version(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         self.log_wal_delete(key, txn_id)?;
 
         let chain = self.mvcc.chain_mut_or_create(key);

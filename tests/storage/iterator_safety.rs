@@ -157,9 +157,6 @@ fn checkpoint_scheduling_with_updates() {
     let mut btree2 = BTree::open(&path, false, Arc::new(GlobalTxnState::new())).unwrap();
     for i in 0..10 {
         let key = format!("key{}", i);
-        assert_eq!(
-            btree2.get(key.as_bytes()).unwrap(),
-            Some(b"value".to_vec())
-        );
+        assert_eq!(btree2.get(key.as_bytes()).unwrap(), Some(b"value".to_vec()));
     }
 }

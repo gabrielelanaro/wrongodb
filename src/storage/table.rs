@@ -9,6 +9,9 @@ use crate::storage::global_wal::GlobalWal;
 use crate::txn::{GlobalTxnState, TxnId};
 use crate::WrongoDBError;
 
+type TableEntry = (Vec<u8>, Vec<u8>);
+type ScanEntries = Vec<TableEntry>;
+
 /// A low-level storage table, wrapping a BTree.
 ///
 /// This provides a byte-oriented interface for storage operations.
@@ -32,7 +35,13 @@ impl Table {
         let btree = if path.exists() {
             BTree::open_with_global_wal(path, wal_enabled, global_txn.clone(), global_wal.clone())?
         } else {
-            BTree::create_with_global_wal(path, 4096, wal_enabled, global_txn.clone(), global_wal.clone())?
+            BTree::create_with_global_wal(
+                path,
+                4096,
+                wal_enabled,
+                global_txn.clone(),
+                global_wal.clone(),
+            )?
         };
         let index_catalog =
             IndexCatalog::load_or_init(collection, db_dir, wal_enabled, global_txn, global_wal)?;
@@ -72,7 +81,7 @@ impl Table {
         start_key: Option<&[u8]>,
         end_key: Option<&[u8]>,
         txn_id: TxnId,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
+    ) -> Result<ScanEntries, WrongoDBError> {
         let entries = self
             .btree
             .range(start_key, end_key)
@@ -136,12 +145,15 @@ impl Table {
     }
 
     pub fn put_recovery(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
-        self.btree.put_with_txn(key, value, crate::txn::TXN_NONE, false)?;
+        self.btree
+            .put_with_txn(key, value, crate::txn::TXN_NONE, false)?;
         Ok(())
     }
 
     pub fn delete_recovery(&mut self, key: &[u8]) -> Result<(), WrongoDBError> {
-        let _ = self.btree.delete_with_txn(key, crate::txn::TXN_NONE, false)?;
+        let _ = self
+            .btree
+            .delete_with_txn(key, crate::txn::TXN_NONE, false)?;
         Ok(())
     }
 
@@ -149,7 +161,10 @@ impl Table {
     // MVCC operations
     // ==========================================================================
 
-    pub fn mark_updates_committed(&mut self, txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
+    pub fn mark_updates_committed(
+        &mut self,
+        txn_id: crate::txn::TxnId,
+    ) -> Result<(), WrongoDBError> {
         self.btree.mark_updates_committed(txn_id)
     }
 
@@ -157,22 +172,40 @@ impl Table {
         self.btree.mark_updates_aborted(txn_id)
     }
 
-    pub fn insert_mvcc(&mut self, key: &[u8], value: &[u8], txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
+    pub fn insert_mvcc(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        txn_id: crate::txn::TxnId,
+    ) -> Result<(), WrongoDBError> {
         self.btree.put_version(key, value, txn_id)?;
         Ok(())
     }
 
-    pub fn update_mvcc(&mut self, key: &[u8], value: &[u8], txn_id: crate::txn::TxnId) -> Result<bool, WrongoDBError> {
+    pub fn update_mvcc(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        txn_id: crate::txn::TxnId,
+    ) -> Result<bool, WrongoDBError> {
         self.btree.put_version(key, value, txn_id)?;
         Ok(true)
     }
 
-    pub fn delete_mvcc(&mut self, key: &[u8], txn_id: crate::txn::TxnId) -> Result<bool, WrongoDBError> {
+    pub fn delete_mvcc(
+        &mut self,
+        key: &[u8],
+        txn_id: crate::txn::TxnId,
+    ) -> Result<bool, WrongoDBError> {
         self.btree.delete_version(key, txn_id)?;
         Ok(true)
     }
 
-    pub fn get_version(&mut self, key: &[u8], txn_id: TxnId) -> Result<Option<Vec<u8>>, WrongoDBError> {
+    pub fn get_version(
+        &mut self,
+        key: &[u8],
+        txn_id: TxnId,
+    ) -> Result<Option<Vec<u8>>, WrongoDBError> {
         self.btree.get_version(key, txn_id)
     }
 
@@ -189,5 +222,4 @@ impl Table {
         }
         (chains, updates, dropped)
     }
-
 }

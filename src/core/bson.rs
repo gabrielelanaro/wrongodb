@@ -25,10 +25,7 @@ pub fn encode_document(doc: &Document) -> Result<Vec<u8>, WrongoDBError> {
     let bson_doc = match bson::to_bson(doc)? {
         Bson::Document(doc) => doc,
         _ => {
-            return Err(StorageError(
-                "document did not serialize to a BSON document".into(),
-            )
-            .into())
+            return Err(StorageError("document did not serialize to a BSON document".into()).into())
         }
     };
     Ok(bson::to_vec(&bson_doc)?)

@@ -37,7 +37,8 @@ fn primary_btree_file_created() {
     let coll = db.collection("test");
     let mut session = db.open_session();
 
-    coll.insert_one(&mut session, json!({"name": "auto"})).unwrap();
+    coll.insert_one(&mut session, json!({"name": "auto"}))
+        .unwrap();
 
     // Primary B+tree file is created and non-empty.
     let meta = std::fs::metadata(&main_table_path).unwrap();
@@ -78,10 +79,16 @@ fn embedded_id_field_ordering() {
 
     // Embedded-doc field order matters for `_id` (Mongo-like):
     // `{a:1,b:2}` and `{b:2,a:1}` should be treated as distinct ids.
-    coll.insert_one(&mut session, json!({"_id": {"a": 1, "b": 2}, "name": "order1"}))
-        .unwrap();
-    coll.insert_one(&mut session, json!({"_id": {"b": 2, "a": 1}, "name": "order2"}))
-        .unwrap();
+    coll.insert_one(
+        &mut session,
+        json!({"_id": {"a": 1, "b": 2}, "name": "order1"}),
+    )
+    .unwrap();
+    coll.insert_one(
+        &mut session,
+        json!({"_id": {"b": 2, "a": 1}, "name": "order2"}),
+    )
+    .unwrap();
 
     let got_order1 = coll
         .find_one(&mut session, Some(json!({"_id": {"a": 1, "b": 2}})))
@@ -105,8 +112,11 @@ fn persistence_across_reopen() {
     {
         let coll = db.collection("test");
         let mut session = db.open_session();
-        coll.insert_one(&mut session, json!({"_id": {"b": 2, "a": 1}, "name": "order2"}))
-            .unwrap();
+        coll.insert_one(
+            &mut session,
+            json!({"_id": {"b": 2, "a": 1}, "name": "order2"}),
+        )
+        .unwrap();
     }
 
     // Re-open and verify primary lookups still work.

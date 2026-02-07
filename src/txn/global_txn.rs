@@ -41,15 +41,13 @@ impl GlobalTxnState {
     /// Recalculate the oldest active transaction ID.
     /// Should be called when a transaction unregisters or aborts.
     fn recalculate_oldest(&self) {
-        let active_guard = self
-            .active_txns
-            .read()
-            .expect("active_txns lock poisoned");
+        let active_guard = self.active_txns.read().expect("active_txns lock poisoned");
         let oldest = active_guard.iter().copied().min();
         drop(active_guard);
 
         if let Some(oldest_id) = oldest {
-            self.oldest_active_txn_id.store(oldest_id, Ordering::Release);
+            self.oldest_active_txn_id
+                .store(oldest_id, Ordering::Release);
         } else {
             // No active transactions - reset to TXN_NONE
             self.oldest_active_txn_id.store(TXN_NONE, Ordering::Release);
@@ -61,10 +59,7 @@ impl GlobalTxnState {
     }
 
     pub fn register_active(&self, txn_id: TxnId) {
-        let mut guard = self
-            .active_txns
-            .write()
-            .expect("active_txns lock poisoned");
+        let mut guard = self.active_txns.write().expect("active_txns lock poisoned");
 
         // If this is the first active transaction, it becomes the oldest
         let was_empty = guard.is_empty();
@@ -77,10 +72,7 @@ impl GlobalTxnState {
     }
 
     pub fn unregister_active(&self, txn_id: TxnId) {
-        let mut guard = self
-            .active_txns
-            .write()
-            .expect("active_txns lock poisoned");
+        let mut guard = self.active_txns.write().expect("active_txns lock poisoned");
 
         // Check if we're removing the oldest active transaction
         let was_oldest = guard.iter().min().copied() == Some(txn_id);
@@ -114,10 +106,7 @@ impl GlobalTxnState {
 
     pub fn take_snapshot(&self, my_txn_id: TxnId) -> Snapshot {
         let current = self.current_txn_id.load(Ordering::Acquire);
-        let active_guard = self
-            .active_txns
-            .read()
-            .expect("active_txns lock poisoned");
+        let active_guard = self.active_txns.read().expect("active_txns lock poisoned");
         let aborted_guard = self
             .aborted_txns
             .read()
@@ -146,5 +135,11 @@ impl GlobalTxnState {
         self.register_active(txn_id);
         let snapshot = self.take_snapshot(txn_id);
         Transaction::new(txn_id, IsolationLevel::Snapshot, snapshot)
+    }
+}
+
+impl Default for GlobalTxnState {
+    fn default() -> Self {
+        Self::new()
     }
 }

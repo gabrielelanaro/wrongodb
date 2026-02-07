@@ -60,10 +60,7 @@ where
 
     fn random_level(&mut self) -> usize {
         // Simple LCG-based RNG; deterministic and dependency-free.
-        self.seed = self
-            .seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1);
+        self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1);
         let mut lvl = 1;
         let mut x = self.seed;
         while lvl < self.max_level && (x & 1) == 1 {
@@ -80,15 +77,12 @@ where
         for level in (0..self.level).rev() {
             loop {
                 let next = self.nodes[current].forwards[level];
-                match next {
-                    Some(idx) => {
-                        let next_key = self.nodes[idx].key.as_ref().expect("node key");
-                        if next_key < &key {
-                            current = idx;
-                            continue;
-                        }
+                if let Some(idx) = next {
+                    let next_key = self.nodes[idx].key.as_ref().expect("node key");
+                    if next_key < &key {
+                        current = idx;
+                        continue;
                     }
-                    None => {}
                 }
                 break;
             }
@@ -105,8 +99,8 @@ where
 
         let node_level = self.random_level();
         if node_level > self.level {
-            for level in self.level..node_level {
-                update[level] = self.head;
+            for slot in update.iter_mut().take(node_level).skip(self.level) {
+                *slot = self.head;
             }
             self.level = node_level;
         }
@@ -119,10 +113,9 @@ where
         let node_idx = self.nodes.len();
         self.nodes.push(node);
 
-        for level in 0..node_level {
-            let prev = update[level];
-            self.nodes[node_idx].forwards[level] = self.nodes[prev].forwards[level];
-            self.nodes[prev].forwards[level] = Some(node_idx);
+        for (level, prev) in update.iter().take(node_level).enumerate() {
+            self.nodes[node_idx].forwards[level] = self.nodes[*prev].forwards[level];
+            self.nodes[*prev].forwards[level] = Some(node_idx);
         }
 
         self.len += 1;
@@ -136,15 +129,12 @@ where
         for level in (0..self.level).rev() {
             loop {
                 let next = self.nodes[current].forwards[level];
-                match next {
-                    Some(idx) => {
-                        let next_key = self.nodes[idx].key.as_ref().expect("node key");
-                        if next_key < key {
-                            current = idx;
-                            continue;
-                        }
+                if let Some(idx) = next {
+                    let next_key = self.nodes[idx].key.as_ref().expect("node key");
+                    if next_key < key {
+                        current = idx;
+                        continue;
                     }
-                    None => {}
                 }
                 break;
             }
@@ -155,13 +145,12 @@ where
         if let Some(idx) = target {
             let target_key = self.nodes[idx].key.as_ref().expect("node key");
             if target_key == key {
-                for level in 0..self.level {
-                    if self.nodes[update[level]].forwards[level] == Some(idx) {
-                        self.nodes[update[level]].forwards[level] = self.nodes[idx].forwards[level];
+                for (level, prev) in update.iter().take(self.level).enumerate() {
+                    if self.nodes[*prev].forwards[level] == Some(idx) {
+                        self.nodes[*prev].forwards[level] = self.nodes[idx].forwards[level];
                     }
                 }
-                while self.level > 1 && self.nodes[self.head].forwards[self.level - 1].is_none()
-                {
+                while self.level > 1 && self.nodes[self.head].forwards[self.level - 1].is_none() {
                     self.level -= 1;
                 }
                 self.len = self.len.saturating_sub(1);
@@ -176,15 +165,12 @@ where
         for level in (0..self.level).rev() {
             loop {
                 let next = self.nodes[current].forwards[level];
-                match next {
-                    Some(idx) => {
-                        let next_key = self.nodes[idx].key.as_ref().expect("node key");
-                        if next_key < key {
-                            current = idx;
-                            continue;
-                        }
+                if let Some(idx) = next {
+                    let next_key = self.nodes[idx].key.as_ref().expect("node key");
+                    if next_key < key {
+                        current = idx;
+                        continue;
                     }
-                    None => {}
                 }
                 break;
             }
@@ -203,15 +189,12 @@ where
         for level in (0..self.level).rev() {
             loop {
                 let next = self.nodes[current].forwards[level];
-                match next {
-                    Some(idx) => {
-                        let next_key = self.nodes[idx].key.as_ref().expect("node key");
-                        if next_key < key {
-                            current = idx;
-                            continue;
-                        }
+                if let Some(idx) = next {
+                    let next_key = self.nodes[idx].key.as_ref().expect("node key");
+                    if next_key < key {
+                        current = idx;
+                        continue;
                     }
-                    None => {}
                 }
                 break;
             }
@@ -259,8 +242,13 @@ impl ExtentIndex {
 
     fn insert(&mut self, extent: Extent) {
         self.by_offset.insert(extent.offset, extent);
-        self.by_size
-            .insert(SizeKey { size: extent.size, offset: extent.offset }, extent);
+        self.by_size.insert(
+            SizeKey {
+                size: extent.size,
+                offset: extent.offset,
+            },
+            extent,
+        );
     }
 
     fn remove_by_offset(&mut self, offset: u64) -> Option<Extent> {

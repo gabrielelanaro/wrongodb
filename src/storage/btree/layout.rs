@@ -6,6 +6,18 @@ use super::{InternalEntries, LeafEntries};
 const PAGE_TYPE_LEAF: u8 = 1;
 const PAGE_TYPE_INTERNAL: u8 = 2;
 
+type PageBytes = Vec<u8>;
+type InternalKeyChildEntries = Vec<(Vec<u8>, u64)>;
+pub(super) type LeafSplit = (PageBytes, PageBytes, Vec<u8>, usize);
+pub(super) type InternalSplit = (
+    PageBytes,
+    PageBytes,
+    Vec<u8>,
+    u64,
+    InternalKeyChildEntries,
+    usize,
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PageType {
     Leaf,
@@ -71,7 +83,7 @@ pub(super) fn internal_entries(buf: &mut [u8]) -> Result<InternalEntries, Wrongo
 pub(super) fn split_leaf_entries(
     entries: &[(Vec<u8>, Vec<u8>)],
     payload_len: usize,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, usize), WrongoDBError> {
+) -> Result<LeafSplit, WrongoDBError> {
     if entries.len() < 2 {
         return Err(StorageError("cannot split leaf with <2 entries".into()).into());
     }
@@ -145,7 +157,7 @@ pub(super) fn split_internal_entries(
     first_child: u64,
     entries: &[(Vec<u8>, u64)],
     payload_len: usize,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, u64, Vec<(Vec<u8>, u64)>, usize), WrongoDBError> {
+) -> Result<InternalSplit, WrongoDBError> {
     if entries.is_empty() {
         return Err(StorageError("cannot split internal with 0 separators".into()).into());
     }
@@ -173,7 +185,14 @@ pub(super) fn split_internal_entries(
         let left = build_internal_page(first_child, left_entries, payload_len);
         let right = build_internal_page(right_first_child, right_entries, payload_len);
         if let (Ok(l), Ok(r)) = (left, right) {
-            return Ok((l, r, promoted_key, first_child, left_entries.to_vec(), promote_idx));
+            return Ok((
+                l,
+                r,
+                promoted_key,
+                first_child,
+                left_entries.to_vec(),
+                promote_idx,
+            ));
         }
     }
 

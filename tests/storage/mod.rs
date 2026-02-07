@@ -1,3 +1,3 @@
 mod blockfile;
-mod iterator_safety;
 mod btree;
+mod iterator_safety;

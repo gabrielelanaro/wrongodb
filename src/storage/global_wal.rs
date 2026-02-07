@@ -61,8 +61,7 @@ impl TryFrom<u8> for WalRecordType {
             3 => Ok(Self::Checkpoint),
             4 => Ok(Self::TxnCommit),
             5 => Ok(Self::TxnAbort),
-            _ => Err(StorageError(format!("invalid WAL record type: {value}"))
-                .into()),
+            _ => Err(StorageError(format!("invalid WAL record type: {value}")).into()),
         }
     }
 }
@@ -139,19 +138,18 @@ impl WalRecord {
         buf
     }
 
-    fn deserialize_payload(
-        record_type: WalRecordType,
-        data: &[u8],
-    ) -> Result<Self, WrongoDBError> {
+    fn deserialize_payload(record_type: WalRecordType, data: &[u8]) -> Result<Self, WrongoDBError> {
         let mut cursor = 0usize;
 
         let read_u64 = |data: &[u8], cursor: &mut usize| -> Result<u64, WrongoDBError> {
             if *cursor + 8 > data.len() {
                 return Err(StorageError("unexpected EOF reading u64".into()).into());
             }
-            let out = u64::from_le_bytes(data[*cursor..*cursor + 8].try_into().map_err(
-                |_| StorageError("invalid u64 encoding".into()),
-            )?);
+            let out = u64::from_le_bytes(
+                data[*cursor..*cursor + 8]
+                    .try_into()
+                    .map_err(|_| StorageError("invalid u64 encoding".into()))?,
+            );
             *cursor += 8;
             Ok(out)
         };
@@ -202,7 +200,7 @@ fn serialize_string(buf: &mut Vec<u8>, value: &str) {
 fn deserialize_string(data: &[u8], cursor: &mut usize) -> Result<String, WrongoDBError> {
     let bytes = deserialize_bytes(data, cursor)?;
     String::from_utf8(bytes)
-        .map_err(|e| StorageError(format!("invalid utf8 in store_name: {e}")) .into())
+        .map_err(|e| StorageError(format!("invalid utf8 in store_name: {e}")).into())
 }
 
 fn serialize_bytes(buf: &mut Vec<u8>, value: &[u8]) {
@@ -272,11 +270,9 @@ impl WalFileHeader {
         buf[cursor..cursor + 8].copy_from_slice(&self.last_lsn.offset.to_le_bytes());
         cursor += 8;
 
-        buf[cursor..cursor + 4]
-            .copy_from_slice(&self.checkpoint_lsn.file_id.to_le_bytes());
+        buf[cursor..cursor + 4].copy_from_slice(&self.checkpoint_lsn.file_id.to_le_bytes());
         cursor += 4;
-        buf[cursor..cursor + 8]
-            .copy_from_slice(&self.checkpoint_lsn.offset.to_le_bytes());
+        buf[cursor..cursor + 8].copy_from_slice(&self.checkpoint_lsn.offset.to_le_bytes());
         cursor += 8;
 
         buf[cursor..cursor + 4].copy_from_slice(&self.crc32.to_le_bytes());
@@ -510,9 +506,7 @@ impl WalFile {
 
         if write_offset < file_len {
             if let Some(reason) = truncate_reason {
-                eprintln!(
-                    "Truncating invalid WAL tail from offset {write_offset}: {reason}"
-                );
+                eprintln!("Truncating invalid WAL tail from offset {write_offset}: {reason}");
             }
             file.set_len(write_offset)?;
         }
@@ -599,7 +593,11 @@ impl WalFile {
         })
     }
 
-    fn log_txn_commit(&mut self, txn_id: TxnId, commit_ts: Timestamp) -> Result<Lsn, WrongoDBError> {
+    fn log_txn_commit(
+        &mut self,
+        txn_id: TxnId,
+        commit_ts: Timestamp,
+    ) -> Result<Lsn, WrongoDBError> {
         self.append_record(WalRecord::TxnCommit { txn_id, commit_ts })
     }
 
@@ -641,7 +639,10 @@ impl WalFile {
         self.write_buffered(&payload)?;
 
         let record_size = RECORD_HEADER_SIZE + payload.len();
-        self.last_lsn = Lsn::new(self.last_lsn.file_id, self.last_lsn.offset + record_size as u64);
+        self.last_lsn = Lsn::new(
+            self.last_lsn.file_id,
+            self.last_lsn.offset + record_size as u64,
+        );
         self.last_record_lsn = lsn;
         self.header.last_lsn = lsn;
 
@@ -674,8 +675,11 @@ impl Drop for WalFile {
 }
 
 fn scan_wal_tail(path: &Path) -> Result<(Lsn, u64, Option<String>), WrongoDBError> {
-    let mut reader = WalReader::open(path)
-        .map_err(|e| StorageError(format!("failed to open WAL reader while scanning tail: {e}")))?;
+    let mut reader = WalReader::open(path).map_err(|e| {
+        StorageError(format!(
+            "failed to open WAL reader while scanning tail: {e}"
+        ))
+    })?;
 
     let mut last_record_lsn = Lsn::new(0, 0);
     let mut truncate_reason = None;
@@ -689,12 +693,10 @@ fn scan_wal_tail(path: &Path) -> Result<(Lsn, u64, Option<String>), WrongoDBErro
                 break reader.current_offset;
             }
             Err(
-                err @ (
-                    RecoveryError::ChecksumMismatch { .. }
-                    | RecoveryError::BrokenLsnChain { .. }
-                    | RecoveryError::CorruptRecordHeader { .. }
-                    | RecoveryError::CorruptRecordPayload { .. }
-                ),
+                err @ (RecoveryError::ChecksumMismatch { .. }
+                | RecoveryError::BrokenLsnChain { .. }
+                | RecoveryError::CorruptRecordHeader { .. }
+                | RecoveryError::CorruptRecordPayload { .. }),
             ) => {
                 truncate_reason = Some(err.to_string());
                 break reader.current_offset;
@@ -840,11 +842,12 @@ impl WalReader {
             return Ok(None);
         }
 
-        let header = WalRecordHeader::deserialize(&header_bytes)
-            .map_err(|e| RecoveryError::CorruptRecordHeader {
+        let header = WalRecordHeader::deserialize(&header_bytes).map_err(|e| {
+            RecoveryError::CorruptRecordHeader {
                 offset: self.current_offset,
                 details: e.to_string(),
-            })?;
+            }
+        })?;
 
         let payload_len = header.payload_len as usize;
         let mut payload = vec![0u8; payload_len];
@@ -876,20 +879,20 @@ impl WalReader {
             });
         }
 
-        let record_type =
-            WalRecordType::try_from(header.record_type).map_err(|_| RecoveryError::CorruptRecordHeader {
+        let record_type = WalRecordType::try_from(header.record_type).map_err(|_| {
+            RecoveryError::CorruptRecordHeader {
                 offset: self.current_offset,
                 details: format!("invalid record type: {}", header.record_type),
-            })?;
+            }
+        })?;
 
-        let record =
-            WalRecord::deserialize_payload(record_type, &payload).map_err(|e| {
-                RecoveryError::CorruptRecordPayload {
-                    record_type,
-                    offset: self.current_offset + RECORD_HEADER_SIZE as u64,
-                    details: e.to_string(),
-                }
-            })?;
+        let record = WalRecord::deserialize_payload(record_type, &payload).map_err(|e| {
+            RecoveryError::CorruptRecordPayload {
+                record_type,
+                offset: self.current_offset + RECORD_HEADER_SIZE as u64,
+                details: e.to_string(),
+            }
+        })?;
 
         self.last_valid_lsn = header.lsn;
         self.current_offset += (RECORD_HEADER_SIZE + payload_len) as u64;
@@ -944,7 +947,11 @@ impl GlobalWal {
         self.file.log_delete(store_name, key, txn_id)
     }
 
-    pub fn log_txn_commit(&mut self, txn_id: TxnId, commit_ts: Timestamp) -> Result<Lsn, WrongoDBError> {
+    pub fn log_txn_commit(
+        &mut self,
+        txn_id: TxnId,
+        commit_ts: Timestamp,
+    ) -> Result<Lsn, WrongoDBError> {
         self.file.log_txn_commit(txn_id, commit_ts)
     }
 

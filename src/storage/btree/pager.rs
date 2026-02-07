@@ -82,10 +82,7 @@ pub(super) trait CheckpointStore: std::fmt::Debug + Send + Sync {
 
 pub(super) trait BTreeStore: PageRead + PageWrite + RootStore + CheckpointStore {}
 
-impl<T> BTreeStore for T where
-    T: PageRead + PageWrite + RootStore + CheckpointStore
-{
-}
+impl<T> BTreeStore for T where T: PageRead + PageWrite + RootStore + CheckpointStore {}
 
 impl Pager {
     pub(super) fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
@@ -198,7 +195,10 @@ impl Pager {
         }
     }
 
-    pub(super) fn unpin_page_mut_commit(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError> {
+    pub(super) fn unpin_page_mut_commit(
+        &mut self,
+        page: PinnedPageMut,
+    ) -> Result<(), WrongoDBError> {
         let PinnedPageMut {
             page_id,
             payload,
@@ -220,7 +220,10 @@ impl Pager {
         Ok(())
     }
 
-    pub(super) fn unpin_page_mut_abort(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError> {
+    pub(super) fn unpin_page_mut_abort(
+        &mut self,
+        page: PinnedPageMut,
+    ) -> Result<(), WrongoDBError> {
         let PinnedPageMut {
             page_id,
             original_page_id,
@@ -360,7 +363,6 @@ impl CheckpointStore for Pager {
     fn sync_all(&mut self) -> Result<(), WrongoDBError> {
         self.bf.sync_all()
     }
-
 }
 
 #[cfg(test)]
@@ -370,9 +372,7 @@ mod tests {
 
     #[test]
     fn lru_skips_pinned_pages() {
-        let mut cache = PageCache::new(PageCacheConfig {
-            capacity_pages: 3,
-        });
+        let mut cache = PageCache::new(PageCacheConfig { capacity_pages: 3 });
         cache.insert(1, vec![1]);
         cache.insert(2, vec![2]);
         cache.insert(3, vec![3]);
@@ -386,9 +386,7 @@ mod tests {
 
     #[test]
     fn evict_lru_errors_when_all_pinned() {
-        let mut cache = PageCache::new(PageCacheConfig {
-            capacity_pages: 2,
-        });
+        let mut cache = PageCache::new(PageCacheConfig { capacity_pages: 2 });
         cache.insert(1, vec![1]).pin_count = 1;
         cache.insert(2, vec![2]).pin_count = 1;
 
@@ -404,9 +402,7 @@ mod tests {
         let payload_len = pager.page_payload_len();
         let page_id = pager.write_new_page(&vec![0u8; payload_len]).unwrap();
 
-        pager.cache = PageCache::new(PageCacheConfig {
-            capacity_pages: 1,
-        });
+        pager.cache = PageCache::new(PageCacheConfig { capacity_pages: 1 });
 
         let payload = vec![7u8; payload_len];
         let entry = pager.cache.insert(page_id, payload.clone());
@@ -432,9 +428,7 @@ mod tests {
         entry.pin_count = 1;
 
         let err = pager.flush_cache().unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("cannot flush dirty pinned page"));
+        assert!(err.to_string().contains("cannot flush dirty pinned page"));
     }
 
     #[test]
@@ -447,9 +441,7 @@ mod tests {
         let page1 = pager.write_new_page(&vec![1u8; payload_len]).unwrap();
         let page2 = pager.write_new_page(&vec![2u8; payload_len]).unwrap();
 
-        pager.cache = PageCache::new(PageCacheConfig {
-            capacity_pages: 1,
-        });
+        pager.cache = PageCache::new(PageCacheConfig { capacity_pages: 1 });
 
         let pinned = pager.pin_page(page1).unwrap();
         assert!(pager.cache.contains(page1));

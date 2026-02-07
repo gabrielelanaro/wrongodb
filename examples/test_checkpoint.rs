@@ -57,7 +57,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("🔎 Testing range query (value > 50)...");
         let range_filter = json!({ "value": { "$gt": 50 } });
         let range_docs = coll.find(&mut session, Some(range_filter))?;
-        println!("   ✅ Found {} documents with value > 50\n", range_docs.len());
+        println!(
+            "   ✅ Found {} documents with value > 50\n",
+            range_docs.len()
+        );
 
         // Test distinct
         println!("🏷️  Testing distinct on \"name\" field...");

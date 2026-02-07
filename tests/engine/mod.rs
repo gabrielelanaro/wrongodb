@@ -49,8 +49,10 @@ fn rebuilds_index_from_disk_on_open() {
         let db = WrongoDB::open(&path).unwrap();
         let coll = db.collection("test");
         let mut session = db.open_session();
-        coll.insert_one(&mut session, json!({"name": "alice"})).unwrap();
-        coll.insert_one(&mut session, json!({"name": "bob"})).unwrap();
+        coll.insert_one(&mut session, json!({"name": "alice"}))
+            .unwrap();
+        coll.insert_one(&mut session, json!({"name": "bob"}))
+            .unwrap();
     }
 
     let db2 = WrongoDB::open(&path).unwrap();

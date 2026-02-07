@@ -82,10 +82,7 @@ impl<'a> BTreeRangeIter<'a> {
 
     fn clear_leaf(&mut self) -> Result<(), WrongoDBError> {
         if let Some(leaf) = self.leaf.take() {
-            let pager = self
-                .pager
-                .as_deref_mut()
-                .ok_or_else(missing_pager)?;
+            let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
             pager.unpin_page(leaf.page_id());
         }
         Ok(())
@@ -96,10 +93,7 @@ impl<'a> BTreeRangeIter<'a> {
         self.stack.clear();
         let mut node_id = root;
         loop {
-            let pager = self
-                .pager
-                .as_deref_mut()
-                .ok_or_else(missing_pager)?;
+            let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
             let mut page = pager.pin_page(node_id)?;
             let page_id = page.page_id();
             let page_type = match page_type(page.payload()) {
@@ -139,7 +133,7 @@ impl<'a> BTreeRangeIter<'a> {
                         Err(e) => {
                             pager.unpin_page(page_id);
                             return Err(
-                                StorageError(format!("corrupt internal {node_id}: {e}")).into(),
+                                StorageError(format!("corrupt internal {node_id}: {e}")).into()
                             );
                         }
                     };
@@ -156,13 +150,14 @@ impl<'a> BTreeRangeIter<'a> {
                     } else {
                         0
                     };
-                    let child_id = match internal_child_at(&internal, child_idx).map_err(map_internal_err) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            pager.unpin_page(page_id);
-                            return Err(e);
-                        }
-                    };
+                    let child_id =
+                        match internal_child_at(&internal, child_idx).map_err(map_internal_err) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                pager.unpin_page(page_id);
+                                return Err(e);
+                            }
+                        };
                     self.stack.push(CursorFrame {
                         internal_id: node_id,
                         child_idx,
@@ -177,10 +172,7 @@ impl<'a> BTreeRangeIter<'a> {
     fn advance_to_next_leaf(&mut self) -> Result<bool, WrongoDBError> {
         self.clear_leaf()?;
         while let Some(frame) = self.stack.pop() {
-            let pager = self
-                .pager
-                .as_deref_mut()
-                .ok_or_else(missing_pager)?;
+            let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
             let mut page = pager.pin_page(frame.internal_id)?;
             let page_id = page.page_id();
             let next_child_id = match (|| {
@@ -221,10 +213,7 @@ impl<'a> BTreeRangeIter<'a> {
     fn descend_leftmost(&mut self, start_id: u64) -> Result<(), WrongoDBError> {
         let mut node_id = start_id;
         loop {
-            let pager = self
-                .pager
-                .as_deref_mut()
-                .ok_or_else(missing_pager)?;
+            let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
             let mut page = pager.pin_page(node_id)?;
             let page_id = page.page_id();
             let page_type = match page_type(page.payload()) {
@@ -246,7 +235,7 @@ impl<'a> BTreeRangeIter<'a> {
                         Err(e) => {
                             pager.unpin_page(page_id);
                             return Err(
-                                StorageError(format!("corrupt internal {node_id}: {e}")).into(),
+                                StorageError(format!("corrupt internal {node_id}: {e}")).into()
                             );
                         }
                     };
@@ -290,11 +279,9 @@ impl<'a> Iterator for BTreeRangeIter<'a> {
                     if let Some(pager) = self.pager.as_deref_mut() {
                         pager.unpin_page(leaf_id);
                     }
-                    return Some(Err(StorageError(format!(
-                        "corrupt leaf {}: {e}",
-                        leaf_id
-                    ))
-                    .into()))
+                    return Some(Err(
+                        StorageError(format!("corrupt leaf {}: {e}", leaf_id)).into()
+                    ));
                 }
             };
 

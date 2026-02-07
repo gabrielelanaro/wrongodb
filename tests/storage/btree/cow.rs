@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tempfile::tempdir;
 
-use wrongodb::{BlockFile, BTree, GlobalTxnState, LeafPage};
+use wrongodb::{BTree, BlockFile, GlobalTxnState, LeafPage};
 
 #[test]
 fn cow_put_preserves_old_root_leaf() {

@@ -51,7 +51,11 @@ impl Session {
         }
     }
 
-    fn get_primary_table(&mut self, collection: &str, mark_touched: bool) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
+    fn get_primary_table(
+        &mut self,
+        collection: &str,
+        mark_touched: bool,
+    ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
         let uri = format!("table:{}", collection);
         let table = self.cache.get_or_open_primary(
             &uri,
@@ -74,7 +78,10 @@ impl Session {
         self.get_primary_table(collection, mark_touched)
     }
 
-    pub(crate) fn record_index_ops(&mut self, ops: Vec<IndexOpRecord>) -> Result<(), WrongoDBError> {
+    pub(crate) fn record_index_ops(
+        &mut self,
+        ops: Vec<IndexOpRecord>,
+    ) -> Result<(), WrongoDBError> {
         if let Some(ref mut ctx) = self.txn {
             ctx.index_ops.extend(ops);
             Ok(())
@@ -86,7 +93,10 @@ impl Session {
     fn rollback_index_ops(&mut self, ops: &[IndexOpRecord], txn_id: crate::txn::TxnId) {
         for op in ops.iter().rev() {
             if let Err(e) = self.apply_index_op(op, op.op.inverse(), txn_id) {
-                eprintln!("Warning: failed to rollback index op {}: {}", op.index_uri, e);
+                eprintln!(
+                    "Warning: failed to rollback index op {}: {}",
+                    op.index_uri, e
+                );
             }
         }
     }
@@ -111,9 +121,10 @@ impl Session {
             let _table = self.get_primary_table(collection, false)?;
             Ok(())
         } else {
-            Err(WrongoDBError::Storage(StorageError(
-                format!("unsupported URI: {}", uri),
-            )))
+            Err(WrongoDBError::Storage(StorageError(format!(
+                "unsupported URI: {}",
+                uri
+            ))))
         }
     }
 
@@ -138,23 +149,24 @@ impl Session {
             return Ok(Cursor::new(index_table, CursorKind::Index));
         }
 
-        Err(WrongoDBError::Storage(StorageError(
-            format!("unsupported URI: {}", uri),
-        )))
+        Err(WrongoDBError::Storage(StorageError(format!(
+            "unsupported URI: {}",
+            uri
+        ))))
     }
 
     /// Begin a new transaction and return an RAII handle.
-    /// 
+    ///
     /// The transaction will auto-rollback if not explicitly committed or aborted.
-    /// 
+    ///
     /// # Example
     /// ```no_run
     /// use wrongodb::{Connection, ConnectionConfig};
-    /// 
+    ///
     /// let conn = Connection::open("/tmp/test", ConnectionConfig::default()).unwrap();
     /// let mut session = conn.open_session();
     /// session.create("table:test").unwrap();
-    /// 
+    ///
     /// let mut cursor = session.open_cursor("table:test").unwrap();
     /// {
     ///     let mut txn = session.transaction().unwrap();
@@ -206,7 +218,7 @@ impl Session {
 }
 
 /// RAII transaction handle for Session.
-/// 
+///
 /// The transaction will auto-rollback on drop if not explicitly committed or aborted.
 /// This follows the pattern used by sled and other Rust database libraries.
 pub struct SessionTxn<'a> {
@@ -289,7 +301,7 @@ impl<'a> SessionTxn<'a> {
     }
 
     /// Get a mutable reference to the underlying transaction.
-    /// 
+    ///
     /// This is useful for accessing transaction metadata (e.g., txn id).
     pub fn as_mut(&mut self) -> &mut Transaction {
         self.session
@@ -300,7 +312,7 @@ impl<'a> SessionTxn<'a> {
     }
 
     /// Get a shared reference to the underlying transaction.
-    /// 
+    ///
     /// This is useful for accessing transaction metadata (e.g., txn id).
     pub fn as_ref(&self) -> &Transaction {
         self.session
@@ -348,18 +360,20 @@ impl<'a> Drop for SessionTxn<'a> {
 
 fn parse_index_uri(uri: &str) -> Result<(&str, &str), WrongoDBError> {
     if !uri.starts_with("index:") {
-        return Err(WrongoDBError::Storage(StorageError(
-            format!("invalid index URI: {}", uri),
-        )));
+        return Err(WrongoDBError::Storage(StorageError(format!(
+            "invalid index URI: {}",
+            uri
+        ))));
     }
     let rest = &uri[6..];
     let mut parts = rest.splitn(2, ':');
     let collection = parts.next().unwrap_or("");
     let index = parts.next().unwrap_or("");
     if collection.is_empty() || index.is_empty() {
-        return Err(WrongoDBError::Storage(StorageError(
-            format!("invalid index URI: {}", uri),
-        )));
+        return Err(WrongoDBError::Storage(StorageError(format!(
+            "invalid index URI: {}",
+            uri
+        ))));
     }
     Ok((collection, index))
 }

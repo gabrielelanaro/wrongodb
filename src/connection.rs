@@ -1,6 +1,6 @@
-use std::fs;
-use std::fmt;
 use std::collections::HashMap;
+use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -121,7 +121,10 @@ fn warn_legacy_per_table_wal_files(base_path: &Path) {
     }
 }
 
-fn recover_global_wal(base_path: &Path, global_txn: Arc<GlobalTxnState>) -> Result<(), WrongoDBError> {
+fn recover_global_wal(
+    base_path: &Path,
+    global_txn: Arc<GlobalTxnState>,
+) -> Result<(), WrongoDBError> {
     let wal_path = GlobalWal::path_for_db(base_path);
     if !wal_path.exists() {
         return Ok(());
@@ -201,12 +204,10 @@ fn next_recovery_record(
         Ok(Some((_header, record))) => Ok(Some(record)),
         Ok(None) => Ok(None),
         Err(
-            err @ (
-                RecoveryError::ChecksumMismatch { .. }
-                | RecoveryError::BrokenLsnChain { .. }
-                | RecoveryError::CorruptRecordHeader { .. }
-                | RecoveryError::CorruptRecordPayload { .. }
-            ),
+            err @ (RecoveryError::ChecksumMismatch { .. }
+            | RecoveryError::BrokenLsnChain { .. }
+            | RecoveryError::CorruptRecordHeader { .. }
+            | RecoveryError::CorruptRecordPayload { .. }),
         ) => {
             eprintln!("Stopping global WAL replay during {pass} at corrupted tail: {err}");
             Ok(None)
