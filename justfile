@@ -30,3 +30,7 @@ all: check test clippy fmt
 # Run development server with auto-reload
 dev-server:
     cargo watch --ignore "test.db*" -x 'run --bin wrongodb-server'
+
+# Run wire-protocol A/B benchmark (WrongoDB vs MongoDB)
+bench-wire-ab:
+    cargo run --release --bin bench_wire_ab --
