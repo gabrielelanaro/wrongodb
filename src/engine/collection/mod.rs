@@ -2,11 +2,11 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
+use crate::api::cursor::Cursor;
+use crate::api::session::Session;
 use crate::core::bson::{decode_document, encode_document, encode_id_value};
 use crate::core::document::{normalize_document_in_place, validate_is_object};
-use crate::cursor::Cursor;
 use crate::index::{decode_index_id, encode_range_bounds};
-use crate::session::Session;
 use crate::txn::TxnId;
 use crate::{Document, WrongoDBError};
 

@@ -16,7 +16,7 @@ use self::mvcc::MvccState;
 use self::pager::{BTreeStore, PageRead, Pager, PinnedPageMut};
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::block::file::NONE_BLOCK_ID;
-use crate::storage::global_wal::GlobalWal;
+use crate::storage::wal::GlobalWal;
 use crate::txn::{GlobalTxnState, TxnId, UpdateType, TXN_NONE};
 use layout::{
     build_internal_page, internal_entries, leaf_entries, map_internal_err, map_leaf_err, page_type,

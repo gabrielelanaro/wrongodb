@@ -1,5 +1,31 @@
 # Decisions
 
+## 2026-02-07: Normalize repository layout around domain modules and suite entrypoints
+
+**Decision**
+- Introduce `src/api/` and move connection/session/cursor/handle-cache modules under it.
+- Rename `src/engine/db.rs` to `src/engine/database.rs`.
+- Rename `src/storage/global_wal.rs` to `src/storage/wal.rs`.
+- Replace test `#[path = ...]` shims with explicit suite entrypoints:
+  - `tests/engine_suite.rs`
+  - `tests/storage_suite.rs`
+  - `tests/server_suite.rs`
+  - `tests/smoke_suite.rs`
+  - `tests/connection_suite.rs`
+- Keep domain folders under `tests/` (`engine/`, `storage/`, `server/`, `smoke/`, `connection/`) with clear file names.
+- Move perf workload from integration tests to Criterion benches (`benches/main_table_vs_append_only.rs`), removing `tests/perf`.
+
+**Why**
+- Root-level module sprawl made ownership boundaries unclear; `src/api/` clarifies runtime API concerns.
+- `database.rs` and `wal.rs` are more discoverable and consistent with existing naming.
+- Explicit suite crates avoid hidden test wiring and remove orphan-file risk.
+- Domain folders plus descriptive names (`split_root`, `multi_level_range`, `block_file`) are easier to navigate than slice labels.
+- Benchmarks should live under `benches/` so integration test suites stay behavior-focused.
+
+**Notes**
+- Public crate API remains stable through `lib.rs` re-exports.
+- Internal module paths now use `crate::api::*` and `crate::storage::wal::*`.
+
 ## 2026-02-07: WAL truncation requires no active txns; indexes use MVCC writes
 
 **Decision**
