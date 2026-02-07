@@ -1,13 +1,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 pub mod page;
 mod page_cache;
 mod pager;
 mod layout;
 mod iter;
 mod mvcc;
-pub mod wal;
 
 pub use iter::BTreeRangeIter;
 
@@ -17,9 +18,9 @@ use layout::{
 };
 use self::pager::{BTreeStore, PageRead, Pager, PinnedPageMut};
 use self::mvcc::MvccState;
-use self::wal::Wal;
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::block::file::NONE_BLOCK_ID;
+use crate::storage::global_wal::GlobalWal;
 use crate::txn::{GlobalTxnState, TxnId, UpdateType, TXN_NONE};
 use page::{InternalPage, LeafPage, LeafPageError};
 
@@ -49,7 +50,9 @@ type KeyValueIter<'a> = BTreeRangeIter<'a>;
 #[derive(Debug)]
 pub struct BTree {
     pager: Box<dyn BTreeStore>,
-    wal: Option<Wal>,
+    global_wal: Option<Arc<Mutex<GlobalWal>>>,
+    wal_enabled: bool,
+    wal_store_name: String,
     mvcc: MvccState,
 }
 
@@ -61,17 +64,25 @@ impl BTree {
         wal_enabled: bool,
         global_txn: Arc<GlobalTxnState>,
     ) -> Result<Self, WrongoDBError> {
+        Self::create_with_global_wal(path, page_size, wal_enabled, global_txn, None)
+    }
+
+    pub(crate) fn create_with_global_wal<P: AsRef<Path>>(
+        path: P,
+        page_size: usize,
+        wal_enabled: bool,
+        global_txn: Arc<GlobalTxnState>,
+        global_wal: Option<Arc<Mutex<GlobalWal>>>,
+    ) -> Result<Self, WrongoDBError> {
         let mut pager = Pager::create(path.as_ref(), page_size)?;
         init_root_if_missing(&mut pager)?;
         pager.checkpoint()?;
-        let wal = if wal_enabled {
-            Some(Wal::create(path.as_ref(), page_size)?)
-        } else {
-            None
-        };
+        let store_name = store_name_from_path(path.as_ref())?;
         Ok(Self {
             pager: Box::new(pager),
-            wal,
+            global_wal,
+            wal_enabled,
+            wal_store_name: store_name,
             mvcc: MvccState::new(global_txn),
         })
     }
@@ -82,26 +93,25 @@ impl BTree {
         wal_enabled: bool,
         global_txn: Arc<GlobalTxnState>,
     ) -> Result<Self, WrongoDBError> {
+        Self::open_with_global_wal(path, wal_enabled, global_txn, None)
+    }
+
+    pub(crate) fn open_with_global_wal<P: AsRef<Path>>(
+        path: P,
+        wal_enabled: bool,
+        global_txn: Arc<GlobalTxnState>,
+        global_wal: Option<Arc<Mutex<GlobalWal>>>,
+    ) -> Result<Self, WrongoDBError> {
         let mut pager = Pager::open(path.as_ref())?;
         init_root_if_missing(&mut pager)?;
-        let wal = if wal_enabled {
-            Some(Wal::open_or_create(path.as_ref(), pager.page_size())?)
-        } else {
-            None
-        };
-        let mut tree = Self {
+        let store_name = store_name_from_path(path.as_ref())?;
+        Ok(Self {
             pager: Box::new(pager),
-            wal,
+            global_wal,
+            wal_enabled,
+            wal_store_name: store_name,
             mvcc: MvccState::new(global_txn),
-        };
-
-        if wal_enabled {
-            if let Err(e) = tree.recover_from_wal() {
-                eprintln!("WAL recovery failed: {}. Database may be inconsistent.", e);
-            }
-        }
-
-        Ok(tree)
+        })
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, WrongoDBError> {
@@ -160,6 +170,16 @@ impl BTree {
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
+        self.put_with_txn(key, value, TXN_NONE, true)
+    }
+
+    pub(crate) fn put_with_txn(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        txn_id: TxnId,
+        log_wal: bool,
+    ) -> Result<(), WrongoDBError> {
         let root = self.pager.root_page_id();
         if root == NONE_BLOCK_ID {
             return Err(StorageError("btree missing root".into()).into());
@@ -184,7 +204,9 @@ impl BTree {
             self.pager.set_root_page_id(result.new_node_id)?;
         }
 
-        self.log_wal_if_enabled(|w| w.log_put(key, value, TXN_NONE))?;
+        if log_wal {
+            self.log_wal_put(key, value, txn_id)?;
+        }
 
         Ok(())
     }
@@ -218,12 +240,21 @@ impl BTree {
             self.pager.set_root_page_id(result.new_node_id)?;
         }
 
-        self.log_wal_if_enabled(|w| w.log_put(key, value, TXN_NONE))?;
+        self.log_wal_put(key, value, TXN_NONE)?;
 
         Ok(true)
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<bool, WrongoDBError> {
+        self.delete_with_txn(key, TXN_NONE, true)
+    }
+
+    pub(crate) fn delete_with_txn(
+        &mut self,
+        key: &[u8],
+        txn_id: TxnId,
+        log_wal: bool,
+    ) -> Result<bool, WrongoDBError> {
         let root = self.pager.root_page_id();
         if root == NONE_BLOCK_ID {
             return Ok(false);
@@ -232,7 +263,9 @@ impl BTree {
         let result = self.delete_recursive(root, key)?;
         self.pager.set_root_page_id(result.new_node_id)?;
 
-        self.log_wal_if_enabled(|w| w.log_delete(key, TXN_NONE))?;
+        if log_wal {
+            self.log_wal_delete(key, txn_id)?;
+        }
 
         Ok(result.deleted)
     }
@@ -248,63 +281,9 @@ impl BTree {
     ///
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         self.materialize_committed_updates()?;
-        // Log checkpoint record BEFORE preparing checkpoint (if WAL is enabled)
         let root = self.pager.checkpoint_prepare();
-
-        // Only log checkpoint if WAL is enabled
-        if let Some(wal) = self.wal.as_mut() {
-            // Get current generation (simplified - using 0 for now)
-            let generation = 0;
-
-            // Log checkpoint record
-            let checkpoint_lsn = wal.log_checkpoint(root, generation)?;
-
-            // Update checkpoint_lsn in WAL header so recovery knows where to start
-            wal.set_checkpoint_lsn(checkpoint_lsn)?;
-
-            // Sync WAL to ensure checkpoint record is durable
-            wal.sync()?;
-        }
-
         self.pager.checkpoint_flush_data()?;
         self.pager.checkpoint_commit(root)?;
-
-        // Truncate WAL after successful checkpoint to reclaim space
-        if let Some(wal) = self.wal.as_mut() {
-            wal.truncate_to_checkpoint()?;
-        }
-
-        Ok(())
-    }
-
-    /// Configure WAL batch sync threshold (sync every N operations).
-    ///
-    /// When configured, the WAL will be synced to disk every N operations
-    /// instead of on every operation. This improves performance at the cost
-    /// of potentially losing up to N operations on a crash.
-    ///
-    /// # Example
-    /// ```no_run
-    /// # use std::sync::Arc;
-    /// # use wrongodb::{BTree, GlobalTxnState};
-    /// # let global_txn = Arc::new(GlobalTxnState::new());
-    /// # let mut tree = BTree::create("/tmp/db", 4096, true, global_txn).unwrap();
-    /// tree.set_wal_sync_threshold(100);  // Sync every 100 operations
-    /// ```
-    pub fn set_wal_sync_threshold(&mut self, threshold: usize) {
-        if let Some(wal) = self.wal.as_mut() {
-            wal.set_sync_threshold(threshold);
-        }
-    }
-
-    /// Force WAL sync to disk.
-    ///
-    /// This ensures all pending WAL records are written to stable storage.
-    /// Call this explicitly if you need durability before a checkpoint.
-    pub fn sync_wal(&mut self) -> Result<(), WrongoDBError> {
-        if let Some(wal) = self.wal.as_mut() {
-            wal.sync()?;
-        }
         Ok(())
     }
 
@@ -314,109 +293,6 @@ impl BTree {
     /// Returns (chains_cleaned, updates_removed, chains_dropped).
     pub fn run_gc(&mut self) -> (usize, usize, usize) {
         self.mvcc.run_gc()
-    }
-
-    /// Recover from WAL after a crash.
-    ///
-    /// This is called automatically during BTree::open() if WAL is enabled.
-    /// It replays all WAL records from the checkpoint LSN via logical BTree operations.
-    fn recover_from_wal(&mut self) -> Result<(), WrongoDBError> {
-        // Get the data file path from the blockfile
-        let data_path = self.pager.data_path();
-
-        let wal_path = wal::wal_path_from_data_path(data_path);
-
-        if !wal_path.exists() {
-            // No WAL file - nothing to recover
-            return Ok(());
-        }
-
-        // Open WAL reader
-        let mut wal_reader = wal::WalReader::open(&wal_path)
-            .map_err(|e| StorageError(format!("Failed to open WAL for recovery: {}", e)))?;
-
-        let checkpoint_lsn = wal_reader.checkpoint_lsn();
-
-        if checkpoint_lsn.is_valid() {
-            eprintln!("Starting WAL recovery from checkpoint LSN: {:?}", checkpoint_lsn);
-        } else {
-            eprintln!("Starting WAL recovery from beginning");
-        }
-
-        // Temporarily take WAL to prevent re-logging during recovery
-        let saved_wal = self.wal.take();
-
-        let result = (|| {
-            let mut stats = RecoveryStats::default();
-
-            // Phase 1: Build transaction table from commit/abort markers
-            let mut committed_txns: std::collections::HashSet<TxnId> = std::collections::HashSet::new();
-            let mut aborted_txns: std::collections::HashSet<TxnId> = std::collections::HashSet::new();
-
-            while let Some((_header, record)) = wal_reader
-                .read_record()
-                .map_err(|e| StorageError(format!("Failed to read WAL record: {}", e)))?
-            {
-                match record {
-                    wal::WalRecord::TxnCommit { txn_id, .. } => {
-                        committed_txns.insert(txn_id);
-                    }
-                    wal::WalRecord::TxnAbort { txn_id } => {
-                        aborted_txns.insert(txn_id);
-                    }
-                    _ => {}
-                }
-            }
-
-            // Reset reader to start from checkpoint again
-            let mut wal_reader = wal::WalReader::open(&wal_path)
-                .map_err(|e| StorageError(format!("Failed to reopen WAL for recovery: {}", e)))?;
-
-            // Phase 2: Replay only committed operations
-            while let Some((_header, record)) = wal_reader
-                .read_record()
-                .map_err(|e| StorageError(format!("Failed to read WAL record: {}", e)))?
-            {
-                match record {
-                    wal::WalRecord::Put { key, value, txn_id } => {
-                        // Replay if: non-transactional (TXN_NONE) or committed
-                        if txn_id == TXN_NONE || committed_txns.contains(&txn_id) {
-                            self.put(&key, &value)?;
-                            stats.puts += 1;
-                        }
-                        // Skip if aborted or uncommitted
-                    }
-                    wal::WalRecord::Delete { key, txn_id } => {
-                        // Replay if: non-transactional (TXN_NONE) or committed
-                        if txn_id == TXN_NONE || committed_txns.contains(&txn_id) {
-                            let _ = self.delete(&key)?;
-                            stats.deletes += 1;
-                        }
-                        // Skip if aborted or uncommitted
-                    }
-                    wal::WalRecord::Checkpoint { .. } => {
-                        stats.checkpoints += 1;
-                    }
-                    wal::WalRecord::TxnCommit { .. } => {
-                        stats.txn_commits += 1;
-                    }
-                    wal::WalRecord::TxnAbort { .. } => {
-                        stats.txn_aborts += 1;
-                    }
-                }
-                stats.operations_replayed += 1;
-            }
-
-            eprintln!(
-                "WAL recovery complete: {} operations replayed (puts={}, deletes={}, checkpoints={}, commits={}, aborts={})",
-                stats.operations_replayed, stats.puts, stats.deletes, stats.checkpoints, stats.txn_commits, stats.txn_aborts
-            );
-
-            Ok(())
-        })();
-
-        self.wal = saved_wal;
-        result
     }
 
     pub fn range(
@@ -442,19 +318,17 @@ impl BTree {
             return Ok(());
         }
 
-        let saved_wal = self.wal.take();
         for (key, update_type, data) in entries {
             match update_type {
                 UpdateType::Standard => {
-                    self.put(&key, &data)?;
+                    self.put_with_txn(&key, &data, TXN_NONE, false)?;
                 }
                 UpdateType::Tombstone => {
-                    let _ = self.delete(&key)?;
+                    let _ = self.delete_with_txn(&key, TXN_NONE, false)?;
                 }
                 UpdateType::Reserve => {}
             }
         }
-        self.wal = saved_wal;
         Ok(())
     }
 
@@ -598,19 +472,31 @@ impl BTree {
         }
     }
 
-    /// Log a WAL record if WAL is enabled.
-    ///
-    /// This helper encapsulates the repetitive pattern of:
-    /// 1. Checking if WAL is enabled
-    /// 2. Logging the WAL record
-    /// 3. Tracking the operation for batch sync
-    fn log_wal_if_enabled<F>(&mut self, op: F) -> Result<(), WrongoDBError>
-    where
-        F: FnOnce(&mut Wal) -> Result<wal::Lsn, WrongoDBError>,
-    {
-        if let Some(wal) = self.wal.as_mut() {
-            op(wal)?;
-            let _ = wal.log_wal_operation();
+    pub(super) fn log_wal_put(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError> {
+        if !self.wal_enabled {
+            return Ok(());
+        }
+        if let Some(global_wal) = self.global_wal.as_ref() {
+            global_wal
+                .lock()
+                .log_put(&self.wal_store_name, key, value, txn_id)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn log_wal_delete(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+        if !self.wal_enabled {
+            return Ok(());
+        }
+        if let Some(global_wal) = self.global_wal.as_ref() {
+            global_wal
+                .lock()
+                .log_delete(&self.wal_store_name, key, txn_id)?;
         }
         Ok(())
     }
@@ -776,16 +662,6 @@ struct InsertResult {
     inserted: bool,
 }
 
-#[derive(Debug, Default, Clone)]
-struct RecoveryStats {
-    operations_replayed: usize,
-    puts: usize,
-    deletes: usize,
-    checkpoints: usize,
-    txn_commits: usize,
-    txn_aborts: usize,
-}
-
 #[derive(Debug, Clone)]
 struct DeleteResult {
     new_node_id: u64,
@@ -802,6 +678,17 @@ fn init_root_if_missing(pager: &mut dyn BTreeStore) -> Result<(), WrongoDBError>
     let leaf_id = pager.write_new_page(&leaf_bytes)?;
     pager.set_root_page_id(leaf_id)?;
     Ok(())
+}
+
+fn store_name_from_path(path: &Path) -> Result<String, WrongoDBError> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(StorageError(format!(
+            "unable to determine store name for path: {}",
+            path.display()
+        ))
+        .into());
+    };
+    Ok(name.to_string())
 }
 
 fn upsert_entry(entries: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &[u8], value: &[u8]) {

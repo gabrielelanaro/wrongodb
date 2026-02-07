@@ -246,3 +246,77 @@ fn session_txn_index_query_sees_uncommitted_write() {
 
     txn.commit().unwrap();
 }
+
+#[test]
+fn crash_before_commit_marker_skips_multi_collection_writes() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("db");
+
+    {
+        let db = WrongoDB::open(&path).unwrap();
+        let coll_a = db.collection("coll_a");
+        let coll_b = db.collection("coll_b");
+        let mut session = db.open_session();
+
+        let mut txn = session.transaction().unwrap();
+        coll_a
+            .insert_one(txn.session_mut(), json!({"_id": 1, "name": "alice"}))
+            .unwrap();
+        coll_b
+            .insert_one(txn.session_mut(), json!({"_id": 1, "name": "bob"}))
+            .unwrap();
+
+        // Simulate process crash before commit/abort marker emission.
+        std::mem::forget(txn);
+    }
+
+    let db = WrongoDB::open(&path).unwrap();
+    let coll_a = db.collection("coll_a");
+    let coll_b = db.collection("coll_b");
+    let mut session = db.open_session();
+
+    assert!(coll_a
+        .find_one(&mut session, Some(json!({"_id": 1})))
+        .unwrap()
+        .is_none());
+    assert!(coll_b
+        .find_one(&mut session, Some(json!({"_id": 1})))
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn crash_after_commit_marker_recovers_multi_collection_writes() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("db");
+
+    {
+        let db = WrongoDB::open(&path).unwrap();
+        let coll_a = db.collection("coll_a");
+        let coll_b = db.collection("coll_b");
+        let mut session = db.open_session();
+
+        let mut txn = session.transaction().unwrap();
+        coll_a
+            .insert_one(txn.session_mut(), json!({"_id": 1, "name": "alice"}))
+            .unwrap();
+        coll_b
+            .insert_one(txn.session_mut(), json!({"_id": 1, "name": "bob"}))
+            .unwrap();
+        txn.commit().unwrap();
+    }
+
+    let db = WrongoDB::open(&path).unwrap();
+    let coll_a = db.collection("coll_a");
+    let coll_b = db.collection("coll_b");
+    let mut session = db.open_session();
+
+    assert!(coll_a
+        .find_one(&mut session, Some(json!({"_id": 1})))
+        .unwrap()
+        .is_some());
+    assert!(coll_b
+        .find_one(&mut session, Some(json!({"_id": 1})))
+        .unwrap()
+        .is_some());
+}

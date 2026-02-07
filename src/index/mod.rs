@@ -5,10 +5,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::storage::global_wal::GlobalWal;
 use crate::txn::GlobalTxnState;
 use crate::{Document, WrongoDBError};
 use crate::storage::table::Table;
@@ -73,9 +74,10 @@ impl PersistentIndex {
         path: &Path,
         wal_enabled: bool,
         global_txn: Arc<GlobalTxnState>,
+        global_wal: Option<Arc<Mutex<GlobalWal>>>,
     ) -> Result<(Self, bool), WrongoDBError> {
         let existed = path.exists();
-        let table = Table::open_or_create_index(path, wal_enabled, global_txn)?;
+        let table = Table::open_or_create_index(path, wal_enabled, global_txn, global_wal)?;
         Ok((
             Self {
                 table: Arc::new(RwLock::new(table)),
@@ -92,7 +94,7 @@ impl PersistentIndex {
     fn insert(&mut self, value: &Value, id: &Value) -> Result<(), WrongoDBError> {
         if let Some(key) = encode_index_key(value, id)? {
             let mut table = self.table.write();
-            table.insert_raw(&key, &[])?;
+            table.insert_raw_with_txn(&key, &[], crate::txn::TXN_NONE)?;
         }
         Ok(())
     }
@@ -118,14 +120,14 @@ impl PersistentIndex {
         Ok(ids)
     }
 
-    fn insert_raw(&mut self, key: &[u8]) -> Result<(), WrongoDBError> {
+    fn insert_raw(&mut self, key: &[u8], txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
         let mut table = self.table.write();
-        table.insert_raw(key, &[])
+        table.insert_raw_with_txn(key, &[], txn_id)
     }
 
-    fn remove_raw(&mut self, key: &[u8]) -> Result<(), WrongoDBError> {
+    fn remove_raw(&mut self, key: &[u8], txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
         let mut table = self.table.write();
-        table.delete_raw(key)?;
+        table.delete_raw_with_txn(key, txn_id)?;
         Ok(())
     }
 
@@ -166,6 +168,7 @@ pub struct IndexCatalog {
     indexes: BTreeMap<String, PersistentIndex>,
     wal_enabled: bool,
     global_txn: Arc<GlobalTxnState>,
+    global_wal: Option<Arc<Mutex<GlobalWal>>>,
 }
 
 impl IndexCatalog {
@@ -174,6 +177,7 @@ impl IndexCatalog {
         db_dir: P,
         wal_enabled: bool,
         global_txn: Arc<GlobalTxnState>,
+        global_wal: Option<Arc<Mutex<GlobalWal>>>,
     ) -> Result<Self, WrongoDBError> {
         let db_dir = db_dir.as_ref().to_path_buf();
         let meta_path = db_dir.join(format!("{}.meta.json", collection));
@@ -233,7 +237,12 @@ impl IndexCatalog {
         for def in definitions.values() {
             let index_path = db_dir.join(&def.source);
             let (index, _created) =
-                PersistentIndex::open_or_create(&index_path, wal_enabled, global_txn.clone())?;
+                PersistentIndex::open_or_create(
+                    &index_path,
+                    wal_enabled,
+                    global_txn.clone(),
+                    global_wal.clone(),
+                )?;
             indexes.insert(def.name.clone(), index);
         }
 
@@ -244,6 +253,7 @@ impl IndexCatalog {
             indexes,
             wal_enabled,
             global_txn,
+            global_wal,
         })
     }
 
@@ -252,6 +262,7 @@ impl IndexCatalog {
         db_dir: P,
         wal_enabled: bool,
         global_txn: Arc<GlobalTxnState>,
+        global_wal: Option<Arc<Mutex<GlobalWal>>>,
     ) -> Self {
         Self {
             collection: collection.to_string(),
@@ -260,6 +271,7 @@ impl IndexCatalog {
             indexes: BTreeMap::new(),
             wal_enabled,
             global_txn,
+            global_wal,
         }
     }
 
@@ -312,7 +324,12 @@ impl IndexCatalog {
         let index_exists = index_path.exists();
 
         let (mut index, created) =
-            PersistentIndex::open_or_create(&index_path, self.wal_enabled, self.global_txn.clone())?;
+            PersistentIndex::open_or_create(
+                &index_path,
+                self.wal_enabled,
+                self.global_txn.clone(),
+                self.global_wal.clone(),
+            )?;
 
         if !index_exists || created {
             let field = &columns[0];
@@ -346,7 +363,11 @@ impl IndexCatalog {
         }
     }
 
-    pub fn add_doc(&mut self, doc: &Document) -> Result<Vec<IndexOpRecord>, WrongoDBError> {
+    pub fn add_doc(
+        &mut self,
+        doc: &Document,
+        txn_id: crate::txn::TxnId,
+    ) -> Result<Vec<IndexOpRecord>, WrongoDBError> {
         let Some(id) = doc.get("_id") else {
             return Ok(Vec::new());
         };
@@ -364,7 +385,7 @@ impl IndexCatalog {
                 continue;
             };
             if let Some(index) = self.indexes.get_mut(name) {
-                index.insert_raw(&key)?;
+                index.insert_raw(&key, txn_id)?;
                 let uri = self.index_uri(name);
                 ops.push(IndexOpRecord::add(uri, key));
             }
@@ -372,7 +393,11 @@ impl IndexCatalog {
         Ok(ops)
     }
 
-    pub fn remove_doc(&mut self, doc: &Document) -> Result<Vec<IndexOpRecord>, WrongoDBError> {
+    pub fn remove_doc(
+        &mut self,
+        doc: &Document,
+        txn_id: crate::txn::TxnId,
+    ) -> Result<Vec<IndexOpRecord>, WrongoDBError> {
         let Some(id) = doc.get("_id") else {
             return Ok(Vec::new());
         };
@@ -390,7 +415,7 @@ impl IndexCatalog {
                 continue;
             };
             if let Some(index) = self.indexes.get_mut(name) {
-                index.remove_raw(&key)?;
+                index.remove_raw(&key, txn_id)?;
                 let uri = self.index_uri(name);
                 ops.push(IndexOpRecord::remove(uri, key));
             }
@@ -403,13 +428,14 @@ impl IndexCatalog {
         index_name: &str,
         key: &[u8],
         op: IndexOpType,
+        txn_id: crate::txn::TxnId,
     ) -> Result<(), WrongoDBError> {
         let Some(index) = self.indexes.get_mut(index_name) else {
             return Ok(());
         };
         match op {
-            IndexOpType::Add => index.insert_raw(key),
-            IndexOpType::Remove => index.remove_raw(key),
+            IndexOpType::Add => index.insert_raw(key, txn_id),
+            IndexOpType::Remove => index.remove_raw(key, txn_id),
         }
     }
 
@@ -468,7 +494,8 @@ mod tests {
         let path = tmp.path().join("test.idx.wt");
         let global_txn = Arc::new(GlobalTxnState::new());
 
-        let (mut index, _created) = PersistentIndex::open_or_create(&path, false, global_txn).unwrap();
+        let (mut index, _created) =
+            PersistentIndex::open_or_create(&path, false, global_txn, None).unwrap();
 
         index.insert(&json!("alice"), &json!("id1")).unwrap();
         index.insert(&json!("bob"), &json!("id2")).unwrap();
@@ -488,7 +515,7 @@ mod tests {
     fn index_catalog_add_and_lookup() {
         let tmp = tempdir().unwrap();
         let global_txn = Arc::new(GlobalTxnState::new());
-        let mut catalog = IndexCatalog::empty("coll", tmp.path(), false, global_txn);
+        let mut catalog = IndexCatalog::empty("coll", tmp.path(), false, global_txn, None);
 
         let docs: Vec<Document> = vec![
             serde_json::from_value(json!({"_id": "a1", "name": "alice"})).unwrap(),

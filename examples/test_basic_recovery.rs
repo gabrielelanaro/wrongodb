@@ -1,36 +1,35 @@
 use std::path::PathBuf;
-use std::sync::Arc;
-use wrongodb::{BTree, GlobalTxnState};
+
+use serde_json::json;
+
+use wrongodb::WrongoDB;
 
 fn main() {
     let db_path: PathBuf = "/tmp/test_recovery.db".into();
 
-    // Clean up
-    let _ = std::fs::remove_file(&db_path);
-    let _ = std::fs::remove_file(db_path.with_extension("db.wal"));
+    let _ = std::fs::remove_dir_all(&db_path);
 
     println!("=== Creating database ===");
     {
-        let global_txn = Arc::new(GlobalTxnState::new());
-        let mut tree = BTree::create(&db_path, 512, true, global_txn).unwrap();
+        let db = WrongoDB::open(&db_path).unwrap();
+        let coll = db.collection("test");
+        let mut session = db.open_session();
 
         println!("Inserting key0");
-        tree.put(b"key0", b"value0").unwrap();
-
-        println!("Syncing WAL");
-        tree.sync_wal().unwrap();
+        coll.insert_one(&mut session, json!({"_id": "key0", "v": "value0"}))
+            .unwrap();
     }
 
     println!("\n=== Reopening database (recovery) ===");
     {
-        let global_txn = Arc::new(GlobalTxnState::new());
-        let mut tree = BTree::open(&db_path, true, global_txn).unwrap();
+        let db = WrongoDB::open(&db_path).unwrap();
+        let coll = db.collection("test");
+        let mut session = db.open_session();
 
         println!("Trying to get key0");
-        match tree.get(b"key0") {
-            Ok(Some(v)) => println!("Found: {:?}", String::from_utf8_lossy(&v)),
-            Ok(None) => println!("Not found (None)"),
-            Err(e) => println!("Error: {}", e),
-        }
+        let found = coll
+            .find_one(&mut session, Some(json!({"_id": "key0"})))
+            .unwrap();
+        println!("Found: {:?}", found);
     }
 }

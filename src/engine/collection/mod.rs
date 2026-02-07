@@ -60,24 +60,34 @@ impl Collection {
             .ok_or(WrongoDBError::NoActiveTransaction)
     }
 
-    fn apply_index_add(&self, session: &mut Session, doc: &Document) -> Result<(), WrongoDBError> {
+    fn apply_index_add(
+        &self,
+        session: &mut Session,
+        doc: &Document,
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError> {
         let table = session.table_handle(&self.name, false)?;
         let mut table_guard = table.write();
         let catalog = table_guard
             .index_catalog_mut()
             .ok_or_else(|| crate::core::errors::StorageError("missing index catalog".into()))?;
-        let ops = catalog.add_doc(doc)?;
+        let ops = catalog.add_doc(doc, txn_id)?;
         session.record_index_ops(ops)?;
         Ok(())
     }
 
-    fn apply_index_remove(&self, session: &mut Session, doc: &Document) -> Result<(), WrongoDBError> {
+    fn apply_index_remove(
+        &self,
+        session: &mut Session,
+        doc: &Document,
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError> {
         let table = session.table_handle(&self.name, false)?;
         let mut table_guard = table.write();
         let catalog = table_guard
             .index_catalog_mut()
             .ok_or_else(|| crate::core::errors::StorageError("missing index catalog".into()))?;
-        let ops = catalog.remove_doc(doc)?;
+        let ops = catalog.remove_doc(doc, txn_id)?;
         session.record_index_ops(ops)?;
         Ok(())
     }
@@ -101,7 +111,7 @@ impl Collection {
         let mut cursor = session.open_cursor(&format!("table:{}", self.name))?;
         cursor.insert(&key, &value, txn_id)?;
 
-        self.apply_index_add(session, &obj)?;
+        self.apply_index_add(session, &obj, txn_id)?;
         Ok(obj)
     }
 
@@ -174,7 +184,7 @@ impl Collection {
             };
             filter_doc
                 .keys()
-                .find(|k| catalog.has_index(*k))
+                .find(|k| catalog.has_index(k))
                 .cloned()
         };
 
@@ -275,8 +285,8 @@ impl Collection {
             let mut cursor = session.open_cursor(&format!("table:{}", self.name))?;
             cursor.update(&key, &value, txn_id)?;
 
-            self.apply_index_remove(session, doc)?;
-            self.apply_index_add(session, &updated_doc)?;
+            self.apply_index_remove(session, doc, txn_id)?;
+            self.apply_index_add(session, &updated_doc, txn_id)?;
 
             Ok(UpdateResult { matched: 1, modified: 1 })
         })
@@ -309,8 +319,8 @@ impl Collection {
                 let mut cursor = session.open_cursor(&format!("table:{}", self.name))?;
                 cursor.update(&key, &value, txn_id)?;
 
-                self.apply_index_remove(session, &doc)?;
-                self.apply_index_add(session, &updated_doc)?;
+                self.apply_index_remove(session, &doc, txn_id)?;
+                self.apply_index_add(session, &updated_doc, txn_id)?;
                 modified += 1;
             }
 
@@ -336,7 +346,7 @@ impl Collection {
             let mut cursor = session.open_cursor(&format!("table:{}", self.name))?;
             cursor.delete(&key, txn_id)?;
 
-            self.apply_index_remove(session, doc)?;
+            self.apply_index_remove(session, doc, txn_id)?;
             Ok(1)
         })
     }
@@ -360,7 +370,7 @@ impl Collection {
                 let mut cursor = session.open_cursor(&format!("table:{}", self.name))?;
                 cursor.delete(&key, txn_id)?;
 
-                self.apply_index_remove(session, &doc)?;
+                self.apply_index_remove(session, &doc, txn_id)?;
                 deleted += 1;
             }
 
@@ -396,9 +406,8 @@ impl Collection {
     }
 
     pub fn checkpoint(&self, session: &mut Session) -> Result<(), WrongoDBError> {
-        let table = session.table_handle(&self.name, false)?;
-        let mut guard = table.write();
-        guard.checkpoint()
+        let _ = session.table_handle(&self.name, false)?;
+        session.checkpoint_all()
     }
 }
 

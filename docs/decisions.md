@@ -1,5 +1,28 @@
 # Decisions
 
+## 2026-02-07: Global connection-level WAL + hard cutover
+
+**Decision**
+- Move WAL ownership from per-BTree files to one connection-level file: `<db_dir>/global.wal`.
+- Route all `Put/Delete` WAL records through the global WAL and include `store_name` in each record.
+- Run recovery once at `Connection::open` (two-pass: txn-table build, then logical replay).
+- Make `SessionTxn::commit` write and sync exactly one `TxnCommit` marker before visibility flip.
+- Make `SessionTxn::abort` write one `TxnAbort` marker; no mandatory sync.
+- Keep `Collection::checkpoint` API, but implement it as a global checkpoint coordinator:
+  - checkpoint all open table handles
+  - write one WAL `Checkpoint` record
+  - sync + truncate global WAL.
+- Hard cutover: legacy per-table `*.wal` files are ignored and only warned about.
+
+**Why**
+- Ensures deterministic cross-collection crash recovery with one ordered log stream.
+- Removes per-table commit-marker coordination complexity.
+- Centralizes durability boundaries and replay semantics in one subsystem.
+
+**Notes**
+- Per-table WAL codepaths and controls (`sync_wal`, `set_wal_sync_threshold`, per-BTree recovery) are removed.
+- Legacy `*.wal` cleanup is an offline maintenance step after successful open/checkpoint.
+
 ## 2026-02-02: Table-owned index catalog + Session-only transactions
 
 **Decision**

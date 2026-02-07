@@ -1,8 +1,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use crate::index::IndexCatalog;
 use crate::storage::btree::BTree;
+use crate::storage::global_wal::GlobalWal;
 use crate::txn::{GlobalTxnState, TxnId};
 use crate::WrongoDBError;
 
@@ -22,15 +25,17 @@ impl Table {
         db_dir: P,
         wal_enabled: bool,
         global_txn: Arc<GlobalTxnState>,
+        global_wal: Option<Arc<Mutex<GlobalWal>>>,
     ) -> Result<Self, WrongoDBError> {
         let db_dir = db_dir.as_ref();
         let path = db_dir.join(format!("{}.main.wt", collection));
         let btree = if path.exists() {
-            BTree::open(path, wal_enabled, global_txn.clone())?
+            BTree::open_with_global_wal(path, wal_enabled, global_txn.clone(), global_wal.clone())?
         } else {
-            BTree::create(path, 4096, wal_enabled, global_txn.clone())?
+            BTree::create_with_global_wal(path, 4096, wal_enabled, global_txn.clone(), global_wal.clone())?
         };
-        let index_catalog = IndexCatalog::load_or_init(collection, db_dir, wal_enabled, global_txn)?;
+        let index_catalog =
+            IndexCatalog::load_or_init(collection, db_dir, wal_enabled, global_txn, global_wal)?;
         Ok(Self {
             btree,
             index_catalog: Some(index_catalog),
@@ -41,11 +46,12 @@ impl Table {
         path: P,
         wal_enabled: bool,
         global_txn: Arc<GlobalTxnState>,
+        global_wal: Option<Arc<Mutex<GlobalWal>>>,
     ) -> Result<Self, WrongoDBError> {
         let btree = if path.as_ref().exists() {
-            BTree::open(path, wal_enabled, global_txn)?
+            BTree::open_with_global_wal(path, wal_enabled, global_txn, global_wal)?
         } else {
-            BTree::create(path, 4096, wal_enabled, global_txn)?
+            BTree::create_with_global_wal(path, 4096, wal_enabled, global_txn, global_wal)?
         };
         Ok(Self {
             btree,
@@ -98,12 +104,44 @@ impl Table {
 
     /// Insert a key/value pair without MVCC (used by index tables).
     pub fn insert_raw(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
-        self.btree.put(key, value)
+        self.insert_raw_with_txn(key, value, crate::txn::TXN_NONE)
     }
 
     /// Delete a key without MVCC (used by index tables).
     pub fn delete_raw(&mut self, key: &[u8]) -> Result<(), WrongoDBError> {
-        let _ = self.btree.delete(key)?;
+        let _ = self.delete_raw_with_txn(key, crate::txn::TXN_NONE)?;
+        Ok(())
+    }
+
+    pub fn insert_raw_with_txn(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        txn_id: crate::txn::TxnId,
+    ) -> Result<(), WrongoDBError> {
+        self.btree.put_with_txn(key, value, txn_id, true)
+    }
+
+    pub fn delete_raw_with_txn(
+        &mut self,
+        key: &[u8],
+        txn_id: crate::txn::TxnId,
+    ) -> Result<bool, WrongoDBError> {
+        let deleted = self.btree.delete_with_txn(key, txn_id, true)?;
+        Ok(deleted)
+    }
+
+    pub fn sync_all(&mut self) -> Result<(), WrongoDBError> {
+        self.btree.sync_all()
+    }
+
+    pub fn put_recovery(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
+        self.btree.put_with_txn(key, value, crate::txn::TXN_NONE, false)?;
+        Ok(())
+    }
+
+    pub fn delete_recovery(&mut self, key: &[u8]) -> Result<(), WrongoDBError> {
+        let _ = self.btree.delete_with_txn(key, crate::txn::TXN_NONE, false)?;
         Ok(())
     }
 

@@ -67,8 +67,8 @@ impl MvccState {
         let mut keys: Vec<Vec<u8>> = self.chains.keys().cloned().collect();
         if start.is_some() || end.is_some() {
             keys.retain(|key| {
-                let after_start = start.map_or(true, |s| key.as_slice() >= s);
-                let before_end = end.map_or(true, |e| key.as_slice() < e);
+                let after_start = start.is_none_or(|s| key.as_slice() >= s);
+                let before_end = end.is_none_or(|e| key.as_slice() < e);
                 after_start && before_end
             });
         }
@@ -129,9 +129,7 @@ impl BTree {
         value: &[u8],
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
-        if let Some(wal) = self.wal.as_mut() {
-            wal.log_put(key, value, txn_id)?;
-        }
+        self.log_wal_put(key, value, txn_id)?;
 
         let chain = self.mvcc.chain_mut_or_create(key);
 
@@ -149,9 +147,7 @@ impl BTree {
         key: &[u8],
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
-        if let Some(wal) = self.wal.as_mut() {
-            wal.log_delete(key, txn_id)?;
-        }
+        self.log_wal_delete(key, txn_id)?;
 
         let chain = self.mvcc.chain_mut_or_create(key);
 
@@ -164,16 +160,9 @@ impl BTree {
         Ok(())
     }
 
-    /// Mark all updates from this transaction as committed in MVCC chains
-    /// and log the commit to WAL.
+    /// Mark all updates from this transaction as committed in MVCC chains.
     /// Note: This does NOT update the transaction state - that's done by Session.
     pub fn mark_updates_committed(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        // Log commit to WAL first (for durability)
-        if let Some(wal) = self.wal.as_mut() {
-            let _commit_ts = wal.log_txn_commit(txn_id, txn_id)?;
-            wal.sync()?; // Ensure commit is durable
-        }
-
         // Update time windows for all modifications to mark them as committed
         // We scan all chains to find updates from this transaction
         for (_, chain) in self.mvcc.chains.iter_mut() {
@@ -189,15 +178,9 @@ impl BTree {
         Ok(())
     }
 
-    /// Mark all updates from this transaction as aborted in MVCC chains
-    /// and log the abort to WAL.
+    /// Mark all updates from this transaction as aborted in MVCC chains.
     /// Note: This does NOT update the transaction state - that's done by Session.
     pub fn mark_updates_aborted(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        // Log abort to WAL
-        if let Some(wal) = self.wal.as_mut() {
-            wal.log_txn_abort(txn_id)?;
-        }
-
         // Mark all updates in chains as aborted
         for (_, chain) in self.mvcc.chains.iter_mut() {
             chain.mark_aborted(txn_id);

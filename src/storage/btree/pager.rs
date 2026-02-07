@@ -78,7 +78,6 @@ pub(super) trait CheckpointStore: std::fmt::Debug + Send + Sync {
     fn checkpoint_flush_data(&mut self) -> Result<(), WrongoDBError>;
     fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError>;
     fn sync_all(&mut self) -> Result<(), WrongoDBError>;
-    fn data_path(&self) -> &Path;
 }
 
 pub(super) trait BTreeStore: PageRead + PageWrite + RootStore + CheckpointStore {}
@@ -123,10 +122,6 @@ impl Pager {
 
     pub(super) fn page_payload_len(&self) -> usize {
         self.bf.page_payload_len()
-    }
-
-    pub(super) fn page_size(&self) -> usize {
-        self.bf.page_size
     }
 
     pub(super) fn root_page_id(&self) -> u64 {
@@ -366,9 +361,6 @@ impl CheckpointStore for Pager {
         self.bf.sync_all()
     }
 
-    fn data_path(&self) -> &Path {
-        self.bf.path.as_path()
-    }
 }
 
 #[cfg(test)]

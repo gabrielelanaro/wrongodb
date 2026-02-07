@@ -1,149 +1,83 @@
-//! WAL integration tests for BTree operations.
+//! Integration tests for connection-level global WAL behavior.
 
-use std::sync::Arc;
+use std::fs;
+
+use serde_json::json;
 use tempfile::tempdir;
-use wrongodb::{BTree, GlobalTxnState};
 
-#[test]
-fn btree_creates_with_wal_enabled() {
-    let tmp = tempdir().unwrap();
-    let path = tmp.path().join("test.wt");
+use wrongodb::{WrongoDB, WrongoDBConfig};
 
-    let _tree = BTree::create(&path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
-
-    // Verify WAL file exists
-    let wal_path = path.with_extension("wt.wal");
-    assert!(wal_path.exists());
+fn global_wal_path(db_dir: &std::path::Path) -> std::path::PathBuf {
+    db_dir.join("global.wal")
 }
 
 #[test]
-fn btree_creates_without_wal() {
+fn global_wal_created_when_enabled() {
     let tmp = tempdir().unwrap();
-    let path = tmp.path().join("test.wt");
+    let db_path = tmp.path().join("db");
 
-    let _tree = BTree::create(&path, 512, false, Arc::new(GlobalTxnState::new())).unwrap();
+    let db = WrongoDB::open(&db_path).unwrap();
+    let coll = db.collection("test");
+    let mut session = db.open_session();
+    coll.insert_one(&mut session, json!({"_id": 1, "v": "a"}))
+        .unwrap();
 
-    // Verify WAL file does NOT exist
-    let wal_path = path.with_extension("wt.wal");
-    assert!(!wal_path.exists());
+    assert!(global_wal_path(&db_path).exists());
 }
 
 #[test]
-fn leaf_insert_logs_wal_record() {
+fn global_wal_not_created_when_disabled() {
     let tmp = tempdir().unwrap();
-    let path = tmp.path().join("test.wt");
+    let db_path = tmp.path().join("db");
+    let cfg = WrongoDBConfig::new().wal_enabled(false);
 
-    let mut tree = BTree::create(&path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
-    tree.put(b"key1", b"value1").unwrap();
-    // Sync WAL to flush the buffer
-    tree.sync_wal().unwrap();
+    let db = WrongoDB::open_with_config(&db_path, cfg).unwrap();
+    let coll = db.collection("test");
+    let mut session = db.open_session();
+    coll.insert_one(&mut session, json!({"_id": 1, "v": "a"}))
+        .unwrap();
 
-    // Verify WAL file has content beyond header
-    let wal_path = path.with_extension("wt.wal");
-    let metadata = std::fs::metadata(&wal_path).unwrap();
-    assert!(metadata.len() > 512);  // More than header size
+    assert!(!global_wal_path(&db_path).exists());
 }
 
 #[test]
-fn multiple_inserts_log_wal_records() {
+fn global_wal_grows_after_committed_writes() {
     let tmp = tempdir().unwrap();
-    let path = tmp.path().join("test_split.wt");
+    let db_path = tmp.path().join("db");
 
-    // Use small page size to create multiple updates
-    let mut tree = BTree::create(&path, 256, true, Arc::new(GlobalTxnState::new())).unwrap();
+    let db = WrongoDB::open(&db_path).unwrap();
+    let coll = db.collection("test");
+    let mut session = db.open_session();
 
-    // Insert many keys to generate multiple WAL records
     for i in 0..20 {
-        let key = format!("key{:05}", i);
-        let value = vec![i as u8; 100];
-        tree.put(key.as_bytes(), &value).unwrap();
+        coll.insert_one(&mut session, json!({"_id": i, "v": i}))
+            .unwrap();
     }
-    // Sync WAL to flush the buffer
-    tree.sync_wal().unwrap();
 
-    // Verify WAL file grew
-    let wal_path = path.with_extension("wt.wal");
-    let metadata = std::fs::metadata(&wal_path).unwrap();
-    assert!(metadata.len() > 2000);  // Should have multiple records
+    let metadata = fs::metadata(global_wal_path(&db_path)).unwrap();
+    assert!(metadata.len() > 512);
 }
 
 #[test]
-fn batch_sync_threshold() {
+fn collection_checkpoint_truncates_global_wal() {
     let tmp = tempdir().unwrap();
-    let path = tmp.path().join("test_batch.wt");
+    let db_path = tmp.path().join("db");
 
-    let mut tree = BTree::create(&path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
-    tree.set_wal_sync_threshold(5);  // Sync every 5 operations
+    let db = WrongoDB::open(&db_path).unwrap();
+    let coll = db.collection("test");
+    let mut session = db.open_session();
 
-    // Insert 10 keys (should trigger 2 syncs)
     for i in 0..10 {
-        let key = format!("key{:02}", i);
-        tree.put(key.as_bytes(), b"value").unwrap();
+        coll.insert_one(&mut session, json!({"_id": i, "v": i}))
+            .unwrap();
     }
 
-    // Force explicit sync
-    tree.sync_wal().unwrap();
+    let wal_path = global_wal_path(&db_path);
+    let before = fs::metadata(&wal_path).unwrap().len();
+    assert!(before > 512);
 
-    // Verify WAL exists
-    let wal_path = path.with_extension("wt.wal");
-    assert!(wal_path.exists());
-}
+    coll.checkpoint(&mut session).unwrap();
 
-#[test]
-fn checkpoint_logs_wal_record() {
-    let tmp = tempdir().unwrap();
-    let path = tmp.path().join("test_ckpt.wt");
-
-    let mut tree = BTree::create(&path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
-    tree.put(b"key", b"value").unwrap();
-    tree.checkpoint().unwrap();
-
-    // Verify WAL has checkpoint record
-    let wal_path = path.with_extension("wt.wal");
-    assert!(wal_path.exists());
-
-    // Note: Checkpoint record verification is done in recovery tests
-}
-
-#[test]
-fn wal_disabled_no_file_created() {
-    let tmp = tempdir().unwrap();
-    let path = tmp.path().join("test_no_wal.wt");
-
-    let mut tree = BTree::create(&path, 512, false, Arc::new(GlobalTxnState::new())).unwrap();
-    tree.put(b"key", b"value").unwrap();
-    tree.checkpoint().unwrap();
-
-    // Verify WAL file does NOT exist
-    let wal_path = path.with_extension("wt.wal");
-    assert!(!wal_path.exists());
-}
-
-#[test]
-fn open_with_wal_reopens_existing_wal() {
-    let tmp = tempdir().unwrap();
-    let path = tmp.path().join("test_reopen.wt");
-
-    // Create with WAL
-    {
-        let mut tree = BTree::create(&path, 512, true, Arc::new(GlobalTxnState::new())).unwrap();
-        tree.put(b"key1", b"value1").unwrap();
-        // Checkpoint to persist data
-        tree.checkpoint().unwrap();
-    }
-
-    // Verify WAL exists
-    let wal_path = path.with_extension("wt.wal");
-    assert!(wal_path.exists());
-
-    // Reopen with WAL enabled
-    {
-        let mut tree = BTree::open(&path, true, Arc::new(GlobalTxnState::new())).unwrap();
-        // Verify data is accessible
-        let value = tree.get(b"key1").unwrap();
-        assert_eq!(value, Some(b"value1".to_vec()));
-    }
-
-    // WAL should still exist
-    assert!(wal_path.exists());
+    let after = fs::metadata(&wal_path).unwrap().len();
+    assert!(after <= 512);
 }

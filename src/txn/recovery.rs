@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use crate::storage::btree::wal::WalRecord;
+use crate::storage::global_wal::WalRecord;
 use crate::txn::{TxnId, TXN_NONE};
 
 /// Transaction table built during WAL recovery.
@@ -58,7 +58,7 @@ impl RecoveryTxnTable {
                     self.pending.insert(*txn_id);
                 }
             }
-            WalRecord::Checkpoint { .. } => {
+            WalRecord::Checkpoint => {
                 // Checkpoints don't affect transaction state
             }
         }
@@ -114,7 +114,7 @@ impl RecoveryTxnTable {
             // Transaction marker records are not "applied" to the btree
             WalRecord::TxnCommit { .. } => return false,
             WalRecord::TxnAbort { .. } => return false,
-            WalRecord::Checkpoint { .. } => return false,
+            WalRecord::Checkpoint => return false,
         };
 
         // Non-transactional operations are always applied
@@ -163,6 +163,15 @@ impl Default for RecoveryTxnTable {
 mod tests {
     use super::*;
 
+    fn put_record(txn_id: TxnId, key: &[u8], value: &[u8]) -> WalRecord {
+        WalRecord::Put {
+            store_name: "test.main.wt".to_string(),
+            key: key.to_vec(),
+            value: value.to_vec(),
+            txn_id,
+        }
+    }
+
     #[test]
     fn test_empty_table() {
         let table = RecoveryTxnTable::new();
@@ -176,11 +185,7 @@ mod tests {
         let mut table = RecoveryTxnTable::new();
 
         // First, add a pending operation
-        table.process_record(&WalRecord::Put {
-            key: b"key".to_vec(),
-            value: b"value".to_vec(),
-            txn_id: 42,
-        });
+        table.process_record(&put_record(42, b"key", b"value"));
         assert!(table.is_pending(42));
 
         // Then commit
@@ -191,43 +196,27 @@ mod tests {
 
         assert!(table.is_committed(42));
         assert!(!table.is_pending(42));
-        assert!(table.should_apply(&WalRecord::Put {
-            key: b"key".to_vec(),
-            value: b"value".to_vec(),
-            txn_id: 42,
-        }));
+        assert!(table.should_apply(&put_record(42, b"key", b"value")));
     }
 
     #[test]
     fn test_abort_record() {
         let mut table = RecoveryTxnTable::new();
 
-        table.process_record(&WalRecord::Put {
-            key: b"key".to_vec(),
-            value: b"value".to_vec(),
-            txn_id: 42,
-        });
+        table.process_record(&put_record(42, b"key", b"value"));
 
         table.process_record(&WalRecord::TxnAbort { txn_id: 42 });
 
         assert!(table.is_aborted(42));
         assert!(!table.is_pending(42));
-        assert!(!table.should_apply(&WalRecord::Put {
-            key: b"key".to_vec(),
-            value: b"value".to_vec(),
-            txn_id: 42,
-        }));
+        assert!(!table.should_apply(&put_record(42, b"key", b"value")));
     }
 
     #[test]
     fn test_non_transactional_always_applied() {
         let table = RecoveryTxnTable::new();
 
-        assert!(table.should_apply(&WalRecord::Put {
-            key: b"key".to_vec(),
-            value: b"value".to_vec(),
-            txn_id: TXN_NONE,
-        }));
+        assert!(table.should_apply(&put_record(TXN_NONE, b"key", b"value")));
     }
 
     #[test]
@@ -235,11 +224,7 @@ mod tests {
         let mut table = RecoveryTxnTable::new();
 
         // Add operations without commit/abort
-        table.process_record(&WalRecord::Put {
-            key: b"key".to_vec(),
-            value: b"value".to_vec(),
-            txn_id: 42,
-        });
+        table.process_record(&put_record(42, b"key", b"value"));
         assert!(table.is_pending(42));
 
         // Finalize - pending become aborted
@@ -282,10 +267,7 @@ mod tests {
             commit_ts: 100,
         }));
         assert!(!table.should_apply(&WalRecord::TxnAbort { txn_id: 1 }));
-        assert!(!table.should_apply(&WalRecord::Checkpoint {
-            root_block_id: 1,
-            generation: 1,
-        }));
+        assert!(!table.should_apply(&WalRecord::Checkpoint));
     }
 
     #[test]
@@ -293,50 +275,26 @@ mod tests {
         let mut table = RecoveryTxnTable::new();
 
         // Transaction 1: committed
-        table.process_record(&WalRecord::Put {
-            key: b"k1".to_vec(),
-            value: b"v1".to_vec(),
-            txn_id: 1,
-        });
+        table.process_record(&put_record(1, b"k1", b"v1"));
         table.process_record(&WalRecord::TxnCommit {
             txn_id: 1,
             commit_ts: 100,
         });
 
         // Transaction 2: aborted
-        table.process_record(&WalRecord::Put {
-            key: b"k2".to_vec(),
-            value: b"v2".to_vec(),
-            txn_id: 2,
-        });
+        table.process_record(&put_record(2, b"k2", b"v2"));
         table.process_record(&WalRecord::TxnAbort { txn_id: 2 });
 
         // Transaction 3: pending (incomplete)
-        table.process_record(&WalRecord::Put {
-            key: b"k3".to_vec(),
-            value: b"v3".to_vec(),
-            txn_id: 3,
-        });
+        table.process_record(&put_record(3, b"k3", b"v3"));
 
         assert_eq!(table.committed_count(), 1);
         assert_eq!(table.aborted_count(), 1);
         assert_eq!(table.pending_count(), 1);
 
         // Only tx 1 should apply
-        assert!(table.should_apply(&WalRecord::Put {
-            key: b"k1".to_vec(),
-            value: b"v1".to_vec(),
-            txn_id: 1,
-        }));
-        assert!(!table.should_apply(&WalRecord::Put {
-            key: b"k2".to_vec(),
-            value: b"v2".to_vec(),
-            txn_id: 2,
-        }));
-        assert!(!table.should_apply(&WalRecord::Put {
-            key: b"k3".to_vec(),
-            value: b"v3".to_vec(),
-            txn_id: 3,
-        }));
+        assert!(table.should_apply(&put_record(1, b"k1", b"v1")));
+        assert!(!table.should_apply(&put_record(2, b"k2", b"v2")));
+        assert!(!table.should_apply(&put_record(3, b"k3", b"v3")));
     }
 }
