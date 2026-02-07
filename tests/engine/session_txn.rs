@@ -248,6 +248,67 @@ fn session_txn_index_query_sees_uncommitted_write() {
 }
 
 #[test]
+fn checkpoint_skips_wal_truncation_with_active_transaction() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("db");
+
+    {
+        let db = WrongoDB::open(&path).unwrap();
+        let coll = db.collection("test");
+
+        let mut writer = db.open_session();
+        let mut checkpointer = db.open_session();
+
+        let mut txn = writer.transaction().unwrap();
+        coll.insert_one(txn.session_mut(), json!({"_id": 1, "name": "alice"}))
+            .unwrap();
+
+        // Checkpoint while the writer txn is still active.
+        coll.checkpoint(&mut checkpointer).unwrap();
+        txn.commit().unwrap();
+    }
+
+    let db = WrongoDB::open(&path).unwrap();
+    let coll = db.collection("test");
+    let mut session = db.open_session();
+    assert!(coll
+        .find_one(&mut session, Some(json!({"_id": 1})))
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn older_snapshot_still_uses_index_after_uncommitted_delete() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("db");
+
+    let db = WrongoDB::open(&path).unwrap();
+    let coll = db.collection("test");
+    let mut seed = db.open_session();
+
+    coll.insert_one(&mut seed, json!({"_id": 1, "name": "alice"}))
+        .unwrap();
+    coll.create_index(&mut seed, "name").unwrap();
+
+    let mut reader = db.open_session();
+    let mut reader_txn = reader.transaction().unwrap();
+
+    let mut writer = db.open_session();
+    let mut writer_txn = writer.transaction().unwrap();
+    coll.delete_one(writer_txn.session_mut(), Some(json!({"_id": 1})))
+        .unwrap();
+
+    // Reader snapshot predates writer txn, so it should still see the indexed row.
+    let found = coll
+        .find(reader_txn.session_mut(), Some(json!({"name": "alice"})))
+        .unwrap();
+    assert_eq!(found.len(), 1);
+
+    writer_txn.abort().unwrap();
+    reader_txn.commit().unwrap();
+}
+
+#[test]
 fn crash_before_commit_marker_skips_multi_collection_writes() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("db");

@@ -6,7 +6,6 @@ use parking_lot::{Mutex, RwLock};
 use crate::core::errors::StorageError;
 use crate::cursor::{Cursor, CursorKind};
 use crate::datahandle_cache::DataHandleCache;
-use crate::index::{IndexOpRecord, IndexOpType};
 use crate::storage::global_wal::GlobalWal;
 use crate::storage::table::Table;
 use crate::txn::{GlobalTxnState, Transaction};
@@ -14,7 +13,6 @@ use crate::WrongoDBError;
 
 struct SessionTxnContext {
     txn: Transaction,
-    index_ops: Vec<IndexOpRecord>,
 }
 
 pub struct Session {
@@ -76,44 +74,6 @@ impl Session {
         mark_touched: bool,
     ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
         self.get_primary_table(collection, mark_touched)
-    }
-
-    pub(crate) fn record_index_ops(
-        &mut self,
-        ops: Vec<IndexOpRecord>,
-    ) -> Result<(), WrongoDBError> {
-        if let Some(ref mut ctx) = self.txn {
-            ctx.index_ops.extend(ops);
-            Ok(())
-        } else {
-            Err(WrongoDBError::NoActiveTransaction)
-        }
-    }
-
-    fn rollback_index_ops(&mut self, ops: &[IndexOpRecord], txn_id: crate::txn::TxnId) {
-        for op in ops.iter().rev() {
-            if let Err(e) = self.apply_index_op(op, op.op.inverse(), txn_id) {
-                eprintln!(
-                    "Warning: failed to rollback index op {}: {}",
-                    op.index_uri, e
-                );
-            }
-        }
-    }
-
-    fn apply_index_op(
-        &mut self,
-        op: &IndexOpRecord,
-        inverse: IndexOpType,
-        txn_id: crate::txn::TxnId,
-    ) -> Result<(), WrongoDBError> {
-        let (collection, index_name) = parse_index_uri(&op.index_uri)?;
-        let table = self.get_primary_table(collection, false)?;
-        let mut table_guard = table.write();
-        let catalog = table_guard
-            .index_catalog_mut()
-            .ok_or_else(|| StorageError("missing index catalog".into()))?;
-        catalog.apply_key_op(index_name, &op.key, inverse, txn_id)
     }
 
     pub fn create(&mut self, uri: &str) -> Result<(), WrongoDBError> {
@@ -180,10 +140,7 @@ impl Session {
             return Err(WrongoDBError::TransactionAlreadyActive);
         }
         let txn = self.global_txn.begin_snapshot_txn();
-        self.txn = Some(SessionTxnContext {
-            txn,
-            index_ops: Vec::new(),
-        });
+        self.txn = Some(SessionTxnContext { txn });
         Ok(SessionTxn::new(self))
     }
 
@@ -203,9 +160,17 @@ impl Session {
             table.write().checkpoint()?;
         }
 
+        if self.wal_enabled && self.global_txn.has_active_transactions() {
+            return Ok(());
+        }
+
         if self.wal_enabled {
             if let Some(global_wal) = self.global_wal.as_ref() {
                 let mut wal = global_wal.lock();
+                if self.global_txn.has_active_transactions() {
+                    return Ok(());
+                }
+
                 let checkpoint_lsn = wal.log_checkpoint()?;
                 wal.set_checkpoint_lsn(checkpoint_lsn)?;
                 wal.sync()?;
@@ -261,6 +226,9 @@ impl<'a> SessionTxn<'a> {
                 let table = self.session.get_primary_table(collection, false)?;
                 let mut table_guard = table.write();
                 table_guard.mark_updates_committed(txn_id)?;
+                if let Some(catalog) = table_guard.index_catalog_mut() {
+                    catalog.mark_updates_committed(txn_id)?;
+                }
             }
         }
         self.committed = true;
@@ -275,7 +243,6 @@ impl<'a> SessionTxn<'a> {
         if let Some(mut ctx) = self.session.txn.take() {
             let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
             let txn_id = ctx.txn.id();
-            self.session.rollback_index_ops(&ctx.index_ops, txn_id);
 
             if self.session.wal_enabled {
                 if let Some(global_wal) = self.session.global_wal.as_ref() {
@@ -294,6 +261,9 @@ impl<'a> SessionTxn<'a> {
                 let table = self.session.get_primary_table(collection, false)?;
                 let mut table_guard = table.write();
                 table_guard.mark_updates_aborted(txn_id)?;
+                if let Some(catalog) = table_guard.index_catalog_mut() {
+                    catalog.mark_updates_aborted(txn_id)?;
+                }
             }
         }
         self.committed = true;
@@ -334,7 +304,6 @@ impl<'a> Drop for SessionTxn<'a> {
                 let touched_tables: Vec<String> =
                     ctx.txn.touched_tables().iter().cloned().collect();
                 let txn_id = ctx.txn.id();
-                self.session.rollback_index_ops(&ctx.index_ops, txn_id);
                 if self.session.wal_enabled {
                     if let Some(global_wal) = self.session.global_wal.as_ref() {
                         let mut wal = global_wal.lock();
@@ -351,6 +320,9 @@ impl<'a> Drop for SessionTxn<'a> {
                     if let Ok(table) = self.session.get_primary_table(collection, false) {
                         let mut table_guard = table.write();
                         let _ = table_guard.mark_updates_aborted(txn_id);
+                        if let Some(catalog) = table_guard.index_catalog_mut() {
+                            let _ = catalog.mark_updates_aborted(txn_id);
+                        }
                     }
                 }
             }

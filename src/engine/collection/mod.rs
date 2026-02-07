@@ -71,8 +71,7 @@ impl Collection {
         let catalog = table_guard
             .index_catalog_mut()
             .ok_or_else(|| crate::core::errors::StorageError("missing index catalog".into()))?;
-        let ops = catalog.add_doc(doc, txn_id)?;
-        session.record_index_ops(ops)?;
+        catalog.add_doc(doc, txn_id)?;
         Ok(())
     }
 
@@ -87,8 +86,7 @@ impl Collection {
         let catalog = table_guard
             .index_catalog_mut()
             .ok_or_else(|| crate::core::errors::StorageError("missing index catalog".into()))?;
-        let ops = catalog.remove_doc(doc, txn_id)?;
-        session.record_index_ops(ops)?;
+        catalog.remove_doc(doc, txn_id)?;
         Ok(())
     }
 

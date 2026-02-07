@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::storage::global_wal::GlobalWal;
 use crate::storage::table::Table;
-use crate::txn::GlobalTxnState;
+use crate::txn::{GlobalTxnState, TxnId, TXN_NONE};
 use crate::{Document, WrongoDBError};
 
 pub use key::{decode_index_id, encode_index_key, encode_range_bounds, encode_scalar_prefix};
@@ -122,12 +122,20 @@ impl PersistentIndex {
 
     fn insert_raw(&mut self, key: &[u8], txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
         let mut table = self.table.write();
-        table.insert_raw_with_txn(key, &[], txn_id)
+        if txn_id == TXN_NONE {
+            table.insert_raw_with_txn(key, &[], txn_id)
+        } else {
+            table.insert_mvcc(key, &[], txn_id)
+        }
     }
 
     fn remove_raw(&mut self, key: &[u8], txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
         let mut table = self.table.write();
-        table.delete_raw_with_txn(key, txn_id)?;
+        if txn_id == TXN_NONE {
+            table.delete_raw_with_txn(key, txn_id)?;
+        } else {
+            table.delete_mvcc(key, txn_id)?;
+        }
         Ok(())
     }
 
@@ -361,16 +369,11 @@ impl IndexCatalog {
         }
     }
 
-    pub fn add_doc(
-        &mut self,
-        doc: &Document,
-        txn_id: crate::txn::TxnId,
-    ) -> Result<Vec<IndexOpRecord>, WrongoDBError> {
+    pub fn add_doc(&mut self, doc: &Document, txn_id: TxnId) -> Result<(), WrongoDBError> {
         let Some(id) = doc.get("_id") else {
-            return Ok(Vec::new());
+            return Ok(());
         };
 
-        let mut ops = Vec::new();
         for (name, def) in &self.definitions {
             let field = match def.columns.first() {
                 Some(field) => field,
@@ -384,23 +387,16 @@ impl IndexCatalog {
             };
             if let Some(index) = self.indexes.get_mut(name) {
                 index.insert_raw(&key, txn_id)?;
-                let uri = self.index_uri(name);
-                ops.push(IndexOpRecord::add(uri, key));
             }
         }
-        Ok(ops)
+        Ok(())
     }
 
-    pub fn remove_doc(
-        &mut self,
-        doc: &Document,
-        txn_id: crate::txn::TxnId,
-    ) -> Result<Vec<IndexOpRecord>, WrongoDBError> {
+    pub fn remove_doc(&mut self, doc: &Document, txn_id: TxnId) -> Result<(), WrongoDBError> {
         let Some(id) = doc.get("_id") else {
-            return Ok(Vec::new());
+            return Ok(());
         };
 
-        let mut ops = Vec::new();
         for (name, def) in &self.definitions {
             let field = match def.columns.first() {
                 Some(field) => field,
@@ -414,11 +410,9 @@ impl IndexCatalog {
             };
             if let Some(index) = self.indexes.get_mut(name) {
                 index.remove_raw(&key, txn_id)?;
-                let uri = self.index_uri(name);
-                ops.push(IndexOpRecord::remove(uri, key));
             }
         }
-        Ok(ops)
+        Ok(())
     }
 
     pub fn apply_key_op(
@@ -435,6 +429,22 @@ impl IndexCatalog {
             IndexOpType::Add => index.insert_raw(key, txn_id),
             IndexOpType::Remove => index.remove_raw(key, txn_id),
         }
+    }
+
+    pub fn mark_updates_committed(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
+        for index in self.indexes.values_mut() {
+            let mut table = index.table.write();
+            table.mark_updates_committed(txn_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn mark_updates_aborted(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
+        for index in self.indexes.values_mut() {
+            let mut table = index.table.write();
+            table.mark_updates_aborted(txn_id)?;
+        }
+        Ok(())
     }
 
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
@@ -461,10 +471,6 @@ impl IndexCatalog {
             total_updates_removed,
             total_chains_dropped,
         )
-    }
-
-    fn index_uri(&self, index_name: &str) -> String {
-        format!("index:{}:{}", self.collection, index_name)
     }
 
     fn save(&self) -> Result<(), WrongoDBError> {

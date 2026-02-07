@@ -1,5 +1,20 @@
 # Decisions
 
+## 2026-02-07: WAL truncation requires no active txns; indexes use MVCC writes
+
+**Decision**
+- `Session::checkpoint_all` must not advance/truncate the global WAL while any transaction is active.
+- Secondary index maintenance (`add_doc`/`remove_doc`) uses MVCC writes for transactional updates.
+- Transaction finalize now propagates `mark_updates_committed/aborted` to both main tables and index tables.
+
+**Why**
+- Prevents checkpoint-time WAL truncation from discarding uncommitted transaction records needed for later commit recovery.
+- Keeps index visibility aligned with transaction boundaries so older snapshots are not hidden by uncommitted index deletes.
+
+**Notes**
+- Global WAL truncation is intentionally conservative under concurrent transactions.
+- Rollback-on-abort for index raw writes is superseded by MVCC commit/abort marking for index tables.
+
 ## 2026-02-07: Global connection-level WAL + hard cutover
 
 **Decision**
