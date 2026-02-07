@@ -1,27 +1,28 @@
 # Making the Tree Crash-Safe
 
-## The gap between working and safe
+## How can I make closing my laptop safe?
 
-The B+tree works. I can insert keys, they get sorted, pages split when they fill up. But there's a gap between "works" and "safe to close the laptop."
+The B+tree works. I can insert keys, they get sorted, pages split when they fill up. Now the fun starts, we need to make this thing resistant to crashes, restarts etc. Let's explore the problem.
 
-When I insert a key that triggers a split, the tree might touch four or five pages: two new leaves, a parent update, maybe a new root. Each page is a separate write to disk. If the program crashes after writing some pages but not others, the file is inconsistent. The root might point to a page that was recycled, or the tree might have orphan pages that nothing references.
+When I insert a key that triggers a split, the tree might touch four or five pages: two new leaves, a parent update, maybe a new root. Each page is a separate write to disk. If the program crashes after writing some pages but not others, the file is in an inconsistent state. The root might point to a page that was recycled, or the tree might have orphan pages that nothing references.
 
-What I need is a way to batch changes, write them all, then say "okay, now it's safe." That's a checkpoint. And to make checkpoints work without copying the whole database each time, I need copy-on-write.
+What I need is a way to batch changes and write them all-or-nothing, this way I have a consistent picture on disk. That's a checkpoint. And to make checkpoints work without copying the whole database each time, whenever we want to modify a page, we create a copy of it. This is called copy-on-write or COW (muuhhh).
 
 ## Two views of the same data
 
-The trick is to stop overwriting pages. Instead, keep two views:
+A tree is a collection of nodes and edges (I guess parent-child relationships). Now, if we make two roots point to the same set of leaves (like a hydra, multiple heads, same body), you start to understand that you can replace some pages individually and this way maintain multiple versions.
 
+In the case of WrongoDB, we have two roots:
 - **Stable root**: The last checkpoint. Immutable. If you crash, you recover here.
 - **Working root**: The current in-progress tree. This is where mutations happen.
 
-When you insert a key, you don't modify the stable page. You copy it to a new location, modify the copy, and update the working root to point there. The stable tree stays exactly as it was. The working tree accumulates new pages. When you're ready, you atomically swap the root pointer in the file header. That's the checkpoint.
+When you insert a key, you copy the original page to a new location, modify the copy, and update the working root to point there. The stable tree stays exactly as it was. The working tree accumulates new pages. When you're ready, you atomically swap the root pointer in the file header. That's the checkpoint.
 
 ![Copy-on-write: stable pages are never overwritten](images/01-cow-sequence.png)
 
 The key invariant: **once a page is part of the stable tree, it never changes**. New writes go to new pages. Old pages are "retired" and can be reclaimed after the next checkpoint.
 
-This is copy-on-write. It lets you treat the stable tree as a snapshot while you build the next one.
+This is copy-on-write. It lets you treat the stable tree as a snapshot while you build the next one. Really cool concept in my opinion.
 
 ## How a write actually works
 
@@ -87,7 +88,7 @@ A checkpoint is the moment the working tree becomes the stable tree. It's simple
 2. Sync to ensure writes are durable
 3. Atomically write the new root block ID to the file header (with a generation number and CRC)
 4. Sync again
-5. Reclaim retired blocks
+5. Reclaim retired blocks (this is unrelated, but worth mentioning there *is* a point where we reclaim some space)
 
 The atomic root swap is the durability boundary. Before step 3, a crash leaves you with the old stable tree—you lose some writes, but the file is consistent. After step 3, a crash leaves you with the new stable tree.
 
@@ -132,24 +133,4 @@ This adds complexity, but it's necessary. Without pinning, a long-running scan c
 This gives us crash consistency—after a checkpoint, the file is valid. But it's not full durability:
 
 - **WAL (Write-Ahead Logging)**: Writes between checkpoints are lost on crash. A WAL would log every operation and replay on recovery, giving durability without constant checkpointing. That's next.
-- **Concurrent transactions**: Everything is single-threaded. MVCC would let readers use the stable snapshot while writers work on the working tree.
-- **Background eviction**: Dirty pages flush during checkpoint. Production systems flush opportunistically under memory pressure.
-
-## What I shipped
-
-- Copy-on-write: every mutation allocates new blocks, stable pages are never overwritten
-- Stable vs working root tracking in the pager
-- Two-slot checkpoint header with generation + CRC for atomic swaps
-- Retired block tracking and post-checkpoint reclamation
-- Page cache with LRU eviction and pin/unpin API for safe iteration
-
-## What's next
-
-- WAL: log every operation, replay on recovery, survive crashes between checkpoints
-- Automatic checkpoint scheduling: trigger after N updates or time
-- Background page flushing: evict dirty pages before checkpoint pressure
-
-## Editing notes
-
-- Consider a concrete walkthrough: insert keys until split, show page IDs changing
-- The pinning section is brief but might need expansion if readers ask about iterator safety
+- **Concurrent transactions**: Everything is single-threaded. MVCC would let readers use the stable snapshot while writers work on the working tree. We might cover it.
