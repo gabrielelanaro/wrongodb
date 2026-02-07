@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::core::errors::WrongoDBError;
-use crate::txn::snapshot::Snapshot;
 use crate::txn::{GlobalTxnState, TxnId, Update, UpdateChain, UpdateType, TS_NONE, TXN_ABORTED};
 
 use super::BTree;
@@ -66,8 +65,8 @@ impl MvccState {
         let mut keys: Vec<Vec<u8>> = self.chains.keys().cloned().collect();
         if start.is_some() || end.is_some() {
             keys.retain(|key| {
-                let after_start = start.map_or(true, |s| key.as_slice() >= s);
-                let before_end = end.map_or(true, |e| key.as_slice() < e);
+                let after_start = start.is_none_or(|s| key.as_slice() >= s);
+                let before_end = end.is_none_or(|e| key.as_slice() < e);
                 after_start && before_end
             });
         }
@@ -75,7 +74,7 @@ impl MvccState {
         keys
     }
 
-    pub(super) fn latest_committed_entries(&self, snapshot: &Snapshot) -> Vec<(Vec<u8>, UpdateType, Vec<u8>)> {
+    pub(super) fn latest_committed_entries(&self) -> Vec<(Vec<u8>, UpdateType, Vec<u8>)> {
         let mut out = Vec::new();
         for (key, chain) in self.chains.iter() {
             for update in chain.iter() {
@@ -87,12 +86,13 @@ impl MvccState {
                 if update.time_window.start_ts == TS_NONE {
                     continue;
                 }
-                if !snapshot.is_visible(update.txn_id) {
-                    continue;
-                }
                 match update.type_ {
-                    UpdateType::Standard => out.push((key.clone(), UpdateType::Standard, update.data.clone())),
-                    UpdateType::Tombstone => out.push((key.clone(), UpdateType::Tombstone, Vec::new())),
+                    UpdateType::Standard => {
+                        out.push((key.clone(), UpdateType::Standard, update.data.clone()))
+                    }
+                    UpdateType::Tombstone => {
+                        out.push((key.clone(), UpdateType::Tombstone, Vec::new()))
+                    }
                     UpdateType::Reserve => {}
                 }
                 break;
@@ -103,7 +103,11 @@ impl MvccState {
 }
 
 impl BTree {
-    pub fn get_version(&mut self, key: &[u8], txn_id: TxnId) -> Result<Option<Vec<u8>>, WrongoDBError> {
+    pub fn get_version(
+        &mut self,
+        key: &[u8],
+        txn_id: TxnId,
+    ) -> Result<Option<Vec<u8>>, WrongoDBError> {
         if let Some(chain) = self.mvcc.chain(key) {
             for update in chain.iter() {
                 let is_aborted = update.time_window.stop_txn == crate::txn::TXN_ABORTED
@@ -131,43 +135,34 @@ impl BTree {
         value: &[u8],
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
+        self.log_wal_put(key, value, txn_id)?;
+
         let chain = self.mvcc.chain_mut_or_create(key);
 
         if let Some(head) = chain.head_mut() {
             head.mark_stopped(txn_id);
         }
 
-        let mut update = Update::new(txn_id, UpdateType::Standard, value.to_vec());
-        if txn_id == crate::txn::TXN_NONE {
-            update.time_window.start_ts = txn_id;
-            update.time_window.stop_ts = u64::MAX;
-        }
+        let update = Update::new(txn_id, UpdateType::Standard, value.to_vec());
         chain.prepend(update);
         Ok(())
     }
 
-    pub fn delete_version(
-        &mut self,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
+    pub fn delete_version(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+        self.log_wal_delete(key, txn_id)?;
+
         let chain = self.mvcc.chain_mut_or_create(key);
 
         if let Some(head) = chain.head_mut() {
             head.mark_stopped(txn_id);
         }
 
-        let mut update = Update::new(txn_id, UpdateType::Tombstone, Vec::new());
-        if txn_id == crate::txn::TXN_NONE {
-            update.time_window.start_ts = txn_id;
-            update.time_window.stop_ts = u64::MAX;
-        }
+        let update = Update::new(txn_id, UpdateType::Tombstone, Vec::new());
         chain.prepend(update);
         Ok(())
     }
 
-    /// Mark all updates from this transaction as committed in MVCC chains
-    /// and log the commit to WAL.
+    /// Mark all updates from this transaction as committed in MVCC chains.
     /// Note: This does NOT update the transaction state - that's done by Session.
     pub fn mark_updates_committed(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
         // Update time windows for all modifications to mark them as committed
@@ -185,8 +180,7 @@ impl BTree {
         Ok(())
     }
 
-    /// Mark all updates from this transaction as aborted in MVCC chains
-    /// and log the abort to WAL.
+    /// Mark all updates from this transaction as aborted in MVCC chains.
     /// Note: This does NOT update the transaction state - that's done by Session.
     pub fn mark_updates_aborted(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
         // Mark all updates in chains as aborted

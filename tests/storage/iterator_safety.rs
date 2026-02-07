@@ -16,7 +16,7 @@ fn range_scan_works_with_cache_eviction() {
     let path = tmp.path().join("iterator-scan.db");
 
     // Create a B+tree with a small cache
-    let mut btree = BTree::create(&path, 256, Arc::new(GlobalTxnState::new())).unwrap();
+    let mut btree = BTree::create(&path, 256, false, Arc::new(GlobalTxnState::new())).unwrap();
 
     // Insert many keys - more than can fit in cache
     let num_keys = 100;
@@ -49,7 +49,7 @@ fn checkpoint_fails_with_dirty_pinned_page() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("dirty-pinned.db");
 
-    let mut btree = BTree::create(&path, 256, Arc::new(GlobalTxnState::new())).unwrap();
+    let mut btree = BTree::create(&path, 256, false, Arc::new(GlobalTxnState::new())).unwrap();
     btree.put(b"key1", b"value1").unwrap();
 
     // Get a mutable pinned page by starting an insert
@@ -62,7 +62,7 @@ fn checkpoint_fails_with_dirty_pinned_page() {
 
     // Verify the key is still there after reopen
     drop(btree);
-    let mut btree2 = BTree::open(&path, Arc::new(GlobalTxnState::new())).unwrap();
+    let mut btree2 = BTree::open(&path, false, Arc::new(GlobalTxnState::new())).unwrap();
     assert_eq!(btree2.get(b"key1").unwrap(), Some(b"value1".to_vec()));
 }
 
@@ -76,7 +76,7 @@ fn loading_page_with_full_pinned_cache_fails() {
     let path = tmp.path().join("full-pinned.db");
 
     // Create with a tiny cache
-    let mut btree = BTree::create(&path, 256, Arc::new(GlobalTxnState::new())).unwrap();
+    let mut btree = BTree::create(&path, 256, false, Arc::new(GlobalTxnState::new())).unwrap();
 
     // Insert one key
     btree.put(b"key1", b"value1").unwrap();
@@ -100,7 +100,7 @@ fn range_scan_handles_empty_ranges() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("range-empty.db");
 
-    let mut btree = BTree::create(&path, 256, Arc::new(GlobalTxnState::new())).unwrap();
+    let mut btree = BTree::create(&path, 256, false, Arc::new(GlobalTxnState::new())).unwrap();
 
     // Empty range scan
     let iter = btree.range(Some(b"z"), Some(b"zz")).unwrap();
@@ -122,13 +122,13 @@ fn checkpoint_stages_basic() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("checkpoint-stages.db");
 
-    let mut btree = BTree::create(&path, 256, Arc::new(GlobalTxnState::new())).unwrap();
+    let mut btree = BTree::create(&path, 256, false, Arc::new(GlobalTxnState::new())).unwrap();
     btree.put(b"key1", b"value1").unwrap();
     btree.checkpoint().unwrap();
 
     // Verify after reopen
     drop(btree);
-    let mut btree2 = BTree::open(&path, Arc::new(GlobalTxnState::new())).unwrap();
+    let mut btree2 = BTree::open(&path, false, Arc::new(GlobalTxnState::new())).unwrap();
     assert_eq!(btree2.get(b"key1").unwrap(), Some(b"value1".to_vec()));
 }
 
@@ -141,7 +141,7 @@ fn checkpoint_scheduling_with_updates() {
     // Note: This test validates the scheduling API is present.
     // Actual checkpoint triggering is the caller's responsibility.
 
-    let mut btree = BTree::create(&path, 256, Arc::new(GlobalTxnState::new())).unwrap();
+    let mut btree = BTree::create(&path, 256, false, Arc::new(GlobalTxnState::new())).unwrap();
 
     // Do some updates
     for i in 0..10 {
@@ -154,12 +154,9 @@ fn checkpoint_scheduling_with_updates() {
 
     // Verify data is persisted
     drop(btree);
-    let mut btree2 = BTree::open(&path, Arc::new(GlobalTxnState::new())).unwrap();
+    let mut btree2 = BTree::open(&path, false, Arc::new(GlobalTxnState::new())).unwrap();
     for i in 0..10 {
         let key = format!("key{}", i);
-        assert_eq!(
-            btree2.get(key.as_bytes()).unwrap(),
-            Some(b"value".to_vec())
-        );
+        assert_eq!(btree2.get(key.as_bytes()).unwrap(), Some(b"value".to_vec()));
     }
 }

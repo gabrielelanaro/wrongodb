@@ -60,7 +60,12 @@ impl Collection {
             .ok_or(WrongoDBError::NoActiveTransaction)
     }
 
-    fn apply_index_add(&self, session: &mut Session, doc: &Document, txn_id: TxnId) -> Result<(), WrongoDBError> {
+    fn apply_index_add(
+        &self,
+        session: &mut Session,
+        doc: &Document,
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError> {
         let table = session.table_handle(&self.name, false)?;
         let mut table_guard = table.write();
         let catalog = table_guard
@@ -70,7 +75,12 @@ impl Collection {
         Ok(())
     }
 
-    fn apply_index_remove(&self, session: &mut Session, doc: &Document, txn_id: TxnId) -> Result<(), WrongoDBError> {
+    fn apply_index_remove(
+        &self,
+        session: &mut Session,
+        doc: &Document,
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError> {
         let table = session.table_handle(&self.name, false)?;
         let mut table_guard = table.write();
         let catalog = table_guard
@@ -84,7 +94,11 @@ impl Collection {
         self.with_txn(session, |session| self.insert_one_in_txn(session, doc))
     }
 
-    fn insert_one_in_txn(&self, session: &mut Session, doc: Value) -> Result<Document, WrongoDBError> {
+    fn insert_one_in_txn(
+        &self,
+        session: &mut Session,
+        doc: Value,
+    ) -> Result<Document, WrongoDBError> {
         validate_is_object(&doc)?;
         let mut obj = doc.as_object().expect("validated object").clone();
         normalize_document_in_place(&mut obj)?;
@@ -103,7 +117,11 @@ impl Collection {
         Ok(obj)
     }
 
-    pub fn find(&self, session: &mut Session, filter: Option<Value>) -> Result<Vec<Document>, WrongoDBError> {
+    pub fn find(
+        &self,
+        session: &mut Session,
+        filter: Option<Value>,
+    ) -> Result<Vec<Document>, WrongoDBError> {
         self.with_txn(session, |session| {
             let txn_id = self.require_txn_id(session)?;
             self.find_with_txn(session, filter, txn_id)
@@ -170,10 +188,7 @@ impl Collection {
                     return self.scan_with_cursor(table_cursor, txn_id, &matches_filter);
                 }
             };
-            filter_doc
-                .keys()
-                .find(|k| catalog.has_index(*k))
-                .cloned()
+            filter_doc.keys().find(|k| catalog.has_index(k)).cloned()
         };
 
         if let Some(field) = indexed_field {
@@ -181,7 +196,8 @@ impl Collection {
             let Some((start_key, end_key)) = encode_range_bounds(value) else {
                 return Ok(Vec::new());
             };
-            let mut index_cursor = session.open_cursor(&format!("index:{}:{}", self.name, field))?;
+            let mut index_cursor =
+                session.open_cursor(&format!("index:{}:{}", self.name, field))?;
             index_cursor.set_range(Some(start_key), Some(end_key));
 
             let mut results = Vec::new();
@@ -222,15 +238,28 @@ impl Collection {
         Ok(results)
     }
 
-    pub fn find_one(&self, session: &mut Session, filter: Option<Value>) -> Result<Option<Document>, WrongoDBError> {
+    pub fn find_one(
+        &self,
+        session: &mut Session,
+        filter: Option<Value>,
+    ) -> Result<Option<Document>, WrongoDBError> {
         Ok(self.find(session, filter)?.into_iter().next())
     }
 
-    pub fn count(&self, session: &mut Session, filter: Option<Value>) -> Result<usize, WrongoDBError> {
+    pub fn count(
+        &self,
+        session: &mut Session,
+        filter: Option<Value>,
+    ) -> Result<usize, WrongoDBError> {
         Ok(self.find(session, filter)?.len())
     }
 
-    pub fn distinct(&self, session: &mut Session, key: &str, filter: Option<Value>) -> Result<Vec<Value>, WrongoDBError> {
+    pub fn distinct(
+        &self,
+        session: &mut Session,
+        key: &str,
+        filter: Option<Value>,
+    ) -> Result<Vec<Value>, WrongoDBError> {
         let docs = self.find(session, filter)?;
         let mut seen = HashSet::new();
         let mut values = Vec::new();
@@ -257,15 +286,18 @@ impl Collection {
             let txn_id = self.require_txn_id(session)?;
             let docs = self.find_with_txn(session, filter, txn_id)?;
             if docs.is_empty() {
-                return Ok(UpdateResult { matched: 0, modified: 0 });
+                return Ok(UpdateResult {
+                    matched: 0,
+                    modified: 0,
+                });
             }
 
             let doc = &docs[0];
             let updated_doc = apply_update(doc, &update)?;
 
-            let id = doc
-                .get("_id")
-                .ok_or_else(|| crate::core::errors::DocumentValidationError("missing _id".into()))?;
+            let id = doc.get("_id").ok_or_else(|| {
+                crate::core::errors::DocumentValidationError("missing _id".into())
+            })?;
             let key = encode_id_value(id)?;
             let value = encode_document(&updated_doc)?;
 
@@ -276,7 +308,10 @@ impl Collection {
             self.apply_index_remove(session, doc, txn_id)?;
             self.apply_index_add(session, &updated_doc, txn_id)?;
 
-            Ok(UpdateResult { matched: 1, modified: 1 })
+            Ok(UpdateResult {
+                matched: 1,
+                modified: 1,
+            })
         })
     }
 
@@ -290,16 +325,19 @@ impl Collection {
             let txn_id = self.require_txn_id(session)?;
             let docs = self.find_with_txn(session, filter, txn_id)?;
             if docs.is_empty() {
-                return Ok(UpdateResult { matched: 0, modified: 0 });
+                return Ok(UpdateResult {
+                    matched: 0,
+                    modified: 0,
+                });
             }
 
             let mut modified = 0;
             for doc in docs {
                 let updated_doc = apply_update(&doc, &update)?;
 
-                let id = doc
-                    .get("_id")
-                    .ok_or_else(|| crate::core::errors::DocumentValidationError("missing _id".into()))?;
+                let id = doc.get("_id").ok_or_else(|| {
+                    crate::core::errors::DocumentValidationError("missing _id".into())
+                })?;
                 let key = encode_id_value(id)?;
                 let value = encode_document(&updated_doc)?;
 
@@ -312,11 +350,18 @@ impl Collection {
                 modified += 1;
             }
 
-            Ok(UpdateResult { matched: modified, modified })
+            Ok(UpdateResult {
+                matched: modified,
+                modified,
+            })
         })
     }
 
-    pub fn delete_one(&self, session: &mut Session, filter: Option<Value>) -> Result<usize, WrongoDBError> {
+    pub fn delete_one(
+        &self,
+        session: &mut Session,
+        filter: Option<Value>,
+    ) -> Result<usize, WrongoDBError> {
         self.with_txn(session, |session| {
             let txn_id = self.require_txn_id(session)?;
             let docs = self.find_with_txn(session, filter, txn_id)?;
@@ -339,7 +384,11 @@ impl Collection {
         })
     }
 
-    pub fn delete_many(&self, session: &mut Session, filter: Option<Value>) -> Result<usize, WrongoDBError> {
+    pub fn delete_many(
+        &self,
+        session: &mut Session,
+        filter: Option<Value>,
+    ) -> Result<usize, WrongoDBError> {
         self.with_txn(session, |session| {
             let txn_id = self.require_txn_id(session)?;
             let docs = self.find_with_txn(session, filter, txn_id)?;
@@ -388,15 +437,14 @@ impl Collection {
             let catalog = table_guard
                 .index_catalog_mut()
                 .ok_or_else(|| crate::core::errors::StorageError("missing index catalog".into()))?;
-            catalog.add_index(field, vec![field.to_string()], &docs, txn_id)?;
+            catalog.add_index(field, vec![field.to_string()], &docs)?;
             Ok(())
         })
     }
 
     pub fn checkpoint(&self, session: &mut Session) -> Result<(), WrongoDBError> {
-        let table = session.table_handle(&self.name, false)?;
-        let mut guard = table.write();
-        guard.checkpoint()
+        let _ = session.table_handle(&self.name, false)?;
+        session.checkpoint_all()
     }
 }
 

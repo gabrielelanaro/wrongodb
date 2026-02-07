@@ -5,8 +5,7 @@ fn main() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("testdb");
 
-    let conn = Connection::open(&db_path, ConnectionConfig::default().disable_auto_checkpoint())
-        .unwrap();
+    let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
 
     // Phase 1: Create and insert initial data
     println!("=== Phase 1: Create and insert 0-4 ===");
@@ -27,10 +26,6 @@ fn main() {
 
         txn.commit().unwrap();
     }
-
-    println!("Checkpointing...");
-    conn.checkpoint_all().unwrap();
-    println!("Checkpoint done");
 
     // Phase 2: Open and insert more data
     println!("\n=== Phase 2: Open and insert 5-9 ===");
@@ -57,8 +52,7 @@ fn main() {
     // Phase 3: Reopen and check
     println!("\n=== Phase 3: Reopen and check ===");
     {
-        let conn = Connection::open(&db_path, ConnectionConfig::default().disable_auto_checkpoint())
-            .unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
         let mut session = conn.open_session();
         let mut cursor = session.open_cursor("table:test").unwrap();
 

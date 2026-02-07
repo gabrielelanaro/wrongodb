@@ -1,17 +1,42 @@
 # Decisions
 
-## 2026-02-04: Guard checkpoint LSN advancement by WAL growth
+## 2026-02-07: WAL truncation requires no active txns; indexes use MVCC writes
 
 **Decision**
-- Only advance `checkpoint_lsn` and truncate WAL when no new WAL records were appended since the checkpoint snapshot was taken (compare WAL end offset).
-- If WAL grew during checkpoint, skip LSN advancement; checkpointed data remains valid but WAL trimming is deferred.
+- `Session::checkpoint_all` must not advance/truncate the global WAL while any transaction is active.
+- Secondary index maintenance (`add_doc`/`remove_doc`) uses MVCC writes for transactional updates.
+- Transaction finalize now propagates `mark_updates_committed/aborted` to both main tables and index tables.
 
 **Why**
-- Prevents losing committed updates that were written after the snapshot but before the checkpoint record.
-- Keeps checkpointing non-blocking while preserving crash recovery correctness.
+- Prevents checkpoint-time WAL truncation from discarding uncommitted transaction records needed for later commit recovery.
+- Keeps index visibility aligned with transaction boundaries so older snapshots are not hidden by uncommitted index deletes.
 
 **Notes**
-- Single-file WAL cannot drop the log prefix; constant-write workloads require log rotation or compaction to reclaim space.
+- Global WAL truncation is intentionally conservative under concurrent transactions.
+- Rollback-on-abort for index raw writes is superseded by MVCC commit/abort marking for index tables.
+
+## 2026-02-07: Global connection-level WAL + hard cutover
+
+**Decision**
+- Move WAL ownership from per-BTree files to one connection-level file: `<db_dir>/global.wal`.
+- Route all `Put/Delete` WAL records through the global WAL and include `store_name` in each record.
+- Run recovery once at `Connection::open` (two-pass: txn-table build, then logical replay).
+- Make `SessionTxn::commit` write and sync exactly one `TxnCommit` marker before visibility flip.
+- Make `SessionTxn::abort` write one `TxnAbort` marker; no mandatory sync.
+- Keep `Collection::checkpoint` API, but implement it as a global checkpoint coordinator:
+  - checkpoint all open table handles
+  - write one WAL `Checkpoint` record
+  - sync + truncate global WAL.
+- Hard cutover: legacy per-table `*.wal` files are ignored and only warned about.
+
+**Why**
+- Ensures deterministic cross-collection crash recovery with one ordered log stream.
+- Removes per-table commit-marker coordination complexity.
+- Centralizes durability boundaries and replay semantics in one subsystem.
+
+**Notes**
+- Per-table WAL codepaths and controls (`sync_wal`, `set_wal_sync_threshold`, per-BTree recovery) are removed.
+- Legacy `*.wal` cleanup is an offline maintenance step after successful open/checkpoint.
 
 ## 2026-02-02: Table-owned index catalog + Session-only transactions
 
@@ -715,21 +740,3 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - **Leaf-only pinning** minimizes pin count but may re-read parent pages during iteration if they're evicted.
 - **Full-path pinning** would keep the entire path from root to leaf pinned, preventing any re-reads but consuming more cache capacity.
 - Current implementation uses leaf-only pinning for simplicity; full-path pinning can be added later if needed for performance.
-
-## 2026-02-03: Global WAL + Snapshot-Based Checkpointing (Default Auto-Checkpoint On)
-
-**Decision**
-- Replace per-table WALs with a **single global WAL** under the database directory.
-- WAL `Put/Delete` records now carry the **target URI** (`table:<name>` / `index:<collection>:<index>`).
-- Checkpointing is **snapshot-based** (WT-like): use a global snapshot to select committed updates for materialization.
-- Auto-checkpointing is **enabled by default**: every 60s or 64MB of WAL growth.
-- Expose DB-wide checkpoint via `Session::checkpoint()` and `Connection::checkpoint_all()`.
-
-**Why**
-- Global WAL simplifies recovery and truncation, and matches WT’s architecture.
-- Snapshot-based checkpoints avoid blocking concurrent operations while preserving a consistent view.
-- Default auto-checkpointing bounds recovery time and WAL growth without explicit user action.
-
-**Notes**
-- WAL truncation is only advanced when no active transactions exist at checkpoint time to avoid losing
-  WAL needed by in-flight transactions.

@@ -28,7 +28,8 @@ fn index_created_on_empty_collection() {
         // Insert documents
         coll.insert_one(&mut session, json!({"username": "alice", "age": 30}))
             .unwrap();
-        coll.insert_one(&mut session, json!({"username": "bob", "age": 25})).unwrap();
+        coll.insert_one(&mut session, json!({"username": "bob", "age": 25}))
+            .unwrap();
         coll.insert_one(&mut session, json!({"username": "alice", "age": 35}))
             .unwrap(); // Duplicate username
 
@@ -48,7 +49,10 @@ fn index_created_on_empty_collection() {
 
     // Verify index file exists
     let index_path = path.join("test.username.idx.wt");
-    assert!(index_path.exists(), "Index file should exist after checkpoint");
+    assert!(
+        index_path.exists(),
+        "Index file should exist after checkpoint"
+    );
 }
 
 #[test]
@@ -63,10 +67,16 @@ fn index_survives_database_restart() {
             let coll = db.collection("test");
             let mut session = db.open_session();
             coll.create_index(&mut session, "email").unwrap();
-            coll.insert_one(&mut session, json!({"email": "alice@example.com", "name": "Alice"}))
-                .unwrap();
-            coll.insert_one(&mut session, json!({"email": "bob@example.com", "name": "Bob"}))
-                .unwrap();
+            coll.insert_one(
+                &mut session,
+                json!({"email": "alice@example.com", "name": "Alice"}),
+            )
+            .unwrap();
+            coll.insert_one(
+                &mut session,
+                json!({"email": "bob@example.com", "name": "Bob"}),
+            )
+            .unwrap();
             coll.checkpoint(&mut session).unwrap();
         }
     }
@@ -82,10 +92,7 @@ fn index_survives_database_restart() {
             .find(&mut session, Some(json!({"email": "alice@example.com"})))
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(
-            results[0].get("name").unwrap().as_str().unwrap(),
-            "Alice"
-        );
+        assert_eq!(results[0].get("name").unwrap().as_str().unwrap(), "Alice");
     }
 }
 
@@ -102,7 +109,8 @@ fn index_builds_from_existing_documents() {
             let mut session = db.open_session();
             coll.insert_one(&mut session, json!({"city": "nyc", "name": "alice"}))
                 .unwrap();
-            coll.insert_one(&mut session, json!({"city": "la", "name": "bob"})).unwrap();
+            coll.insert_one(&mut session, json!({"city": "la", "name": "bob"}))
+                .unwrap();
             coll.insert_one(&mut session, json!({"city": "nyc", "name": "charlie"}))
                 .unwrap();
             coll.checkpoint(&mut session).unwrap();
@@ -172,12 +180,21 @@ fn index_maintenance_on_delete() {
     let coll = db.collection("test");
     let mut session = db.open_session();
     coll.create_index(&mut session, "category").unwrap();
-    coll.insert_one(&mut session, json!({"name": "item1", "category": "electronics"}))
-        .unwrap();
-    coll.insert_one(&mut session, json!({"name": "item2", "category": "electronics"}))
-        .unwrap();
-    coll.insert_one(&mut session, json!({"name": "item3", "category": "clothing"}))
-        .unwrap();
+    coll.insert_one(
+        &mut session,
+        json!({"name": "item1", "category": "electronics"}),
+    )
+    .unwrap();
+    coll.insert_one(
+        &mut session,
+        json!({"name": "item2", "category": "electronics"}),
+    )
+    .unwrap();
+    coll.insert_one(
+        &mut session,
+        json!({"name": "item3", "category": "clothing"}),
+    )
+    .unwrap();
 
     // Verify initial state
     let electronics = coll
@@ -192,7 +209,11 @@ fn index_maintenance_on_delete() {
     let electronics = coll
         .find(&mut session, Some(json!({"category": "electronics"})))
         .unwrap();
-    assert_eq!(electronics.len(), 1, "Expected 1 electronics item after delete");
+    assert_eq!(
+        electronics.len(),
+        1,
+        "Expected 1 electronics item after delete"
+    );
 }
 
 #[test]
@@ -206,15 +227,26 @@ fn multiple_indexes_on_same_collection() {
         let mut session = db.open_session();
         coll.create_index(&mut session, "dept").unwrap();
         coll.create_index(&mut session, "role").unwrap();
-        coll.insert_one(&mut session, json!({"name": "alice", "dept": "eng", "role": "dev"}))
-            .unwrap();
-        coll.insert_one(&mut session, json!({"name": "bob", "dept": "eng", "role": "manager"}))
-            .unwrap();
-        coll.insert_one(&mut session, json!({"name": "charlie", "dept": "sales", "role": "manager"}))
-            .unwrap();
+        coll.insert_one(
+            &mut session,
+            json!({"name": "alice", "dept": "eng", "role": "dev"}),
+        )
+        .unwrap();
+        coll.insert_one(
+            &mut session,
+            json!({"name": "bob", "dept": "eng", "role": "manager"}),
+        )
+        .unwrap();
+        coll.insert_one(
+            &mut session,
+            json!({"name": "charlie", "dept": "sales", "role": "manager"}),
+        )
+        .unwrap();
 
         // Query by dept
-        let eng = coll.find(&mut session, Some(json!({"dept": "eng"}))).unwrap();
+        let eng = coll
+            .find(&mut session, Some(json!({"dept": "eng"})))
+            .unwrap();
         assert_eq!(eng.len(), 2);
 
         // Query by role
@@ -302,7 +334,10 @@ fn create_index_dynamically() {
 
     // Verify index file was created
     let index_path = path.join("test.country.idx.wt");
-    assert!(index_path.exists(), "Dynamically created index file should exist");
+    assert!(
+        index_path.exists(),
+        "Dynamically created index file should exist"
+    );
 }
 
 #[test]

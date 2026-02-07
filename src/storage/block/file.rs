@@ -202,15 +202,18 @@ impl FileHeader {
             lists.discard.push(read_extent(&mut rdr)?);
         }
 
-        Ok((Self {
-            magic,
-            version,
-            page_size,
-            alloc_count,
-            avail_count,
-            discard_count,
-            checkpoint_slots,
-        }, lists))
+        Ok((
+            Self {
+                magic,
+                version,
+                page_size,
+                alloc_count,
+                avail_count,
+                discard_count,
+                checkpoint_slots,
+            },
+            lists,
+        ))
     }
 }
 

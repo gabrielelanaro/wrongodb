@@ -46,11 +46,7 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub(crate) fn new(
-        id: TxnId,
-        isolation: IsolationLevel,
-        snapshot: Snapshot,
-    ) -> Self {
+    pub(crate) fn new(id: TxnId, isolation: IsolationLevel, snapshot: Snapshot) -> Self {
         Self {
             id,
             isolation,
@@ -112,10 +108,10 @@ impl Transaction {
                 Ok(commit_ts)
             }
             TxnState::Committed { .. } => Err(WrongoDBError::InvalidTransactionState(
-                "transaction already committed".to_string()
+                "transaction already committed".to_string(),
             )),
             TxnState::Aborted => Err(WrongoDBError::InvalidTransactionState(
-                "cannot commit aborted transaction".to_string()
+                "cannot commit aborted transaction".to_string(),
             )),
         }
     }
@@ -138,10 +134,10 @@ impl Transaction {
                 Ok(())
             }
             TxnState::Committed { .. } => Err(WrongoDBError::InvalidTransactionState(
-                "cannot abort committed transaction".to_string()
+                "cannot abort committed transaction".to_string(),
             )),
             TxnState::Aborted => Err(WrongoDBError::InvalidTransactionState(
-                "transaction already aborted".to_string()
+                "transaction already aborted".to_string(),
             )),
         }
     }

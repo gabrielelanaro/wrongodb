@@ -1,93 +1,34 @@
 # WAL Recovery Implementation Summary
 
-## Overview
+Date: 2026-02-07
+Status: Active
 
-Minimongo now uses **logical WAL recovery** (WiredTiger-style). The WAL records logical B+tree operations
-(put/delete/checkpoint), and recovery replays those operations through the normal `BTree` API with WAL
-logging disabled. This eliminates page-id drift and split logging complexity.
+This document summarizes the **current** recovery implementation for WrongoDB's
+connection-level global WAL. See `docs/global_wal_architecture.md` for the full
+architecture and invariants.
 
-## Completed Components
+## Current behavior
 
-### 1. WalReader (`src/btree/wal.rs`)
+- Single WAL file per database: `<db_dir>/global.wal`
+- Recovery runs once at `Connection::open`
+- Replay is logical (`Put` / `Delete`), routed by `store_name`
+- Replay applies only committed transactions (plus `TXN_NONE` ops)
 
-Sequential WAL reader with validation:
-- Opens WAL file and validates header (magic number, CRC32, version)
-- Reads records from checkpoint LSN to end of file
-- Validates CRC32 checksums for each record
-- Validates LSN chain (detects gaps in sequence)
-- Handles partial records at EOF gracefully
-- Returns `RecoveryError` with detailed error information
+## Recovery algorithm
 
-Key features:
-- `open()`: Open WAL file for reading
-- `read_record()`: Read next WAL record
-- `checkpoint_lsn()`: Get checkpoint LSN from header
-- `is_eof()`: Check if end of file reached
+1. Open `global.wal` and validate header/CRC.
+2. First pass: build `RecoveryTxnTable` from `TxnCommit` / `TxnAbort` markers.
+3. Finalize pending transactions as aborted.
+4. Second pass: replay eligible `Put/Delete` records in WAL order.
+5. Checkpoint replayed stores to persist roots.
 
-### 2. Logical WAL Records (`src/btree/wal.rs`)
+## Corruption handling
 
-WAL now logs logical operations:
-- **Put**: Insert/update a key/value pair
-- **Delete**: Remove a key (optional, idempotent)
-- **Checkpoint**: Consistency marker with root id + generation
+- Header corruption: recovery is skipped with warning.
+- Corrupt tail/partial record: replay stops at last valid record.
+- No panic path is expected from WAL parse failures.
 
-### 3. Recovery Integration (`src/btree.rs`)
+## Notes
 
-Recovery is integrated into `BTree::open()`:
-- Opens WAL reader if WAL is enabled
-- Temporarily disables WAL logging during replay
-- Replays logical records via `BTree::put` / `BTree::delete`
-- Logs recovery stats and continues on errors (corrupted WAL does not prevent open)
-
-### 4. WAL Logging (`src/btree.rs` + `src/btree/wal.rs`)
-
-WAL logging now happens at the **logical operation** level:
-- `BTree::put` logs `WalRecord::Put`
-- `BTree::delete` logs `WalRecord::Delete`
-- Checkpoint logs `WalRecord::Checkpoint`
-
-No split records or page-id tracking are needed.
-
-## Design Decisions
-
-### Logical Replay from Checkpoint LSN
-- Recovery reads records sequentially starting at the checkpoint LSN
-- Only post-checkpoint records are applied
-
-### WAL Disabled During Replay
-- Recovery temporarily removes the WAL handle to avoid re-logging
-- Replay uses normal B+tree code paths (splits/root updates included)
-
-### Graceful Degradation
-- Recovery errors do not prevent database open
-- Corrupted WAL results in warnings and partial recovery
-
-## Known Issues / Limitations
-
-- **No automatic checkpoint after recovery**: recovered data remains in the working tree until the user checkpoints.
-- **Delete is non-balancing**: deletes do not merge/rebalance pages (acceptable for now; performance may degrade).
-
-## Files Modified
-
-- `src/btree/wal.rs`: logical WAL record types, version bump, reader validation
-- `src/btree.rs`: logical logging + replay during open
-- `src/btree/pager.rs`: WAL handle suspension helpers
-- `tests/btree_recovery.rs`: recovery tests updated for logical WAL
-- `docs/wal_recovery_comparison.md`: updated to logical WAL alignment
-
-## Verification
-
-Run recovery tests:
-```bash
-cargo test --test btree_recovery
-```
-
-Run WAL tests:
-```bash
-cargo test --test btree_wal
-```
-
-## Conclusion
-
-Recovery now follows WiredTiger’s logical replay strategy. This removes the COW page-id drift problem,
-eliminates split logging dependencies, and simplifies the recovery pipeline while preserving idempotence.
+- Per-table `*.wal` files are ignored (hard cutover policy).
+- WAL replay does not use per-table recovery paths anymore.

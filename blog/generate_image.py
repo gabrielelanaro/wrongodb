@@ -3,6 +3,9 @@
 
 Supports an agentic draft→generate→critique loop in agentic mode and emits a
 sidecar JSON summary. Reads API key from .env (GEMINI_API_KEY or GOOGLE_API_KEY).
+
+Also supports structured diagram generation with HTML/CSS intermediate representation
+via the --structured flag.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ import base64
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -126,6 +130,158 @@ def _parse_json_blob(text: str | None) -> dict | None:
         return data if isinstance(data, dict) else None
     except json.JSONDecodeError:
         return None
+
+
+# --- Structured diagram generation (HTML intermediate) ---
+
+def _generate_html_diagram(client, model: str, seed_prompt: str) -> tuple[str, dict]:
+    """Generate HTML representation of the diagram."""
+    html_instruction = (
+        "You are a technical diagram designer. Create a clean, well-structured HTML/CSS "
+        "representation of the diagram described. The HTML should:\n"
+        "- Use semantic HTML with clear section labels\n"
+        "- Include inline CSS for styling (clean, modern, diagram-like appearance)\n"
+        "- Use CSS Grid or Flexbox for layout\n"
+        "- Include visual elements: boxes, arrows, labels, colors\n"
+        "- Be self-contained (no external dependencies)\n"
+        "- Have a white or light background\n"
+        "- Use a reasonable size (800-1200px wide)\n\n"
+        "Return ONLY JSON with keys:\n"
+        "{\n"
+        '  "html": "complete HTML document as a single string",\n'
+        '  "is_multi_panel": true or false,\n'
+        '  "panels": ["description of each panel if multi-panel"],\n'
+        '  "description": "brief description of the diagram structure",\n'
+        '  "key_elements": ["list of main visual elements"]\n'
+        "}\n\n"
+        "If this is a multi-panel diagram (like 4 panels showing steps/progression), "
+        "set is_multi_panel: true and provide panel descriptions.\n\n"
+        "Diagram description:\n"
+        f"{seed_prompt}\n"
+    )
+
+    response = client.models.generate_content(model=model, contents=html_instruction)
+    text = _response_text(response)
+    data = _parse_json_blob(text) or {}
+
+    html = data.get("html", "")
+    if not html or "<html" not in html.lower():
+        # Fallback: wrap in basic HTML if model didn't return proper HTML
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+<style>
+body {{ font-family: system-ui, -apple-system, sans-serif; margin: 40px; background: #f5f5f5; }}
+.diagram {{ background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+</style>
+</head>
+<body>
+<div class="diagram">
+{html if html else "<p>Diagram content could not be generated</p>"}
+</div>
+</body>
+</html>"""
+
+    return html, data
+
+
+def _generate_panel_html(client, model: str, panel_description: str, panel_index: int) -> str:
+    """Generate HTML for a specific panel in a multi-panel diagram."""
+    html_instruction = (
+        f"You are creating HTML/CSS for Panel {panel_index + 1} of a multi-panel diagram.\n\n"
+        f"Panel description: {panel_description}\n\n"
+        "Generate complete, self-contained HTML/CSS for this panel. "
+        "Use the same styling conventions as other panels for consistency.\n\n"
+        "Return ONLY the HTML code (no JSON wrapper, no markdown fences)."
+    )
+
+    response = client.models.generate_content(model=model, contents=html_instruction)
+    text = _response_text(response) or ""
+
+    # Clean up the response (remove markdown fences if present)
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    return text
+
+
+def _render_html_to_image(html: str, width: int = 1200, height: int = 900) -> bytes:
+    """Render HTML to PNG using Playwright."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("Missing dependency: playwright. Install with 'pip install playwright'.", file=sys.stderr)
+        print("Then run: playwright install chromium", file=sys.stderr)
+        sys.exit(3)
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as f:
+        f.write(html)
+        html_path = f.name
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page(viewport={'width': width, 'height': height})
+            page.goto(f'file://{html_path}')
+            page.wait_for_load_state('networkidle')
+
+            # Get actual content height for better cropping
+            content_height = page.evaluate('document.body.scrollHeight')
+            page.set_viewport_size({'width': width, 'height': max(content_height + 40, 400)})
+
+            screenshot = page.screenshot(full_page=True, type='png')
+            browser.close()
+            return screenshot
+    finally:
+        os.unlink(html_path)
+
+
+def _generate_image_from_reference(
+    client,
+    model: str,
+    seed_prompt: str,
+    reference_image_bytes: bytes,
+    description: str,
+    aspect: str,
+    size: str,
+) -> tuple[bytes, str | None, str | None]:
+    """Generate final image using reference rendering as visual guide."""
+    from google.genai import types
+
+    final_prompt = (
+        "Create a polished, professional technical diagram illustration based on:\n\n"
+        f"DESCRIPTION: {seed_prompt}\n\n"
+        f"STRUCTURE REFERENCE: {description}\n\n"
+        "Follow the layout and structure shown in the reference image closely. "
+        "Transform it into a beautiful, modern technical illustration with:\n"
+        "- Clean, consistent styling\n"
+        "- Professional color palette suitable for technical documentation\n"
+        "- Clear visual hierarchy\n"
+        "- Crisp typography and icons\n"
+        "- Subtle shadows and depth\n"
+        "Maintain all structural relationships, labels, and positions from the reference."
+    )
+
+    image_part = types.Part.from_bytes(data=reference_image_bytes, mime_type="image/png")
+    text_part = types.Part.from_text(text=final_prompt)
+    content = types.Content(role="user", parts=[text_part, image_part])
+
+    image_config = types.ImageConfig(aspect_ratio=aspect, image_size=size)
+    config = types.GenerateContentConfig(image_config=image_config)
+
+    response = client.models.generate_content(model=model, contents=[content], config=config)
+
+    extracted = _extract_image_data(response)
+    if not extracted:
+        return b"", None, _response_text(response)
+
+    return extracted[0], extracted[1], None
 
 
 def _write_image(out_path: Path, image_bytes: bytes, mime: str | None) -> None:
@@ -295,6 +451,21 @@ def main() -> int:
         help="Enable agentic draft→generate→critique loop",
     )
     parser.add_argument(
+        "--structured",
+        action="store_true",
+        help="Generate structured diagrams using HTML/CSS intermediate (for technical diagrams)",
+    )
+    parser.add_argument(
+        "--html-model",
+        default=None,
+        help="Model for HTML generation in structured mode (defaults to --model)",
+    )
+    parser.add_argument(
+        "--save-html",
+        action="store_true",
+        help="Save intermediate HTML and reference render (only with --structured)",
+    )
+    parser.add_argument(
         "--iterations",
         type=int,
         default=2,
@@ -415,6 +586,9 @@ def main() -> int:
         print(str(out_path))
         return 0
 
+    if args.structured:
+        return _run_structured_mode(client, args, out_path)
+
     image_bytes, mime, error_text = _generate_image_bytes(
         client,
         args.model,
@@ -429,6 +603,114 @@ def main() -> int:
         return 4
 
     _write_image(out_path, image_bytes, mime)
+    print(str(out_path))
+    return 0
+
+
+def _run_structured_mode(client, args, out_path: Path) -> int:
+    """Run structured diagram generation using HTML/CSS intermediate."""
+    print("Step 1: Generating HTML representation...", file=sys.stderr)
+
+    # Use a text model for HTML generation (faster/cheaper than image model)
+    html_model = getattr(args, 'html_model', None) or args.model
+
+    html, html_data = _generate_html_diagram(client, html_model, args.prompt)
+
+    is_multi_panel = html_data.get("is_multi_panel", False)
+    panels = html_data.get("panels", [])
+
+    htmls = []
+
+    if is_multi_panel and panels:
+        print(f"  Multi-panel diagram detected ({len(panels)} panels)...", file=sys.stderr)
+        for i, panel_desc in enumerate(panels):
+            print(f"  Generating Panel {i + 1}: {panel_desc[:50]}...", file=sys.stderr)
+            panel_html = _generate_panel_html(client, html_model, panel_desc, i)
+            htmls.append(panel_html)
+    else:
+        print("  Single panel diagram...", file=sys.stderr)
+        htmls.append(html)
+
+    # For multi-panel, combine into HTML grid
+    if len(htmls) > 1:
+        combined_html = f"""<!DOCTYPE html>
+<html>
+<head>
+<style>
+body {{ font-family: system-ui, -apple-system, sans-serif; margin: 20px; background: #f5f5f5; }}
+.grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 1400px; margin: 0 auto; }}
+.panel {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+.panel h3 {{ margin: 0 0 15px 0; font-size: 16px; color: #333; text-align: center; border-bottom: 1px solid #eee; padding-bottom: 10px; }}
+</style>
+</head>
+<body>
+<div class="grid">
+"""
+        for i, h in enumerate(htmls):
+            # Extract body content from each panel's HTML
+            body_start = h.find("<body>")
+            body_end = h.find("</body>")
+            body_content = h[body_start + 6:body_end] if body_start > 0 and body_end > 0 else h
+            title = panels[i].split(":")[0] if i < len(panels) and ":" in panels[i] else f"Panel {i + 1}"
+            combined_html += f'<div class="panel"><h3>{title}</h3>{body_content}</div>\n'
+        combined_html += "</div></body></html>"
+        html = combined_html
+
+    if args.save_html:
+        html_path = out_path.with_suffix(".html")
+        html_path.write_text(html, encoding="utf-8")
+        print(f"  Saved HTML: {html_path}", file=sys.stderr)
+
+    print("Step 2: Rendering HTML to image...", file=sys.stderr)
+    html_image = _render_html_to_image(html)
+
+    if args.save_html:
+        html_png_path = out_path.with_suffix(".ref.png")
+        html_png_path.write_bytes(html_image)
+        print(f"  Saved HTML render: {html_png_path}", file=sys.stderr)
+
+    print("Step 3: Generating final image from reference...", file=sys.stderr)
+    description = html_data.get("description", "")
+
+    image_bytes, mime, error = _generate_image_from_reference(
+        client,
+        args.model,
+        args.prompt,
+        html_image,
+        description,
+        args.aspect,
+        args.size,
+    )
+
+    if error:
+        print(f"  Error: {error}", file=sys.stderr)
+    if not image_bytes:
+        print("Failed to generate final image.", file=sys.stderr)
+        return 4
+
+    _write_image(out_path, image_bytes, mime)
+    print(f"Saved final image: {out_path}", file=sys.stderr)
+
+    # Save sidecar metadata
+    sidecar_path = out_path.with_suffix(".json")
+    sidecar = {
+        "seed_prompt": args.prompt,
+        "html_model": html_model,
+        "image_model": args.model,
+        "aspect": args.aspect,
+        "size": args.size,
+        "is_multi_panel": is_multi_panel,
+        "panels": panels,
+        "html_description": description,
+        "html_key_elements": html_data.get("key_elements", []),
+        "intermediate_files": {
+            "html": str(out_path.with_suffix(".html")) if args.save_html else None,
+            "html_render": str(out_path.with_suffix(".ref.png")) if args.save_html else None,
+        },
+    }
+    sidecar_path.write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
+    print(f"Saved metadata: {sidecar_path}", file=sys.stderr)
+
     print(str(out_path))
     return 0
 

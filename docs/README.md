@@ -6,11 +6,16 @@ This directory contains design documents and architectural decisions for the min
 
 ### Recovery and WAL
 
+- **`global_wal_architecture.md`** - Canonical global WAL architecture and invariants
+  - Date: 2026-02-07
+  - Connection-level WAL ownership, recovery flow, checkpoint/truncation, and legacy cleanup policy
 - **`wal_recovery_implementation.md`** - Logical WAL recovery implementation summary
-  - Date: 2026-01-27
-  - Describes logical WAL record types, replay flow, and recovery behavior
+  - Date: 2026-02-07
+  - Current connection-open recovery implementation details
 - **`wal_recovery_comparison.md`** - WiredTiger vs minimongo logical WAL comparison
-  - Shows why logical replay avoids page-id drift and split logging
+  - Updated comparison for global-WAL logical replay
+- **`wal_architecture_comparison.md`** - Current architecture and WiredTiger comparison
+  - Updated to reflect active connection-level WAL design
 - **`wal_checkpoint_lsn_bug.md`** - Checkpoint LSN bug analysis
   - Date: 2025-01-27
   - Explains the off-by-record bug and expected fix

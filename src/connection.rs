@@ -1,31 +1,28 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
+use parking_lot::Mutex;
+
+use crate::core::errors::StorageError;
 use crate::datahandle_cache::DataHandleCache;
 use crate::session::Session;
-use crate::storage::wal::{wal_path_from_base_path, CheckpointSignal, GlobalWal, WalReader, WalRecord};
+use crate::storage::btree::BTree;
+use crate::storage::global_wal::{GlobalWal, RecoveryError, WalReader, WalRecord};
 use crate::txn::GlobalTxnState;
+use crate::txn::RecoveryTxnTable;
+use crate::txn::TXN_NONE;
 use crate::WrongoDBError;
-use parking_lot::Mutex;
 
 pub struct ConnectionConfig {
     pub wal_enabled: bool,
-    pub checkpoint_wait_secs: Option<u64>,
-    pub checkpoint_log_size_bytes: Option<u64>,
 }
 
 impl Default for ConnectionConfig {
     fn default() -> Self {
-        Self {
-            wal_enabled: true,
-            checkpoint_wait_secs: Some(60),
-            checkpoint_log_size_bytes: Some(64 * 1024 * 1024),
-        }
+        Self { wal_enabled: true }
     }
 }
 
@@ -38,108 +35,14 @@ impl ConnectionConfig {
         self.wal_enabled = enabled;
         self
     }
-
-    pub fn checkpoint_wait_secs(mut self, wait_secs: Option<u64>) -> Self {
-        self.checkpoint_wait_secs = wait_secs;
-        self
-    }
-
-    pub fn checkpoint_log_size_bytes(mut self, bytes: Option<u64>) -> Self {
-        self.checkpoint_log_size_bytes = bytes;
-        self
-    }
-
-    pub fn disable_auto_checkpoint(mut self) -> Self {
-        self.checkpoint_wait_secs = None;
-        self.checkpoint_log_size_bytes = None;
-        self
-    }
 }
 
 pub struct Connection {
     base_path: PathBuf,
     dhandle_cache: Arc<DataHandleCache>,
     wal_enabled: bool,
-    wal: Option<Arc<GlobalWal>>,
-    checkpoint_wait_secs: Option<u64>,
-    checkpoint_log_size_bytes: Option<u64>,
-    checkpoint_mutex: Arc<Mutex<()>>,
-    checkpoint_manager: Option<CheckpointManager>,
+    global_wal: Option<Arc<Mutex<GlobalWal>>>,
     global_txn: Arc<GlobalTxnState>,
-}
-
-struct CheckpointManager {
-    stop: Arc<AtomicBool>,
-    handle: Option<thread::JoinHandle<()>>,
-    signal: Option<CheckpointSignal>,
-}
-
-impl Drop for CheckpointManager {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        if let Some(signal) = &self.signal {
-            signal.notify();
-        }
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-pub(crate) struct CheckpointContext {
-    base_path: PathBuf,
-    dhandle_cache: Arc<DataHandleCache>,
-    wal: Option<Arc<GlobalWal>>,
-    checkpoint_mutex: Arc<Mutex<()>>,
-    global_txn: Arc<GlobalTxnState>,
-}
-
-impl CheckpointContext {
-    pub(crate) fn new(
-        base_path: PathBuf,
-        dhandle_cache: Arc<DataHandleCache>,
-        wal: Option<Arc<GlobalWal>>,
-        checkpoint_mutex: Arc<Mutex<()>>,
-        global_txn: Arc<GlobalTxnState>,
-    ) -> Self {
-        Self {
-            base_path,
-            dhandle_cache,
-            wal,
-            checkpoint_mutex,
-            global_txn,
-        }
-    }
-}
-
-pub(crate) fn checkpoint_all_with_context(ctx: &CheckpointContext) -> Result<(), WrongoDBError> {
-    let _guard = ctx.checkpoint_mutex.lock();
-    let snapshot = ctx.global_txn.checkpoint_snapshot();
-    let expected_offset = ctx.wal.as_ref().map(|wal| wal.last_offset());
-    let collection_names = list_collections(&ctx.base_path)?;
-
-    for name in collection_names {
-        let uri = format!("table:{}", name);
-        let table = ctx.dhandle_cache.get_or_open_primary(
-            &uri,
-            &name,
-            &ctx.base_path,
-            ctx.wal.clone(),
-            ctx.global_txn.clone(),
-        )?;
-        let mut guard = table.write();
-        guard.checkpoint_with_snapshot(&snapshot)?;
-    }
-
-    if let Some(wal) = ctx.wal.as_ref() {
-        if snapshot.active.is_empty() {
-            if let Some(expected) = expected_offset {
-                let _ = wal.try_advance_checkpoint(expected)?;
-            }
-        }
-    }
-
-    Ok(())
 }
 
 impl fmt::Debug for Connection {
@@ -147,8 +50,6 @@ impl fmt::Debug for Connection {
         f.debug_struct("Connection")
             .field("base_path", &self.base_path)
             .field("wal_enabled", &self.wal_enabled)
-            .field("checkpoint_wait_secs", &self.checkpoint_wait_secs)
-            .field("checkpoint_log_size_bytes", &self.checkpoint_log_size_bytes)
             .finish()
     }
 }
@@ -161,229 +62,177 @@ impl Connection {
         let base_path = path.as_ref().to_path_buf();
         fs::create_dir_all(&base_path)?;
         let global_txn = Arc::new(GlobalTxnState::new());
-        let wal = if config.wal_enabled {
-            Some(Arc::new(GlobalWal::open_or_create(&base_path, 4096)?))
+        let global_wal = if config.wal_enabled {
+            warn_legacy_per_table_wal_files(&base_path);
+            recover_global_wal(&base_path, global_txn.clone())?;
+            Some(Arc::new(Mutex::new(GlobalWal::open_or_create(&base_path)?)))
         } else {
             None
         };
 
-        if let Some(wal) = wal.as_ref() {
-            wal.set_log_size_threshold(config.checkpoint_log_size_bytes);
-        }
-
-        let checkpoint_mutex = Arc::new(Mutex::new(()));
-
-        let mut conn = Self {
+        Ok(Self {
             base_path,
-            dhandle_cache: Arc::new(DataHandleCache::new()),
+            dhandle_cache: Arc::new(DataHandleCache::new(global_wal.clone())),
             wal_enabled: config.wal_enabled,
-            wal,
-            checkpoint_wait_secs: config.checkpoint_wait_secs,
-            checkpoint_log_size_bytes: config.checkpoint_log_size_bytes,
-            checkpoint_mutex,
-            checkpoint_manager: None,
+            global_wal,
             global_txn,
-        };
-
-        if conn.wal_enabled {
-            if let Err(err) = conn.recover_from_wal() {
-                eprintln!("WAL recovery failed: {}. Database may be inconsistent.", err);
-            }
-        }
-
-        conn.start_checkpoint_manager();
-
-        Ok(conn)
+        })
     }
 
     pub fn open_session(&self) -> Session {
         Session::new(
             self.dhandle_cache.clone(),
             self.base_path.clone(),
-            self.wal.clone(),
+            self.wal_enabled,
+            self.global_wal.clone(),
             self.global_txn.clone(),
-            self.checkpoint_mutex.clone(),
         )
-    }
-
-    pub fn checkpoint_all(&self) -> Result<(), WrongoDBError> {
-        let ctx = self.checkpoint_context();
-        checkpoint_all_with_context(&ctx)
-    }
-
-    fn checkpoint_context(&self) -> CheckpointContext {
-        CheckpointContext {
-            base_path: self.base_path.clone(),
-            dhandle_cache: self.dhandle_cache.clone(),
-            wal: self.wal.clone(),
-            checkpoint_mutex: self.checkpoint_mutex.clone(),
-            global_txn: self.global_txn.clone(),
-        }
-    }
-
-    fn start_checkpoint_manager(&mut self) {
-        let wait_secs = self.checkpoint_wait_secs;
-        let log_size = self.checkpoint_log_size_bytes;
-        if wait_secs.is_none() && log_size.is_none() {
-            return;
-        }
-
-        let signal = self
-            .wal
-            .as_ref()
-            .map(|wal| wal.checkpoint_signal())
-            .unwrap_or_else(CheckpointSignal::new);
-        let thread_signal = signal.clone();
-        let ctx = self.checkpoint_context();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread = stop.clone();
-
-        let handle = thread::spawn(move || {
-            let wait = wait_secs.map(Duration::from_secs).unwrap_or(Duration::from_secs(3600));
-            loop {
-                if stop_thread.load(Ordering::Acquire) {
-                    break;
-                }
-                let signaled = thread_signal.wait_timeout(wait);
-                if stop_thread.load(Ordering::Acquire) {
-                    break;
-                }
-                if signaled || wait_secs.is_some() {
-                    if let Err(err) = checkpoint_all_with_context(&ctx) {
-                        eprintln!("auto-checkpoint failed: {}", err);
-                    }
-                }
-            }
-        });
-
-        self.checkpoint_manager = Some(CheckpointManager {
-            stop,
-            handle: Some(handle),
-            signal: Some(signal),
-        });
     }
 
     pub fn base_path(&self) -> &Path {
         &self.base_path
     }
+}
 
-    fn recover_from_wal(&self) -> Result<(), WrongoDBError> {
-        let wal_path = wal_path_from_base_path(&self.base_path);
-        if !wal_path.exists() {
-            return Ok(());
-        }
+fn warn_legacy_per_table_wal_files(base_path: &Path) {
+    let mut legacy_wals = Vec::new();
 
-        let mut wal_reader = WalReader::open(&wal_path)
-            .map_err(|e| crate::core::errors::StorageError(format!("failed to open WAL: {e}")))?;
-
-        let mut txn_table = crate::txn::recovery::RecoveryTxnTable::new();
-
-        while let Some((_header, record)) = wal_reader
-            .read_record()
-            .map_err(|e| crate::core::errors::StorageError(format!("WAL read failed: {e}")))? {
-            txn_table.process_record(&record);
-        }
-        txn_table.finalize_pending();
-
-        let mut wal_reader = WalReader::open(&wal_path)
-            .map_err(|e| crate::core::errors::StorageError(format!("failed to reopen WAL: {e}")))?;
-
-        while let Some((_header, record)) = wal_reader
-            .read_record()
-            .map_err(|e| crate::core::errors::StorageError(format!("WAL read failed: {e}")))? {
-            if !txn_table.should_apply(&record) {
+    if let Ok(entries) = fs::read_dir(base_path) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name == "global.wal" {
                 continue;
             }
-
-            match record {
-                WalRecord::Put { uri, key, value, .. } => {
-                    if let Some(table) = self.open_table_for_uri(&uri)? {
-                        let mut guard = table.write();
-                        guard.apply_recovery_put(&key, &value)?;
-                    }
-                }
-                WalRecord::Delete { uri, key, .. } => {
-                    if let Some(table) = self.open_table_for_uri(&uri)? {
-                        let mut guard = table.write();
-                        guard.apply_recovery_delete(&key)?;
-                    }
-                }
-                WalRecord::Checkpoint { .. } => {}
-                WalRecord::TxnCommit { .. } => {}
-                WalRecord::TxnAbort { .. } => {}
+            if name.ends_with(".wal") {
+                legacy_wals.push(name.to_string());
             }
         }
-
-        Ok(())
     }
 
-    fn open_table_for_uri(&self, uri: &str) -> Result<Option<Arc<parking_lot::RwLock<crate::storage::table::Table>>>, WrongoDBError> {
-        if uri.starts_with("table:") {
-            let collection = &uri[6..];
-            let table = self.dhandle_cache.get_or_open_primary(
-                uri,
-                collection,
-                &self.base_path,
-                self.wal.clone(),
-                self.global_txn.clone(),
-            )?;
-            return Ok(Some(table));
-        }
-
-        if uri.starts_with("index:") {
-            let (collection, index_name) = parse_index_uri(uri)?;
-            let table = self.dhandle_cache.get_or_open_primary(
-                &format!("table:{}", collection),
-                collection,
-                &self.base_path,
-                self.wal.clone(),
-                self.global_txn.clone(),
-            )?;
-            let index_table = {
-                let table_guard = table.read();
-                let catalog = match table_guard.index_catalog() {
-                    Some(cat) => cat,
-                    None => return Ok(None),
-                };
-                match catalog.index_handle(index_name) {
-                    Some(idx) => idx,
-                    None => return Ok(None),
-                }
-            };
-            return Ok(Some(index_table));
-        }
-
-        Ok(None)
+    if !legacy_wals.is_empty() {
+        eprintln!(
+            "Found {} legacy per-table WAL file(s); they are ignored after global WAL cutover: {}",
+            legacy_wals.len(),
+            legacy_wals.join(", ")
+        );
     }
 }
 
-fn parse_index_uri(uri: &str) -> Result<(&str, &str), WrongoDBError> {
-    if !uri.starts_with("index:") {
-        return Err(crate::core::errors::StorageError(format!("invalid index URI: {}", uri)).into());
+fn recover_global_wal(
+    base_path: &Path,
+    global_txn: Arc<GlobalTxnState>,
+) -> Result<(), WrongoDBError> {
+    let wal_path = GlobalWal::path_for_db(base_path);
+    if !wal_path.exists() {
+        return Ok(());
     }
-    let rest = &uri[6..];
-    let mut parts = rest.splitn(2, ':');
-    let collection = parts.next().unwrap_or("");
-    let index = parts.next().unwrap_or("");
-    if collection.is_empty() || index.is_empty() {
-        return Err(crate::core::errors::StorageError(format!("invalid index URI: {}", uri)).into());
+
+    let mut first_pass_reader = match WalReader::open(&wal_path) {
+        Ok(reader) => reader,
+        Err(err) => {
+            eprintln!("Skipping global WAL recovery (failed to open WAL): {err}");
+            return Ok(());
+        }
+    };
+
+    let mut txn_table = RecoveryTxnTable::new();
+    while let Some(record) = next_recovery_record(&mut first_pass_reader, "pass 1")? {
+        txn_table.process_record(&record);
     }
-    Ok((collection, index))
+    txn_table.finalize_pending();
+
+    let mut second_pass_reader = match WalReader::open(&wal_path) {
+        Ok(reader) => reader,
+        Err(err) => {
+            eprintln!("Skipping global WAL recovery (failed to reopen WAL): {err}");
+            return Ok(());
+        }
+    };
+
+    let mut replay_trees: HashMap<String, BTree> = HashMap::new();
+
+    while let Some(record) = next_recovery_record(&mut second_pass_reader, "pass 2")? {
+        if !txn_table.should_apply(&record) {
+            continue;
+        }
+
+        match record {
+            WalRecord::Put {
+                store_name,
+                key,
+                value,
+                ..
+            } => {
+                ensure_replay_tree(
+                    &mut replay_trees,
+                    base_path,
+                    &store_name,
+                    global_txn.clone(),
+                )?
+                .put_with_txn(&key, &value, TXN_NONE, false)?;
+            }
+            WalRecord::Delete {
+                store_name, key, ..
+            } => {
+                ensure_replay_tree(
+                    &mut replay_trees,
+                    base_path,
+                    &store_name,
+                    global_txn.clone(),
+                )?
+                .delete_with_txn(&key, TXN_NONE, false)?;
+            }
+            WalRecord::Checkpoint | WalRecord::TxnCommit { .. } | WalRecord::TxnAbort { .. } => {}
+        }
+    }
+
+    for tree in replay_trees.values_mut() {
+        tree.checkpoint()?;
+    }
+
+    Ok(())
 }
 
-fn list_collections(base_path: &Path) -> Result<Vec<String>, WrongoDBError> {
-    let mut names = Vec::new();
-    for entry in fs::read_dir(base_path)? {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        let file_name = match file_name.to_str() {
-            Some(s) => s,
-            None => continue,
+fn next_recovery_record(
+    reader: &mut WalReader,
+    pass: &str,
+) -> Result<Option<WalRecord>, WrongoDBError> {
+    match reader.read_record() {
+        Ok(Some((_header, record))) => Ok(Some(record)),
+        Ok(None) => Ok(None),
+        Err(
+            err @ (RecoveryError::ChecksumMismatch { .. }
+            | RecoveryError::BrokenLsnChain { .. }
+            | RecoveryError::CorruptRecordHeader { .. }
+            | RecoveryError::CorruptRecordPayload { .. }),
+        ) => {
+            eprintln!("Stopping global WAL replay during {pass} at corrupted tail: {err}");
+            Ok(None)
+        }
+        Err(err) => Err(StorageError(format!("failed reading WAL during {pass}: {err}")).into()),
+    }
+}
+
+fn ensure_replay_tree<'a>(
+    replay_trees: &'a mut HashMap<String, BTree>,
+    base_path: &Path,
+    store_name: &str,
+    global_txn: Arc<GlobalTxnState>,
+) -> Result<&'a mut BTree, WrongoDBError> {
+    if !replay_trees.contains_key(store_name) {
+        let store_path = base_path.join(store_name);
+        let tree = if store_path.exists() {
+            BTree::open_with_global_wal(&store_path, false, global_txn, None)?
+        } else {
+            BTree::create_with_global_wal(&store_path, 4096, false, global_txn, None)?
         };
-        if let Some(name) = file_name.strip_suffix(".main.wt") {
-            names.push(name.to_string());
-        }
+        replay_trees.insert(store_name.to_string(), tree);
     }
-    names.sort();
-    Ok(names)
+
+    replay_trees
+        .get_mut(store_name)
+        .ok_or_else(|| StorageError(format!("replay tree missing for store {store_name}")).into())
 }

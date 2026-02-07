@@ -3,12 +3,11 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
-use crate::connection::{checkpoint_all_with_context, CheckpointContext};
 use crate::core::errors::StorageError;
 use crate::cursor::{Cursor, CursorKind};
 use crate::datahandle_cache::DataHandleCache;
+use crate::storage::global_wal::GlobalWal;
 use crate::storage::table::Table;
-use crate::storage::wal::GlobalWal;
 use crate::txn::{GlobalTxnState, Transaction};
 use crate::WrongoDBError;
 
@@ -19,9 +18,9 @@ struct SessionTxnContext {
 pub struct Session {
     cache: Arc<DataHandleCache>,
     base_path: PathBuf,
-    wal: Option<Arc<GlobalWal>>,
+    wal_enabled: bool,
+    global_wal: Option<Arc<Mutex<GlobalWal>>>,
     global_txn: Arc<GlobalTxnState>,
-    checkpoint_mutex: Arc<Mutex<()>>,
     txn: Option<SessionTxnContext>,
 }
 
@@ -29,16 +28,16 @@ impl Session {
     pub(crate) fn new(
         cache: Arc<DataHandleCache>,
         base_path: PathBuf,
-        wal: Option<Arc<GlobalWal>>,
+        wal_enabled: bool,
+        global_wal: Option<Arc<Mutex<GlobalWal>>>,
         global_txn: Arc<GlobalTxnState>,
-        checkpoint_mutex: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             cache,
             base_path,
-            wal,
+            wal_enabled,
+            global_wal,
             global_txn,
-            checkpoint_mutex,
             txn: None,
         }
     }
@@ -50,13 +49,17 @@ impl Session {
         }
     }
 
-    fn get_primary_table(&mut self, collection: &str, mark_touched: bool) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
+    fn get_primary_table(
+        &mut self,
+        collection: &str,
+        mark_touched: bool,
+    ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
         let uri = format!("table:{}", collection);
         let table = self.cache.get_or_open_primary(
             &uri,
             collection,
             &self.base_path,
-            self.wal.clone(),
+            self.wal_enabled,
             self.global_txn.clone(),
         )?;
         if mark_touched {
@@ -74,20 +77,19 @@ impl Session {
     }
 
     pub fn create(&mut self, uri: &str) -> Result<(), WrongoDBError> {
-        if uri.starts_with("table:") {
-            let collection = &uri[6..];
+        if let Some(collection) = uri.strip_prefix("table:") {
             let _table = self.get_primary_table(collection, false)?;
             Ok(())
         } else {
-            Err(WrongoDBError::Storage(StorageError(
-                format!("unsupported URI: {}", uri),
-            )))
+            Err(WrongoDBError::Storage(StorageError(format!(
+                "unsupported URI: {}",
+                uri
+            ))))
         }
     }
 
     pub fn open_cursor(&mut self, uri: &str) -> Result<Cursor, WrongoDBError> {
-        if uri.starts_with("table:") {
-            let collection = &uri[6..];
+        if let Some(collection) = uri.strip_prefix("table:") {
             let table = self.get_primary_table(collection, true)?;
             return Ok(Cursor::new(table, CursorKind::Table));
         }
@@ -107,34 +109,24 @@ impl Session {
             return Ok(Cursor::new(index_table, CursorKind::Index));
         }
 
-        Err(WrongoDBError::Storage(StorageError(
-            format!("unsupported URI: {}", uri),
-        )))
-    }
-
-    pub fn checkpoint(&self) -> Result<(), WrongoDBError> {
-        let ctx = CheckpointContext::new(
-            self.base_path.clone(),
-            self.cache.clone(),
-            self.wal.clone(),
-            self.checkpoint_mutex.clone(),
-            self.global_txn.clone(),
-        );
-        checkpoint_all_with_context(&ctx)
+        Err(WrongoDBError::Storage(StorageError(format!(
+            "unsupported URI: {}",
+            uri
+        ))))
     }
 
     /// Begin a new transaction and return an RAII handle.
-    /// 
+    ///
     /// The transaction will auto-rollback if not explicitly committed or aborted.
-    /// 
+    ///
     /// # Example
     /// ```no_run
     /// use wrongodb::{Connection, ConnectionConfig};
-    /// 
+    ///
     /// let conn = Connection::open("/tmp/test", ConnectionConfig::default()).unwrap();
     /// let mut session = conn.open_session();
     /// session.create("table:test").unwrap();
-    /// 
+    ///
     /// let mut cursor = session.open_cursor("table:test").unwrap();
     /// {
     ///     let mut txn = session.transaction().unwrap();
@@ -148,9 +140,7 @@ impl Session {
             return Err(WrongoDBError::TransactionAlreadyActive);
         }
         let txn = self.global_txn.begin_snapshot_txn();
-        self.txn = Some(SessionTxnContext {
-            txn,
-        });
+        self.txn = Some(SessionTxnContext { txn });
         Ok(SessionTxn::new(self))
     }
 
@@ -163,10 +153,37 @@ impl Session {
     pub fn current_txn_mut(&mut self) -> Option<&mut Transaction> {
         self.txn.as_mut().map(|ctx| &mut ctx.txn)
     }
+
+    pub(crate) fn checkpoint_all(&mut self) -> Result<(), WrongoDBError> {
+        let handles = self.cache.all_handles();
+        for table in handles {
+            table.write().checkpoint()?;
+        }
+
+        if self.wal_enabled && self.global_txn.has_active_transactions() {
+            return Ok(());
+        }
+
+        if self.wal_enabled {
+            if let Some(global_wal) = self.global_wal.as_ref() {
+                let mut wal = global_wal.lock();
+                if self.global_txn.has_active_transactions() {
+                    return Ok(());
+                }
+
+                let checkpoint_lsn = wal.log_checkpoint()?;
+                wal.set_checkpoint_lsn(checkpoint_lsn)?;
+                wal.sync()?;
+                wal.truncate_to_checkpoint()?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// RAII transaction handle for Session.
-/// 
+///
 /// The transaction will auto-rollback on drop if not explicitly committed or aborted.
 /// This follows the pattern used by sled and other Rust database libraries.
 pub struct SessionTxn<'a> {
@@ -191,12 +208,15 @@ impl<'a> SessionTxn<'a> {
             let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
             let txn_id = ctx.txn.id();
 
-            ctx.txn.commit(&self.session.global_txn)?;
-
-            if let Some(wal) = self.session.wal.as_ref() {
-                let _ = wal.log_txn_commit(txn_id, txn_id)?;
-                wal.sync()?;
+            if self.session.wal_enabled {
+                if let Some(global_wal) = self.session.global_wal.as_ref() {
+                    let mut wal = global_wal.lock();
+                    wal.log_txn_commit(txn_id, txn_id)?;
+                    wal.sync()?;
+                }
             }
+
+            ctx.txn.commit(&self.session.global_txn)?;
 
             for uri in &touched_tables {
                 if !uri.starts_with("table:") {
@@ -224,11 +244,14 @@ impl<'a> SessionTxn<'a> {
             let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
             let txn_id = ctx.txn.id();
 
-            ctx.txn.abort(&self.session.global_txn)?;
-
-            if let Some(wal) = self.session.wal.as_ref() {
-                let _ = wal.log_txn_abort(txn_id)?;
+            if self.session.wal_enabled {
+                if let Some(global_wal) = self.session.global_wal.as_ref() {
+                    let mut wal = global_wal.lock();
+                    wal.log_txn_abort(txn_id)?;
+                }
             }
+
+            ctx.txn.abort(&self.session.global_txn)?;
 
             for uri in &touched_tables {
                 if !uri.starts_with("table:") {
@@ -248,7 +271,7 @@ impl<'a> SessionTxn<'a> {
     }
 
     /// Get a mutable reference to the underlying transaction.
-    /// 
+    ///
     /// This is useful for accessing transaction metadata (e.g., txn id).
     pub fn as_mut(&mut self) -> &mut Transaction {
         self.session
@@ -259,7 +282,7 @@ impl<'a> SessionTxn<'a> {
     }
 
     /// Get a shared reference to the underlying transaction.
-    /// 
+    ///
     /// This is useful for accessing transaction metadata (e.g., txn id).
     pub fn as_ref(&self) -> &Transaction {
         self.session
@@ -281,6 +304,12 @@ impl<'a> Drop for SessionTxn<'a> {
                 let touched_tables: Vec<String> =
                     ctx.txn.touched_tables().iter().cloned().collect();
                 let txn_id = ctx.txn.id();
+                if self.session.wal_enabled {
+                    if let Some(global_wal) = self.session.global_wal.as_ref() {
+                        let mut wal = global_wal.lock();
+                        let _ = wal.log_txn_abort(txn_id);
+                    }
+                }
                 let _ = ctx.txn.abort(&self.session.global_txn);
 
                 for uri in &touched_tables {
@@ -303,18 +332,20 @@ impl<'a> Drop for SessionTxn<'a> {
 
 fn parse_index_uri(uri: &str) -> Result<(&str, &str), WrongoDBError> {
     if !uri.starts_with("index:") {
-        return Err(WrongoDBError::Storage(StorageError(
-            format!("invalid index URI: {}", uri),
-        )));
+        return Err(WrongoDBError::Storage(StorageError(format!(
+            "invalid index URI: {}",
+            uri
+        ))));
     }
     let rest = &uri[6..];
     let mut parts = rest.splitn(2, ':');
     let collection = parts.next().unwrap_or("");
     let index = parts.next().unwrap_or("");
     if collection.is_empty() || index.is_empty() {
-        return Err(WrongoDBError::Storage(StorageError(
-            format!("invalid index URI: {}", uri),
-        )));
+        return Err(WrongoDBError::Storage(StorageError(format!(
+            "invalid index URI: {}",
+            uri
+        ))));
     }
     Ok((collection, index))
 }

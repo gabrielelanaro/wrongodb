@@ -210,7 +210,9 @@ impl Command for UpdateCommand {
                     let filter_json = filter.map(|d| bson_to_value(&d));
 
                     let update_spec = update_doc.get("u").and_then(|u| u.as_document()).cloned();
-                    let update_json = update_spec.map(|d| bson_to_value(&d)).unwrap_or(Value::Null);
+                    let update_json = update_spec
+                        .map(|d| bson_to_value(&d))
+                        .unwrap_or(Value::Null);
 
                     let multi = update_doc.get_bool("multi").unwrap_or(false);
 

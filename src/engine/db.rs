@@ -10,19 +10,11 @@ use super::collection::Collection;
 pub struct WrongoDBConfig {
     /// Enable WAL for durability (default: true)
     pub wal_enabled: bool,
-    /// Auto-checkpoint interval in seconds (default: 60s)
-    pub checkpoint_wait_secs: Option<u64>,
-    /// Auto-checkpoint WAL size threshold in bytes (default: 64MB)
-    pub checkpoint_log_size_bytes: Option<u64>,
 }
 
 impl Default for WrongoDBConfig {
     fn default() -> Self {
-        Self {
-            wal_enabled: true,
-            checkpoint_wait_secs: Some(60),
-            checkpoint_log_size_bytes: Some(64 * 1024 * 1024),
-        }
+        Self { wal_enabled: true }
     }
 }
 
@@ -35,22 +27,6 @@ impl WrongoDBConfig {
     /// Enable or disable WAL (default: true).
     pub fn wal_enabled(mut self, enabled: bool) -> Self {
         self.wal_enabled = enabled;
-        self
-    }
-
-    pub fn checkpoint_wait_secs(mut self, wait_secs: Option<u64>) -> Self {
-        self.checkpoint_wait_secs = wait_secs;
-        self
-    }
-
-    pub fn checkpoint_log_size_bytes(mut self, bytes: Option<u64>) -> Self {
-        self.checkpoint_log_size_bytes = bytes;
-        self
-    }
-
-    pub fn disable_auto_checkpoint(mut self) -> Self {
-        self.checkpoint_wait_secs = None;
-        self.checkpoint_log_size_bytes = None;
         self
     }
 }
@@ -80,8 +56,6 @@ impl WrongoDB {
             base_path,
             ConnectionConfig {
                 wal_enabled: config.wal_enabled,
-                checkpoint_wait_secs: config.checkpoint_wait_secs,
-                checkpoint_log_size_bytes: config.checkpoint_log_size_bytes,
             },
         )?;
         Ok(Self { connection: conn })

@@ -1,71 +1,83 @@
-//! WAL integration tests for DB-level operations.
+//! Integration tests for connection-level global WAL behavior.
 
 use std::fs;
-use std::path::{Path, PathBuf};
 
+use serde_json::json;
 use tempfile::tempdir;
-use wrongodb::{Connection, ConnectionConfig};
 
-fn wal_path(base_path: &Path) -> PathBuf {
-    base_path.join("wrongo.wal")
+use wrongodb::{WrongoDB, WrongoDBConfig};
+
+fn global_wal_path(db_dir: &std::path::Path) -> std::path::PathBuf {
+    db_dir.join("global.wal")
 }
 
 #[test]
-fn wal_created_when_enabled() {
+fn global_wal_created_when_enabled() {
     let tmp = tempdir().unwrap();
-    let db_path = tmp.path().join("wal-enabled");
+    let db_path = tmp.path().join("db");
 
-    let conn = Connection::open(&db_path, ConnectionConfig::default().disable_auto_checkpoint())
-        .unwrap();
-    drop(conn);
-
-    assert!(wal_path(&db_path).exists());
-}
-
-#[test]
-fn wal_disabled_no_file_created() {
-    let tmp = tempdir().unwrap();
-    let db_path = tmp.path().join("wal-disabled");
-
-    let conn = Connection::open(
-        &db_path,
-        ConnectionConfig::default()
-            .wal_enabled(false)
-            .disable_auto_checkpoint(),
-    )
-    .unwrap();
-
-    {
-        let mut session = conn.open_session();
-        session.create("table:test").unwrap();
-    }
-
-    drop(conn);
-
-    assert!(!wal_path(&db_path).exists());
-}
-
-#[test]
-fn wal_records_written_for_committed_write() {
-    let tmp = tempdir().unwrap();
-    let db_path = tmp.path().join("wal-write");
-
-    let conn = Connection::open(&db_path, ConnectionConfig::default().disable_auto_checkpoint())
+    let db = WrongoDB::open(&db_path).unwrap();
+    let coll = db.collection("test");
+    let mut session = db.open_session();
+    coll.insert_one(&mut session, json!({"_id": 1, "v": "a"}))
         .unwrap();
 
-    {
-        let mut session = conn.open_session();
-        session.create("table:test").unwrap();
+    assert!(global_wal_path(&db_path).exists());
+}
 
-        let mut txn = session.transaction().unwrap();
-        let txn_id = txn.as_mut().id();
-        let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
-        cursor.insert(b"key1", b"value1", txn_id).unwrap();
-        txn.commit().unwrap();
+#[test]
+fn global_wal_not_created_when_disabled() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("db");
+    let cfg = WrongoDBConfig::new().wal_enabled(false);
+
+    let db = WrongoDB::open_with_config(&db_path, cfg).unwrap();
+    let coll = db.collection("test");
+    let mut session = db.open_session();
+    coll.insert_one(&mut session, json!({"_id": 1, "v": "a"}))
+        .unwrap();
+
+    assert!(!global_wal_path(&db_path).exists());
+}
+
+#[test]
+fn global_wal_grows_after_committed_writes() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("db");
+
+    let db = WrongoDB::open(&db_path).unwrap();
+    let coll = db.collection("test");
+    let mut session = db.open_session();
+
+    for i in 0..20 {
+        coll.insert_one(&mut session, json!({"_id": i, "v": i}))
+            .unwrap();
     }
 
-    drop(conn);
-
-    let metadata = fs::metadata(wal_path(&db_path)).unwrap();
+    let metadata = fs::metadata(global_wal_path(&db_path)).unwrap();
     assert!(metadata.len() > 512);
+}
+
+#[test]
+fn collection_checkpoint_truncates_global_wal() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("db");
+
+    let db = WrongoDB::open(&db_path).unwrap();
+    let coll = db.collection("test");
+    let mut session = db.open_session();
+
+    for i in 0..10 {
+        coll.insert_one(&mut session, json!({"_id": i, "v": i}))
+            .unwrap();
+    }
+
+    let wal_path = global_wal_path(&db_path);
+    let before = fs::metadata(&wal_path).unwrap().len();
+    assert!(before > 512);
+
+    coll.checkpoint(&mut session).unwrap();
+
+    let after = fs::metadata(&wal_path).unwrap().len();
+    assert!(after <= 512);
 }

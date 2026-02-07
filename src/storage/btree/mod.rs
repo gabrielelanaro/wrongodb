@@ -1,25 +1,27 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
+mod iter;
+mod layout;
+mod mvcc;
 pub mod page;
 mod page_cache;
 mod pager;
-mod layout;
-mod iter;
-mod mvcc;
 
 pub use iter::BTreeRangeIter;
 
+use self::mvcc::MvccState;
+use self::pager::{BTreeStore, PageRead, Pager, PinnedPageMut};
+use crate::core::errors::{StorageError, WrongoDBError};
+use crate::storage::block::file::NONE_BLOCK_ID;
+use crate::storage::global_wal::GlobalWal;
+use crate::txn::{GlobalTxnState, TxnId, UpdateType, TXN_NONE};
 use layout::{
     build_internal_page, internal_entries, leaf_entries, map_internal_err, map_leaf_err, page_type,
     split_internal_entries, split_leaf_entries, PageType,
 };
-use self::pager::{BTreeStore, PageRead, Pager, PinnedPageMut};
-use self::mvcc::MvccState;
-use crate::core::errors::{StorageError, WrongoDBError};
-use crate::storage::block::file::NONE_BLOCK_ID;
-use crate::txn::snapshot::Snapshot;
-use crate::txn::{GlobalTxnState, UpdateType};
 use page::{InternalPage, LeafPage, LeafPageError};
 
 // Type aliases for B-tree operations to clarify intent and reduce complexity
@@ -48,37 +50,68 @@ type KeyValueIter<'a> = BTreeRangeIter<'a>;
 #[derive(Debug)]
 pub struct BTree {
     pager: Box<dyn BTreeStore>,
+    global_wal: Option<Arc<Mutex<GlobalWal>>>,
+    wal_enabled: bool,
+    wal_store_name: String,
     mvcc: MvccState,
 }
 
 impl BTree {
-    /// Create a new BTree.
+    /// Create a new BTree with WAL enabled or disabled.
     pub fn create<P: AsRef<Path>>(
         path: P,
         page_size: usize,
+        wal_enabled: bool,
         global_txn: Arc<GlobalTxnState>,
+    ) -> Result<Self, WrongoDBError> {
+        Self::create_with_global_wal(path, page_size, wal_enabled, global_txn, None)
+    }
+
+    pub(crate) fn create_with_global_wal<P: AsRef<Path>>(
+        path: P,
+        page_size: usize,
+        wal_enabled: bool,
+        global_txn: Arc<GlobalTxnState>,
+        global_wal: Option<Arc<Mutex<GlobalWal>>>,
     ) -> Result<Self, WrongoDBError> {
         let mut pager = Pager::create(path.as_ref(), page_size)?;
         init_root_if_missing(&mut pager)?;
         pager.checkpoint()?;
+        let store_name = store_name_from_path(path.as_ref())?;
         Ok(Self {
             pager: Box::new(pager),
+            global_wal,
+            wal_enabled,
+            wal_store_name: store_name,
             mvcc: MvccState::new(global_txn),
         })
     }
 
-    /// Open an existing BTree.
+    /// Open an existing BTree with WAL enabled or disabled.
     pub fn open<P: AsRef<Path>>(
         path: P,
+        wal_enabled: bool,
         global_txn: Arc<GlobalTxnState>,
+    ) -> Result<Self, WrongoDBError> {
+        Self::open_with_global_wal(path, wal_enabled, global_txn, None)
+    }
+
+    pub(crate) fn open_with_global_wal<P: AsRef<Path>>(
+        path: P,
+        wal_enabled: bool,
+        global_txn: Arc<GlobalTxnState>,
+        global_wal: Option<Arc<Mutex<GlobalWal>>>,
     ) -> Result<Self, WrongoDBError> {
         let mut pager = Pager::open(path.as_ref())?;
         init_root_if_missing(&mut pager)?;
-        let tree = Self {
+        let store_name = store_name_from_path(path.as_ref())?;
+        Ok(Self {
             pager: Box::new(pager),
+            global_wal,
+            wal_enabled,
+            wal_store_name: store_name,
             mvcc: MvccState::new(global_txn),
-        };
-        Ok(tree)
+        })
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, WrongoDBError> {
@@ -116,7 +149,7 @@ impl BTree {
                         Err(e) => {
                             self.pager.unpin_page(page_id);
                             return Err(
-                                StorageError(format!("corrupt internal {node_id}: {e}")).into(),
+                                StorageError(format!("corrupt internal {node_id}: {e}")).into()
                             );
                         }
                     };
@@ -137,6 +170,16 @@ impl BTree {
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
+        self.put_with_txn(key, value, TXN_NONE, true)
+    }
+
+    pub(crate) fn put_with_txn(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        txn_id: TxnId,
+        log_wal: bool,
+    ) -> Result<(), WrongoDBError> {
         let root = self.pager.root_page_id();
         if root == NONE_BLOCK_ID {
             return Err(StorageError("btree missing root".into()).into());
@@ -147,9 +190,8 @@ impl BTree {
             let payload_len = self.pager.page_payload_len();
             let mut root_internal_bytes = vec![0u8; payload_len];
             {
-                let mut internal =
-                    InternalPage::init(&mut root_internal_bytes, result.new_node_id)
-                        .map_err(|e| StorageError(format!("init new root internal failed: {e}")))?;
+                let mut internal = InternalPage::init(&mut root_internal_bytes, result.new_node_id)
+                    .map_err(|e| StorageError(format!("init new root internal failed: {e}")))?;
                 internal
                     .put_separator(&split.sep_key, split.right_child)
                     .map_err(map_internal_err)?;
@@ -159,6 +201,10 @@ impl BTree {
             self.pager.set_root_page_id(new_root_id)?;
         } else {
             self.pager.set_root_page_id(result.new_node_id)?;
+        }
+
+        if log_wal {
+            self.log_wal_put(key, value, txn_id)?;
         }
 
         Ok(())
@@ -179,9 +225,8 @@ impl BTree {
             let payload_len = self.pager.page_payload_len();
             let mut root_internal_bytes = vec![0u8; payload_len];
             {
-                let mut internal =
-                    InternalPage::init(&mut root_internal_bytes, result.new_node_id)
-                        .map_err(|e| StorageError(format!("init new root internal failed: {e}")))?;
+                let mut internal = InternalPage::init(&mut root_internal_bytes, result.new_node_id)
+                    .map_err(|e| StorageError(format!("init new root internal failed: {e}")))?;
                 internal
                     .put_separator(&split.sep_key, split.right_child)
                     .map_err(map_internal_err)?;
@@ -193,10 +238,21 @@ impl BTree {
             self.pager.set_root_page_id(result.new_node_id)?;
         }
 
+        self.log_wal_put(key, value, TXN_NONE)?;
+
         Ok(true)
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<bool, WrongoDBError> {
+        self.delete_with_txn(key, TXN_NONE, true)
+    }
+
+    pub(crate) fn delete_with_txn(
+        &mut self,
+        key: &[u8],
+        txn_id: TxnId,
+        log_wal: bool,
+    ) -> Result<bool, WrongoDBError> {
         let root = self.pager.root_page_id();
         if root == NONE_BLOCK_ID {
             return Ok(false);
@@ -204,6 +260,10 @@ impl BTree {
 
         let result = self.delete_recursive(root, key)?;
         self.pager.set_root_page_id(result.new_node_id)?;
+
+        if log_wal {
+            self.log_wal_delete(key, txn_id)?;
+        }
 
         Ok(result.deleted)
     }
@@ -218,20 +278,11 @@ impl BTree {
     /// After this returns, all previous mutations are durable.
     ///
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
-        let snapshot = self.mvcc.global.checkpoint_snapshot();
-        self.checkpoint_with_snapshot(&snapshot)
-    }
-
-    pub fn checkpoint_with_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), WrongoDBError> {
-        self.materialize_committed_updates(snapshot)?;
+        self.materialize_committed_updates()?;
         let root = self.pager.checkpoint_prepare();
         self.pager.checkpoint_flush_data()?;
         self.pager.checkpoint_commit(root)?;
         Ok(())
-    }
-
-    pub fn checkpoint_snapshot(&self) -> Snapshot {
-        self.mvcc.global.checkpoint_snapshot()
     }
 
     /// Run garbage collection on MVCC update chains.
@@ -242,14 +293,11 @@ impl BTree {
         self.mvcc.run_gc()
     }
 
-    // WAL recovery is handled at the connection level.
-
     pub fn range(
         &mut self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
-    ) -> Result<KeyValueIter<'_>, WrongoDBError>
-    {
+    ) -> Result<KeyValueIter<'_>, WrongoDBError> {
         let root = self.pager.root_page_id();
         if root == NONE_BLOCK_ID {
             return Ok(BTreeRangeIter::empty());
@@ -261,8 +309,8 @@ impl BTree {
         self.mvcc.keys_in_range(start, end)
     }
 
-    pub fn materialize_committed_updates(&mut self, snapshot: &Snapshot) -> Result<(), WrongoDBError> {
-        let entries = self.mvcc.latest_committed_entries(snapshot);
+    pub fn materialize_committed_updates(&mut self) -> Result<(), WrongoDBError> {
+        let entries = self.mvcc.latest_committed_entries();
         if entries.is_empty() {
             return Ok(());
         }
@@ -270,10 +318,10 @@ impl BTree {
         for (key, update_type, data) in entries {
             match update_type {
                 UpdateType::Standard => {
-                    self.put(&key, &data)?;
+                    self.put_with_txn(&key, &data, TXN_NONE, false)?;
                 }
                 UpdateType::Tombstone => {
-                    let _ = self.delete(&key)?;
+                    let _ = self.delete_with_txn(&key, TXN_NONE, false)?;
                 }
                 UpdateType::Reserve => {}
             }
@@ -286,14 +334,16 @@ impl BTree {
     /// Returns:
     /// - `Ok(DeleteResult)` with the new subtree root id and a flag indicating deletion.
     ///   No merge/borrow is performed; empty pages may remain.
-    fn delete_recursive(&mut self, node_id: u64, key: &[u8]) -> Result<DeleteResult, WrongoDBError> {
+    fn delete_recursive(
+        &mut self,
+        node_id: u64,
+        key: &[u8],
+    ) -> Result<DeleteResult, WrongoDBError> {
         let mut page = self.pager.pin_page_mut(node_id)?;
         let page_type = match page_type(page.payload()) {
             Ok(t) => t,
             Err(e) => {
-                if let Err(unpin_err) = self.pager.unpin_page_mut_abort(page) {
-                    return Err(unpin_err);
-                }
+                self.pager.unpin_page_mut_abort(page)?;
                 return Err(e);
             }
         };
@@ -307,9 +357,7 @@ impl BTree {
                 Ok(ok)
             }
             Err(err) => {
-                if let Err(unpin_err) = self.pager.unpin_page_mut_abort(page) {
-                    return Err(unpin_err);
-                }
+                self.pager.unpin_page_mut_abort(page)?;
                 Err(err)
             }
         }
@@ -393,9 +441,7 @@ impl BTree {
         let page_type = match page_type(page.payload()) {
             Ok(t) => t,
             Err(e) => {
-                if let Err(unpin_err) = self.pager.unpin_page_mut_abort(page) {
-                    return Err(unpin_err);
-                }
+                self.pager.unpin_page_mut_abort(page)?;
                 return Err(e);
             }
         };
@@ -413,12 +459,43 @@ impl BTree {
                 Ok(ok)
             }
             Err(err) => {
-                if let Err(unpin_err) = self.pager.unpin_page_mut_abort(page) {
-                    return Err(unpin_err);
-                }
+                self.pager.unpin_page_mut_abort(page)?;
                 Err(err)
             }
         }
+    }
+
+    pub(super) fn log_wal_put(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError> {
+        if !self.wal_enabled {
+            return Ok(());
+        }
+        if let Some(global_wal) = self.global_wal.as_ref() {
+            global_wal
+                .lock()
+                .log_put(&self.wal_store_name, key, value, txn_id)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn log_wal_delete(
+        &mut self,
+        key: &[u8],
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError> {
+        if !self.wal_enabled {
+            return Ok(());
+        }
+        if let Some(global_wal) = self.global_wal.as_ref() {
+            global_wal
+                .lock()
+                .log_delete(&self.wal_store_name, key, txn_id)?;
+        }
+        Ok(())
     }
 
     /// Insert into a leaf page, splitting if it overflows.
@@ -445,14 +522,12 @@ impl BTree {
         {
             let mut leaf = LeafPage::open(page.payload_mut())
                 .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
-            if mode == InsertMode::Unique {
-                if leaf.contains_key(key).map_err(map_leaf_err)? {
-                    return Ok(InsertResult {
-                        new_node_id: page_id,
-                        split: None,
-                        inserted: false,
-                    });
-                }
+            if mode == InsertMode::Unique && leaf.contains_key(key).map_err(map_leaf_err)? {
+                return Ok(InsertResult {
+                    new_node_id: page_id,
+                    split: None,
+                    inserted: false,
+                });
             }
             match leaf.put(key, value) {
                 Ok(()) => {
@@ -469,7 +544,8 @@ impl BTree {
 
         let mut entries = leaf_entries(page.payload_mut())?;
         upsert_entry(&mut entries, key, value);
-        let (left_bytes, right_bytes, split_key, _split_idx) = split_leaf_entries(&entries, payload_len)?;
+        let (left_bytes, right_bytes, split_key, _split_idx) =
+            split_leaf_entries(&entries, payload_len)?;
 
         // Allocate right sibling first
         let right_leaf_id = self.pager.write_new_page(&right_bytes)?;
@@ -540,8 +616,14 @@ impl BTree {
             });
         }
 
-        let (left_bytes, right_bytes, promoted_key, _left_first_child, _left_separators, _promote_idx) =
-            split_internal_entries(first_child, &entries, payload_len)?;
+        let (
+            left_bytes,
+            right_bytes,
+            promoted_key,
+            _left_first_child,
+            _left_separators,
+            _promote_idx,
+        ) = split_internal_entries(first_child, &entries, payload_len)?;
 
         // Allocate right sibling first
         let right_internal_id = self.pager.write_new_page(&right_bytes)?;
@@ -598,6 +680,17 @@ fn init_root_if_missing(pager: &mut dyn BTreeStore) -> Result<(), WrongoDBError>
     let leaf_id = pager.write_new_page(&leaf_bytes)?;
     pager.set_root_page_id(leaf_id)?;
     Ok(())
+}
+
+fn store_name_from_path(path: &Path) -> Result<String, WrongoDBError> {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(StorageError(format!(
+            "unable to determine store name for path: {}",
+            path.display()
+        ))
+        .into());
+    };
+    Ok(name.to_string())
 }
 
 fn upsert_entry(entries: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &[u8], value: &[u8]) {
