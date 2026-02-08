@@ -162,3 +162,32 @@ Notes
 ## Current conclusion
 - MVCC global lock pressure was reduced, but scaling is still bounded by WAL serialization.
 - Next meaningful step should be WT-inspired WAL slot/group-commit style buffering (or equivalent background writer batching), not more broad table-lock tuning.
+
+# Notes: WAL lock critical-section trim (owned WAL record writes), 2026-02-08
+
+## Hypothesis
+- `SessionTxn::commit` still spends too much time inside the global WAL mutex cloning `store_name/key/value` for each pending WAL op.
+- If commit flush moves owned buffers directly into WAL append calls, lock hold time per commit should shrink.
+
+## Change
+- Added owned WAL APIs:
+  - `GlobalWal::log_put_owned(...)`
+  - `GlobalWal::log_delete_owned(...)`
+  - corresponding `WalFile` owned variants.
+- `SessionTxn::flush_pending_wal_ops` now consumes `Vec<PendingWalOp>` and uses owned WAL calls, avoiding clone-heavy `log_put/log_delete` in the hot lock section.
+
+## Evidence
+- Full benchmark replicates (criterion mean throughput):
+  - run A: c1 ~313.7k ops/s, c16 ~272.0k ops/s, ratio ~0.867
+  - run B: c1 ~295.9k ops/s, c16 ~267.0k ops/s, ratio ~0.902
+- c16 lock stats after change (`target/bench-data-engine-concurrency/lock-stats-engine_insert_unique_scaling.json`):
+  - wal.wait_ns: ~1.15e11
+  - wal.hold_ns: ~4.81e9
+- Post-change profile artifacts:
+  - `/tmp/wrongo-profile/iter4-20260208-124425-post-ownedwal/current_c16.sample.txt`
+  - `/tmp/wrongo-profile/iter4-20260208-124425-post-ownedwal/current_c16.svg`
+  - `/tmp/wrongo-profile/iter4-20260208-124425-post-ownedwal/diff_vs_iter3.svg`
+
+## Interpretation
+- The engine scaling gate (`c16/c1 >= 0.80`) is met in repeated runs after this change.
+- WAL remains the top lock-wait subsystem, but the critical-section copy/alloc overhead is reduced.

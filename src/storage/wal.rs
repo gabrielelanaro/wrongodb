@@ -572,10 +572,20 @@ impl WalFile {
         value: &[u8],
         txn_id: TxnId,
     ) -> Result<Lsn, WrongoDBError> {
+        self.log_put_owned(store_name.to_string(), key.to_vec(), value.to_vec(), txn_id)
+    }
+
+    fn log_put_owned(
+        &mut self,
+        store_name: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        txn_id: TxnId,
+    ) -> Result<Lsn, WrongoDBError> {
         self.append_record(WalRecord::Put {
-            store_name: store_name.to_string(),
-            key: key.to_vec(),
-            value: value.to_vec(),
+            store_name,
+            key,
+            value,
             txn_id,
         })
     }
@@ -586,9 +596,18 @@ impl WalFile {
         key: &[u8],
         txn_id: TxnId,
     ) -> Result<Lsn, WrongoDBError> {
+        self.log_delete_owned(store_name.to_string(), key.to_vec(), txn_id)
+    }
+
+    fn log_delete_owned(
+        &mut self,
+        store_name: String,
+        key: Vec<u8>,
+        txn_id: TxnId,
+    ) -> Result<Lsn, WrongoDBError> {
         self.append_record(WalRecord::Delete {
-            store_name: store_name.to_string(),
-            key: key.to_vec(),
+            store_name,
+            key,
             txn_id,
         })
     }
@@ -938,6 +957,16 @@ impl GlobalWal {
         self.file.log_put(store_name, key, value, txn_id)
     }
 
+    pub fn log_put_owned(
+        &mut self,
+        store_name: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        txn_id: TxnId,
+    ) -> Result<Lsn, WrongoDBError> {
+        self.file.log_put_owned(store_name, key, value, txn_id)
+    }
+
     pub fn log_delete(
         &mut self,
         store_name: &str,
@@ -945,6 +974,15 @@ impl GlobalWal {
         txn_id: TxnId,
     ) -> Result<Lsn, WrongoDBError> {
         self.file.log_delete(store_name, key, txn_id)
+    }
+
+    pub fn log_delete_owned(
+        &mut self,
+        store_name: String,
+        key: Vec<u8>,
+        txn_id: TxnId,
+    ) -> Result<Lsn, WrongoDBError> {
+        self.file.log_delete_owned(store_name, key, txn_id)
     }
 
     pub fn log_txn_commit(

@@ -251,21 +251,9 @@ impl<'a> SessionTxn<'a> {
                     let mut wal = global_wal.lock();
                     record_lock_wait(LockStatKind::Wal, wait_start.elapsed());
                     let _hold = begin_lock_hold(LockStatKind::Wal);
-                    if let Err(err) =
-                        Self::flush_pending_wal_ops(&mut wal, txn_id, &pending_wal_ops)
-                    {
-                        self.session
-                            .global_txn
-                            .restore_pending_wal_ops(txn_id, pending_wal_ops);
-                        return Err(err);
-                    }
+                    Self::flush_pending_wal_ops(&mut wal, txn_id, pending_wal_ops)?;
                     wal.log_txn_commit(txn_id, txn_id)?;
-                    if let Err(err) = self.session.maybe_sync_wal_locked(&mut wal) {
-                        self.session
-                            .global_txn
-                            .restore_pending_wal_ops(txn_id, pending_wal_ops);
-                        return Err(err);
-                    }
+                    self.session.maybe_sync_wal_locked(&mut wal)?;
                 }
             }
 
@@ -388,7 +376,7 @@ impl<'a> SessionTxn<'a> {
     fn flush_pending_wal_ops(
         wal: &mut GlobalWal,
         txn_id: u64,
-        pending_wal_ops: &[PendingWalOp],
+        pending_wal_ops: Vec<PendingWalOp>,
     ) -> Result<(), WrongoDBError> {
         for op in pending_wal_ops {
             match op {
@@ -397,10 +385,10 @@ impl<'a> SessionTxn<'a> {
                     key,
                     value,
                 } => {
-                    wal.log_put(store_name, key, value, txn_id)?;
+                    wal.log_put_owned(store_name, key, value, txn_id)?;
                 }
                 PendingWalOp::Delete { store_name, key } => {
-                    wal.log_delete(store_name, key, txn_id)?;
+                    wal.log_delete_owned(store_name, key, txn_id)?;
                 }
             }
         }
