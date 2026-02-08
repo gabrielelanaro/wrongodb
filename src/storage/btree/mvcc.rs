@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::core::errors::WrongoDBError;
+use crate::core::lock_stats::{begin_lock_hold, record_lock_wait, LockStatKind};
 use crate::txn::{GlobalTxnState, TxnId, Update, UpdateChain, UpdateType, TS_NONE, TXN_ABORTED};
 
 use super::BTree;
@@ -114,6 +116,8 @@ impl BTree {
         key: &[u8],
         txn_id: TxnId,
     ) -> Result<Option<Vec<u8>>, WrongoDBError> {
+        record_lock_wait(LockStatKind::MvccShard, Duration::ZERO);
+        let _hold = begin_lock_hold(LockStatKind::MvccShard);
         if let Some(chain) = self.mvcc.chain(key) {
             for update in chain.iter() {
                 let is_aborted = update.time_window.stop_txn == crate::txn::TXN_ABORTED
@@ -141,6 +145,8 @@ impl BTree {
         value: &[u8],
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
+        record_lock_wait(LockStatKind::MvccShard, Duration::ZERO);
+        let _hold = begin_lock_hold(LockStatKind::MvccShard);
         self.log_wal_put(key, value, txn_id)?;
 
         let chain = self.mvcc.chain_mut_or_create(key);
@@ -155,6 +161,8 @@ impl BTree {
     }
 
     pub fn delete_version(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+        record_lock_wait(LockStatKind::MvccShard, Duration::ZERO);
+        let _hold = begin_lock_hold(LockStatKind::MvccShard);
         self.log_wal_delete(key, txn_id)?;
 
         let chain = self.mvcc.chain_mut_or_create(key);

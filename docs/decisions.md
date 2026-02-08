@@ -1,5 +1,29 @@
 # Decisions
 
+## 2026-02-08: Add lock contention counters and benchmark artifacts
+
+**Decision**
+- Add lock contention counters for:
+  - table locks
+  - WAL lock
+  - MVCC shard lock
+  - checkpoint lock
+- Add `lock_stats_enabled` to `ConnectionConfig` and `WrongoDBConfig`.
+- Export lock-stats APIs:
+  - `set_lock_stats_enabled`
+  - `reset_lock_stats`
+  - `snapshot_lock_stats`
+- Engine benchmark writes lock-stats artifacts under `target/bench-data-engine-concurrency/`.
+- Wire A/B benchmark collects WrongoDB lock stats into `target/benchmarks/.../lock_stats.json` and includes them in `summary.md`.
+
+**Why**
+- We need direct visibility into lock wait/hold time before and during lock-granularity refactors.
+- Putting metrics in benchmark artifacts makes each optimization step auditable.
+
+**Notes**
+- Lock stats are process-global in this iteration and intended for benchmarking/profiling workflows.
+- MVCC shard counters are wired now and become materially informative once sharded MVCC locks land.
+
 ## 2026-02-07: MVCC commit visibility is derived from global txn state
 
 **Decision**

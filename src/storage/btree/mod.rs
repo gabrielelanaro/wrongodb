@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
@@ -15,6 +16,7 @@ pub use iter::BTreeRangeIter;
 use self::mvcc::MvccState;
 use self::pager::{BTreeStore, PageRead, Pager, PinnedPageMut};
 use crate::core::errors::{StorageError, WrongoDBError};
+use crate::core::lock_stats::{begin_lock_hold, record_lock_wait, LockStatKind};
 use crate::storage::block::file::NONE_BLOCK_ID;
 use crate::storage::wal::GlobalWal;
 use crate::txn::{GlobalTxnState, TxnId, UpdateType, TXN_NONE};
@@ -475,9 +477,11 @@ impl BTree {
             return Ok(());
         }
         if let Some(global_wal) = self.global_wal.as_ref() {
-            global_wal
-                .lock()
-                .log_put(&self.wal_store_name, key, value, txn_id)?;
+            let wait_start = Instant::now();
+            let mut wal = global_wal.lock();
+            record_lock_wait(LockStatKind::Wal, wait_start.elapsed());
+            let _hold = begin_lock_hold(LockStatKind::Wal);
+            wal.log_put(&self.wal_store_name, key, value, txn_id)?;
         }
         Ok(())
     }
@@ -491,9 +495,11 @@ impl BTree {
             return Ok(());
         }
         if let Some(global_wal) = self.global_wal.as_ref() {
-            global_wal
-                .lock()
-                .log_delete(&self.wal_store_name, key, txn_id)?;
+            let wait_start = Instant::now();
+            let mut wal = global_wal.lock();
+            record_lock_wait(LockStatKind::Wal, wait_start.elapsed());
+            let _hold = begin_lock_hold(LockStatKind::Wal);
+            wal.log_delete(&self.wal_store_name, key, txn_id)?;
         }
         Ok(())
     }

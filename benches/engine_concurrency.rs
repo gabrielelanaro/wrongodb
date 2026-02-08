@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
-use wrongodb::{WrongoDB, WrongoDBConfig};
+use wrongodb::{
+    reset_lock_stats, set_lock_stats_enabled, snapshot_lock_stats, WrongoDB, WrongoDBConfig,
+};
 
 const CONCURRENCY_LEVELS: &[usize] = &[1, 4, 8, 16];
 const PAYLOAD_SIZE: usize = 1024;
@@ -27,8 +29,24 @@ fn open_bench_db(label: &str) -> WrongoDB {
     let db_id = NEXT_DB_ID.fetch_add(1, Ordering::Relaxed);
     let path = bench_data_dir().join(format!("{label}-{db_id}"));
     let _ = fs::remove_dir_all(&path);
-    WrongoDB::open_with_config(&path, WrongoDBConfig::new().wal_enabled(true))
-        .expect("failed to open benchmark database")
+    WrongoDB::open_with_config(
+        &path,
+        WrongoDBConfig::new()
+            .wal_enabled(true)
+            .lock_stats_enabled(true),
+    )
+    .expect("failed to open benchmark database")
+}
+
+fn write_lock_stats(label: &str) {
+    let path = bench_data_dir().join(format!("lock-stats-{label}.json"));
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let snapshot = snapshot_lock_stats();
+    if let Ok(bytes) = serde_json::to_vec_pretty(&snapshot) {
+        let _ = fs::write(path, bytes);
+    }
 }
 
 fn run_insert_unique_batch(
@@ -100,6 +118,8 @@ fn run_update_hotspot_batch(
 
 fn bench_engine_insert_unique_scaling(c: &mut Criterion) {
     let _ = fs::remove_dir_all(bench_data_dir());
+    set_lock_stats_enabled(true);
+    reset_lock_stats();
     let payload = "x".repeat(PAYLOAD_SIZE);
 
     let mut group = c.benchmark_group("engine_insert_unique_scaling");
@@ -132,10 +152,13 @@ fn bench_engine_insert_unique_scaling(c: &mut Criterion) {
     }
 
     group.finish();
+    write_lock_stats("engine_insert_unique_scaling");
 }
 
 fn bench_engine_update_hotspot_scaling(c: &mut Criterion) {
     let _ = fs::remove_dir_all(bench_data_dir());
+    set_lock_stats_enabled(true);
+    reset_lock_stats();
 
     let mut group = c.benchmark_group("engine_update_hotspot_scaling");
     group.sample_size(10);
@@ -173,6 +196,7 @@ fn bench_engine_update_hotspot_scaling(c: &mut Criterion) {
     }
 
     group.finish();
+    write_lock_stats("engine_update_hotspot_scaling");
 }
 
 criterion_group!(

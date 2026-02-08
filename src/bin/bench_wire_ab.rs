@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bson::{doc, Document};
 use mongodb::{options::ClientOptions, Client, Collection};
 use serde::Serialize;
+use serde_json::Value as JsonValue;
 use tokio::sync::Barrier;
 
 const DB_NAME: &str = "bench";
@@ -89,10 +90,17 @@ struct GateReport {
 }
 
 #[derive(Debug)]
+struct BenchmarkRunOutput {
+    results: Vec<RunResult>,
+    wrongo_lock_stats: Option<JsonValue>,
+}
+
+#[derive(Debug)]
 struct WrongoBackend {
     addr: String,
     uri: String,
     db_path: PathBuf,
+    lock_stats_path: PathBuf,
     child: Option<Child>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
@@ -170,10 +178,12 @@ impl WrongoBackend {
         let addr = format!("127.0.0.1:{port}");
         let uri = format!("mongodb://{addr}");
         let db_path = out_dir.join("tmp").join("wrongodb-data");
+        let lock_stats_path = out_dir.join("tmp").join("wrongo-lock-stats.json");
         Self {
             addr,
             uri,
             db_path,
+            lock_stats_path,
             child: None,
             stderr_tail: Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES))),
         }
@@ -196,6 +206,7 @@ impl WrongoBackend {
                 )
             })?;
         }
+        let _ = fs::remove_file(&self.lock_stats_path);
 
         let mut cmd = Command::new("cargo");
         cmd.arg("run")
@@ -207,6 +218,7 @@ impl WrongoBackend {
             .arg(&self.addr)
             .arg("--db-path")
             .arg(&self.db_path)
+            .env("WRONGO_LOCK_STATS_PATH", &self.lock_stats_path)
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
@@ -241,6 +253,11 @@ impl WrongoBackend {
         }
 
         Ok(())
+    }
+
+    fn read_lock_stats(&self) -> Option<JsonValue> {
+        let bytes = fs::read(&self.lock_stats_path).ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     fn stderr_tail(&self) -> String {
@@ -921,6 +938,7 @@ fn write_summary(
     config: &BenchmarkConfig,
     results: &[RunResult],
     gate: &GateReport,
+    wrongo_lock_stats: Option<&JsonValue>,
 ) -> Result<(), String> {
     let mut grouped: BTreeMap<(Scenario, usize, String), Vec<&RunResult>> = BTreeMap::new();
     for row in results {
@@ -980,6 +998,15 @@ fn write_summary(
     summary.push_str(&format!("- scale_gap: {:.3}\n", gate.scale_gap));
     summary.push_str(&format!("- notes: {}\n", gate.notes));
 
+    if let Some(stats) = wrongo_lock_stats {
+        summary.push_str("\n## Lock Stats (WrongoDB)\n\n");
+        let stats_pretty = serde_json::to_string_pretty(stats)
+            .map_err(|e| format!("failed to serialize lock stats for summary: {e}"))?;
+        summary.push_str("```json\n");
+        summary.push_str(&stats_pretty);
+        summary.push_str("\n```\n");
+    }
+
     fs::write(path, summary)
         .map_err(|e| format!("failed to write summary '{}': {e}", path.display()))
 }
@@ -987,7 +1014,7 @@ fn write_summary(
 async fn run_benchmarks(
     config: &BenchmarkConfig,
     session_run_id: &str,
-) -> Result<Vec<RunResult>, String> {
+) -> Result<BenchmarkRunOutput, String> {
     fs::create_dir_all(&config.out_dir).map_err(|e| {
         format!(
             "failed to create benchmark output dir '{}': {e}",
@@ -1003,23 +1030,45 @@ async fn run_benchmarks(
     let mut all = Vec::new();
 
     let mut wrongo_rows = run_backend(&mut wrongo, config, session_run_id).await?;
+    let wrongo_lock_stats = match &wrongo {
+        BackendKind::Wrongo(backend) => backend.read_lock_stats(),
+        BackendKind::Mongo(_) => None,
+    };
     all.append(&mut wrongo_rows);
 
     let mut mongo_rows = run_backend(&mut mongo, config, session_run_id).await?;
     all.append(&mut mongo_rows);
 
-    Ok(all)
+    Ok(BenchmarkRunOutput {
+        results: all,
+        wrongo_lock_stats,
+    })
 }
 
-fn write_artifacts(config: &BenchmarkConfig, results: &[RunResult]) -> Result<GateReport, String> {
+fn write_artifacts(
+    config: &BenchmarkConfig,
+    results: &[RunResult],
+    wrongo_lock_stats: Option<&JsonValue>,
+) -> Result<GateReport, String> {
     let results_path = config.out_dir.join("results.csv");
     let gate_path = config.out_dir.join("gate.json");
     let summary_path = config.out_dir.join("summary.md");
+    let lock_stats_path = config.out_dir.join("lock_stats.json");
 
     write_results_csv(&results_path, results)?;
     let gate = evaluate_gate(results);
     write_gate_json(&gate_path, &gate)?;
-    write_summary(&summary_path, config, results, &gate)?;
+    write_summary(&summary_path, config, results, &gate, wrongo_lock_stats)?;
+    if let Some(stats) = wrongo_lock_stats {
+        let bytes = serde_json::to_vec_pretty(stats)
+            .map_err(|e| format!("failed to serialize lock stats JSON: {e}"))?;
+        fs::write(&lock_stats_path, bytes).map_err(|e| {
+            format!(
+                "failed to write lock stats JSON '{}': {e}",
+                lock_stats_path.display()
+            )
+        })?;
+    }
 
     Ok(gate)
 }
@@ -1035,11 +1084,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let session_run_id = format!("run-{}", now_millis());
-    let results = run_benchmarks(&config, &session_run_id)
+    let output = run_benchmarks(&config, &session_run_id)
         .await
         .map_err(|e| format!("benchmark failed: {e}"))?;
 
-    let gate = write_artifacts(&config, &results)
+    let gate = write_artifacts(&config, &output.results, output.wrongo_lock_stats.as_ref())
         .map_err(|e| format!("failed writing benchmark artifacts: {e}"))?;
 
     println!("benchmark complete");
@@ -1154,10 +1203,11 @@ mod tests {
         };
 
         let run_id = format!("smoke-{}", now_millis());
-        let rows = run_benchmarks(&config, &run_id).await.unwrap();
-        assert!(!rows.is_empty());
+        let output = run_benchmarks(&config, &run_id).await.unwrap();
+        assert!(!output.results.is_empty());
 
-        let gate = write_artifacts(&config, &rows).unwrap();
+        let gate =
+            write_artifacts(&config, &output.results, output.wrongo_lock_stats.as_ref()).unwrap();
         assert!(!gate.classification.is_empty());
         assert!(config.out_dir.join("results.csv").exists());
         assert!(config.out_dir.join("gate.json").exists());

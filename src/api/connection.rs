@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use crate::api::data_handle_cache::DataHandleCache;
 use crate::api::session::Session;
 use crate::core::errors::StorageError;
+use crate::core::lock_stats::set_lock_stats_enabled;
 use crate::storage::btree::BTree;
 use crate::storage::wal::{GlobalWal, RecoveryError, WalReader, WalRecord};
 use crate::txn::GlobalTxnState;
@@ -24,6 +25,7 @@ pub struct ConnectionConfig {
     /// - 0 = sync on every commit (strict durability)
     /// - N > 0 = at most one sync every N milliseconds (group sync)
     pub wal_sync_interval_ms: u64,
+    pub lock_stats_enabled: bool,
 }
 
 impl Default for ConnectionConfig {
@@ -31,6 +33,7 @@ impl Default for ConnectionConfig {
         Self {
             wal_enabled: true,
             wal_sync_interval_ms: 100,
+            lock_stats_enabled: false,
         }
     }
 }
@@ -54,6 +57,11 @@ impl ConnectionConfig {
         self.wal_sync_interval_ms = 0;
         self
     }
+
+    pub fn lock_stats_enabled(mut self, enabled: bool) -> Self {
+        self.lock_stats_enabled = enabled;
+        self
+    }
 }
 
 pub struct Connection {
@@ -61,6 +69,7 @@ pub struct Connection {
     dhandle_cache: Arc<DataHandleCache>,
     wal_enabled: bool,
     wal_sync_interval_ms: u64,
+    lock_stats_enabled: bool,
     wal_last_sync_ms: Arc<AtomicU64>,
     global_wal: Option<Arc<Mutex<GlobalWal>>>,
     global_txn: Arc<GlobalTxnState>,
@@ -72,6 +81,7 @@ impl fmt::Debug for Connection {
             .field("base_path", &self.base_path)
             .field("wal_enabled", &self.wal_enabled)
             .field("wal_sync_interval_ms", &self.wal_sync_interval_ms)
+            .field("lock_stats_enabled", &self.lock_stats_enabled)
             .finish()
     }
 }
@@ -83,6 +93,7 @@ impl Connection {
     {
         let base_path = path.as_ref().to_path_buf();
         fs::create_dir_all(&base_path)?;
+        set_lock_stats_enabled(config.lock_stats_enabled);
         let global_txn = Arc::new(GlobalTxnState::new());
         let global_wal = if config.wal_enabled {
             warn_legacy_per_table_wal_files(&base_path);
@@ -97,6 +108,7 @@ impl Connection {
             dhandle_cache: Arc::new(DataHandleCache::new(global_wal.clone())),
             wal_enabled: config.wal_enabled,
             wal_sync_interval_ms: config.wal_sync_interval_ms,
+            lock_stats_enabled: config.lock_stats_enabled,
             wal_last_sync_ms: Arc::new(AtomicU64::new(now_millis())),
             global_wal,
             global_txn,

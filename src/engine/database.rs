@@ -14,6 +14,8 @@ pub struct WrongoDBConfig {
     /// - 0 = sync on every commit
     /// - N > 0 = at most one sync every N ms (group sync)
     pub wal_sync_interval_ms: u64,
+    /// Enable collection of lock wait/hold counters.
+    pub lock_stats_enabled: bool,
 }
 
 impl Default for WrongoDBConfig {
@@ -21,6 +23,7 @@ impl Default for WrongoDBConfig {
         Self {
             wal_enabled: true,
             wal_sync_interval_ms: 100,
+            lock_stats_enabled: false,
         }
     }
 }
@@ -44,6 +47,11 @@ impl WrongoDBConfig {
 
     pub fn wal_sync_immediate(mut self) -> Self {
         self.wal_sync_interval_ms = 0;
+        self
+    }
+
+    pub fn lock_stats_enabled(mut self, enabled: bool) -> Self {
+        self.lock_stats_enabled = enabled;
         self
     }
 }
@@ -74,6 +82,7 @@ impl WrongoDB {
             ConnectionConfig {
                 wal_enabled: config.wal_enabled,
                 wal_sync_interval_ms: config.wal_sync_interval_ms,
+                lock_stats_enabled: config.lock_stats_enabled,
             },
         )?;
         Ok(Self { connection: conn })
