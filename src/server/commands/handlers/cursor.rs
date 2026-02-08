@@ -11,7 +11,7 @@ impl Command for GetMoreCommand {
         &["getMore"]
     }
 
-    fn execute(&self, doc: &Document, _db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, _db: &WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("collection").unwrap_or("test");
 
         // Since cursor ID is always 0 and we return all results in firstBatch,
@@ -36,7 +36,7 @@ impl Command for KillCursorsCommand {
         &["killCursors"]
     }
 
-    fn execute(&self, doc: &Document, _db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, _db: &WrongoDB) -> Result<Document, WrongoDBError> {
         let cursors = doc.get_array("cursors").cloned().unwrap_or_else(|_| vec![]);
 
         Ok(doc! {

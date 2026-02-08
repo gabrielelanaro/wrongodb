@@ -10,7 +10,7 @@ impl Command for HelloCommand {
         &["hello", "ismaster", "isMaster"]
     }
 
-    fn execute(&self, _doc: &Document, _db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, _doc: &Document, _db: &WrongoDB) -> Result<Document, WrongoDBError> {
         Ok(doc! {
             "ok": Bson::Double(1.0),
             "isMaster": Bson::Boolean(true),
@@ -38,7 +38,7 @@ impl Command for PingCommand {
         &["ping"]
     }
 
-    fn execute(&self, _doc: &Document, _db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, _doc: &Document, _db: &WrongoDB) -> Result<Document, WrongoDBError> {
         Ok(doc! { "ok": Bson::Double(1.0) })
     }
 }
@@ -51,7 +51,7 @@ impl Command for BuildInfoCommand {
         &["buildInfo", "buildinfo"]
     }
 
-    fn execute(&self, _doc: &Document, _db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, _doc: &Document, _db: &WrongoDB) -> Result<Document, WrongoDBError> {
         Ok(doc! {
             "ok": Bson::Double(1.0),
             "version": "0.0.1-wrongodb",
@@ -76,7 +76,7 @@ impl Command for ServerStatusCommand {
         &["serverStatus"]
     }
 
-    fn execute(&self, _doc: &Document, _db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, _doc: &Document, _db: &WrongoDB) -> Result<Document, WrongoDBError> {
         Ok(doc! {
             "ok": Bson::Double(1.0),
             "host": "localhost",
@@ -100,7 +100,7 @@ impl Command for ConnectionStatusCommand {
         &["connectionStatus"]
     }
 
-    fn execute(&self, _doc: &Document, _db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, _doc: &Document, _db: &WrongoDB) -> Result<Document, WrongoDBError> {
         Ok(doc! {
             "ok": Bson::Double(1.0),
             "authInfo": {

@@ -79,7 +79,7 @@ impl Command for InsertCommand {
         &["insert"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("insert").unwrap_or("test");
         let coll = db.collection(coll_name);
         let mut session = db.open_session();
@@ -134,7 +134,7 @@ impl Command for FindCommand {
         &["find"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("find").unwrap_or("test");
         let coll = db.collection(coll_name);
         let mut session = db.open_session();
@@ -196,7 +196,7 @@ impl Command for UpdateCommand {
         &["update"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("update").unwrap_or("test");
         let coll = db.collection(coll_name);
         let mut session = db.open_session();
@@ -247,7 +247,7 @@ impl Command for DeleteCommand {
         &["delete"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("delete").unwrap_or("test");
         let coll = db.collection(coll_name);
         let mut session = db.open_session();

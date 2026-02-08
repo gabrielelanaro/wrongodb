@@ -10,7 +10,7 @@ impl Command for ListDatabasesCommand {
         &["listDatabases"]
     }
 
-    fn execute(&self, _doc: &Document, _db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, _doc: &Document, _db: &WrongoDB) -> Result<Document, WrongoDBError> {
         // TODO: When multi-database support is added, return actual databases
         Ok(doc! {
             "ok": Bson::Double(1.0),
@@ -35,7 +35,7 @@ impl Command for ListCollectionsCommand {
         &["listCollections"]
     }
 
-    fn execute(&self, _doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, _doc: &Document, db: &WrongoDB) -> Result<Document, WrongoDBError> {
         let collections = db.list_collections()?;
         let collections_bson: Vec<Bson> = collections
             .into_iter()
@@ -85,7 +85,7 @@ impl Command for DbStatsCommand {
         &["dbStats"]
     }
 
-    fn execute(&self, _doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, _doc: &Document, db: &WrongoDB) -> Result<Document, WrongoDBError> {
         let stats = db.stats()?;
         Ok(doc! {
             "ok": Bson::Double(1.0),
@@ -109,7 +109,7 @@ impl Command for CollStatsCommand {
         &["collStats"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("collStats").unwrap_or("test");
         let coll = db.collection(coll_name);
         let mut session = db.open_session();

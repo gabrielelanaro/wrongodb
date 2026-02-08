@@ -2,7 +2,6 @@ use futures_util::stream::{StreamExt, TryStreamExt};
 use mongodb::{bson::doc, options::ClientOptions, Client};
 use std::sync::Arc;
 use tempfile::tempdir;
-use tokio::sync::Mutex;
 use wrongodb::{start_server, WrongoDB};
 
 #[tokio::test]
@@ -11,7 +10,7 @@ async fn test_mongo_client_connection() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("test_server.db");
     let db = WrongoDB::open(db_path.to_str().unwrap()).unwrap();
-    let db = Arc::new(Mutex::new(db));
+    let db = Arc::new(db);
 
     let db_clone = Arc::clone(&db);
     tokio::spawn(async move {
@@ -89,7 +88,7 @@ async fn test_supported_mongosh_commands() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("test_shell.db");
     let db = WrongoDB::open(db_path.to_str().unwrap()).unwrap();
-    let db = Arc::new(Mutex::new(db));
+    let db = Arc::new(db);
 
     let db_clone = Arc::clone(&db);
     tokio::spawn(async move {

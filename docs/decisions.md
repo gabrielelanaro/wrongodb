@@ -1,5 +1,20 @@
 # Decisions
 
+## 2026-02-08: Remove server-wide async DB mutex from wire-protocol request path
+
+**Decision**
+- Change server ownership from `Arc<tokio::sync::Mutex<WrongoDB>>` to `Arc<WrongoDB>`.
+- Change command execution signature from `execute(..., db: &mut WrongoDB)` to `execute(..., db: &WrongoDB)`.
+- Execute wire-protocol handlers directly against shared `WrongoDB` references (no per-request `db.lock().await`).
+
+**Why**
+- The server previously serialized all commands behind one async mutex, creating a global contention point unrelated to table-level concurrency.
+- `WrongoDB` command usage is session-based and already works from shared references, so a mutable database borrow at command boundary was unnecessary.
+
+**Notes**
+- This removes only the top-level server lock; table/cursor locking behavior is unchanged.
+- Remaining hotspots are expected at lower layers (table `RwLock` write usage in read paths and WAL/global txn coordination).
+
 ## 2026-02-07: Wire-protocol A/B benchmark gate for concurrency refactor decisions
 
 **Decision**

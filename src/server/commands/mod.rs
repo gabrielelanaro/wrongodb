@@ -14,5 +14,5 @@ pub trait Command: Send + Sync {
     fn names(&self) -> &[&str];
 
     /// Execute the command with the given document and database
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError>;
+    fn execute(&self, doc: &Document, db: &WrongoDB) -> Result<Document, WrongoDBError>;
 }
