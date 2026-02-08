@@ -301,6 +301,10 @@ impl IndexCatalog {
         self.definitions.contains_key(name)
     }
 
+    pub fn has_indexes(&self) -> bool {
+        !self.definitions.is_empty()
+    }
+
     pub fn index_definition(&self, name: &str) -> Option<&IndexDefinition> {
         self.definitions.get(name)
     }
@@ -433,7 +437,7 @@ impl IndexCatalog {
 
     pub fn mark_updates_committed(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
         for index in self.indexes.values_mut() {
-            let mut table = index.table.write();
+            let table = index.table.write();
             table.mark_updates_committed(txn_id)?;
         }
         Ok(())
@@ -441,7 +445,7 @@ impl IndexCatalog {
 
     pub fn mark_updates_aborted(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
         for index in self.indexes.values_mut() {
-            let mut table = index.table.write();
+            let table = index.table.write();
             table.mark_updates_aborted(txn_id)?;
         }
         Ok(())

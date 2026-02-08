@@ -1,7 +1,9 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::RwLock;
 
+use crate::core::lock_stats::{begin_lock_hold, record_lock_wait, LockStatKind};
 use crate::storage::table::Table;
 use crate::txn::TxnId;
 use crate::WrongoDBError;
@@ -45,18 +47,54 @@ impl Cursor {
 
     pub fn insert(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
-        let mut table = self.table.write();
-        if table.get_version(key, txn_id)?.is_some() {
+        {
+            let wait_start = Instant::now();
+            let table = self.table.read();
+            record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+            let _hold = begin_lock_hold(LockStatKind::Table);
+
+            if !table.base_may_have_keys() {
+                if !table.insert_mvcc_if_absent(key, value, txn_id)? {
+                    return Err(crate::core::errors::DocumentValidationError(
+                        "duplicate key error".into(),
+                    )
+                    .into());
+                }
+                return Ok(());
+            }
+        }
+
+        let duplicate = {
+            let wait_start = Instant::now();
+            let mut table = self.table.write();
+            record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+            let _hold = begin_lock_hold(LockStatKind::Table);
+            table.get_version(key, txn_id)?.is_some()
+        };
+        if duplicate {
             return Err(
                 crate::core::errors::DocumentValidationError("duplicate key error".into()).into(),
             );
         }
-        table.insert_mvcc(key, value, txn_id)
+
+        let wait_start = Instant::now();
+        let table = self.table.read();
+        record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+        let _hold = begin_lock_hold(LockStatKind::Table);
+        if !table.insert_mvcc_if_absent(key, value, txn_id)? {
+            return Err(
+                crate::core::errors::DocumentValidationError("duplicate key error".into()).into(),
+            );
+        }
+        Ok(())
     }
 
     pub fn update(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
-        let mut table = self.table.write();
+        let wait_start = Instant::now();
+        let table = self.table.read();
+        record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+        let _hold = begin_lock_hold(LockStatKind::Table);
         let result = table.update_mvcc(key, value, txn_id)?;
         if !result {
             return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
@@ -68,7 +106,10 @@ impl Cursor {
 
     pub fn delete(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
-        let mut table = self.table.write();
+        let wait_start = Instant::now();
+        let table = self.table.read();
+        record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+        let _hold = begin_lock_hold(LockStatKind::Table);
         let result = table.delete_mvcc(key, txn_id)?;
         if !result {
             return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
@@ -79,7 +120,10 @@ impl Cursor {
     }
 
     pub fn get(&mut self, key: &[u8], txn_id: TxnId) -> Result<Option<Vec<u8>>, WrongoDBError> {
+        let wait_start = Instant::now();
         let mut table = self.table.write();
+        record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+        let _hold = begin_lock_hold(LockStatKind::Table);
         table.get_version(key, txn_id)
     }
 
@@ -110,7 +154,10 @@ impl Cursor {
     }
 
     fn refill_buffer(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
+        let wait_start = Instant::now();
         let mut table = self.table.write();
+        record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+        let _hold = begin_lock_hold(LockStatKind::Table);
 
         let mut start_key = self.range_start.as_deref();
         let mut skip_start = false;

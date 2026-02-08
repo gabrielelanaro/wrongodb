@@ -111,6 +111,10 @@ impl Table {
         Ok(())
     }
 
+    pub fn base_may_have_keys(&self) -> bool {
+        self.btree.base_may_have_keys()
+    }
+
     /// Insert a key/value pair without MVCC (used by index tables).
     pub fn insert_raw(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
         self.insert_raw_with_txn(key, value, crate::txn::TXN_NONE)
@@ -161,19 +165,16 @@ impl Table {
     // MVCC operations
     // ==========================================================================
 
-    pub fn mark_updates_committed(
-        &mut self,
-        txn_id: crate::txn::TxnId,
-    ) -> Result<(), WrongoDBError> {
+    pub fn mark_updates_committed(&self, txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
         self.btree.mark_updates_committed(txn_id)
     }
 
-    pub fn mark_updates_aborted(&mut self, txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
+    pub fn mark_updates_aborted(&self, txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
         self.btree.mark_updates_aborted(txn_id)
     }
 
     pub fn insert_mvcc(
-        &mut self,
+        &self,
         key: &[u8],
         value: &[u8],
         txn_id: crate::txn::TxnId,
@@ -182,8 +183,17 @@ impl Table {
         Ok(())
     }
 
+    pub fn insert_mvcc_if_absent(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        txn_id: crate::txn::TxnId,
+    ) -> Result<bool, WrongoDBError> {
+        self.btree.put_version_if_absent(key, value, txn_id)
+    }
+
     pub fn update_mvcc(
-        &mut self,
+        &self,
         key: &[u8],
         value: &[u8],
         txn_id: crate::txn::TxnId,
@@ -193,7 +203,7 @@ impl Table {
     }
 
     pub fn delete_mvcc(
-        &mut self,
+        &self,
         key: &[u8],
         txn_id: crate::txn::TxnId,
     ) -> Result<bool, WrongoDBError> {

@@ -119,3 +119,75 @@ Notes
 ## Implications for minimongo
 - A WT-like MVCC core implies per-key update chains in memory, a history store for older versions, and snapshot visibility based on txn ids + timestamps.
 - A Mongo-like API surface suggests RAII write units of work and lazy snapshot creation, with retryable write conflicts.
+
+# Notes: Engine scaling investigation (lock contention), 2026-02-08
+
+## What was changed in WrongoDB
+- Added an engine-level benchmark lock-artifact fix so insert/update groups no longer delete each other's lock stats (`benches/engine_concurrency.rs`).
+- Sharded MVCC chain locking to 256 shards (`src/storage/btree/mvcc.rs`).
+- Deferred transactional WAL `put/delete` writes into per-transaction pending buffers (`src/txn/global_txn.rs`) and flushed them in `SessionTxn::commit` (`src/api/session.rs`).
+
+## Measured evidence (engine_insert_unique_scaling)
+- Representative run (criterion mean throughput from `target/criterion/.../new/estimates.json`):
+  - c1: ~290k ops/s
+  - c16: ~213k ops/s
+  - ratio c16/c1: ~0.735
+- Lock stats (`target/bench-data-engine-concurrency/lock-stats-engine_insert_unique_scaling.json`) still show WAL wait dominating:
+  - wal.wait_ns: ~1.78e11
+  - mvcc_shard.wait_ns: ~3.41e8
+  - table.wait_ns: ~4.95e8
+
+## Profiling evidence
+- Fresh c16 sample + flamegraph:
+  - `/tmp/wrongo-profile/iter3-20260208-123552-current/current_c16.sample.txt`
+  - `/tmp/wrongo-profile/iter3-20260208-123552-current/current_c16.svg`
+  - `/tmp/wrongo-profile/iter3-20260208-123552-current/diff_vs_baseline.svg`
+- Dominant stacks include:
+  - `SessionTxn::commit`
+  - `parking_lot::RawMutex::lock_slow`
+  - `GlobalWal::log_put` / `WalFile::append_record`
+
+## MongoDB / WiredTiger references used
+- MongoDB lock hierarchy and intent locking:
+  - `mongodb/src/mongo/db/shard_role/lock_manager/README.md`
+    - Global/DB/Collection intent locks (IS/IX), document-level locking delegated to storage engine.
+- MongoDB `WriteUnitOfWork` context and 2PL behavior:
+  - `mongodb/src/mongo/db/shard_role/lock_manager/README.md`
+  - `mongodb/src/mongo/db/shard_role/lock_manager/d_concurrency.h`
+- WiredTiger logging slots / consolidation model:
+  - `wiredtiger/src/log/log_private.h`
+  - `wiredtiger/src/log/log_mgr.c`
+  - key point: slot-based write consolidation and log worker processing to avoid a naive per-write global critical section.
+
+## Current conclusion
+- MVCC global lock pressure was reduced, but scaling is still bounded by WAL serialization.
+- Next meaningful step should be WT-inspired WAL slot/group-commit style buffering (or equivalent background writer batching), not more broad table-lock tuning.
+
+# Notes: WAL lock critical-section trim (owned WAL record writes), 2026-02-08
+
+## Hypothesis
+- `SessionTxn::commit` still spends too much time inside the global WAL mutex cloning `store_name/key/value` for each pending WAL op.
+- If commit flush moves owned buffers directly into WAL append calls, lock hold time per commit should shrink.
+
+## Change
+- Added owned WAL APIs:
+  - `GlobalWal::log_put_owned(...)`
+  - `GlobalWal::log_delete_owned(...)`
+  - corresponding `WalFile` owned variants.
+- `SessionTxn::flush_pending_wal_ops` now consumes `Vec<PendingWalOp>` and uses owned WAL calls, avoiding clone-heavy `log_put/log_delete` in the hot lock section.
+
+## Evidence
+- Full benchmark replicates (criterion mean throughput):
+  - run A: c1 ~313.7k ops/s, c16 ~272.0k ops/s, ratio ~0.867
+  - run B: c1 ~295.9k ops/s, c16 ~267.0k ops/s, ratio ~0.902
+- c16 lock stats after change (`target/bench-data-engine-concurrency/lock-stats-engine_insert_unique_scaling.json`):
+  - wal.wait_ns: ~1.15e11
+  - wal.hold_ns: ~4.81e9
+- Post-change profile artifacts:
+  - `/tmp/wrongo-profile/iter4-20260208-124425-post-ownedwal/current_c16.sample.txt`
+  - `/tmp/wrongo-profile/iter4-20260208-124425-post-ownedwal/current_c16.svg`
+  - `/tmp/wrongo-profile/iter4-20260208-124425-post-ownedwal/diff_vs_iter3.svg`
+
+## Interpretation
+- The engine scaling gate (`c16/c1 >= 0.80`) is met in repeated runs after this change.
+- WAL remains the top lock-wait subsystem, but the critical-section copy/alloc overhead is reduced.

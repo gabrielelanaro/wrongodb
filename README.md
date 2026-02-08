@@ -118,6 +118,12 @@ Artifacts are written to:
 - `target/benchmarks/wire_ab/gate.json`
 - `target/benchmarks/wire_ab/summary.md`
 
+Run deep engine-level concurrency benchmarks (direct `WrongoDB` API, no wire protocol):
+
+```bash
+just bench-engine
+```
+
 ## Release
 
 Create a version tag and push it to trigger the GitHub Actions release workflow:

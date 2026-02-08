@@ -11,6 +11,10 @@ fn global_wal_path(db_dir: &std::path::Path) -> std::path::PathBuf {
     db_dir.join("global.wal")
 }
 
+fn wal_immediate() -> WrongoDBConfig {
+    WrongoDBConfig::new().wal_sync_immediate()
+}
+
 #[test]
 fn global_wal_created_when_enabled() {
     let tmp = tempdir().unwrap();
@@ -45,7 +49,7 @@ fn global_wal_grows_after_committed_writes() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("db");
 
-    let db = WrongoDB::open(&db_path).unwrap();
+    let db = WrongoDB::open_with_config(&db_path, wal_immediate()).unwrap();
     let coll = db.collection("test");
     let mut session = db.open_session();
 
@@ -63,7 +67,7 @@ fn collection_checkpoint_truncates_global_wal() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("db");
 
-    let db = WrongoDB::open(&db_path).unwrap();
+    let db = WrongoDB::open_with_config(&db_path, wal_immediate()).unwrap();
     let coll = db.collection("test");
     let mut session = db.open_session();
 

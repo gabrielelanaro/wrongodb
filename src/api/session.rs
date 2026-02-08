@@ -1,14 +1,17 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Mutex, RwLock};
 
 use crate::api::cursor::{Cursor, CursorKind};
 use crate::api::data_handle_cache::DataHandleCache;
 use crate::core::errors::StorageError;
+use crate::core::lock_stats::{begin_lock_hold, record_lock_wait, LockStatKind};
 use crate::storage::table::Table;
 use crate::storage::wal::GlobalWal;
-use crate::txn::{GlobalTxnState, Transaction};
+use crate::txn::{GlobalTxnState, PendingWalOp, Transaction};
 use crate::WrongoDBError;
 
 struct SessionTxnContext {
@@ -19,6 +22,8 @@ pub struct Session {
     cache: Arc<DataHandleCache>,
     base_path: PathBuf,
     wal_enabled: bool,
+    wal_sync_interval_ms: u64,
+    wal_last_sync_ms: Arc<AtomicU64>,
     global_wal: Option<Arc<Mutex<GlobalWal>>>,
     global_txn: Arc<GlobalTxnState>,
     txn: Option<SessionTxnContext>,
@@ -29,6 +34,8 @@ impl Session {
         cache: Arc<DataHandleCache>,
         base_path: PathBuf,
         wal_enabled: bool,
+        wal_sync_interval_ms: u64,
+        wal_last_sync_ms: Arc<AtomicU64>,
         global_wal: Option<Arc<Mutex<GlobalWal>>>,
         global_txn: Arc<GlobalTxnState>,
     ) -> Self {
@@ -36,6 +43,8 @@ impl Session {
             cache,
             base_path,
             wal_enabled,
+            wal_sync_interval_ms,
+            wal_last_sync_ms,
             global_wal,
             global_txn,
             txn: None,
@@ -154,10 +163,35 @@ impl Session {
         self.txn.as_mut().map(|ctx| &mut ctx.txn)
     }
 
+    fn maybe_sync_wal_locked(&self, wal: &mut GlobalWal) -> Result<(), WrongoDBError> {
+        if self.wal_sync_interval_ms == 0 {
+            return wal.sync();
+        }
+
+        let now = now_millis();
+        let last_sync = self.wal_last_sync_ms.load(Ordering::Acquire);
+        if now.saturating_sub(last_sync) >= self.wal_sync_interval_ms
+            && self
+                .wal_last_sync_ms
+                .compare_exchange(last_sync, now, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            if let Err(err) = wal.sync() {
+                self.wal_last_sync_ms.store(last_sync, Ordering::Release);
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn checkpoint_all(&mut self) -> Result<(), WrongoDBError> {
         let handles = self.cache.all_handles();
         for table in handles {
-            table.write().checkpoint()?;
+            let wait_start = Instant::now();
+            let mut guard = table.write();
+            record_lock_wait(LockStatKind::Checkpoint, wait_start.elapsed());
+            let _hold = begin_lock_hold(LockStatKind::Checkpoint);
+            guard.checkpoint()?;
         }
 
         if self.wal_enabled && self.global_txn.has_active_transactions() {
@@ -166,7 +200,10 @@ impl Session {
 
         if self.wal_enabled {
             if let Some(global_wal) = self.global_wal.as_ref() {
+                let wait_start = Instant::now();
                 let mut wal = global_wal.lock();
+                record_lock_wait(LockStatKind::Wal, wait_start.elapsed());
+                let _hold = begin_lock_hold(LockStatKind::Wal);
                 if self.global_txn.has_active_transactions() {
                     return Ok(());
                 }
@@ -205,31 +242,22 @@ impl<'a> SessionTxn<'a> {
     /// Commits the transaction across all touched tables.
     pub fn commit(mut self) -> Result<(), WrongoDBError> {
         if let Some(mut ctx) = self.session.txn.take() {
-            let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
             let txn_id = ctx.txn.id();
 
             if self.session.wal_enabled {
+                let pending_wal_ops = self.session.global_txn.take_pending_wal_ops(txn_id);
                 if let Some(global_wal) = self.session.global_wal.as_ref() {
+                    let wait_start = Instant::now();
                     let mut wal = global_wal.lock();
+                    record_lock_wait(LockStatKind::Wal, wait_start.elapsed());
+                    let _hold = begin_lock_hold(LockStatKind::Wal);
+                    Self::flush_pending_wal_ops(&mut wal, txn_id, pending_wal_ops)?;
                     wal.log_txn_commit(txn_id, txn_id)?;
-                    wal.sync()?;
+                    self.session.maybe_sync_wal_locked(&mut wal)?;
                 }
             }
 
             ctx.txn.commit(&self.session.global_txn)?;
-
-            for uri in &touched_tables {
-                if !uri.starts_with("table:") {
-                    continue;
-                }
-                let collection = &uri[6..];
-                let table = self.session.get_primary_table(collection, false)?;
-                let mut table_guard = table.write();
-                table_guard.mark_updates_committed(txn_id)?;
-                if let Some(catalog) = table_guard.index_catalog_mut() {
-                    catalog.mark_updates_committed(txn_id)?;
-                }
-            }
         }
         self.committed = true;
         Ok(())
@@ -243,10 +271,14 @@ impl<'a> SessionTxn<'a> {
         if let Some(mut ctx) = self.session.txn.take() {
             let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
             let txn_id = ctx.txn.id();
+            self.session.global_txn.clear_pending_wal_ops(txn_id);
 
             if self.session.wal_enabled {
                 if let Some(global_wal) = self.session.global_wal.as_ref() {
+                    let wait_start = Instant::now();
                     let mut wal = global_wal.lock();
+                    record_lock_wait(LockStatKind::Wal, wait_start.elapsed());
+                    let _hold = begin_lock_hold(LockStatKind::Wal);
                     wal.log_txn_abort(txn_id)?;
                 }
             }
@@ -259,7 +291,10 @@ impl<'a> SessionTxn<'a> {
                 }
                 let collection = &uri[6..];
                 let table = self.session.get_primary_table(collection, false)?;
+                let wait_start = Instant::now();
                 let mut table_guard = table.write();
+                record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+                let _hold = begin_lock_hold(LockStatKind::Table);
                 table_guard.mark_updates_aborted(txn_id)?;
                 if let Some(catalog) = table_guard.index_catalog_mut() {
                     catalog.mark_updates_aborted(txn_id)?;
@@ -304,9 +339,13 @@ impl<'a> Drop for SessionTxn<'a> {
                 let touched_tables: Vec<String> =
                     ctx.txn.touched_tables().iter().cloned().collect();
                 let txn_id = ctx.txn.id();
+                self.session.global_txn.clear_pending_wal_ops(txn_id);
                 if self.session.wal_enabled {
                     if let Some(global_wal) = self.session.global_wal.as_ref() {
+                        let wait_start = Instant::now();
                         let mut wal = global_wal.lock();
+                        record_lock_wait(LockStatKind::Wal, wait_start.elapsed());
+                        let _hold = begin_lock_hold(LockStatKind::Wal);
                         let _ = wal.log_txn_abort(txn_id);
                     }
                 }
@@ -318,7 +357,10 @@ impl<'a> Drop for SessionTxn<'a> {
                     }
                     let collection = &uri[6..];
                     if let Ok(table) = self.session.get_primary_table(collection, false) {
+                        let wait_start = Instant::now();
                         let mut table_guard = table.write();
+                        record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+                        let _hold = begin_lock_hold(LockStatKind::Table);
                         let _ = table_guard.mark_updates_aborted(txn_id);
                         if let Some(catalog) = table_guard.index_catalog_mut() {
                             let _ = catalog.mark_updates_aborted(txn_id);
@@ -327,6 +369,30 @@ impl<'a> Drop for SessionTxn<'a> {
                 }
             }
         }
+    }
+}
+
+impl<'a> SessionTxn<'a> {
+    fn flush_pending_wal_ops(
+        wal: &mut GlobalWal,
+        txn_id: u64,
+        pending_wal_ops: Vec<PendingWalOp>,
+    ) -> Result<(), WrongoDBError> {
+        for op in pending_wal_ops {
+            match op {
+                PendingWalOp::Put {
+                    store_name,
+                    key,
+                    value,
+                } => {
+                    wal.log_put_owned(store_name, key, value, txn_id)?;
+                }
+                PendingWalOp::Delete { store_name, key } => {
+                    wal.log_delete_owned(store_name, key, txn_id)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -348,6 +414,13 @@ fn parse_index_uri(uri: &str) -> Result<(&str, &str), WrongoDBError> {
         ))));
     }
     Ok((collection, index))
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 // SAFETY: SessionTxn holds &mut Session, so it's !Send by default.

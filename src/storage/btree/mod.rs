@@ -1,5 +1,7 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
@@ -15,6 +17,7 @@ pub use iter::BTreeRangeIter;
 use self::mvcc::MvccState;
 use self::pager::{BTreeStore, PageRead, Pager, PinnedPageMut};
 use crate::core::errors::{StorageError, WrongoDBError};
+use crate::core::lock_stats::{begin_lock_hold, record_lock_wait, LockStatKind};
 use crate::storage::block::file::NONE_BLOCK_ID;
 use crate::storage::wal::GlobalWal;
 use crate::txn::{GlobalTxnState, TxnId, UpdateType, TXN_NONE};
@@ -53,6 +56,7 @@ pub struct BTree {
     global_wal: Option<Arc<Mutex<GlobalWal>>>,
     wal_enabled: bool,
     wal_store_name: String,
+    base_may_have_keys: AtomicBool,
     mvcc: MvccState,
 }
 
@@ -83,6 +87,7 @@ impl BTree {
             global_wal,
             wal_enabled,
             wal_store_name: store_name,
+            base_may_have_keys: AtomicBool::new(false),
             mvcc: MvccState::new(global_txn),
         })
     }
@@ -110,6 +115,8 @@ impl BTree {
             global_wal,
             wal_enabled,
             wal_store_name: store_name,
+            // Existing files may already have durable keys.
+            base_may_have_keys: AtomicBool::new(true),
             mvcc: MvccState::new(global_txn),
         })
     }
@@ -207,6 +214,7 @@ impl BTree {
             self.log_wal_put(key, value, txn_id)?;
         }
 
+        self.base_may_have_keys.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -240,6 +248,7 @@ impl BTree {
 
         self.log_wal_put(key, value, TXN_NONE)?;
 
+        self.base_may_have_keys.store(true, Ordering::Release);
         Ok(true)
     }
 
@@ -265,7 +274,14 @@ impl BTree {
             self.log_wal_delete(key, txn_id)?;
         }
 
+        if result.deleted {
+            self.base_may_have_keys.store(true, Ordering::Release);
+        }
         Ok(result.deleted)
+    }
+
+    pub fn base_may_have_keys(&self) -> bool {
+        self.base_may_have_keys.load(Ordering::Acquire)
     }
 
     pub fn sync_all(&mut self) -> Result<(), WrongoDBError> {
@@ -466,7 +482,7 @@ impl BTree {
     }
 
     pub(super) fn log_wal_put(
-        &mut self,
+        &self,
         key: &[u8],
         value: &[u8],
         txn_id: TxnId,
@@ -474,26 +490,38 @@ impl BTree {
         if !self.wal_enabled {
             return Ok(());
         }
+        if txn_id != TXN_NONE {
+            self.mvcc
+                .global
+                .enqueue_wal_put(txn_id, &self.wal_store_name, key, value);
+            return Ok(());
+        }
         if let Some(global_wal) = self.global_wal.as_ref() {
-            global_wal
-                .lock()
-                .log_put(&self.wal_store_name, key, value, txn_id)?;
+            let wait_start = Instant::now();
+            let mut wal = global_wal.lock();
+            record_lock_wait(LockStatKind::Wal, wait_start.elapsed());
+            let _hold = begin_lock_hold(LockStatKind::Wal);
+            wal.log_put(&self.wal_store_name, key, value, txn_id)?;
         }
         Ok(())
     }
 
-    pub(super) fn log_wal_delete(
-        &mut self,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
+    pub(super) fn log_wal_delete(&self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         if !self.wal_enabled {
             return Ok(());
         }
+        if txn_id != TXN_NONE {
+            self.mvcc
+                .global
+                .enqueue_wal_delete(txn_id, &self.wal_store_name, key);
+            return Ok(());
+        }
         if let Some(global_wal) = self.global_wal.as_ref() {
-            global_wal
-                .lock()
-                .log_delete(&self.wal_store_name, key, txn_id)?;
+            let wait_start = Instant::now();
+            let mut wal = global_wal.lock();
+            record_lock_wait(LockStatKind::Wal, wait_start.elapsed());
+            let _hold = begin_lock_hold(LockStatKind::Wal);
+            wal.log_delete(&self.wal_store_name, key, txn_id)?;
         }
         Ok(())
     }

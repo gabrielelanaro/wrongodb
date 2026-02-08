@@ -1,7 +1,8 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Mutex;
-use wrongodb::{start_server, WrongoDB};
+use wrongodb::{snapshot_lock_stats, start_server, WrongoDB, WrongoDBConfig};
 
 fn print_usage_and_exit(exit_code: i32) -> ! {
     eprintln!(
@@ -123,10 +124,55 @@ fn db_path(parsed: &ParsedArgs) -> String {
     "test.db".to_string()
 }
 
+fn lock_stats_path() -> Option<String> {
+    if let Ok(path) = std::env::var("WRONGO_LOCK_STATS_PATH") {
+        if !path.is_empty() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn should_enable_lock_stats(path: Option<&str>) -> bool {
+    if path.is_some() {
+        return true;
+    }
+    if let Ok(value) = std::env::var("WRONGO_LOCK_STATS_ENABLED") {
+        return value == "1" || value.eq_ignore_ascii_case("true");
+    }
+    false
+}
+
+fn spawn_lock_stats_reporter(path: String) {
+    std::thread::spawn(move || {
+        let out_path = std::path::PathBuf::from(path);
+        if let Some(parent) = out_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp_path = out_path.with_extension("tmp");
+
+        loop {
+            let snapshot = snapshot_lock_stats();
+            if let Ok(bytes) = serde_json::to_vec_pretty(&snapshot) {
+                let _ = std::fs::write(&tmp_path, bytes);
+                let _ = std::fs::rename(&tmp_path, &out_path);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parsed = parse_args();
-    let db = WrongoDB::open(db_path(&parsed))?;
+    let stats_path = lock_stats_path();
+    let db = WrongoDB::open_with_config(
+        db_path(&parsed),
+        WrongoDBConfig::new().lock_stats_enabled(should_enable_lock_stats(stats_path.as_deref())),
+    )?;
+    if let Some(path) = stats_path {
+        spawn_lock_stats_reporter(path);
+    }
     let db = Arc::new(Mutex::new(db));
     let addr = server_addr(&parsed);
     start_server(&addr, db).await?;

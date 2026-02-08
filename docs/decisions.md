@@ -1,5 +1,87 @@
 # Decisions
 
+## 2026-02-08: Add lock contention counters and benchmark artifacts
+
+**Decision**
+- Add lock contention counters for:
+  - table locks
+  - WAL lock
+  - MVCC shard lock
+  - checkpoint lock
+- Add `lock_stats_enabled` to `ConnectionConfig` and `WrongoDBConfig`.
+- Export lock-stats APIs:
+  - `set_lock_stats_enabled`
+  - `reset_lock_stats`
+  - `snapshot_lock_stats`
+- Engine benchmark writes lock-stats artifacts under `target/bench-data-engine-concurrency/`.
+- Wire A/B benchmark collects WrongoDB lock stats into `target/benchmarks/.../lock_stats.json` and includes them in `summary.md`.
+
+**Why**
+- We need direct visibility into lock wait/hold time before and during lock-granularity refactors.
+- Putting metrics in benchmark artifacts makes each optimization step auditable.
+
+**Notes**
+- Lock stats are process-global in this iteration and intended for benchmarking/profiling workflows.
+- MVCC shard counters are wired now and become materially informative once sharded MVCC locks land.
+
+## 2026-02-07: MVCC commit visibility is derived from global txn state
+
+**Decision**
+- Remove per-commit MVCC chain marking from the hot commit path.
+- `SessionTxn::commit` now commits only global txn state (plus WAL commit marker/sync policy), without scanning touched tables/chains.
+- `latest_committed_entries` derives committed visibility from `GlobalTxnState` (`is_active` / `is_aborted`) instead of `start_ts` mutation during commit.
+
+**Why**
+- Per-operation transactions were paying extra lock-heavy table passes on commit.
+- Commit visibility is already represented by global transaction state, so chain mutation at commit was redundant for this implementation.
+
+**Notes**
+- `mark_updates_aborted` remains as a chain scan for abort cleanup (abort path is rare).
+
+## 2026-02-07: Default WAL commit sync uses interval group-sync
+
+**Decision**
+- Add configurable WAL sync interval (`wal_sync_interval_ms`) to `ConnectionConfig` and `WrongoDBConfig`.
+- Set default to `100ms` (`0` keeps strict per-commit sync).
+- Commit path now:
+  - always writes `TxnCommit` to global WAL
+  - syncs immediately only when `wal_sync_interval_ms == 0`
+  - otherwise syncs at most once per interval using a shared connection-level clock.
+
+**Why**
+- Per-operation `fsync` dominated runtime and collapsed concurrency scaling.
+- MongoDB-style interval group-sync preserves journaling while amortizing sync cost across many commits.
+
+**Notes**
+- This is a durability/latency tradeoff: commits acknowledged within the interval may be lost on crash.
+- Users can opt into strict durability via `wal_sync_immediate()` / `wal_sync_interval_ms(0)`.
+
+## 2026-02-07: Skip index mutation lock path when collection has no indexes
+
+**Decision**
+- In `Collection::apply_index_add` / `apply_index_remove`, check `IndexCatalog::has_indexes()` first under a shared table lock.
+- If no secondary indexes exist, return early and avoid acquiring the table write lock for index maintenance.
+
+**Why**
+- Write-heavy no-index workloads were paying an avoidable second table lock per operation.
+- Early return reduces lock contention in deep engine-level concurrency benchmarks.
+
+## 2026-02-07: Add engine-level Criterion concurrency benchmark for fast inner-loop diagnosis
+
+**Decision**
+- Add `benches/engine_concurrency.rs` with two direct API workloads:
+  - `engine_insert_unique_scaling`
+  - `engine_update_hotspot_scaling`
+- Run with fixed concurrency levels (`1,4,8,16`) against `WrongoDB` engine APIs (no wire protocol).
+- Keep wire A/B benchmark as comparison/gate benchmark, but use this bench for fast local bottleneck iteration.
+
+**Why**
+- Wire-protocol A/B benchmarks include protocol, client, runtime, and container overhead that slow down profiling iteration.
+- Direct engine-level benchmarks isolate storage/transaction/locking behavior where scaling regressions are most likely.
+
+**Notes**
+- Each workload runs on dedicated benchmark databases under `target/bench-data-engine-concurrency/`.
+
 ## 2026-02-07: Wire-protocol A/B benchmark gate for concurrency refactor decisions
 
 **Decision**
@@ -794,3 +876,23 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - **Leaf-only pinning** minimizes pin count but may re-read parent pages during iteration if they're evicted.
 - **Full-path pinning** would keep the entire path from root to leaf pinned, preventing any re-reads but consuming more cache capacity.
 - Current implementation uses leaf-only pinning for simplicity; full-path pinning can be added later if needed for performance.
+
+## 2026-02-08: Sharded MVCC locking + commit-time WAL flush for transactional writes
+
+**Decision**
+- Replace the single MVCC chain map lock with 256 hash shards (`parking_lot::Mutex<HashMap<...>>`), keyed by document key hash.
+- Keep transactional (`txn_id != TXN_NONE`) WAL writes out of the hot MVCC write path by enqueuing per-transaction WAL ops in `GlobalTxnState`.
+- Flush queued WAL `Put/Delete` records during `SessionTxn::commit` under a single WAL lock, followed by the `TxnCommit` record and sync policy check.
+- Clear queued WAL ops on abort/drop/unregister to avoid retaining aborted transaction log payloads.
+- Add a `base_may_have_keys` heuristic in `BTree` and a cursor insert fallback:
+  - fast path: direct MVCC insert-if-absent when base pages are known empty,
+  - fallback: duplicate pre-check when base pages may contain durable keys.
+
+**Why**
+- Remove global MVCC write serialization across unrelated keys.
+- Reduce lock hold time in the write path by replacing synchronous WAL append-in-lock with cheap enqueue for transactional updates.
+- Preserve recovery semantics (no WAL format change) and transaction visibility rules while reducing contention.
+
+**Tradeoffs**
+- WAL serialization remains a dominant bottleneck at high concurrency; this change reduces but does not eliminate global WAL pressure.
+- Duplicate pre-check fallback can still cost extra table locking when base-tree keys are present.

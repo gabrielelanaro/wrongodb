@@ -4,7 +4,7 @@ pub mod snapshot;
 pub mod transaction;
 pub mod update;
 
-pub use global_txn::GlobalTxnState;
+pub use global_txn::{GlobalTxnState, PendingWalOp};
 #[allow(unused_imports)]
 pub use recovery::RecoveryTxnTable;
 #[allow(unused_imports)]

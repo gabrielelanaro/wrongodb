@@ -10,11 +10,21 @@ use super::collection::Collection;
 pub struct WrongoDBConfig {
     /// Enable WAL for durability (default: true)
     pub wal_enabled: bool,
+    /// WAL sync interval in milliseconds.
+    /// - 0 = sync on every commit
+    /// - N > 0 = at most one sync every N ms (group sync)
+    pub wal_sync_interval_ms: u64,
+    /// Enable collection of lock wait/hold counters.
+    pub lock_stats_enabled: bool,
 }
 
 impl Default for WrongoDBConfig {
     fn default() -> Self {
-        Self { wal_enabled: true }
+        Self {
+            wal_enabled: true,
+            wal_sync_interval_ms: 100,
+            lock_stats_enabled: false,
+        }
     }
 }
 
@@ -27,6 +37,21 @@ impl WrongoDBConfig {
     /// Enable or disable WAL (default: true).
     pub fn wal_enabled(mut self, enabled: bool) -> Self {
         self.wal_enabled = enabled;
+        self
+    }
+
+    pub fn wal_sync_interval_ms(mut self, interval_ms: u64) -> Self {
+        self.wal_sync_interval_ms = interval_ms;
+        self
+    }
+
+    pub fn wal_sync_immediate(mut self) -> Self {
+        self.wal_sync_interval_ms = 0;
+        self
+    }
+
+    pub fn lock_stats_enabled(mut self, enabled: bool) -> Self {
+        self.lock_stats_enabled = enabled;
         self
     }
 }
@@ -56,6 +81,8 @@ impl WrongoDB {
             base_path,
             ConnectionConfig {
                 wal_enabled: config.wal_enabled,
+                wal_sync_interval_ms: config.wal_sync_interval_ms,
+                lock_stats_enabled: config.lock_stats_enabled,
             },
         )?;
         Ok(Self { connection: conn })

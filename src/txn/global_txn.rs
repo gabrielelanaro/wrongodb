@@ -1,16 +1,32 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use super::snapshot::Snapshot;
 use super::transaction::{IsolationLevel, Transaction};
 use super::{TxnId, TXN_NONE};
+
+const WAL_OP_SHARD_COUNT: usize = 64;
+
+#[derive(Debug, Clone)]
+pub enum PendingWalOp {
+    Put {
+        store_name: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Delete {
+        store_name: String,
+        key: Vec<u8>,
+    },
+}
 
 #[derive(Debug)]
 pub struct GlobalTxnState {
     current_txn_id: AtomicU64,
     active_txns: RwLock<Vec<TxnId>>,
     aborted_txns: RwLock<HashSet<TxnId>>,
+    pending_wal_ops: Vec<Mutex<HashMap<TxnId, Vec<PendingWalOp>>>>,
     // Cached oldest active transaction ID for GC threshold
     oldest_active_txn_id: AtomicU64,
 }
@@ -21,8 +37,16 @@ impl GlobalTxnState {
             current_txn_id: AtomicU64::new(TXN_NONE),
             active_txns: RwLock::new(Vec::new()),
             aborted_txns: RwLock::new(HashSet::new()),
+            pending_wal_ops: (0..WAL_OP_SHARD_COUNT)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
             oldest_active_txn_id: AtomicU64::new(TXN_NONE),
         }
+    }
+
+    fn wal_shard(&self, txn_id: TxnId) -> &Mutex<HashMap<TxnId, Vec<PendingWalOp>>> {
+        let idx = (txn_id as usize) % self.pending_wal_ops.len();
+        &self.pending_wal_ops[idx]
     }
 
     /// Get the oldest active transaction ID.
@@ -84,11 +108,22 @@ impl GlobalTxnState {
         if was_oldest {
             self.recalculate_oldest();
         }
+
+        self.clear_pending_wal_ops(txn_id);
     }
 
     pub fn has_active_transactions(&self) -> bool {
         let guard = self.active_txns.read().expect("active_txns lock poisoned");
         !guard.is_empty()
+    }
+
+    /// Check if a transaction is currently active.
+    pub fn is_active(&self, txn_id: TxnId) -> bool {
+        if txn_id == TXN_NONE {
+            return false;
+        }
+        let guard = self.active_txns.read().expect("active_txns lock poisoned");
+        guard.contains(&txn_id)
     }
 
     /// Mark a transaction as aborted
@@ -140,6 +175,58 @@ impl GlobalTxnState {
         self.register_active(txn_id);
         let snapshot = self.take_snapshot(txn_id);
         Transaction::new(txn_id, IsolationLevel::Snapshot, snapshot)
+    }
+
+    pub fn enqueue_wal_put(&self, txn_id: TxnId, store_name: &str, key: &[u8], value: &[u8]) {
+        if txn_id == TXN_NONE {
+            return;
+        }
+        let shard = self.wal_shard(txn_id);
+        let mut guard = shard.lock().expect("pending_wal_ops lock poisoned");
+        guard.entry(txn_id).or_default().push(PendingWalOp::Put {
+            store_name: store_name.to_string(),
+            key: key.to_vec(),
+            value: value.to_vec(),
+        });
+    }
+
+    pub fn enqueue_wal_delete(&self, txn_id: TxnId, store_name: &str, key: &[u8]) {
+        if txn_id == TXN_NONE {
+            return;
+        }
+        let shard = self.wal_shard(txn_id);
+        let mut guard = shard.lock().expect("pending_wal_ops lock poisoned");
+        guard.entry(txn_id).or_default().push(PendingWalOp::Delete {
+            store_name: store_name.to_string(),
+            key: key.to_vec(),
+        });
+    }
+
+    pub fn take_pending_wal_ops(&self, txn_id: TxnId) -> Vec<PendingWalOp> {
+        if txn_id == TXN_NONE {
+            return Vec::new();
+        }
+        let shard = self.wal_shard(txn_id);
+        let mut guard = shard.lock().expect("pending_wal_ops lock poisoned");
+        guard.remove(&txn_id).unwrap_or_default()
+    }
+
+    pub fn restore_pending_wal_ops(&self, txn_id: TxnId, mut ops: Vec<PendingWalOp>) {
+        if txn_id == TXN_NONE || ops.is_empty() {
+            return;
+        }
+        let shard = self.wal_shard(txn_id);
+        let mut guard = shard.lock().expect("pending_wal_ops lock poisoned");
+        guard.entry(txn_id).or_default().append(&mut ops);
+    }
+
+    pub fn clear_pending_wal_ops(&self, txn_id: TxnId) {
+        if txn_id == TXN_NONE {
+            return;
+        }
+        let shard = self.wal_shard(txn_id);
+        let mut guard = shard.lock().expect("pending_wal_ops lock poisoned");
+        guard.remove(&txn_id);
     }
 }
 

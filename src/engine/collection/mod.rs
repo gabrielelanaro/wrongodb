@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::time::Instant;
 
 use serde_json::Value;
 
@@ -6,6 +7,7 @@ use crate::api::cursor::Cursor;
 use crate::api::session::Session;
 use crate::core::bson::{decode_document, encode_document, encode_id_value};
 use crate::core::document::{normalize_document_in_place, validate_is_object};
+use crate::core::lock_stats::{begin_lock_hold, record_lock_wait, LockStatKind};
 use crate::index::{decode_index_id, encode_range_bounds};
 use crate::txn::TxnId;
 use crate::{Document, WrongoDBError};
@@ -67,7 +69,23 @@ impl Collection {
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
         let table = session.table_handle(&self.name, false)?;
+        let has_indexes = {
+            let wait_start = Instant::now();
+            let table_guard = table.read();
+            record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+            let _hold = begin_lock_hold(LockStatKind::Table);
+            table_guard
+                .index_catalog()
+                .map(|catalog| catalog.has_indexes())
+                .unwrap_or(false)
+        };
+        if !has_indexes {
+            return Ok(());
+        }
+        let wait_start = Instant::now();
         let mut table_guard = table.write();
+        record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+        let _hold = begin_lock_hold(LockStatKind::Table);
         let catalog = table_guard
             .index_catalog_mut()
             .ok_or_else(|| crate::core::errors::StorageError("missing index catalog".into()))?;
@@ -82,7 +100,23 @@ impl Collection {
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
         let table = session.table_handle(&self.name, false)?;
+        let has_indexes = {
+            let wait_start = Instant::now();
+            let table_guard = table.read();
+            record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+            let _hold = begin_lock_hold(LockStatKind::Table);
+            table_guard
+                .index_catalog()
+                .map(|catalog| catalog.has_indexes())
+                .unwrap_or(false)
+        };
+        if !has_indexes {
+            return Ok(());
+        }
+        let wait_start = Instant::now();
         let mut table_guard = table.write();
+        record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+        let _hold = begin_lock_hold(LockStatKind::Table);
         let catalog = table_guard
             .index_catalog_mut()
             .ok_or_else(|| crate::core::errors::StorageError("missing index catalog".into()))?;
@@ -181,7 +215,10 @@ impl Collection {
 
         let indexed_field = {
             let table_handle = session.table_handle(&self.name, false)?;
+            let wait_start = Instant::now();
             let table_guard = table_handle.read();
+            record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+            let _hold = begin_lock_hold(LockStatKind::Table);
             let catalog = match table_guard.index_catalog() {
                 Some(c) => c,
                 None => {
