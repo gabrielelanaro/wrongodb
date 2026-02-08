@@ -29,7 +29,7 @@ impl CommandRegistry {
         self.handlers.push(handler);
     }
 
-    pub fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    pub fn execute(&self, doc: &Document, db: &WrongoDB) -> Result<Document, WrongoDBError> {
         for key in doc.keys() {
             if let Some(&idx) = self.name_to_handler.get(&key.to_lowercase()) {
                 return self.handlers[idx].execute(doc, db);

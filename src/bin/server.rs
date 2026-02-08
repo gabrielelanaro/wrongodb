@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
 use wrongodb::{start_server, WrongoDB};
 
 fn print_usage_and_exit(exit_code: i32) -> ! {
@@ -127,7 +126,7 @@ fn db_path(parsed: &ParsedArgs) -> String {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parsed = parse_args();
     let db = WrongoDB::open(db_path(&parsed))?;
-    let db = Arc::new(Mutex::new(db));
+    let db = Arc::new(db);
     let addr = server_addr(&parsed);
     start_server(&addr, db).await?;
     Ok(())

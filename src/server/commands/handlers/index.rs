@@ -10,7 +10,7 @@ impl Command for ListIndexesCommand {
         &["listIndexes"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("listIndexes").unwrap_or("test");
         let coll = db.collection(coll_name);
         let mut session = db.open_session();
@@ -58,7 +58,7 @@ impl Command for CreateIndexesCommand {
         &["createIndexes"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("createIndexes").unwrap_or("test");
         let coll = db.collection(coll_name);
         let mut session = db.open_session();

@@ -9,7 +9,6 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
 
 use self::commands::handlers::crud::{bson_to_value, value_to_bson};
 use self::commands::CommandRegistry;
@@ -47,10 +46,7 @@ impl MsgHeader {
     }
 }
 
-pub async fn start_server(
-    addr: &str,
-    db: Arc<Mutex<WrongoDB>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn start_server(addr: &str, db: Arc<WrongoDB>) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     let registry = Arc::new(CommandRegistry::new());
     println!("Server listening on {}", addr);
@@ -69,7 +65,7 @@ pub async fn start_server(
 
 async fn handle_connection(
     mut socket: TcpStream,
-    db: Arc<Mutex<WrongoDB>>,
+    db: Arc<WrongoDB>,
     registry: Arc<CommandRegistry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
@@ -117,7 +113,7 @@ async fn handle_connection(
 
 async fn handle_op_msg(
     body_buf: &[u8],
-    db: &Arc<Mutex<WrongoDB>>,
+    db: &Arc<WrongoDB>,
     registry: &CommandRegistry,
 ) -> Result<Document, WrongoDBError> {
     let mut cursor = Cursor::new(body_buf);
@@ -164,8 +160,7 @@ async fn handle_op_msg(
                 doc.insert("documents", Bson::Array(docs_bson));
             }
         }
-        let mut db_lock = db.lock().await;
-        return registry.execute(&doc, &mut db_lock);
+        return registry.execute(&doc, db);
     }
 
     Ok(doc! { "ok": Bson::Double(0.0), "errmsg": "No command document" })
@@ -173,7 +168,7 @@ async fn handle_op_msg(
 
 async fn handle_op_query(
     body_buf: &[u8],
-    db: &Arc<Mutex<WrongoDB>>,
+    db: &Arc<WrongoDB>,
     registry: &CommandRegistry,
 ) -> Result<Document, WrongoDBError> {
     let mut cursor = Cursor::new(body_buf);
@@ -200,18 +195,16 @@ async fn handle_op_query(
     let query_doc: Document = bson::from_slice(&query_buf).map_err(WrongoDBError::BsonDe)?;
 
     if full_coll_name == "admin.$cmd" {
-        let mut db_lock = db.lock().await;
-        return registry.execute(&query_doc, &mut db_lock);
+        return registry.execute(&query_doc, db);
     }
 
     let filter_json = bson_to_value(&query_doc);
-    let db_lock = db.lock().await;
     let coll_name = full_coll_name
         .split_once('.')
         .map(|(_, coll)| coll)
         .unwrap_or(full_coll_name.as_str());
-    let coll = db_lock.collection(coll_name);
-    let mut session = db_lock.open_session();
+    let coll = db.collection(coll_name);
+    let mut session = db.open_session();
     let results = coll.find(&mut session, Some(filter_json))?;
     let results_bson: Vec<Bson> = results
         .into_iter()

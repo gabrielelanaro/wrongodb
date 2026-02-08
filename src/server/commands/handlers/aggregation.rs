@@ -12,7 +12,7 @@ impl Command for CountCommand {
         &["count"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("count").unwrap_or("test");
         let coll = db.collection(coll_name);
         let mut session = db.open_session();
@@ -36,7 +36,7 @@ impl Command for DistinctCommand {
         &["distinct"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("distinct").unwrap_or("test");
         let coll = db.collection(coll_name);
         let mut session = db.open_session();
@@ -66,7 +66,7 @@ impl Command for AggregateCommand {
         &["aggregate"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &WrongoDB) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("aggregate").unwrap_or("test");
         let coll = db.collection(coll_name);
         let mut session = db.open_session();
@@ -100,7 +100,7 @@ impl Command for AggregateCommand {
 fn apply_pipeline_stage(
     stage: &Document,
     mut results: Vec<serde_json::Map<String, Value>>,
-    _db: &mut WrongoDB,
+    _db: &WrongoDB,
 ) -> Result<Vec<serde_json::Map<String, Value>>, WrongoDBError> {
     // $match - filter documents
     if let Ok(match_doc) = stage.get_document("$match") {
