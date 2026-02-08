@@ -437,7 +437,7 @@ impl IndexCatalog {
 
     pub fn mark_updates_committed(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
         for index in self.indexes.values_mut() {
-            let mut table = index.table.write();
+            let table = index.table.write();
             table.mark_updates_committed(txn_id)?;
         }
         Ok(())
@@ -445,7 +445,7 @@ impl IndexCatalog {
 
     pub fn mark_updates_aborted(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
         for index in self.indexes.values_mut() {
-            let mut table = index.table.write();
+            let table = index.table.write();
             table.mark_updates_aborted(txn_id)?;
         }
         Ok(())

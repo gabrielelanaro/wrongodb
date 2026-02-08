@@ -876,3 +876,23 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - **Leaf-only pinning** minimizes pin count but may re-read parent pages during iteration if they're evicted.
 - **Full-path pinning** would keep the entire path from root to leaf pinned, preventing any re-reads but consuming more cache capacity.
 - Current implementation uses leaf-only pinning for simplicity; full-path pinning can be added later if needed for performance.
+
+## 2026-02-08: Sharded MVCC locking + commit-time WAL flush for transactional writes
+
+**Decision**
+- Replace the single MVCC chain map lock with 256 hash shards (`parking_lot::Mutex<HashMap<...>>`), keyed by document key hash.
+- Keep transactional (`txn_id != TXN_NONE`) WAL writes out of the hot MVCC write path by enqueuing per-transaction WAL ops in `GlobalTxnState`.
+- Flush queued WAL `Put/Delete` records during `SessionTxn::commit` under a single WAL lock, followed by the `TxnCommit` record and sync policy check.
+- Clear queued WAL ops on abort/drop/unregister to avoid retaining aborted transaction log payloads.
+- Add a `base_may_have_keys` heuristic in `BTree` and a cursor insert fallback:
+  - fast path: direct MVCC insert-if-absent when base pages are known empty,
+  - fallback: duplicate pre-check when base pages may contain durable keys.
+
+**Why**
+- Remove global MVCC write serialization across unrelated keys.
+- Reduce lock hold time in the write path by replacing synchronous WAL append-in-lock with cheap enqueue for transactional updates.
+- Preserve recovery semantics (no WAL format change) and transaction visibility rules while reducing contention.
+
+**Tradeoffs**
+- WAL serialization remains a dominant bottleneck at high concurrency; this change reduces but does not eliminate global WAL pressure.
+- Duplicate pre-check fallback can still cost extra table locking when base-tree keys are present.

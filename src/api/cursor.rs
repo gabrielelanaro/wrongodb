@@ -47,22 +47,52 @@ impl Cursor {
 
     pub fn insert(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
-        let wait_start = Instant::now();
-        let mut table = self.table.write();
-        record_lock_wait(LockStatKind::Table, wait_start.elapsed());
-        let _hold = begin_lock_hold(LockStatKind::Table);
-        if table.get_version(key, txn_id)?.is_some() {
+        {
+            let wait_start = Instant::now();
+            let table = self.table.read();
+            record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+            let _hold = begin_lock_hold(LockStatKind::Table);
+
+            if !table.base_may_have_keys() {
+                if !table.insert_mvcc_if_absent(key, value, txn_id)? {
+                    return Err(crate::core::errors::DocumentValidationError(
+                        "duplicate key error".into(),
+                    )
+                    .into());
+                }
+                return Ok(());
+            }
+        }
+
+        let duplicate = {
+            let wait_start = Instant::now();
+            let mut table = self.table.write();
+            record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+            let _hold = begin_lock_hold(LockStatKind::Table);
+            table.get_version(key, txn_id)?.is_some()
+        };
+        if duplicate {
             return Err(
                 crate::core::errors::DocumentValidationError("duplicate key error".into()).into(),
             );
         }
-        table.insert_mvcc(key, value, txn_id)
+
+        let wait_start = Instant::now();
+        let table = self.table.read();
+        record_lock_wait(LockStatKind::Table, wait_start.elapsed());
+        let _hold = begin_lock_hold(LockStatKind::Table);
+        if !table.insert_mvcc_if_absent(key, value, txn_id)? {
+            return Err(
+                crate::core::errors::DocumentValidationError("duplicate key error".into()).into(),
+            );
+        }
+        Ok(())
     }
 
     pub fn update(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
         let wait_start = Instant::now();
-        let mut table = self.table.write();
+        let table = self.table.read();
         record_lock_wait(LockStatKind::Table, wait_start.elapsed());
         let _hold = begin_lock_hold(LockStatKind::Table);
         let result = table.update_mvcc(key, value, txn_id)?;
@@ -77,7 +107,7 @@ impl Cursor {
     pub fn delete(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
         let wait_start = Instant::now();
-        let mut table = self.table.write();
+        let table = self.table.read();
         record_lock_wait(LockStatKind::Table, wait_start.elapsed());
         let _hold = begin_lock_hold(LockStatKind::Table);
         let result = table.delete_mvcc(key, txn_id)?;

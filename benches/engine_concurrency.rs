@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Barrier;
+use std::sync::Once;
 use std::thread;
 use std::time::Duration;
 
@@ -20,9 +21,18 @@ const UPDATES_PER_WORKER: usize = 4096;
 
 static NEXT_DOC_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_DB_ID: AtomicU64 = AtomicU64::new(0);
+static BENCH_DATA_PREPARE: Once = Once::new();
 
 fn bench_data_dir() -> PathBuf {
     PathBuf::from("target/bench-data-engine-concurrency")
+}
+
+fn prepare_bench_data_dir() {
+    BENCH_DATA_PREPARE.call_once(|| {
+        let path = bench_data_dir();
+        let _ = fs::remove_dir_all(&path);
+        let _ = fs::create_dir_all(&path);
+    });
 }
 
 fn open_bench_db(label: &str) -> WrongoDB {
@@ -117,7 +127,7 @@ fn run_update_hotspot_batch(
 }
 
 fn bench_engine_insert_unique_scaling(c: &mut Criterion) {
-    let _ = fs::remove_dir_all(bench_data_dir());
+    prepare_bench_data_dir();
     set_lock_stats_enabled(true);
     reset_lock_stats();
     let payload = "x".repeat(PAYLOAD_SIZE);
@@ -156,7 +166,7 @@ fn bench_engine_insert_unique_scaling(c: &mut Criterion) {
 }
 
 fn bench_engine_update_hotspot_scaling(c: &mut Criterion) {
-    let _ = fs::remove_dir_all(bench_data_dir());
+    prepare_bench_data_dir();
     set_lock_stats_enabled(true);
     reset_lock_stats();
 

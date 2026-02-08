@@ -119,3 +119,46 @@ Notes
 ## Implications for minimongo
 - A WT-like MVCC core implies per-key update chains in memory, a history store for older versions, and snapshot visibility based on txn ids + timestamps.
 - A Mongo-like API surface suggests RAII write units of work and lazy snapshot creation, with retryable write conflicts.
+
+# Notes: Engine scaling investigation (lock contention), 2026-02-08
+
+## What was changed in WrongoDB
+- Added an engine-level benchmark lock-artifact fix so insert/update groups no longer delete each other's lock stats (`benches/engine_concurrency.rs`).
+- Sharded MVCC chain locking to 256 shards (`src/storage/btree/mvcc.rs`).
+- Deferred transactional WAL `put/delete` writes into per-transaction pending buffers (`src/txn/global_txn.rs`) and flushed them in `SessionTxn::commit` (`src/api/session.rs`).
+
+## Measured evidence (engine_insert_unique_scaling)
+- Representative run (criterion mean throughput from `target/criterion/.../new/estimates.json`):
+  - c1: ~290k ops/s
+  - c16: ~213k ops/s
+  - ratio c16/c1: ~0.735
+- Lock stats (`target/bench-data-engine-concurrency/lock-stats-engine_insert_unique_scaling.json`) still show WAL wait dominating:
+  - wal.wait_ns: ~1.78e11
+  - mvcc_shard.wait_ns: ~3.41e8
+  - table.wait_ns: ~4.95e8
+
+## Profiling evidence
+- Fresh c16 sample + flamegraph:
+  - `/tmp/wrongo-profile/iter3-20260208-123552-current/current_c16.sample.txt`
+  - `/tmp/wrongo-profile/iter3-20260208-123552-current/current_c16.svg`
+  - `/tmp/wrongo-profile/iter3-20260208-123552-current/diff_vs_baseline.svg`
+- Dominant stacks include:
+  - `SessionTxn::commit`
+  - `parking_lot::RawMutex::lock_slow`
+  - `GlobalWal::log_put` / `WalFile::append_record`
+
+## MongoDB / WiredTiger references used
+- MongoDB lock hierarchy and intent locking:
+  - `mongodb/src/mongo/db/shard_role/lock_manager/README.md`
+    - Global/DB/Collection intent locks (IS/IX), document-level locking delegated to storage engine.
+- MongoDB `WriteUnitOfWork` context and 2PL behavior:
+  - `mongodb/src/mongo/db/shard_role/lock_manager/README.md`
+  - `mongodb/src/mongo/db/shard_role/lock_manager/d_concurrency.h`
+- WiredTiger logging slots / consolidation model:
+  - `wiredtiger/src/log/log_private.h`
+  - `wiredtiger/src/log/log_mgr.c`
+  - key point: slot-based write consolidation and log worker processing to avoid a naive per-write global critical section.
+
+## Current conclusion
+- MVCC global lock pressure was reduced, but scaling is still bounded by WAL serialization.
+- Next meaningful step should be WT-inspired WAL slot/group-commit style buffering (or equivalent background writer batching), not more broad table-lock tuning.
