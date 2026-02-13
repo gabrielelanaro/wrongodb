@@ -16,15 +16,22 @@ It is a learning resource, a playground, and a documentation of the path from "n
 
 ## Current State
 
-A tiny, learning-oriented MongoDB-like store written in Rust.
+A learning-oriented MongoDB-compatible database in Rust, inspired by WiredTiger's architecture.
 
-### Features
-- Append-only log on disk (newline-delimited JSON).
-- In-memory index rebuilt at startup.
-- API: `collection("name")` with `insert_one`, `find_one`, `find` and top-level equality filters.
-- Single-process, no concurrency controls (yet!).
+### Storage Engine
+- **B+tree storage**: Fixed-size paged files with slotted leaf/internal pages, arbitrary height, splits, range scans
+- **Page cache**: LRU eviction, pin/unpin API, dirty tracking, copy-on-write updates
+- **Checkpoints**: Atomic root swap via checkpoint slots, dirty page flush, retired block reuse
+- **WAL (Write-Ahead Logging)**: Global WAL with LSNs, CRC32 checksums, change-vector logging, recovery replay
+- **MVCC/Transactions**: Global transaction state, snapshot isolation, version chains, commit/abort
 
-This repo evolves step by step. Check [PLAN.md](PLAN.md) to see where we are going (WiredTiger-inspired storage engine).
+### API
+- `collection("name")` with `insert_one`, `find_one`, `find`, `update_one`, `delete_one`
+- Secondary indexes with range queries
+- MongoDB wire protocol server (works with `mongosh`)
+
+### Future Work
+- Background maintenance: space reuse, compaction, compression
 
 ## Source Layout
 
