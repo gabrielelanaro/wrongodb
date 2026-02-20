@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use super::snapshot::Snapshot;
-use super::transaction::{IsolationLevel, Transaction};
+use super::transaction::Transaction;
 use super::{TxnId, TXN_NONE};
 
 #[derive(Debug)]
@@ -139,7 +139,7 @@ impl GlobalTxnState {
         let txn_id = self.allocate_txn_id();
         self.register_active(txn_id);
         let snapshot = self.take_snapshot(txn_id);
-        Transaction::new(txn_id, IsolationLevel::Snapshot, snapshot)
+        Transaction::new(txn_id, snapshot)
     }
 }
 

@@ -18,42 +18,23 @@ pub enum TxnState {
     Aborted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WriteOp {
-    Put,
-    Delete,
-}
-
-#[derive(Debug, Clone)]
-pub struct WriteRef {
-    #[allow(dead_code)]
-    pub key: Vec<u8>,
-    #[allow(dead_code)]
-    pub op: WriteOp,
-}
-
 #[derive(Debug)]
 pub struct Transaction {
     id: TxnId,
-    #[allow(dead_code)]
-    isolation: IsolationLevel,
     snapshot: Option<Snapshot>,
     read_ts: Option<Timestamp>,
     state: TxnState,
-    pub(crate) modifications: Vec<WriteRef>,
     /// Tables (URIs) that have been touched in this transaction
     pub(crate) touched_tables: HashSet<String>,
 }
 
 impl Transaction {
-    pub(crate) fn new(id: TxnId, isolation: IsolationLevel, snapshot: Snapshot) -> Self {
+    pub(crate) fn new(id: TxnId, snapshot: Snapshot) -> Self {
         Self {
             id,
-            isolation,
             snapshot: Some(snapshot),
             read_ts: None,
             state: TxnState::Active,
-            modifications: Vec::new(),
             touched_tables: HashSet::new(),
         }
     }
@@ -78,14 +59,6 @@ impl Transaction {
 
     pub fn state(&self) -> TxnState {
         self.state
-    }
-
-    /// Track a write operation for this transaction.
-    pub fn track_write(&mut self, key: &[u8], op: WriteOp) {
-        self.modifications.push(WriteRef {
-            key: key.to_vec(),
-            op,
-        });
     }
 
     /// Commit the transaction.
@@ -121,9 +94,6 @@ impl Transaction {
         match self.state {
             TxnState::Active => {
                 self.state = TxnState::Aborted;
-
-                // Clear modifications
-                self.modifications.clear();
 
                 // Mark as aborted and unregister from active transactions
                 if self.id != TXN_NONE {

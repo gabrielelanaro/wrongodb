@@ -52,11 +52,6 @@ impl MvccState {
         (chains_cleaned, updates_removed, chains_dropped)
     }
 
-    #[allow(dead_code)]
-    pub fn chain_count(&self) -> usize {
-        self.chains.len()
-    }
-
     pub fn keys_in_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Vec<Vec<u8>> {
         let mut keys: Vec<Vec<u8>> = self.chains.keys().cloned().collect();
         if start.is_some() || end.is_some() {

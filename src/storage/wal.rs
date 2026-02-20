@@ -925,13 +925,6 @@ impl GlobalWal {
         db_dir.as_ref().join(GLOBAL_WAL_FILE_NAME)
     }
 
-    #[allow(dead_code)]
-    pub fn create<P: AsRef<Path>>(db_dir: P) -> Result<Self, WrongoDBError> {
-        let path = Self::path_for_db(db_dir);
-        let file = WalFile::create(path)?;
-        Ok(Self { file })
-    }
-
     pub fn open_or_create<P: AsRef<Path>>(db_dir: P) -> Result<Self, WrongoDBError> {
         let path = Self::path_for_db(db_dir);
         let file = if path.exists() {
@@ -1014,7 +1007,7 @@ mod tests {
     #[test]
     fn create_log_and_read() {
         let dir = tempdir().unwrap();
-        let mut wal = GlobalWal::create(dir.path()).unwrap();
+        let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
 
         wal.log_put("users.main.wt", b"k1", b"v1", 1).unwrap();
         wal.log_txn_commit(1, 1).unwrap();

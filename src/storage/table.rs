@@ -219,7 +219,6 @@ impl Table {
             .get(&self.store_name, &mut self.btree, key, txn_id)
     }
 
-    #[allow(dead_code)]
     pub fn run_gc(&mut self) -> (usize, usize, usize) {
         let (chains, updates, dropped) =
             self.transaction_manager.run_gc_for_store(&self.store_name);
