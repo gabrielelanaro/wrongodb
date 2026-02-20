@@ -1,14 +1,13 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 
 use crate::api::cursor::{Cursor, CursorKind};
 use crate::api::data_handle_cache::DataHandleCache;
 use crate::core::errors::StorageError;
 use crate::storage::table::Table;
-use crate::storage::wal::GlobalWal;
-use crate::txn::{GlobalTxnState, Transaction};
+use crate::txn::{Transaction, TxnManager};
 use crate::WrongoDBError;
 
 struct SessionTxnContext {
@@ -18,9 +17,7 @@ struct SessionTxnContext {
 pub struct Session {
     cache: Arc<DataHandleCache>,
     base_path: PathBuf,
-    wal_enabled: bool,
-    global_wal: Option<Arc<Mutex<GlobalWal>>>,
-    global_txn: Arc<GlobalTxnState>,
+    txn_manager: Arc<TxnManager>,
     txn: Option<SessionTxnContext>,
 }
 
@@ -28,16 +25,12 @@ impl Session {
     pub(crate) fn new(
         cache: Arc<DataHandleCache>,
         base_path: PathBuf,
-        wal_enabled: bool,
-        global_wal: Option<Arc<Mutex<GlobalWal>>>,
-        global_txn: Arc<GlobalTxnState>,
+        txn_manager: Arc<TxnManager>,
     ) -> Self {
         Self {
             cache,
             base_path,
-            wal_enabled,
-            global_wal,
-            global_txn,
+            txn_manager,
             txn: None,
         }
     }
@@ -55,13 +48,9 @@ impl Session {
         mark_touched: bool,
     ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
         let uri = format!("table:{}", collection);
-        let table = self.cache.get_or_open_primary(
-            &uri,
-            collection,
-            &self.base_path,
-            self.wal_enabled,
-            self.global_txn.clone(),
-        )?;
+        let table = self
+            .cache
+            .get_or_open_primary(&uri, collection, &self.base_path)?;
         if mark_touched {
             self.mark_table_touched(&uri);
         }
@@ -139,7 +128,7 @@ impl Session {
         if self.txn.is_some() {
             return Err(WrongoDBError::TransactionAlreadyActive);
         }
-        let txn = self.global_txn.begin_snapshot_txn();
+        let txn = self.txn_manager.begin_snapshot_txn();
         self.txn = Some(SessionTxnContext { txn });
         Ok(SessionTxn::new(self))
     }
@@ -159,26 +148,7 @@ impl Session {
         for table in handles {
             table.write().checkpoint()?;
         }
-
-        if self.wal_enabled && self.global_txn.has_active_transactions() {
-            return Ok(());
-        }
-
-        if self.wal_enabled {
-            if let Some(global_wal) = self.global_wal.as_ref() {
-                let mut wal = global_wal.lock();
-                if self.global_txn.has_active_transactions() {
-                    return Ok(());
-                }
-
-                let checkpoint_lsn = wal.log_checkpoint()?;
-                wal.set_checkpoint_lsn(checkpoint_lsn)?;
-                wal.sync()?;
-                wal.truncate_to_checkpoint()?;
-            }
-        }
-
-        Ok(())
+        self.txn_manager.checkpoint_global_wal()
     }
 }
 
@@ -208,15 +178,9 @@ impl<'a> SessionTxn<'a> {
             let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
             let txn_id = ctx.txn.id();
 
-            if self.session.wal_enabled {
-                if let Some(global_wal) = self.session.global_wal.as_ref() {
-                    let mut wal = global_wal.lock();
-                    wal.log_txn_commit(txn_id, txn_id)?;
-                    wal.sync()?;
-                }
-            }
+            self.session.txn_manager.log_txn_commit(txn_id, txn_id)?;
 
-            ctx.txn.commit(&self.session.global_txn)?;
+            ctx.txn.commit(self.session.txn_manager.global_txn())?;
 
             for uri in &touched_tables {
                 if !uri.starts_with("table:") {
@@ -244,14 +208,9 @@ impl<'a> SessionTxn<'a> {
             let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
             let txn_id = ctx.txn.id();
 
-            if self.session.wal_enabled {
-                if let Some(global_wal) = self.session.global_wal.as_ref() {
-                    let mut wal = global_wal.lock();
-                    wal.log_txn_abort(txn_id)?;
-                }
-            }
+            self.session.txn_manager.log_txn_abort(txn_id)?;
 
-            ctx.txn.abort(&self.session.global_txn)?;
+            ctx.txn.abort(self.session.txn_manager.global_txn())?;
 
             for uri in &touched_tables {
                 if !uri.starts_with("table:") {
@@ -304,13 +263,8 @@ impl<'a> Drop for SessionTxn<'a> {
                 let touched_tables: Vec<String> =
                     ctx.txn.touched_tables().iter().cloned().collect();
                 let txn_id = ctx.txn.id();
-                if self.session.wal_enabled {
-                    if let Some(global_wal) = self.session.global_wal.as_ref() {
-                        let mut wal = global_wal.lock();
-                        let _ = wal.log_txn_abort(txn_id);
-                    }
-                }
-                let _ = ctx.txn.abort(&self.session.global_txn);
+                let _ = self.session.txn_manager.log_txn_abort(txn_id);
+                let _ = ctx.txn.abort(self.session.txn_manager.global_txn());
 
                 for uri in &touched_tables {
                     if !uri.starts_with("table:") {

@@ -1,23 +1,16 @@
 use std::path::Path;
-use std::sync::Arc;
-
-use parking_lot::Mutex;
 
 mod iter;
 mod layout;
-mod mvcc;
 pub mod page;
 mod page_cache;
 mod pager;
 
 pub use iter::BTreeRangeIter;
 
-use self::mvcc::MvccState;
 use self::pager::{BTreeStore, PageRead, Pager, PinnedPageMut};
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::block::file::NONE_BLOCK_ID;
-use crate::storage::wal::GlobalWal;
-use crate::txn::{GlobalTxnState, TxnId, UpdateType, TXN_NONE};
 use layout::{
     build_internal_page, internal_entries, leaf_entries, map_internal_err, map_leaf_err, page_type,
     split_internal_entries, split_leaf_entries, PageType,
@@ -50,67 +43,23 @@ type KeyValueIter<'a> = BTreeRangeIter<'a>;
 #[derive(Debug)]
 pub struct BTree {
     pager: Box<dyn BTreeStore>,
-    global_wal: Option<Arc<Mutex<GlobalWal>>>,
-    wal_enabled: bool,
-    wal_store_name: String,
-    mvcc: MvccState,
 }
 
 impl BTree {
-    /// Create a new BTree with WAL enabled or disabled.
-    pub fn create<P: AsRef<Path>>(
-        path: P,
-        page_size: usize,
-        wal_enabled: bool,
-        global_txn: Arc<GlobalTxnState>,
-    ) -> Result<Self, WrongoDBError> {
-        Self::create_with_global_wal(path, page_size, wal_enabled, global_txn, None)
-    }
-
-    pub(crate) fn create_with_global_wal<P: AsRef<Path>>(
-        path: P,
-        page_size: usize,
-        wal_enabled: bool,
-        global_txn: Arc<GlobalTxnState>,
-        global_wal: Option<Arc<Mutex<GlobalWal>>>,
-    ) -> Result<Self, WrongoDBError> {
+    pub fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
         let mut pager = Pager::create(path.as_ref(), page_size)?;
         init_root_if_missing(&mut pager)?;
         pager.checkpoint()?;
-        let store_name = store_name_from_path(path.as_ref())?;
         Ok(Self {
             pager: Box::new(pager),
-            global_wal,
-            wal_enabled,
-            wal_store_name: store_name,
-            mvcc: MvccState::new(global_txn),
         })
     }
 
-    /// Open an existing BTree with WAL enabled or disabled.
-    pub fn open<P: AsRef<Path>>(
-        path: P,
-        wal_enabled: bool,
-        global_txn: Arc<GlobalTxnState>,
-    ) -> Result<Self, WrongoDBError> {
-        Self::open_with_global_wal(path, wal_enabled, global_txn, None)
-    }
-
-    pub(crate) fn open_with_global_wal<P: AsRef<Path>>(
-        path: P,
-        wal_enabled: bool,
-        global_txn: Arc<GlobalTxnState>,
-        global_wal: Option<Arc<Mutex<GlobalWal>>>,
-    ) -> Result<Self, WrongoDBError> {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, WrongoDBError> {
         let mut pager = Pager::open(path.as_ref())?;
         init_root_if_missing(&mut pager)?;
-        let store_name = store_name_from_path(path.as_ref())?;
         Ok(Self {
             pager: Box::new(pager),
-            global_wal,
-            wal_enabled,
-            wal_store_name: store_name,
-            mvcc: MvccState::new(global_txn),
         })
     }
 
@@ -170,16 +119,6 @@ impl BTree {
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
-        self.put_with_txn(key, value, TXN_NONE, true)
-    }
-
-    pub(crate) fn put_with_txn(
-        &mut self,
-        key: &[u8],
-        value: &[u8],
-        txn_id: TxnId,
-        log_wal: bool,
-    ) -> Result<(), WrongoDBError> {
         let root = self.pager.root_page_id();
         if root == NONE_BLOCK_ID {
             return Err(StorageError("btree missing root".into()).into());
@@ -201,10 +140,6 @@ impl BTree {
             self.pager.set_root_page_id(new_root_id)?;
         } else {
             self.pager.set_root_page_id(result.new_node_id)?;
-        }
-
-        if log_wal {
-            self.log_wal_put(key, value, txn_id)?;
         }
 
         Ok(())
@@ -238,21 +173,10 @@ impl BTree {
             self.pager.set_root_page_id(result.new_node_id)?;
         }
 
-        self.log_wal_put(key, value, TXN_NONE)?;
-
         Ok(true)
     }
 
     pub fn delete(&mut self, key: &[u8]) -> Result<bool, WrongoDBError> {
-        self.delete_with_txn(key, TXN_NONE, true)
-    }
-
-    pub(crate) fn delete_with_txn(
-        &mut self,
-        key: &[u8],
-        txn_id: TxnId,
-        log_wal: bool,
-    ) -> Result<bool, WrongoDBError> {
         let root = self.pager.root_page_id();
         if root == NONE_BLOCK_ID {
             return Ok(false);
@@ -260,10 +184,6 @@ impl BTree {
 
         let result = self.delete_recursive(root, key)?;
         self.pager.set_root_page_id(result.new_node_id)?;
-
-        if log_wal {
-            self.log_wal_delete(key, txn_id)?;
-        }
 
         Ok(result.deleted)
     }
@@ -278,19 +198,10 @@ impl BTree {
     /// After this returns, all previous mutations are durable.
     ///
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
-        self.materialize_committed_updates()?;
         let root = self.pager.checkpoint_prepare();
         self.pager.checkpoint_flush_data()?;
         self.pager.checkpoint_commit(root)?;
         Ok(())
-    }
-
-    /// Run garbage collection on MVCC update chains.
-    ///
-    /// Removes obsolete updates that are no longer visible to any active transaction.
-    /// Returns (chains_cleaned, updates_removed, chains_dropped).
-    pub fn run_gc(&mut self) -> (usize, usize, usize) {
-        self.mvcc.run_gc()
     }
 
     pub fn range(
@@ -303,30 +214,6 @@ impl BTree {
             return Ok(BTreeRangeIter::empty());
         }
         BTreeRangeIter::new(self.pager.as_mut() as &mut dyn PageRead, root, start, end)
-    }
-
-    pub fn mvcc_keys_in_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Vec<Vec<u8>> {
-        self.mvcc.keys_in_range(start, end)
-    }
-
-    pub fn materialize_committed_updates(&mut self) -> Result<(), WrongoDBError> {
-        let entries = self.mvcc.latest_committed_entries();
-        if entries.is_empty() {
-            return Ok(());
-        }
-
-        for (key, update_type, data) in entries {
-            match update_type {
-                UpdateType::Standard => {
-                    self.put_with_txn(&key, &data, TXN_NONE, false)?;
-                }
-                UpdateType::Tombstone => {
-                    let _ = self.delete_with_txn(&key, TXN_NONE, false)?;
-                }
-                UpdateType::Reserve => {}
-            }
-        }
-        Ok(())
     }
 
     /// Delete a key from the subtree rooted at `node_id`.
@@ -463,39 +350,6 @@ impl BTree {
                 Err(err)
             }
         }
-    }
-
-    pub(super) fn log_wal_put(
-        &mut self,
-        key: &[u8],
-        value: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        if !self.wal_enabled {
-            return Ok(());
-        }
-        if let Some(global_wal) = self.global_wal.as_ref() {
-            global_wal
-                .lock()
-                .log_put(&self.wal_store_name, key, value, txn_id)?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn log_wal_delete(
-        &mut self,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        if !self.wal_enabled {
-            return Ok(());
-        }
-        if let Some(global_wal) = self.global_wal.as_ref() {
-            global_wal
-                .lock()
-                .log_delete(&self.wal_store_name, key, txn_id)?;
-        }
-        Ok(())
     }
 
     /// Insert into a leaf page, splitting if it overflows.
@@ -680,17 +534,6 @@ fn init_root_if_missing(pager: &mut dyn BTreeStore) -> Result<(), WrongoDBError>
     let leaf_id = pager.write_new_page(&leaf_bytes)?;
     pager.set_root_page_id(leaf_id)?;
     Ok(())
-}
-
-fn store_name_from_path(path: &Path) -> Result<String, WrongoDBError> {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return Err(StorageError(format!(
-            "unable to determine store name for path: {}",
-            path.display()
-        ))
-        .into());
-    };
-    Ok(name.to_string())
 }
 
 fn upsert_entry(entries: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &[u8], value: &[u8]) {

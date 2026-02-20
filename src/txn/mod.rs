@@ -2,6 +2,7 @@ pub mod global_txn;
 pub mod recovery;
 pub mod snapshot;
 pub mod transaction;
+pub mod txn_manager;
 pub mod update;
 
 pub use global_txn::GlobalTxnState;
@@ -9,6 +10,7 @@ pub use global_txn::GlobalTxnState;
 pub use recovery::RecoveryTxnTable;
 #[allow(unused_imports)]
 pub use transaction::{IsolationLevel, Transaction, TxnState, WriteOp, WriteRef};
+pub use txn_manager::TxnManager;
 pub use update::{Update, UpdateChain, UpdateType};
 
 pub type TxnId = u64;

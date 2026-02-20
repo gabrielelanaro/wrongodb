@@ -1,5 +1,29 @@
 # Decisions
 
+## 2026-02-20: Detangle BTree from MVCC and WAL via TxnManager
+
+**Decision**
+- Make `BTree` a pure physical key/value structure:
+  - remove `global_txn`, `global_wal`, and internal MVCC state
+  - remove transaction-aware write APIs and WAL logging hooks from `BTree`
+  - keep only physical byte operations (`put/get/delete/range/checkpoint`)
+- Move MVCC chain storage to `src/storage/mvcc.rs` as `MvccState`.
+- Introduce `src/txn/txn_manager.rs` with `TxnManager` as the coordinator for:
+  - global transaction state (`GlobalTxnState`)
+  - optional global WAL handle (`GlobalWal`)
+  - per-store MVCC chain maps
+- Route `Table` read/write/commit-abort bookkeeping and checkpoint materialization through `TxnManager`.
+- Replay crash recovery through `Table::put_recovery` / `Table::delete_recovery` instead of writing to `BTree` directly in `Connection`.
+
+**Why**
+- Remove circular coupling where the physical access method carried transaction visibility and durability logic.
+- Centralize MVCC + WAL semantics in one place so `Table` and `Session` can delegate policy while `BTree` stays format/IO-focused.
+- Align recovery path with logical table APIs rather than bypassing them.
+
+**Notes**
+- Transactional writes continue to stage in MVCC chains and become physically materialized at checkpoint/recovery boundaries.
+- Non-transactional writes continue to write directly to `BTree` and can still be WAL-logged by `TxnManager`.
+
 ## 2026-02-07: Wire-protocol A/B benchmark gate for concurrency refactor decisions
 
 **Decision**

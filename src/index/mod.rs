@@ -5,13 +5,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::storage::table::Table;
-use crate::storage::wal::GlobalWal;
-use crate::txn::{GlobalTxnState, TxnId, TXN_NONE};
+use crate::txn::{TxnId, TxnManager, TXN_NONE};
 use crate::{Document, WrongoDBError};
 
 pub use key::{decode_index_id, encode_index_key, encode_range_bounds, encode_scalar_prefix};
@@ -72,12 +71,10 @@ impl PersistentIndex {
     /// Open an existing index BTree or create a new one if it doesn't exist.
     fn open_or_create(
         path: &Path,
-        wal_enabled: bool,
-        global_txn: Arc<GlobalTxnState>,
-        global_wal: Option<Arc<Mutex<GlobalWal>>>,
+        txn_manager: Arc<TxnManager>,
     ) -> Result<(Self, bool), WrongoDBError> {
         let existed = path.exists();
-        let table = Table::open_or_create_index(path, wal_enabled, global_txn, global_wal)?;
+        let table = Table::open_or_create_index(path, txn_manager)?;
         Ok((
             Self {
                 table: Arc::new(RwLock::new(table)),
@@ -174,18 +171,14 @@ pub struct IndexCatalog {
     db_dir: PathBuf,
     definitions: BTreeMap<String, IndexDefinition>,
     indexes: BTreeMap<String, PersistentIndex>,
-    wal_enabled: bool,
-    global_txn: Arc<GlobalTxnState>,
-    global_wal: Option<Arc<Mutex<GlobalWal>>>,
+    txn_manager: Arc<TxnManager>,
 }
 
 impl IndexCatalog {
     pub fn load_or_init<P: AsRef<Path>>(
         collection: &str,
         db_dir: P,
-        wal_enabled: bool,
-        global_txn: Arc<GlobalTxnState>,
-        global_wal: Option<Arc<Mutex<GlobalWal>>>,
+        txn_manager: Arc<TxnManager>,
     ) -> Result<Self, WrongoDBError> {
         let db_dir = db_dir.as_ref().to_path_buf();
         let meta_path = db_dir.join(format!("{}.meta.json", collection));
@@ -244,12 +237,8 @@ impl IndexCatalog {
         let mut indexes = BTreeMap::new();
         for def in definitions.values() {
             let index_path = db_dir.join(&def.source);
-            let (index, _created) = PersistentIndex::open_or_create(
-                &index_path,
-                wal_enabled,
-                global_txn.clone(),
-                global_wal.clone(),
-            )?;
+            let (index, _created) =
+                PersistentIndex::open_or_create(&index_path, txn_manager.clone())?;
             indexes.insert(def.name.clone(), index);
         }
 
@@ -258,27 +247,21 @@ impl IndexCatalog {
             db_dir,
             definitions,
             indexes,
-            wal_enabled,
-            global_txn,
-            global_wal,
+            txn_manager,
         })
     }
 
     pub fn empty<P: AsRef<Path>>(
         collection: &str,
         db_dir: P,
-        wal_enabled: bool,
-        global_txn: Arc<GlobalTxnState>,
-        global_wal: Option<Arc<Mutex<GlobalWal>>>,
+        txn_manager: Arc<TxnManager>,
     ) -> Self {
         Self {
             collection: collection.to_string(),
             db_dir: db_dir.as_ref().to_path_buf(),
             definitions: BTreeMap::new(),
             indexes: BTreeMap::new(),
-            wal_enabled,
-            global_txn,
-            global_wal,
+            txn_manager,
         }
     }
 
@@ -330,12 +313,8 @@ impl IndexCatalog {
         let index_path = self.db_dir.join(&index_file);
         let index_exists = index_path.exists();
 
-        let (mut index, created) = PersistentIndex::open_or_create(
-            &index_path,
-            self.wal_enabled,
-            self.global_txn.clone(),
-            self.global_wal.clone(),
-        )?;
+        let (mut index, created) =
+            PersistentIndex::open_or_create(&index_path, self.txn_manager.clone())?;
 
         if !index_exists || created {
             let field = &columns[0];
@@ -498,10 +477,13 @@ mod tests {
     fn persistent_index_insert_and_lookup() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("test.idx.wt");
-        let global_txn = Arc::new(GlobalTxnState::new());
+        let txn_manager = Arc::new(TxnManager::new(
+            false,
+            Arc::new(crate::txn::GlobalTxnState::new()),
+            None,
+        ));
 
-        let (mut index, _created) =
-            PersistentIndex::open_or_create(&path, false, global_txn, None).unwrap();
+        let (mut index, _created) = PersistentIndex::open_or_create(&path, txn_manager).unwrap();
 
         index.insert(&json!("alice"), &json!("id1")).unwrap();
         index.insert(&json!("bob"), &json!("id2")).unwrap();
@@ -520,8 +502,12 @@ mod tests {
     #[test]
     fn index_catalog_add_and_lookup() {
         let tmp = tempdir().unwrap();
-        let global_txn = Arc::new(GlobalTxnState::new());
-        let mut catalog = IndexCatalog::empty("coll", tmp.path(), false, global_txn, None);
+        let txn_manager = Arc::new(TxnManager::new(
+            false,
+            Arc::new(crate::txn::GlobalTxnState::new()),
+            None,
+        ));
+        let mut catalog = IndexCatalog::empty("coll", tmp.path(), txn_manager);
 
         let docs: Vec<Document> = vec![
             serde_json::from_value(json!({"_id": "a1", "name": "alice"})).unwrap(),

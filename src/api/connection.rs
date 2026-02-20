@@ -9,11 +9,9 @@ use parking_lot::Mutex;
 use crate::api::data_handle_cache::DataHandleCache;
 use crate::api::session::Session;
 use crate::core::errors::StorageError;
-use crate::storage::btree::BTree;
+use crate::storage::table::Table;
 use crate::storage::wal::{GlobalWal, RecoveryError, WalReader, WalRecord};
-use crate::txn::GlobalTxnState;
-use crate::txn::RecoveryTxnTable;
-use crate::txn::TXN_NONE;
+use crate::txn::{GlobalTxnState, RecoveryTxnTable, TxnManager};
 use crate::WrongoDBError;
 
 pub struct ConnectionConfig {
@@ -41,8 +39,7 @@ pub struct Connection {
     base_path: PathBuf,
     dhandle_cache: Arc<DataHandleCache>,
     wal_enabled: bool,
-    global_wal: Option<Arc<Mutex<GlobalWal>>>,
-    global_txn: Arc<GlobalTxnState>,
+    txn_manager: Arc<TxnManager>,
 }
 
 impl fmt::Debug for Connection {
@@ -64,18 +61,19 @@ impl Connection {
         let global_txn = Arc::new(GlobalTxnState::new());
         let global_wal = if config.wal_enabled {
             warn_legacy_per_table_wal_files(&base_path);
-            recover_global_wal(&base_path, global_txn.clone())?;
+            let recovery_manager = Arc::new(TxnManager::new(false, global_txn.clone(), None));
+            recover_global_wal(&base_path, recovery_manager)?;
             Some(Arc::new(Mutex::new(GlobalWal::open_or_create(&base_path)?)))
         } else {
             None
         };
+        let txn_manager = Arc::new(TxnManager::new(config.wal_enabled, global_txn, global_wal));
 
         Ok(Self {
             base_path,
-            dhandle_cache: Arc::new(DataHandleCache::new(global_wal.clone())),
+            dhandle_cache: Arc::new(DataHandleCache::new(txn_manager.clone())),
             wal_enabled: config.wal_enabled,
-            global_wal,
-            global_txn,
+            txn_manager,
         })
     }
 
@@ -83,9 +81,7 @@ impl Connection {
         Session::new(
             self.dhandle_cache.clone(),
             self.base_path.clone(),
-            self.wal_enabled,
-            self.global_wal.clone(),
-            self.global_txn.clone(),
+            self.txn_manager.clone(),
         )
     }
 
@@ -121,10 +117,7 @@ fn warn_legacy_per_table_wal_files(base_path: &Path) {
     }
 }
 
-fn recover_global_wal(
-    base_path: &Path,
-    global_txn: Arc<GlobalTxnState>,
-) -> Result<(), WrongoDBError> {
+fn recover_global_wal(base_path: &Path, txn_manager: Arc<TxnManager>) -> Result<(), WrongoDBError> {
     let wal_path = GlobalWal::path_for_db(base_path);
     if !wal_path.exists() {
         return Ok(());
@@ -152,7 +145,7 @@ fn recover_global_wal(
         }
     };
 
-    let mut replay_trees: HashMap<String, BTree> = HashMap::new();
+    let mut replay_tables: HashMap<String, Table> = HashMap::new();
 
     while let Some(record) = next_recovery_record(&mut second_pass_reader, "pass 2")? {
         if !txn_table.should_apply(&record) {
@@ -166,31 +159,31 @@ fn recover_global_wal(
                 value,
                 ..
             } => {
-                ensure_replay_tree(
-                    &mut replay_trees,
+                ensure_replay_table(
+                    &mut replay_tables,
                     base_path,
                     &store_name,
-                    global_txn.clone(),
+                    txn_manager.clone(),
                 )?
-                .put_with_txn(&key, &value, TXN_NONE, false)?;
+                .put_recovery(&key, &value)?;
             }
             WalRecord::Delete {
                 store_name, key, ..
             } => {
-                ensure_replay_tree(
-                    &mut replay_trees,
+                ensure_replay_table(
+                    &mut replay_tables,
                     base_path,
                     &store_name,
-                    global_txn.clone(),
+                    txn_manager.clone(),
                 )?
-                .delete_with_txn(&key, TXN_NONE, false)?;
+                .delete_recovery(&key)?;
             }
             WalRecord::Checkpoint | WalRecord::TxnCommit { .. } | WalRecord::TxnAbort { .. } => {}
         }
     }
 
-    for tree in replay_trees.values_mut() {
-        tree.checkpoint()?;
+    for table in replay_tables.values_mut() {
+        table.checkpoint()?;
     }
 
     Ok(())
@@ -216,23 +209,19 @@ fn next_recovery_record(
     }
 }
 
-fn ensure_replay_tree<'a>(
-    replay_trees: &'a mut HashMap<String, BTree>,
+fn ensure_replay_table<'a>(
+    replay_tables: &'a mut HashMap<String, Table>,
     base_path: &Path,
     store_name: &str,
-    global_txn: Arc<GlobalTxnState>,
-) -> Result<&'a mut BTree, WrongoDBError> {
-    if !replay_trees.contains_key(store_name) {
+    txn_manager: Arc<TxnManager>,
+) -> Result<&'a mut Table, WrongoDBError> {
+    if !replay_tables.contains_key(store_name) {
         let store_path = base_path.join(store_name);
-        let tree = if store_path.exists() {
-            BTree::open_with_global_wal(&store_path, false, global_txn, None)?
-        } else {
-            BTree::create_with_global_wal(&store_path, 4096, false, global_txn, None)?
-        };
-        replay_trees.insert(store_name.to_string(), tree);
+        let table = Table::open_or_create_index(&store_path, txn_manager)?;
+        replay_tables.insert(store_name.to_string(), table);
     }
 
-    replay_trees
+    replay_tables
         .get_mut(store_name)
-        .ok_or_else(|| StorageError(format!("replay tree missing for store {store_name}")).into())
+        .ok_or_else(|| StorageError(format!("replay table missing for store {store_name}")).into())
 }

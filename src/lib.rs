@@ -23,7 +23,8 @@ pub use crate::storage::block::file::{BlockFile, CheckpointSlot, FileHeader, NON
 pub use crate::storage::btree::page::{InternalPage, InternalPageError, LeafPage, LeafPageError};
 pub use crate::storage::btree::BTree;
 pub use crate::txn::{
-    GlobalTxnState, IsolationLevel, NonTransactional, ReadContext, Transaction, TxnId, TxnState,
+    GlobalTxnState, IsolationLevel, NonTransactional, ReadContext, Transaction, TxnId, TxnManager,
+    TxnState,
 };
 
 pub type Document = serde_json::Map<String, serde_json::Value>;
