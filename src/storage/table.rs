@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use crate::core::errors::StorageError;
 use crate::index::IndexCatalog;
+use crate::storage::block::file::NONE_BLOCK_ID;
+use crate::storage::btree::page::LeafPage;
 use crate::storage::btree::BTree;
+use crate::storage::page_store::{PageStore, PageStoreTrait};
 use crate::storage::wal::WalSink;
 use crate::txn::transaction_manager::TransactionManager;
 use crate::txn::TxnId;
@@ -235,11 +238,30 @@ impl Table {
 
     fn open_or_create_btree(path: &Path) -> Result<BTree, WrongoDBError> {
         if path.exists() {
-            BTree::open(path)
+            let mut page_store = PageStore::open(path)?;
+            init_root_if_missing(&mut page_store)?;
+            Ok(BTree::new(Box::new(page_store)))
         } else {
-            BTree::create(path, 4096)
+            let mut page_store = PageStore::create(path, 4096)?;
+            init_root_if_missing(&mut page_store)?;
+            page_store.checkpoint()?;
+            Ok(BTree::new(Box::new(page_store)))
         }
     }
+}
+
+fn init_root_if_missing(page_store: &mut dyn PageStoreTrait) -> Result<(), WrongoDBError> {
+    if page_store.root_page_id() != NONE_BLOCK_ID {
+        return Ok(());
+    }
+
+    let payload_len = page_store.page_payload_len();
+    let mut leaf_bytes = vec![0u8; payload_len];
+    LeafPage::init(&mut leaf_bytes)
+        .map_err(|e| StorageError(format!("init root leaf failed: {e}")))?;
+    let leaf_id = page_store.write_new_page(&leaf_bytes)?;
+    page_store.set_root_page_id(leaf_id)?;
+    Ok(())
 }
 
 fn store_name_from_path(path: &Path) -> Result<String, WrongoDBError> {

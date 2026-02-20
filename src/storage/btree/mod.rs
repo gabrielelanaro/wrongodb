@@ -1,16 +1,11 @@
-use std::path::Path;
-
 mod iter;
 mod layout;
 pub mod page;
-mod page_cache;
-mod pager;
 
 pub use iter::BTreeRangeIter;
 
-use self::pager::{BTreeStore, PageRead, Pager, PinnedPageMut};
 use crate::core::errors::{StorageError, WrongoDBError};
-use crate::storage::block::file::NONE_BLOCK_ID;
+use crate::storage::page_store::{PageRead, PageStoreTrait, PinnedPageMut};
 use layout::{
     build_internal_page, internal_entries, leaf_entries, map_internal_err, map_leaf_err, page_type,
     split_internal_entries, split_leaf_entries, PageType,
@@ -40,32 +35,22 @@ type InternalEntries = (u64, Vec<KeyChildId>);
 /// Iterator over key-value pairs, yielding results or errors
 type KeyValueIter<'a> = BTreeRangeIter<'a>;
 
+const NONE_PAGE_ID: u64 = 0;
+
 #[derive(Debug)]
 pub struct BTree {
-    pager: Box<dyn BTreeStore>,
+    pager: Box<dyn PageStoreTrait>,
 }
 
 impl BTree {
-    pub fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
-        let mut pager = Pager::create(path.as_ref(), page_size)?;
-        init_root_if_missing(&mut pager)?;
-        pager.checkpoint()?;
-        Ok(Self {
-            pager: Box::new(pager),
-        })
-    }
-
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, WrongoDBError> {
-        let mut pager = Pager::open(path.as_ref())?;
-        init_root_if_missing(&mut pager)?;
-        Ok(Self {
-            pager: Box::new(pager),
-        })
+    /// Create a BTree with the given page-store implementation.
+    pub fn new(store: Box<dyn PageStoreTrait>) -> Self {
+        Self { pager: store }
     }
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, WrongoDBError> {
         let mut node_id = self.pager.root_page_id();
-        if node_id == NONE_BLOCK_ID {
+        if node_id == NONE_PAGE_ID {
             return Ok(None);
         }
 
@@ -120,7 +105,7 @@ impl BTree {
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
         let root = self.pager.root_page_id();
-        if root == NONE_BLOCK_ID {
+        if root == NONE_PAGE_ID {
             return Err(StorageError("btree missing root".into()).into());
         }
 
@@ -147,7 +132,7 @@ impl BTree {
 
     pub fn insert_unique(&mut self, key: &[u8], value: &[u8]) -> Result<bool, WrongoDBError> {
         let root = self.pager.root_page_id();
-        if root == NONE_BLOCK_ID {
+        if root == NONE_PAGE_ID {
             return Err(StorageError("btree missing root".into()).into());
         }
 
@@ -178,7 +163,7 @@ impl BTree {
 
     pub fn delete(&mut self, key: &[u8]) -> Result<bool, WrongoDBError> {
         let root = self.pager.root_page_id();
-        if root == NONE_BLOCK_ID {
+        if root == NONE_PAGE_ID {
             return Ok(false);
         }
 
@@ -210,7 +195,7 @@ impl BTree {
         end: Option<&[u8]>,
     ) -> Result<KeyValueIter<'_>, WrongoDBError> {
         let root = self.pager.root_page_id();
-        if root == NONE_BLOCK_ID {
+        if root == NONE_PAGE_ID {
             return Ok(BTreeRangeIter::empty());
         }
         BTreeRangeIter::new(self.pager.as_mut() as &mut dyn PageRead, root, start, end)
@@ -522,18 +507,6 @@ struct InsertResult {
 struct DeleteResult {
     new_node_id: u64,
     deleted: bool,
-}
-
-fn init_root_if_missing(pager: &mut dyn BTreeStore) -> Result<(), WrongoDBError> {
-    if pager.root_page_id() != NONE_BLOCK_ID {
-        return Ok(());
-    }
-    let payload_len = pager.page_payload_len();
-    let mut leaf_bytes = vec![0u8; payload_len];
-    LeafPage::init(&mut leaf_bytes).map_err(map_leaf_err)?;
-    let leaf_id = pager.write_new_page(&leaf_bytes)?;
-    pager.set_root_page_id(leaf_id)?;
-    Ok(())
 }
 
 fn upsert_entry(entries: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &[u8], value: &[u8]) {

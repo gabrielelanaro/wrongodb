@@ -1,7 +1,38 @@
 //! Tests for iterator safety under eviction and pinning edge cases.
 
+use std::path::Path;
+
 use tempfile::tempdir;
-use wrongodb::BTree;
+use wrongodb::{
+    BTree, LeafPage, PageStore, PageStoreTrait, StorageError, WrongoDBError, NONE_BLOCK_ID,
+};
+
+fn create_tree(path: &Path, page_size: usize) -> Result<BTree, WrongoDBError> {
+    let mut page_store = PageStore::create(path, page_size)?;
+    init_root_if_missing(&mut page_store)?;
+    page_store.checkpoint()?;
+    Ok(BTree::new(Box::new(page_store)))
+}
+
+fn open_tree(path: &Path) -> Result<BTree, WrongoDBError> {
+    let mut page_store = PageStore::open(path)?;
+    init_root_if_missing(&mut page_store)?;
+    Ok(BTree::new(Box::new(page_store)))
+}
+
+fn init_root_if_missing(page_store: &mut dyn PageStoreTrait) -> Result<(), WrongoDBError> {
+    if page_store.root_page_id() != NONE_BLOCK_ID {
+        return Ok(());
+    }
+
+    let payload_len = page_store.page_payload_len();
+    let mut leaf_bytes = vec![0u8; payload_len];
+    LeafPage::init(&mut leaf_bytes)
+        .map_err(|e| StorageError(format!("init root leaf failed: {e}")))?;
+    let leaf_id = page_store.write_new_page(&leaf_bytes)?;
+    page_store.set_root_page_id(leaf_id)?;
+    Ok(())
+}
 
 /// Test that eviction during range scan doesn't break iteration.
 ///
@@ -15,7 +46,7 @@ fn range_scan_works_with_cache_eviction() {
     let path = tmp.path().join("iterator-scan.db");
 
     // Create a B+tree with a small cache
-    let mut btree = BTree::create(&path, 256).unwrap();
+    let mut btree = create_tree(&path, 256).unwrap();
 
     // Insert many keys - more than can fit in cache
     let num_keys = 100;
@@ -48,7 +79,7 @@ fn checkpoint_fails_with_dirty_pinned_page() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("dirty-pinned.db");
 
-    let mut btree = BTree::create(&path, 256).unwrap();
+    let mut btree = create_tree(&path, 256).unwrap();
     btree.put(b"key1", b"value1").unwrap();
 
     // Get a mutable pinned page by starting an insert
@@ -61,7 +92,7 @@ fn checkpoint_fails_with_dirty_pinned_page() {
 
     // Verify the key is still there after reopen
     drop(btree);
-    let mut btree2 = BTree::open(&path).unwrap();
+    let mut btree2 = open_tree(&path).unwrap();
     assert_eq!(btree2.get(b"key1").unwrap(), Some(b"value1".to_vec()));
 }
 
@@ -75,7 +106,7 @@ fn loading_page_with_full_pinned_cache_fails() {
     let path = tmp.path().join("full-pinned.db");
 
     // Create with a tiny cache
-    let mut btree = BTree::create(&path, 256).unwrap();
+    let mut btree = create_tree(&path, 256).unwrap();
 
     // Insert one key
     btree.put(b"key1", b"value1").unwrap();
@@ -99,7 +130,7 @@ fn range_scan_handles_empty_ranges() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("range-empty.db");
 
-    let mut btree = BTree::create(&path, 256).unwrap();
+    let mut btree = create_tree(&path, 256).unwrap();
 
     // Empty range scan
     let iter = btree.range(Some(b"z"), Some(b"zz")).unwrap();
@@ -121,13 +152,13 @@ fn checkpoint_stages_basic() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("checkpoint-stages.db");
 
-    let mut btree = BTree::create(&path, 256).unwrap();
+    let mut btree = create_tree(&path, 256).unwrap();
     btree.put(b"key1", b"value1").unwrap();
     btree.checkpoint().unwrap();
 
     // Verify after reopen
     drop(btree);
-    let mut btree2 = BTree::open(&path).unwrap();
+    let mut btree2 = open_tree(&path).unwrap();
     assert_eq!(btree2.get(b"key1").unwrap(), Some(b"value1".to_vec()));
 }
 
@@ -140,7 +171,7 @@ fn checkpoint_scheduling_with_updates() {
     // Note: This test validates the scheduling API is present.
     // Actual checkpoint triggering is the caller's responsibility.
 
-    let mut btree = BTree::create(&path, 256).unwrap();
+    let mut btree = create_tree(&path, 256).unwrap();
 
     // Do some updates
     for i in 0..10 {
@@ -153,7 +184,7 @@ fn checkpoint_scheduling_with_updates() {
 
     // Verify data is persisted
     drop(btree);
-    let mut btree2 = BTree::open(&path).unwrap();
+    let mut btree2 = open_tree(&path).unwrap();
     for i in 0..10 {
         let key = format!("key{}", i);
         assert_eq!(btree2.get(key.as_bytes()).unwrap(), Some(b"value".to_vec()));

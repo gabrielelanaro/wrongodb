@@ -1,8 +1,8 @@
 use crate::core::errors::{StorageError, WrongoDBError};
+use crate::storage::page_store::{PageRead, PinnedPage};
 
 use super::layout::{map_internal_err, map_leaf_err, page_type, PageType};
 use super::page::{InternalPage, InternalPageError, LeafPage, LeafPageError};
-use super::pager::{PageRead, PinnedPage};
 
 #[derive(Debug, Clone, Copy)]
 struct CursorFrame {
@@ -47,7 +47,7 @@ pub struct BTreeRangeIter<'a> {
 }
 
 fn missing_pager() -> WrongoDBError {
-    StorageError("range iterator has no backing Pager".into()).into()
+    StorageError("range iterator has no backing page store".into()).into()
 }
 
 impl<'a> BTreeRangeIter<'a> {

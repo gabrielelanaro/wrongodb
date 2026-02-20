@@ -5,87 +5,20 @@ use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::block::file::{BlockFile, NONE_BLOCK_ID};
 
 use super::page_cache::{PageCache, PageCacheConfig};
+use super::traits::{CheckpointStore, PageRead, PageWrite, RootStore};
+use super::types::{PinnedPage, PinnedPageMut};
 
+/// File-backed page store implementation.
 #[derive(Debug)]
-pub(super) struct Pager {
+pub struct PageStore {
     bf: BlockFile,
     working_root: u64,
     working_pages: HashSet<u64>,
     cache: PageCache,
 }
 
-#[derive(Debug)]
-pub(super) struct PinnedPage {
-    page_id: u64,
-    payload: Vec<u8>,
-}
-
-impl PinnedPage {
-    pub(super) fn page_id(&self) -> u64 {
-        self.page_id
-    }
-
-    pub(super) fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-
-    pub(super) fn payload_mut(&mut self) -> &mut [u8] {
-        &mut self.payload
-    }
-}
-
-#[derive(Debug)]
-pub(super) struct PinnedPageMut {
-    page_id: u64,
-    payload: Vec<u8>,
-    original_page_id: Option<u64>,
-}
-
-impl PinnedPageMut {
-    pub(super) fn page_id(&self) -> u64 {
-        self.page_id
-    }
-
-    pub(super) fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-
-    pub(super) fn payload_mut(&mut self) -> &mut [u8] {
-        &mut self.payload
-    }
-}
-
-pub(super) trait PageRead: std::fmt::Debug + Send + Sync {
-    fn page_payload_len(&self) -> usize;
-    fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError>;
-    fn unpin_page(&mut self, page_id: u64);
-}
-
-pub(super) trait PageWrite: std::fmt::Debug + Send + Sync {
-    fn pin_page_mut(&mut self, page_id: u64) -> Result<PinnedPageMut, WrongoDBError>;
-    fn unpin_page_mut_commit(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError>;
-    fn unpin_page_mut_abort(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError>;
-    fn write_new_page(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError>;
-}
-
-pub(super) trait RootStore: std::fmt::Debug + Send + Sync {
-    fn root_page_id(&self) -> u64;
-    fn set_root_page_id(&mut self, root_page_id: u64) -> Result<(), WrongoDBError>;
-}
-
-pub(super) trait CheckpointStore: std::fmt::Debug + Send + Sync {
-    fn checkpoint_prepare(&self) -> u64;
-    fn checkpoint_flush_data(&mut self) -> Result<(), WrongoDBError>;
-    fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError>;
-    fn sync_all(&mut self) -> Result<(), WrongoDBError>;
-}
-
-pub(super) trait BTreeStore: PageRead + PageWrite + RootStore + CheckpointStore {}
-
-impl<T> BTreeStore for T where T: PageRead + PageWrite + RootStore + CheckpointStore {}
-
-impl Pager {
-    pub(super) fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
+impl PageStore {
+    pub fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
         let mut bf = BlockFile::create(&path, page_size)?;
         if let Ok(raw) = std::env::var("WRONGO_PREALLOC_PAGES") {
             if !raw.is_empty() {
@@ -105,7 +38,7 @@ impl Pager {
         })
     }
 
-    pub(super) fn open<P: AsRef<Path>>(path: P) -> Result<Self, WrongoDBError> {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, WrongoDBError> {
         let bf = BlockFile::open(&path)?;
         let working_root = bf.root_block_id();
 
@@ -117,15 +50,22 @@ impl Pager {
         })
     }
 
-    pub(super) fn page_payload_len(&self) -> usize {
+    pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
+        let root = self.checkpoint_prepare();
+        self.checkpoint_flush_data()?;
+        self.checkpoint_commit(root)?;
+        Ok(())
+    }
+
+    fn page_payload_len(&self) -> usize {
         self.bf.page_payload_len()
     }
 
-    pub(super) fn root_page_id(&self) -> u64 {
+    fn root_page_id(&self) -> u64 {
         self.working_root
     }
 
-    pub(super) fn set_root_page_id(&mut self, root_page_id: u64) -> Result<(), WrongoDBError> {
+    fn set_root_page_id(&mut self, root_page_id: u64) -> Result<(), WrongoDBError> {
         self.working_root = root_page_id;
         Ok(())
     }
@@ -154,19 +94,12 @@ impl Pager {
         Ok(())
     }
 
-    pub(super) fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
-        let root = self.checkpoint_prepare();
-        self.checkpoint_flush_data()?;
-        self.checkpoint_commit(root)?;
-        Ok(())
-    }
-
-    pub(super) fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError> {
+    fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError> {
         let payload = self.load_page_and_pin(page_id)?;
         Ok(PinnedPage { page_id, payload })
     }
 
-    pub(super) fn pin_page_mut(&mut self, page_id: u64) -> Result<PinnedPageMut, WrongoDBError> {
+    fn pin_page_mut(&mut self, page_id: u64) -> Result<PinnedPageMut, WrongoDBError> {
         if self.working_pages.contains(&page_id) {
             let payload = self.load_page_and_pin(page_id)?;
             return Ok(PinnedPageMut {
@@ -189,16 +122,13 @@ impl Pager {
         })
     }
 
-    pub(super) fn unpin_page(&mut self, _page_id: u64) {
-        if let Err(err) = self.cache.unpin(_page_id) {
+    fn unpin_page(&mut self, page_id: u64) {
+        if let Err(err) = self.cache.unpin(page_id) {
             debug_assert!(false, "{err}");
         }
     }
 
-    pub(super) fn unpin_page_mut_commit(
-        &mut self,
-        page: PinnedPageMut,
-    ) -> Result<(), WrongoDBError> {
+    fn unpin_page_mut_commit(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError> {
         let PinnedPageMut {
             page_id,
             payload,
@@ -220,10 +150,7 @@ impl Pager {
         Ok(())
     }
 
-    pub(super) fn unpin_page_mut_abort(
-        &mut self,
-        page: PinnedPageMut,
-    ) -> Result<(), WrongoDBError> {
+    fn unpin_page_mut_abort(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError> {
         let PinnedPageMut {
             page_id,
             original_page_id,
@@ -253,7 +180,7 @@ impl Pager {
         Ok(())
     }
 
-    pub(super) fn write_page(&mut self, page_id: u64, payload: &[u8]) -> Result<(), WrongoDBError> {
+    fn write_page(&mut self, page_id: u64, payload: &[u8]) -> Result<(), WrongoDBError> {
         self.bf.write_block(page_id, payload)
     }
 
@@ -261,14 +188,14 @@ impl Pager {
         self.bf.allocate_block()
     }
 
-    pub(super) fn write_new_page(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError> {
+    fn write_new_page(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError> {
         let page_id = self.allocate_page()?;
         self.working_pages.insert(page_id);
         self.write_page(page_id, payload)?;
         Ok(page_id)
     }
 
-    pub(super) fn retire_page(&mut self, page_id: u64) -> Result<(), WrongoDBError> {
+    fn retire_page(&mut self, page_id: u64) -> Result<(), WrongoDBError> {
         if page_id == NONE_BLOCK_ID {
             return Ok(());
         }
@@ -300,49 +227,49 @@ impl Pager {
     }
 }
 
-impl PageRead for Pager {
+impl PageRead for PageStore {
     fn page_payload_len(&self) -> usize {
-        Pager::page_payload_len(self)
+        PageStore::page_payload_len(self)
     }
 
     fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError> {
-        Pager::pin_page(self, page_id)
+        PageStore::pin_page(self, page_id)
     }
 
     fn unpin_page(&mut self, page_id: u64) {
-        Pager::unpin_page(self, page_id);
+        PageStore::unpin_page(self, page_id);
     }
 }
 
-impl PageWrite for Pager {
+impl PageWrite for PageStore {
     fn pin_page_mut(&mut self, page_id: u64) -> Result<PinnedPageMut, WrongoDBError> {
-        Pager::pin_page_mut(self, page_id)
+        PageStore::pin_page_mut(self, page_id)
     }
 
     fn unpin_page_mut_commit(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError> {
-        Pager::unpin_page_mut_commit(self, page)
+        PageStore::unpin_page_mut_commit(self, page)
     }
 
     fn unpin_page_mut_abort(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError> {
-        Pager::unpin_page_mut_abort(self, page)
+        PageStore::unpin_page_mut_abort(self, page)
     }
 
     fn write_new_page(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError> {
-        Pager::write_new_page(self, payload)
+        PageStore::write_new_page(self, payload)
     }
 }
 
-impl RootStore for Pager {
+impl RootStore for PageStore {
     fn root_page_id(&self) -> u64 {
-        Pager::root_page_id(self)
+        PageStore::root_page_id(self)
     }
 
     fn set_root_page_id(&mut self, root_page_id: u64) -> Result<(), WrongoDBError> {
-        Pager::set_root_page_id(self, root_page_id)
+        PageStore::set_root_page_id(self, root_page_id)
     }
 }
 
-impl CheckpointStore for Pager {
+impl CheckpointStore for PageStore {
     fn checkpoint_prepare(&self) -> u64 {
         self.working_root
     }
@@ -367,8 +294,10 @@ impl CheckpointStore for Pager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::tempdir;
+
+    use super::*;
+    use crate::storage::page_store::page_cache::{PageCache, PageCacheConfig};
 
     #[test]
     fn lru_skips_pinned_pages() {
@@ -397,68 +326,68 @@ mod tests {
     #[test]
     fn eviction_writes_back_dirty_page() {
         let tmp = tempdir().unwrap();
-        let path = tmp.path().join("pager-cache.db");
-        let mut pager = Pager::create(&path, 256).unwrap();
-        let payload_len = pager.page_payload_len();
-        let page_id = pager.write_new_page(&vec![0u8; payload_len]).unwrap();
+        let path = tmp.path().join("page-store-cache.db");
+        let mut page_store = PageStore::create(&path, 256).unwrap();
+        let payload_len = page_store.page_payload_len();
+        let page_id = page_store.write_new_page(&vec![0u8; payload_len]).unwrap();
 
-        pager.cache = PageCache::new(PageCacheConfig { capacity_pages: 1 });
+        page_store.cache = PageCache::new(PageCacheConfig { capacity_pages: 1 });
 
         let payload = vec![7u8; payload_len];
-        let entry = pager.cache.insert(page_id, payload.clone());
+        let entry = page_store.cache.insert(page_id, payload.clone());
         entry.dirty = true;
 
-        pager.evict_cache_if_full().unwrap();
-        assert!(!pager.cache.contains(page_id));
+        page_store.evict_cache_if_full().unwrap();
+        assert!(!page_store.cache.contains(page_id));
 
-        let read = pager.bf.read_block(page_id, true).unwrap();
+        let read = page_store.bf.read_block(page_id, true).unwrap();
         assert_eq!(read, payload);
     }
 
     #[test]
     fn flush_rejects_dirty_pinned_page() {
         let tmp = tempdir().unwrap();
-        let path = tmp.path().join("pager-cache-flush.db");
-        let mut pager = Pager::create(&path, 256).unwrap();
-        let payload_len = pager.page_payload_len();
-        let page_id = pager.write_new_page(&vec![0u8; payload_len]).unwrap();
+        let path = tmp.path().join("page-store-cache-flush.db");
+        let mut page_store = PageStore::create(&path, 256).unwrap();
+        let payload_len = page_store.page_payload_len();
+        let page_id = page_store.write_new_page(&vec![0u8; payload_len]).unwrap();
 
-        let entry = pager.cache.insert(page_id, vec![9u8; payload_len]);
+        let entry = page_store.cache.insert(page_id, vec![9u8; payload_len]);
         entry.dirty = true;
         entry.pin_count = 1;
 
-        let err = pager.flush_cache().unwrap_err();
+        let err = page_store.flush_cache().unwrap_err();
         assert!(err.to_string().contains("cannot flush dirty pinned page"));
     }
 
     #[test]
     fn pin_blocks_eviction_until_unpinned() {
         let tmp = tempdir().unwrap();
-        let path = tmp.path().join("pager-cache-pin.db");
-        let mut pager = Pager::create(&path, 256).unwrap();
-        let payload_len = pager.page_payload_len();
+        let path = tmp.path().join("page-store-cache-pin.db");
+        let mut page_store = PageStore::create(&path, 256).unwrap();
+        let payload_len = page_store.page_payload_len();
 
-        let page1 = pager.write_new_page(&vec![1u8; payload_len]).unwrap();
-        let page2 = pager.write_new_page(&vec![2u8; payload_len]).unwrap();
+        let page1 = page_store.write_new_page(&vec![1u8; payload_len]).unwrap();
+        let page2 = page_store.write_new_page(&vec![2u8; payload_len]).unwrap();
 
-        pager.cache = PageCache::new(PageCacheConfig { capacity_pages: 1 });
+        page_store.cache = PageCache::new(PageCacheConfig { capacity_pages: 1 });
 
-        let pinned = pager.pin_page(page1).unwrap();
-        assert!(pager.cache.contains(page1));
+        let pinned = page_store.pin_page(page1).unwrap();
+        assert!(page_store.cache.contains(page1));
 
-        let err = pager.pin_page(page2).unwrap_err();
+        let err = page_store.pin_page(page2).unwrap_err();
         assert!(matches!(err, WrongoDBError::Storage(_)));
 
-        pager.unpin_page(pinned.page_id());
+        page_store.unpin_page(pinned.page_id());
 
-        let pinned2 = pager.pin_page(page2).unwrap();
-        assert!(pager.cache.contains(page2));
-        assert!(!pager.cache.contains(page1));
+        let pinned2 = page_store.pin_page(page2).unwrap();
+        assert!(page_store.cache.contains(page2));
+        assert!(!page_store.cache.contains(page1));
 
-        pager.unpin_page(pinned2.page_id());
+        page_store.unpin_page(pinned2.page_id());
 
-        let pinned2_again = pager.pin_page(page2).unwrap();
-        assert!(pager.cache.contains(page2));
-        pager.unpin_page(pinned2_again.page_id());
+        let pinned2_again = page_store.pin_page(page2).unwrap();
+        assert!(page_store.cache.contains(page2));
+        page_store.unpin_page(pinned2_again.page_id());
     }
 }

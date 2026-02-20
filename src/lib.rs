@@ -23,6 +23,7 @@ pub use crate::server::start_server;
 pub use crate::storage::block::file::{BlockFile, CheckpointSlot, FileHeader, NONE_BLOCK_ID};
 pub use crate::storage::btree::page::{InternalPage, InternalPageError, LeafPage, LeafPageError};
 pub use crate::storage::btree::BTree;
+pub use crate::storage::page_store::{PageStore, PageStoreTrait};
 pub use crate::txn::{
     GlobalTxnState, IsolationLevel, NonTransactional, ReadContext, Transaction, TxnId, TxnState,
 };

@@ -1,5 +1,30 @@
 # Decisions
 
+## 2026-02-20: Make BTree pure by splitting out PageStore module
+
+**Decision**
+- Move page-storage abstractions and implementation out of `src/storage/btree/` into a new
+  `src/storage/page_store/` module:
+  - `traits.rs`: `PageRead`, `PageWrite`, `RootStore`, `CheckpointStore`, composed as `PageStore`
+  - `types.rs`: `PinnedPage`, `PinnedPageMut`
+  - `store.rs`: file-backed `PageStore` implementation (formerly `Pager`)
+  - `page_cache.rs`: page-cache implementation reused by the store
+- Remove path-based constructors from `BTree` (`create/open`) and keep a single constructor:
+  `BTree::new(Box<dyn PageStoreTrait>)`.
+- Move root initialization responsibility out of `BTree` and into callers (`Table` and test helpers).
+
+**Why**
+- Keep `BTree` focused on tree algorithms and page-format logic, independent from storage backend
+  wiring and filesystem path concerns.
+- Make page storage reusable by other structures (non-BTree users) and easier to mock in tests.
+- Clarify architecture boundaries: callers construct storage, then inject it into tree logic.
+
+**Notes**
+- `Table::open_or_create_btree` now constructs the file-backed page store and performs root
+  bootstrapping/checkpoint for newly-created files.
+- Integration tests that previously used `BTree::create/open` now construct trees via
+  `PageStore + BTree::new`.
+
 ## 2026-02-20: Detangle BTree from MVCC and WAL via TxnManager
 
 **Decision**
