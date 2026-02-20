@@ -5,19 +5,25 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::storage::table::Table;
-use crate::txn::TxnManager;
+use crate::storage::wal::WalSink;
+use crate::txn::transaction_manager::TransactionManager;
 use crate::WrongoDBError;
 
 pub struct DataHandleCache {
     handles: RwLock<HashMap<String, Arc<RwLock<Table>>>>,
-    txn_manager: Arc<TxnManager>,
+    transaction_manager: Arc<TransactionManager>,
+    wal_sink: Option<Arc<dyn WalSink>>,
 }
 
 impl DataHandleCache {
-    pub fn new(txn_manager: Arc<TxnManager>) -> Self {
+    pub fn new(
+        transaction_manager: Arc<TransactionManager>,
+        wal_sink: Option<Arc<dyn WalSink>>,
+    ) -> Self {
         Self {
             handles: RwLock::new(HashMap::new()),
-            txn_manager,
+            transaction_manager,
+            wal_sink,
         }
     }
 
@@ -39,7 +45,8 @@ impl DataHandleCache {
         let table = Arc::new(RwLock::new(Table::open_or_create_primary(
             collection,
             db_dir,
-            self.txn_manager.clone(),
+            self.transaction_manager.clone(),
+            self.wal_sink.clone(),
         )?));
         handles.insert(uri.to_string(), table.clone());
         Ok(table)

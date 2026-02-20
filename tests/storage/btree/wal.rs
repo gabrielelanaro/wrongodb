@@ -81,3 +81,35 @@ fn collection_checkpoint_truncates_global_wal() {
     let after = fs::metadata(&wal_path).unwrap().len();
     assert!(after <= 512);
 }
+
+#[test]
+fn checkpoint_does_not_truncate_wal_while_transaction_is_active() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("db");
+
+    let db = WrongoDB::open(&db_path).unwrap();
+    let coll = db.collection("test");
+    let mut writer = db.open_session();
+    let mut checkpointer = db.open_session();
+
+    coll.insert_one(&mut checkpointer, json!({"_id": 1, "v": "seed"}))
+        .unwrap();
+
+    let wal_path = global_wal_path(&db_path);
+    let before = fs::metadata(&wal_path).unwrap().len();
+    assert!(before > 512);
+
+    let mut txn = writer.transaction().unwrap();
+    coll.insert_one(txn.session_mut(), json!({"_id": 2, "v": "pending"}))
+        .unwrap();
+
+    coll.checkpoint(&mut checkpointer).unwrap();
+    let after_skip = fs::metadata(&wal_path).unwrap().len();
+    assert!(after_skip >= before);
+
+    txn.commit().unwrap();
+    coll.checkpoint(&mut checkpointer).unwrap();
+
+    let after_truncate = fs::metadata(&wal_path).unwrap().len();
+    assert!(after_truncate <= 512);
+}

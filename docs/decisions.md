@@ -24,6 +24,33 @@
 - Transactional writes continue to stage in MVCC chains and become physically materialized at checkpoint/recovery boundaries.
 - Non-transactional writes continue to write directly to `BTree` and can still be WAL-logged by `TxnManager`.
 
+## 2026-02-20: Hard split between TransactionManager and RecoveryManager
+
+**Decision**
+- Rename `TxnManager` to `TransactionManager` and scope it to transaction visibility + MVCC only:
+  - begin/commit/abort transaction state
+  - per-store MVCC update chains
+  - snapshot reads, commit/abort marking, GC, checkpoint materialization
+- Introduce `src/recovery/manager.rs` with `RecoveryManager` as the only owner of:
+  - global WAL open/init
+  - WAL record append (`Put/Delete/TxnCommit/TxnAbort`)
+  - commit-marker sync semantics
+  - checkpoint marker + WAL truncation gating
+  - startup two-pass WAL replay
+- Introduce `WalSink` in `src/storage/wal.rs` so `Table` logs writes without depending on recovery internals.
+- Move `RecoveryTxnTable` from `src/txn/` to `src/recovery/txn_table.rs`.
+- Remove `TxnManager` from public crate exports.
+
+**Why**
+- Enforce a strict ownership boundary: transaction policy and recovery/durability policy evolve independently.
+- Eliminate the previous mixed responsibility class that carried both MVCC state and WAL lifecycle.
+- Keep table write paths explicit: log through a durability interface, then apply through transaction state.
+
+**Notes**
+- Recovery replay applies directly through `Table::put_recovery/delete_recovery` and is WAL-sink free (no re-log during replay).
+- Commit ordering remains unchanged: WAL commit marker + fsync before visibility flip.
+- Checkpoint WAL truncation remains blocked while any transaction is active.
+
 ## 2026-02-07: Wire-protocol A/B benchmark gate for concurrency refactor decisions
 
 **Decision**

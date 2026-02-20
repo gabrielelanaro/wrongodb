@@ -148,6 +148,32 @@ fn recovery_handles_corrupted_global_wal_tail() {
 }
 
 #[test]
+fn recovery_replay_does_not_append_new_wal_records() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("db");
+
+    {
+        let db = WrongoDB::open(&db_path).unwrap();
+        let coll = db.collection("test");
+        let mut session = db.open_session();
+
+        coll.insert_one(&mut session, json!({"_id": 1, "v": "a"}))
+            .unwrap();
+    }
+
+    let wal_path = global_wal_path(&db_path);
+    let before = std::fs::metadata(&wal_path).unwrap().len();
+    assert!(before > 512);
+
+    {
+        let _db = WrongoDB::open(&db_path).unwrap();
+    }
+
+    let after = std::fs::metadata(&wal_path).unwrap().len();
+    assert_eq!(after, before);
+}
+
+#[test]
 fn wal_disabled_still_requires_checkpoint_for_durability() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("db");

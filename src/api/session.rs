@@ -6,8 +6,10 @@ use parking_lot::RwLock;
 use crate::api::cursor::{Cursor, CursorKind};
 use crate::api::data_handle_cache::DataHandleCache;
 use crate::core::errors::StorageError;
+use crate::recovery::RecoveryManager;
 use crate::storage::table::Table;
-use crate::txn::{Transaction, TxnManager};
+use crate::txn::transaction_manager::TransactionManager;
+use crate::txn::Transaction;
 use crate::WrongoDBError;
 
 struct SessionTxnContext {
@@ -17,7 +19,8 @@ struct SessionTxnContext {
 pub struct Session {
     cache: Arc<DataHandleCache>,
     base_path: PathBuf,
-    txn_manager: Arc<TxnManager>,
+    transaction_manager: Arc<TransactionManager>,
+    recovery_manager: Arc<RecoveryManager>,
     txn: Option<SessionTxnContext>,
 }
 
@@ -25,12 +28,14 @@ impl Session {
     pub(crate) fn new(
         cache: Arc<DataHandleCache>,
         base_path: PathBuf,
-        txn_manager: Arc<TxnManager>,
+        transaction_manager: Arc<TransactionManager>,
+        recovery_manager: Arc<RecoveryManager>,
     ) -> Self {
         Self {
             cache,
             base_path,
-            txn_manager,
+            transaction_manager,
+            recovery_manager,
             txn: None,
         }
     }
@@ -128,7 +133,7 @@ impl Session {
         if self.txn.is_some() {
             return Err(WrongoDBError::TransactionAlreadyActive);
         }
-        let txn = self.txn_manager.begin_snapshot_txn();
+        let txn = self.transaction_manager.begin_snapshot_txn();
         self.txn = Some(SessionTxnContext { txn });
         Ok(SessionTxn::new(self))
     }
@@ -148,7 +153,8 @@ impl Session {
         for table in handles {
             table.write().checkpoint()?;
         }
-        self.txn_manager.checkpoint_global_wal()
+        self.recovery_manager
+            .checkpoint_and_truncate_if_safe(self.transaction_manager.has_active_transactions())
     }
 }
 
@@ -178,9 +184,13 @@ impl<'a> SessionTxn<'a> {
             let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
             let txn_id = ctx.txn.id();
 
-            self.session.txn_manager.log_txn_commit(txn_id, txn_id)?;
+            self.session
+                .recovery_manager
+                .log_txn_commit_sync(txn_id, txn_id)?;
 
-            ctx.txn.commit(self.session.txn_manager.global_txn())?;
+            self.session
+                .transaction_manager
+                .commit_txn_state(&mut ctx.txn)?;
 
             for uri in &touched_tables {
                 if !uri.starts_with("table:") {
@@ -208,9 +218,11 @@ impl<'a> SessionTxn<'a> {
             let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
             let txn_id = ctx.txn.id();
 
-            self.session.txn_manager.log_txn_abort(txn_id)?;
+            self.session.recovery_manager.log_txn_abort(txn_id)?;
 
-            ctx.txn.abort(self.session.txn_manager.global_txn())?;
+            self.session
+                .transaction_manager
+                .abort_txn_state(&mut ctx.txn)?;
 
             for uri in &touched_tables {
                 if !uri.starts_with("table:") {
@@ -263,8 +275,11 @@ impl<'a> Drop for SessionTxn<'a> {
                 let touched_tables: Vec<String> =
                     ctx.txn.touched_tables().iter().cloned().collect();
                 let txn_id = ctx.txn.id();
-                let _ = self.session.txn_manager.log_txn_abort(txn_id);
-                let _ = ctx.txn.abort(self.session.txn_manager.global_txn());
+                let _ = self.session.recovery_manager.log_txn_abort(txn_id);
+                let _ = self
+                    .session
+                    .transaction_manager
+                    .abort_txn_state(&mut ctx.txn);
 
                 for uri in &touched_tables {
                     if !uri.starts_with("table:") {

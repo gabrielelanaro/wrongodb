@@ -1,52 +1,44 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 
 use crate::core::errors::WrongoDBError;
 use crate::storage::btree::BTree;
 use crate::storage::mvcc::MvccState;
-use crate::storage::wal::GlobalWal;
 use crate::txn::{
-    GlobalTxnState, Transaction, TxnId, Update, UpdateType, TS_MAX, TS_NONE, TXN_ABORTED, TXN_NONE,
+    GlobalTxnState, Timestamp, Transaction, TxnId, Update, UpdateType, TS_MAX, TS_NONE,
+    TXN_ABORTED, TXN_NONE,
 };
 
 #[derive(Debug)]
-pub struct TxnManager {
+pub struct TransactionManager {
     global_txn: Arc<GlobalTxnState>,
-    global_wal: Option<Arc<Mutex<GlobalWal>>>,
-    wal_enabled: bool,
     stores: RwLock<HashMap<String, MvccState>>,
 }
 
-impl TxnManager {
-    pub fn new(
-        wal_enabled: bool,
-        global_txn: Arc<GlobalTxnState>,
-        global_wal: Option<Arc<Mutex<GlobalWal>>>,
-    ) -> Self {
+impl TransactionManager {
+    pub fn new(global_txn: Arc<GlobalTxnState>) -> Self {
         Self {
             global_txn,
-            global_wal,
-            wal_enabled,
             stores: RwLock::new(HashMap::new()),
         }
-    }
-
-    pub fn wal_enabled(&self) -> bool {
-        self.wal_enabled
     }
 
     pub fn has_active_transactions(&self) -> bool {
         self.global_txn.has_active_transactions()
     }
 
-    pub fn global_txn(&self) -> &GlobalTxnState {
-        &self.global_txn
-    }
-
     pub fn begin_snapshot_txn(&self) -> Transaction {
         self.global_txn.begin_snapshot_txn()
+    }
+
+    pub fn commit_txn_state(&self, txn: &mut Transaction) -> Result<Timestamp, WrongoDBError> {
+        txn.commit(&self.global_txn)
+    }
+
+    pub fn abort_txn_state(&self, txn: &mut Transaction) -> Result<(), WrongoDBError> {
+        txn.abort(&self.global_txn)
     }
 
     pub fn put(
@@ -57,8 +49,6 @@ impl TxnManager {
         value: &[u8],
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
-        self.log_wal_put(store_name, key, value, txn_id)?;
-
         if txn_id == TXN_NONE {
             btree.put(key, value)?;
             return Ok(());
@@ -86,8 +76,6 @@ impl TxnManager {
         key: &[u8],
         txn_id: TxnId,
     ) -> Result<bool, WrongoDBError> {
-        self.log_wal_delete(store_name, key, txn_id)?;
-
         if txn_id == TXN_NONE {
             return btree.delete(key);
         }
@@ -223,93 +211,5 @@ impl TxnManager {
             .get_mut(store_name)
             .map(MvccState::run_gc)
             .unwrap_or((0, 0, 0))
-    }
-
-    pub fn put_recovery(
-        &self,
-        btree: &mut BTree,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<(), WrongoDBError> {
-        btree.put(key, value)
-    }
-
-    pub fn delete_recovery(&self, btree: &mut BTree, key: &[u8]) -> Result<(), WrongoDBError> {
-        let _ = btree.delete(key)?;
-        Ok(())
-    }
-
-    pub fn log_txn_commit(&self, txn_id: TxnId, commit_ts: TxnId) -> Result<(), WrongoDBError> {
-        if !self.wal_enabled {
-            return Ok(());
-        }
-        if let Some(global_wal) = self.global_wal.as_ref() {
-            let mut wal = global_wal.lock();
-            wal.log_txn_commit(txn_id, commit_ts)?;
-            wal.sync()?;
-        }
-        Ok(())
-    }
-
-    pub fn log_txn_abort(&self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        if !self.wal_enabled {
-            return Ok(());
-        }
-        if let Some(global_wal) = self.global_wal.as_ref() {
-            let mut wal = global_wal.lock();
-            wal.log_txn_abort(txn_id)?;
-        }
-        Ok(())
-    }
-
-    pub fn checkpoint_global_wal(&self) -> Result<(), WrongoDBError> {
-        if !self.wal_enabled || self.global_txn.has_active_transactions() {
-            return Ok(());
-        }
-
-        if let Some(global_wal) = self.global_wal.as_ref() {
-            let mut wal = global_wal.lock();
-            if self.global_txn.has_active_transactions() {
-                return Ok(());
-            }
-
-            let checkpoint_lsn = wal.log_checkpoint()?;
-            wal.set_checkpoint_lsn(checkpoint_lsn)?;
-            wal.sync()?;
-            wal.truncate_to_checkpoint()?;
-        }
-
-        Ok(())
-    }
-
-    fn log_wal_put(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        value: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        if !self.wal_enabled {
-            return Ok(());
-        }
-        if let Some(global_wal) = self.global_wal.as_ref() {
-            global_wal.lock().log_put(store_name, key, value, txn_id)?;
-        }
-        Ok(())
-    }
-
-    fn log_wal_delete(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        if !self.wal_enabled {
-            return Ok(());
-        }
-        if let Some(global_wal) = self.global_wal.as_ref() {
-            global_wal.lock().log_delete(store_name, key, txn_id)?;
-        }
-        Ok(())
     }
 }
