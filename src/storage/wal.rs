@@ -30,11 +30,11 @@ const GLOBAL_WAL_FILE_NAME: &str = "global.wal";
 /// WAL file magic bytes (8 bytes)
 const WAL_MAGIC: &[u8; 8] = b"WALG001\0";
 /// WAL file format version
-const WAL_VERSION: u16 = 1;
+const WAL_VERSION: u16 = 2;
 /// WAL file header size (512 bytes)
 const WAL_HEADER_SIZE: usize = 512;
-/// WAL record header size (32 bytes)
-const RECORD_HEADER_SIZE: usize = 32;
+/// WAL record header size (42 bytes)
+const RECORD_HEADER_SIZE: usize = 42;
 
 /// Log Sequence Number - uniquely identifies a position in the WAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -246,6 +246,9 @@ struct WalFileHeader {
     version: u16,
     last_lsn: Lsn,
     checkpoint_lsn: Lsn,
+    last_raft_index: u64,
+    snapshot_last_included_index: u64,
+    snapshot_last_included_term: u64,
     crc32: u32,
 }
 
@@ -256,6 +259,9 @@ impl WalFileHeader {
             version: WAL_VERSION,
             last_lsn: Lsn::new(0, 0),
             checkpoint_lsn: Lsn::new(0, 0),
+            last_raft_index: 0,
+            snapshot_last_included_index: 0,
+            snapshot_last_included_term: 0,
             crc32: 0,
         };
         header.crc32 = header.compute_crc32();
@@ -286,6 +292,15 @@ impl WalFileHeader {
         buf[cursor..cursor + 4].copy_from_slice(&self.checkpoint_lsn.file_id.to_le_bytes());
         cursor += 4;
         buf[cursor..cursor + 8].copy_from_slice(&self.checkpoint_lsn.offset.to_le_bytes());
+        cursor += 8;
+
+        buf[cursor..cursor + 8].copy_from_slice(&self.last_raft_index.to_le_bytes());
+        cursor += 8;
+
+        buf[cursor..cursor + 8].copy_from_slice(&self.snapshot_last_included_index.to_le_bytes());
+        cursor += 8;
+
+        buf[cursor..cursor + 8].copy_from_slice(&self.snapshot_last_included_term.to_le_bytes());
         cursor += 8;
 
         buf[cursor..cursor + 4].copy_from_slice(&self.crc32.to_le_bytes());
@@ -346,6 +361,27 @@ impl WalFileHeader {
         );
         cursor += 8;
 
+        let last_raft_index = u64::from_le_bytes(
+            data[cursor..cursor + 8]
+                .try_into()
+                .map_err(|_| StorageError("invalid last_raft_index".into()))?,
+        );
+        cursor += 8;
+
+        let snapshot_last_included_index = u64::from_le_bytes(
+            data[cursor..cursor + 8]
+                .try_into()
+                .map_err(|_| StorageError("invalid snapshot_last_included_index".into()))?,
+        );
+        cursor += 8;
+
+        let snapshot_last_included_term = u64::from_le_bytes(
+            data[cursor..cursor + 8]
+                .try_into()
+                .map_err(|_| StorageError("invalid snapshot_last_included_term".into()))?,
+        );
+        cursor += 8;
+
         let crc32 = u32::from_le_bytes(
             data[cursor..cursor + 4]
                 .try_into()
@@ -357,6 +393,9 @@ impl WalFileHeader {
             version,
             last_lsn: Lsn::new(last_lsn_file_id, last_lsn_offset),
             checkpoint_lsn: Lsn::new(checkpoint_lsn_file_id, checkpoint_lsn_offset),
+            last_raft_index,
+            snapshot_last_included_index,
+            snapshot_last_included_term,
             crc32,
         })
     }
@@ -371,6 +410,9 @@ impl WalFileHeader {
         hasher.update(&self.last_lsn.offset.to_le_bytes());
         hasher.update(&self.checkpoint_lsn.file_id.to_le_bytes());
         hasher.update(&self.checkpoint_lsn.offset.to_le_bytes());
+        hasher.update(&self.last_raft_index.to_le_bytes());
+        hasher.update(&self.snapshot_last_included_index.to_le_bytes());
+        hasher.update(&self.snapshot_last_included_term.to_le_bytes());
         hasher.finalize()
     }
 
@@ -380,11 +422,13 @@ impl WalFileHeader {
 }
 
 /// WAL record header - precedes each record in the WAL.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalRecordHeader {
     pub record_type: u8,
     pub flags: u8,
     pub payload_len: u16,
+    pub raft_term: u64,
+    pub raft_index: u64,
     pub lsn: Lsn,
     pub prev_lsn: Lsn,
     pub crc32: u32,
@@ -404,6 +448,12 @@ impl WalRecordHeader {
 
         // reserved
         cursor += 2;
+
+        buf[cursor..cursor + 8].copy_from_slice(&self.raft_term.to_le_bytes());
+        cursor += 8;
+
+        buf[cursor..cursor + 8].copy_from_slice(&self.raft_index.to_le_bytes());
+        cursor += 8;
 
         buf[cursor..cursor + 8].copy_from_slice(&self.lsn.offset.to_le_bytes());
         cursor += 8;
@@ -437,6 +487,20 @@ impl WalRecordHeader {
         // reserved
         cursor += 2;
 
+        let raft_term = u64::from_le_bytes(
+            data[cursor..cursor + 8]
+                .try_into()
+                .map_err(|_| StorageError("invalid raft term".into()))?,
+        );
+        cursor += 8;
+
+        let raft_index = u64::from_le_bytes(
+            data[cursor..cursor + 8]
+                .try_into()
+                .map_err(|_| StorageError("invalid raft index".into()))?,
+        );
+        cursor += 8;
+
         let lsn_offset = u64::from_le_bytes(
             data[cursor..cursor + 8]
                 .try_into()
@@ -461,6 +525,8 @@ impl WalRecordHeader {
             record_type,
             flags,
             payload_len,
+            raft_term,
+            raft_index,
             lsn: Lsn::new(0, lsn_offset),
             prev_lsn: Lsn::new(0, prev_lsn_offset),
             crc32,
@@ -476,6 +542,8 @@ struct WalFile {
     buffer_capacity: usize,
     last_lsn: Lsn,
     last_record_lsn: Lsn,
+    last_raft_index: u64,
+    last_record_raft_term: u64,
 }
 
 impl WalFile {
@@ -496,6 +564,8 @@ impl WalFile {
             buffer_capacity: Self::DEFAULT_BUFFER_CAPACITY,
             last_lsn: Lsn::new(0, WAL_HEADER_SIZE as u64),
             last_record_lsn: Lsn::new(0, 0),
+            last_raft_index: 0,
+            last_record_raft_term: 0,
         })
     }
 
@@ -511,7 +581,23 @@ impl WalFile {
             return Err(StorageError("WAL header CRC32 mismatch".into()).into());
         }
 
-        let (last_record_lsn, mut write_offset, truncate_reason) = scan_wal_tail(path)?;
+        let (
+            last_record_lsn,
+            scanned_last_raft_index,
+            scanned_last_raft_term,
+            mut write_offset,
+            truncate_reason,
+        ) = scan_wal_tail(path)?;
+        let last_raft_index = if scanned_last_raft_index == 0 {
+            header.last_raft_index
+        } else {
+            scanned_last_raft_index
+        };
+        let last_record_raft_term = if scanned_last_raft_index == 0 {
+            header.snapshot_last_included_term
+        } else {
+            scanned_last_raft_term
+        };
         let file_len = file.metadata()?.len();
         if write_offset > file_len {
             write_offset = file_len;
@@ -524,8 +610,9 @@ impl WalFile {
             file.set_len(write_offset)?;
         }
 
-        if header.last_lsn != last_record_lsn {
+        if header.last_lsn != last_record_lsn || header.last_raft_index != last_raft_index {
             header.last_lsn = last_record_lsn;
+            header.last_raft_index = last_raft_index;
             header.crc32 = header.compute_crc32();
             file.seek(SeekFrom::Start(0))?;
             file.write_all(&header.serialize())?;
@@ -540,6 +627,8 @@ impl WalFile {
             buffer_capacity: Self::DEFAULT_BUFFER_CAPACITY,
             last_lsn: Lsn::new(0, write_offset),
             last_record_lsn,
+            last_raft_index,
+            last_record_raft_term,
         })
     }
 
@@ -558,10 +647,18 @@ impl WalFile {
     fn truncate_to_checkpoint(&mut self) -> Result<(), WrongoDBError> {
         self.sync()?;
         self.file.set_len(WAL_HEADER_SIZE as u64)?;
+
+        if self.last_raft_index > 0 {
+            self.header.snapshot_last_included_index = self.last_raft_index;
+            self.header.snapshot_last_included_term = self.last_record_raft_term;
+        }
+
         self.last_lsn = Lsn::new(0, WAL_HEADER_SIZE as u64);
         self.last_record_lsn = Lsn::new(0, 0);
         self.header.last_lsn = Lsn::new(0, 0);
         self.header.checkpoint_lsn = Lsn::new(0, 0);
+        self.last_record_raft_term = self.header.snapshot_last_included_term;
+        self.header.last_raft_index = self.last_raft_index;
         self.header.crc32 = self.header.compute_crc32();
         let header_bytes = self.header.serialize();
         self.file.seek(SeekFrom::Start(0))?;
@@ -584,13 +681,17 @@ impl WalFile {
         key: &[u8],
         value: &[u8],
         txn_id: TxnId,
+        raft_term: u64,
     ) -> Result<Lsn, WrongoDBError> {
-        self.append_record(WalRecord::Put {
-            store_name: store_name.to_string(),
-            key: key.to_vec(),
-            value: value.to_vec(),
-            txn_id,
-        })
+        self.append_record(
+            WalRecord::Put {
+                store_name: store_name.to_string(),
+                key: key.to_vec(),
+                value: value.to_vec(),
+                txn_id,
+            },
+            raft_term,
+        )
     }
 
     fn log_delete(
@@ -598,34 +699,40 @@ impl WalFile {
         store_name: &str,
         key: &[u8],
         txn_id: TxnId,
+        raft_term: u64,
     ) -> Result<Lsn, WrongoDBError> {
-        self.append_record(WalRecord::Delete {
-            store_name: store_name.to_string(),
-            key: key.to_vec(),
-            txn_id,
-        })
+        self.append_record(
+            WalRecord::Delete {
+                store_name: store_name.to_string(),
+                key: key.to_vec(),
+                txn_id,
+            },
+            raft_term,
+        )
     }
 
     fn log_txn_commit(
         &mut self,
         txn_id: TxnId,
         commit_ts: Timestamp,
+        raft_term: u64,
     ) -> Result<Lsn, WrongoDBError> {
-        self.append_record(WalRecord::TxnCommit { txn_id, commit_ts })
+        self.append_record(WalRecord::TxnCommit { txn_id, commit_ts }, raft_term)
     }
 
-    fn log_txn_abort(&mut self, txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
-        self.append_record(WalRecord::TxnAbort { txn_id })
+    fn log_txn_abort(&mut self, txn_id: TxnId, raft_term: u64) -> Result<Lsn, WrongoDBError> {
+        self.append_record(WalRecord::TxnAbort { txn_id }, raft_term)
     }
 
-    fn log_checkpoint(&mut self) -> Result<Lsn, WrongoDBError> {
-        self.append_record(WalRecord::Checkpoint)
+    fn log_checkpoint(&mut self, raft_term: u64) -> Result<Lsn, WrongoDBError> {
+        self.append_record(WalRecord::Checkpoint, raft_term)
     }
 
-    fn append_record(&mut self, record: WalRecord) -> Result<Lsn, WrongoDBError> {
+    fn append_record(&mut self, record: WalRecord, raft_term: u64) -> Result<Lsn, WrongoDBError> {
         let payload = record.serialize_payload();
         let record_type = record.record_type() as u8;
         let payload_len = payload.len() as u16;
+        let raft_index = self.last_raft_index + 1;
 
         let lsn = self.last_lsn;
         let prev_lsn = self.last_record_lsn;
@@ -634,6 +741,8 @@ impl WalFile {
         hasher.update(&[record_type, 0]);
         hasher.update(&payload_len.to_le_bytes());
         hasher.update(&[0u8, 0u8]);
+        hasher.update(&raft_term.to_le_bytes());
+        hasher.update(&raft_index.to_le_bytes());
         hasher.update(&lsn.offset.to_le_bytes());
         hasher.update(&prev_lsn.offset.to_le_bytes());
         hasher.update(&payload);
@@ -643,6 +752,8 @@ impl WalFile {
             record_type,
             flags: 0,
             payload_len,
+            raft_term,
+            raft_index,
             lsn,
             prev_lsn,
             crc32,
@@ -657,7 +768,10 @@ impl WalFile {
             self.last_lsn.offset + record_size as u64,
         );
         self.last_record_lsn = lsn;
+        self.last_record_raft_term = raft_term;
+        self.last_raft_index = raft_index;
         self.header.last_lsn = lsn;
+        self.header.last_raft_index = raft_index;
 
         Ok(lsn)
     }
@@ -687,7 +801,7 @@ impl Drop for WalFile {
     }
 }
 
-fn scan_wal_tail(path: &Path) -> Result<(Lsn, u64, Option<String>), WrongoDBError> {
+fn scan_wal_tail(path: &Path) -> Result<(Lsn, u64, u64, u64, Option<String>), WrongoDBError> {
     let mut reader = WalReader::open(path).map_err(|e| {
         StorageError(format!(
             "failed to open WAL reader while scanning tail: {e}"
@@ -695,12 +809,16 @@ fn scan_wal_tail(path: &Path) -> Result<(Lsn, u64, Option<String>), WrongoDBErro
     })?;
 
     let mut last_record_lsn = Lsn::new(0, 0);
+    let mut last_raft_index = 0u64;
+    let mut last_raft_term = 0u64;
     let mut truncate_reason = None;
 
     let write_offset = loop {
         match reader.read_record() {
             Ok(Some((header, _record))) => {
                 last_record_lsn = header.lsn;
+                last_raft_index = header.raft_index;
+                last_raft_term = header.raft_term;
             }
             Ok(None) => {
                 break reader.current_offset;
@@ -720,7 +838,13 @@ fn scan_wal_tail(path: &Path) -> Result<(Lsn, u64, Option<String>), WrongoDBErro
         }
     };
 
-    Ok((last_record_lsn, write_offset, truncate_reason))
+    Ok((
+        last_record_lsn,
+        last_raft_index,
+        last_raft_term,
+        write_offset,
+        truncate_reason,
+    ))
 }
 
 /// Recovery-specific error type for WAL operations.
@@ -870,7 +994,7 @@ impl WalReader {
             return Ok(None);
         }
 
-        let crc_header_len = 1 + 1 + 2 + 2 + 8 + 8;
+        let crc_header_len = 1 + 1 + 2 + 2 + 8 + 8 + 8 + 8;
         let mut hasher = Hasher::new();
         hasher.update(&header_bytes[0..crc_header_len]);
         hasher.update(&payload);
@@ -941,8 +1065,9 @@ impl GlobalWal {
         key: &[u8],
         value: &[u8],
         txn_id: TxnId,
+        raft_term: u64,
     ) -> Result<Lsn, WrongoDBError> {
-        self.file.log_put(store_name, key, value, txn_id)
+        self.file.log_put(store_name, key, value, txn_id, raft_term)
     }
 
     pub fn log_delete(
@@ -950,24 +1075,26 @@ impl GlobalWal {
         store_name: &str,
         key: &[u8],
         txn_id: TxnId,
+        raft_term: u64,
     ) -> Result<Lsn, WrongoDBError> {
-        self.file.log_delete(store_name, key, txn_id)
+        self.file.log_delete(store_name, key, txn_id, raft_term)
     }
 
     pub fn log_txn_commit(
         &mut self,
         txn_id: TxnId,
         commit_ts: Timestamp,
+        raft_term: u64,
     ) -> Result<Lsn, WrongoDBError> {
-        self.file.log_txn_commit(txn_id, commit_ts)
+        self.file.log_txn_commit(txn_id, commit_ts, raft_term)
     }
 
-    pub fn log_txn_abort(&mut self, txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
-        self.file.log_txn_abort(txn_id)
+    pub fn log_txn_abort(&mut self, txn_id: TxnId, raft_term: u64) -> Result<Lsn, WrongoDBError> {
+        self.file.log_txn_abort(txn_id, raft_term)
     }
 
-    pub fn log_checkpoint(&mut self) -> Result<Lsn, WrongoDBError> {
-        self.file.log_checkpoint()
+    pub fn log_checkpoint(&mut self, raft_term: u64) -> Result<Lsn, WrongoDBError> {
+        self.file.log_checkpoint(raft_term)
     }
 
     pub fn set_checkpoint_lsn(&mut self, lsn: Lsn) -> Result<(), WrongoDBError> {
@@ -985,9 +1112,20 @@ impl GlobalWal {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{self, OpenOptions};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::Path;
+
     use tempfile::tempdir;
 
     use super::*;
+
+    fn read_header(path: &Path) -> WalFileHeader {
+        let mut file = File::open(path).unwrap();
+        let mut bytes = vec![0u8; WAL_HEADER_SIZE];
+        file.read_exact(&mut bytes).unwrap();
+        WalFileHeader::deserialize(&bytes).unwrap()
+    }
 
     #[test]
     fn wal_record_round_trip() {
@@ -1005,16 +1143,38 @@ mod tests {
     }
 
     #[test]
+    fn wal_record_header_round_trip_includes_raft_identity() {
+        let input = WalRecordHeader {
+            record_type: WalRecordType::Put as u8,
+            flags: 1,
+            payload_len: 77,
+            raft_term: 9,
+            raft_index: 17,
+            lsn: Lsn::new(0, 4096),
+            prev_lsn: Lsn::new(0, 2048),
+            crc32: 0x11223344,
+        };
+
+        let encoded = input.serialize();
+        let out = WalRecordHeader::deserialize(&encoded).unwrap();
+
+        assert_eq!(input, out);
+    }
+
+    #[test]
     fn create_log_and_read() {
         let dir = tempdir().unwrap();
         let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
 
-        wal.log_put("users.main.wt", b"k1", b"v1", 1).unwrap();
-        wal.log_txn_commit(1, 1).unwrap();
+        wal.log_put("users.main.wt", b"k1", b"v1", 1, 7).unwrap();
+        wal.log_txn_commit(1, 1, 7).unwrap();
         wal.sync().unwrap();
 
         let mut reader = WalReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
-        let (_header, record) = reader.read_record().unwrap().unwrap();
+        let (header, record) = reader.read_record().unwrap().unwrap();
+        assert_eq!(header.raft_term, 7);
+        assert_eq!(header.raft_index, 1);
+
         match record {
             WalRecord::Put {
                 store_name,
@@ -1029,5 +1189,113 @@ mod tests {
             }
             other => panic!("unexpected record: {other:?}"),
         }
+    }
+
+    #[test]
+    fn wal_crc_mismatch_when_raft_identity_bytes_are_corrupted() {
+        let dir = tempdir().unwrap();
+        let wal_path = GlobalWal::path_for_db(dir.path());
+        let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
+        wal.log_put("users.main.wt", b"k1", b"v1", 1, 10).unwrap();
+        wal.sync().unwrap();
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal_path)
+            .unwrap();
+        let raft_term_offset = WAL_HEADER_SIZE as u64 + 6;
+        file.seek(SeekFrom::Start(raft_term_offset)).unwrap();
+        file.write_all(&[0xAA]).unwrap();
+        file.sync_all().unwrap();
+
+        let mut reader = WalReader::open(&wal_path).unwrap();
+        let err = reader.read_record().unwrap_err();
+        assert!(matches!(err, RecoveryError::ChecksumMismatch { .. }));
+    }
+
+    #[test]
+    fn raft_index_increments_monotonically() {
+        let dir = tempdir().unwrap();
+        let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
+
+        wal.log_put("users.main.wt", b"k1", b"v1", 1, 3).unwrap();
+        wal.log_delete("users.main.wt", b"k1", 1, 3).unwrap();
+        wal.log_txn_commit(1, 1, 3).unwrap();
+        wal.sync().unwrap();
+
+        let mut reader = WalReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
+        let mut indexes = Vec::new();
+        while let Some((header, _)) = reader.read_record().unwrap() {
+            indexes.push(header.raft_index);
+        }
+
+        assert_eq!(indexes, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn truncate_then_append_keeps_raft_index_monotonic() {
+        let dir = tempdir().unwrap();
+        let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
+
+        wal.log_put("users.main.wt", b"k1", b"v1", 1, 5).unwrap();
+        wal.log_txn_commit(1, 1, 5).unwrap();
+        let checkpoint_lsn = wal.log_checkpoint(5).unwrap();
+        wal.set_checkpoint_lsn(checkpoint_lsn).unwrap();
+        wal.sync().unwrap();
+        wal.truncate_to_checkpoint().unwrap();
+
+        wal.log_put("users.main.wt", b"k2", b"v2", 2, 6).unwrap();
+        wal.sync().unwrap();
+
+        let mut reader = WalReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
+        let (header, _) = reader.read_record().unwrap().unwrap();
+        assert_eq!(header.raft_index, 4);
+        assert_eq!(header.raft_term, 6);
+    }
+
+    #[test]
+    fn truncate_updates_snapshot_boundary_metadata() {
+        let dir = tempdir().unwrap();
+        let wal_path = GlobalWal::path_for_db(dir.path());
+        let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
+
+        wal.log_put("users.main.wt", b"k1", b"v1", 1, 8).unwrap();
+        wal.log_txn_commit(1, 1, 9).unwrap();
+        let checkpoint_lsn = wal.log_checkpoint(9).unwrap();
+        wal.set_checkpoint_lsn(checkpoint_lsn).unwrap();
+        wal.sync().unwrap();
+        wal.truncate_to_checkpoint().unwrap();
+
+        let header = read_header(&wal_path);
+        assert_eq!(header.last_raft_index, 3);
+        assert_eq!(header.snapshot_last_included_index, 3);
+        assert_eq!(header.snapshot_last_included_term, 9);
+        assert_eq!(header.last_lsn, Lsn::new(0, 0));
+    }
+
+    #[test]
+    fn wal_v1_header_is_rejected() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("legacy.wal");
+
+        let mut header = WalFileHeader {
+            magic: *WAL_MAGIC,
+            version: 1,
+            last_lsn: Lsn::new(0, 0),
+            checkpoint_lsn: Lsn::new(0, 0),
+            last_raft_index: 0,
+            snapshot_last_included_index: 0,
+            snapshot_last_included_term: 0,
+            crc32: 0,
+        };
+        header.crc32 = header.compute_crc32();
+        fs::write(&wal_path, header.serialize()).unwrap();
+
+        let err = match WalReader::open(&wal_path) {
+            Ok(_) => panic!("expected v1 header to be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("unsupported WAL version: 1"));
     }
 }

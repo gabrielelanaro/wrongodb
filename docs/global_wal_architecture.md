@@ -1,6 +1,6 @@
 # Global WAL Architecture
 
-Date: 2026-02-07
+Date: 2026-02-22
 Status: Active
 
 ## Summary
@@ -20,6 +20,23 @@ Global WAL records are logical and include the target store name for row operati
 - `TxnCommit { txn_id, commit_ts }`
 - `TxnAbort { txn_id }`
 - `Checkpoint`
+
+Each physical WAL record header (v2) also carries Raft identity metadata:
+
+- `raft_term`
+- `raft_index`
+
+`raft_index` is explicit and monotonic; it is not derived from LSN offsets.
+
+## WAL header (v2)
+
+WAL file header persists both physical and Raft snapshot state:
+
+- `last_lsn`
+- `checkpoint_lsn`
+- `last_raft_index`
+- `snapshot_last_included_index`
+- `snapshot_last_included_term`
 
 ## Durability boundary
 
@@ -42,7 +59,13 @@ Collection checkpoint now coordinates global durability:
 
 1. Flush/checkpoint all open table handles.
 2. Write one global `Checkpoint` record.
-3. Sync WAL and truncate to header (reset log).
+3. Sync WAL and truncate to header.
+
+On truncation:
+
+- `snapshot_last_included_index/term` are set to the latest appended record.
+- WAL records are removed from disk.
+- `last_raft_index` is preserved, so the next append receives `last_raft_index + 1`.
 
 ## Legacy per-table WAL files
 

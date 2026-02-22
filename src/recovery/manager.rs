@@ -13,6 +13,8 @@ use crate::txn::transaction_manager::TransactionManager;
 use crate::txn::TxnId;
 use crate::WrongoDBError;
 
+const BOOTSTRAP_RAFT_TERM: u64 = 0;
+
 #[derive(Debug)]
 pub(crate) struct RecoveryManager {
     wal_enabled: bool,
@@ -52,7 +54,9 @@ impl RecoveryManager {
             return Ok(());
         }
         if let Some(global_wal) = self.global_wal.as_ref() {
-            global_wal.lock().log_put(store_name, key, value, txn_id)?;
+            global_wal
+                .lock()
+                .log_put(store_name, key, value, txn_id, BOOTSTRAP_RAFT_TERM)?;
         }
         Ok(())
     }
@@ -67,7 +71,9 @@ impl RecoveryManager {
             return Ok(());
         }
         if let Some(global_wal) = self.global_wal.as_ref() {
-            global_wal.lock().log_delete(store_name, key, txn_id)?;
+            global_wal
+                .lock()
+                .log_delete(store_name, key, txn_id, BOOTSTRAP_RAFT_TERM)?;
         }
         Ok(())
     }
@@ -82,7 +88,7 @@ impl RecoveryManager {
         }
         if let Some(global_wal) = self.global_wal.as_ref() {
             let mut wal = global_wal.lock();
-            wal.log_txn_commit(txn_id, commit_ts)?;
+            wal.log_txn_commit(txn_id, commit_ts, BOOTSTRAP_RAFT_TERM)?;
             wal.sync()?;
         }
         Ok(())
@@ -93,7 +99,9 @@ impl RecoveryManager {
             return Ok(());
         }
         if let Some(global_wal) = self.global_wal.as_ref() {
-            global_wal.lock().log_txn_abort(txn_id)?;
+            global_wal
+                .lock()
+                .log_txn_abort(txn_id, BOOTSTRAP_RAFT_TERM)?;
         }
         Ok(())
     }
@@ -105,7 +113,7 @@ impl RecoveryManager {
 
         if let Some(global_wal) = self.global_wal.as_ref() {
             let mut wal = global_wal.lock();
-            let checkpoint_lsn = wal.log_checkpoint()?;
+            let checkpoint_lsn = wal.log_checkpoint(BOOTSTRAP_RAFT_TERM)?;
             wal.set_checkpoint_lsn(checkpoint_lsn)?;
             wal.sync()?;
             wal.truncate_to_checkpoint()?;

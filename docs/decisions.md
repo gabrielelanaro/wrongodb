@@ -1,5 +1,32 @@
 # Decisions
 
+## 2026-02-22: WAL v2 adds Raft term/index identity and snapshot boundary metadata
+
+**Decision**
+- Bump WAL format to v2 and make each WAL record carry explicit Raft identity in the record header:
+  - `raft_term`
+  - `raft_index`
+- Keep WAL logical payloads unchanged (`Put/Delete/TxnCommit/TxnAbort/Checkpoint`).
+- Extend WAL file header with Raft truncation state:
+  - `last_raft_index` (monotonic, never reset by truncation)
+  - `snapshot_last_included_index`
+  - `snapshot_last_included_term`
+- Keep checkpoint truncation enabled, but when truncating:
+  - update snapshot boundary fields to the latest appended entry
+  - truncate records to header
+  - preserve `last_raft_index` so post-truncate appends continue from `N+1`.
+- Require WAL append APIs to accept explicit `raft_term` now; current non-Raft callers pass bootstrap term `0`.
+- Hard cutover policy remains: unsupported WAL versions are rejected (no v1 compatibility path).
+
+**Why**
+- Raft log matching requires stable `(term, index)` identity per entry.
+- LSN is a physical byte-position identifier and is unsuitable as the sole Raft index across truncation/snapshot boundaries.
+- Persisting snapshot boundary metadata allows truncation to remain active without violating monotonic Raft index semantics.
+
+**Notes**
+- Recovery semantics are unchanged: replay still filters by transaction commit markers and ignores Raft metadata for now.
+- Persistent Raft hard-state (`current_term`, `voted_for`) is intentionally out of scope for this slice.
+
 ## 2026-02-20: Make BTree pure by splitting out PageStore module
 
 **Decision**
