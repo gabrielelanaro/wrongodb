@@ -1,5 +1,31 @@
 # Decisions
 
+## 2026-02-22: Add deterministic Raft role/timer engine with outbound effects (no transport)
+
+**Decision**
+- Add `src/raft/role_engine.rs` with a pure role/timer engine that manages:
+  - node role (`Follower`, `Candidate`, `Leader`)
+  - election and heartbeat logical tick counters
+  - deterministic pseudo-random election timeout selection in `[min,max]`
+  - candidate vote tracking
+  - leader replication progress (`next_index`, `match_index`)
+- Define outbound transport-agnostic effects:
+  - `SendRequestVote`
+  - `SendAppendEntries`
+- Keep membership static and in-memory for this phase (`local_node_id`, `peer_ids`).
+- Wire `RaftNodeCore` to delegate role/timer behavior to the engine and persist only protocol
+  state deltas (hard state + protocol log) after tick/response handling.
+
+**Why**
+- Separating role/timer logic from transport lets us test consensus behavior deterministically
+  before introducing network failure modes.
+- Logical ticks make election behavior reproducible in unit/integration harnesses.
+- Static membership keeps this slice focused on core consensus lifecycle.
+
+**Notes**
+- Runtime/server background scheduling is intentionally out of scope.
+- Volatile role/timer/leader-tracking state remains non-persistent across restart in this slice.
+
 ## 2026-02-22: Add durable Raft protocol adapter layer in RaftNodeCore
 
 **Decision**
