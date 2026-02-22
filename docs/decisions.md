@@ -1,5 +1,33 @@
 # Decisions
 
+## 2026-02-22: Add durable Raft protocol adapter layer in RaftNodeCore
+
+**Decision**
+- Add `src/raft/log_store.rs` with `RaftLogStore`, a dedicated durable log for protocol-core
+  entries (`raft_log.bin`) that supports:
+  - `last_log_index_term`
+  - `term_at(index)`
+  - `truncate_from(index)` with Raft 1-based semantics
+  - `append_entries`
+- Keep protocol payload opaque (`Vec<u8>`) and independent from WAL `WalRecord`.
+- Extend `RaftNodeCore` with adapter methods:
+  - `handle_request_vote_rpc`
+  - `handle_append_entries_rpc`
+- Route inbound RPCs through pure handlers in `src/raft/protocol.rs`, then persist effects:
+  - hard state updates (`current_term`, `voted_for`) via `RaftHardStateStore`
+  - log truncation/append via `RaftLogStore`
+- Initialize in-memory protocol state on open from persisted hard state + persisted protocol log.
+
+**Why**
+- The pure protocol core is now executable against real durable state without introducing
+  networking or timers.
+- Raft log conflict repair requires truncation by logical index, which existing append-only WAL
+  APIs do not provide.
+
+**Notes**
+- Existing WAL/recovery write path for database mutations remains unchanged.
+- Commit index remains volatile in this slice (reconstructed from persisted log tail on open).
+
 ## 2026-02-22: Add pure Raft protocol handlers for RequestVote and AppendEntries
 
 **Decision**
