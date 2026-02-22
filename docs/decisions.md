@@ -1,5 +1,43 @@
 # Decisions
 
+## 2026-02-22: Require quorum-committed Raft proposals before acknowledging WAL mutations
+
+**Decision**
+- Introduce replicated state-machine commands in `src/raft/command.rs`:
+  - `Put`, `Delete`, `TxnCommit`, `TxnAbort`, `Checkpoint`
+  with deterministic binary `encode/decode`.
+- Make `RaftNodeCore` proposal-driven for writes:
+  - add `propose_command` (leader-only)
+  - persist protocol log entry first
+  - emit immediate replication effects via role engine.
+- Add explicit apply loop in `RaftNodeCore`:
+  - `apply_committed_entries` decodes committed protocol entries and applies them to WAL in
+    strict log-index order.
+  - track `last_applied_protocol_index` separately from protocol `commit_index`.
+- Set restart commit boundary conservatively:
+  - `commit_index = min(protocol_log_last_index, wal.last_raft_index())`
+  - never auto-commit protocol-log tail on open.
+- Extend `RaftRuntime` with proposal/commit waiting APIs:
+  - `propose`
+  - `wait_for_commit`
+  - `wait_for_commit_with_driver`
+  - `step_until_quiescent`
+  and return explicit timeout errors when quorum commit is not reached.
+- Route `RecoveryManager` WAL mutation APIs through replicated proposals instead of direct WAL appends:
+  - `log_put`, `log_delete`, `log_txn_commit_sync`, `log_txn_abort`, `checkpoint_and_truncate_if_safe`.
+- Keep static membership only (`peer_ids`), no dynamic membership or transport daemon in this slice.
+
+**Why**
+- Leader-local append ACKs can acknowledge data that is lost on leader failover.
+- Protocol log must be the authoritative source for commit/apply ordering, with WAL as the applied
+  state-machine side effect.
+- Conservative restart commit reconstruction avoids incorrectly applying uncommitted tails after crash.
+
+**Notes**
+- Standalone mode remains immediately writable (majority = 1) and commits locally.
+- Cluster mode without a transport driver now fails proposals with an explicit quorum-timeout error
+  instead of silently local-acking writes.
+
 ## 2026-02-22: Add Raft runtime bridge and leader-gated write path with wire-protocol errors
 
 **Decision**

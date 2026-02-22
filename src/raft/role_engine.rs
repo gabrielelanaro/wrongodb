@@ -118,6 +118,29 @@ impl RaftRoleEngine {
         }
     }
 
+    pub(crate) fn on_local_log_appended(
+        &mut self,
+        protocol_state: &mut RaftProtocolState,
+    ) -> Vec<RaftEffect> {
+        if self.role != RaftRole::Leader {
+            return Vec::new();
+        }
+
+        self.advance_leader_commit_index(protocol_state);
+
+        self.config
+            .peer_ids
+            .iter()
+            .map(|peer| {
+                self.build_append_effect_for_peer(
+                    peer,
+                    protocol_state,
+                    AppendMode::ReplicateFromNext,
+                )
+            })
+            .collect()
+    }
+
     pub(crate) fn on_inbound_request_vote(
         &mut self,
         prev_term: u64,
@@ -781,5 +804,59 @@ mod tests {
         engine.on_inbound_append_entries(0, &req, &resp, &state);
         assert_eq!(engine.role(), RaftRole::Follower);
         assert_eq!(engine.leader_id(), Some("n2"));
+    }
+
+    #[test]
+    fn leader_local_append_advances_commit_in_single_node_cluster() {
+        let cfg = config("n1", &[], 1, 1, 1);
+        let mut state = RaftProtocolState {
+            current_term: 1,
+            voted_for: Some("n1".to_string()),
+            log: vec![entry(1, b"cmd")],
+            commit_index: 0,
+        };
+        let mut engine = RaftRoleEngine::new(cfg, &state).unwrap();
+        engine.bootstrap_single_node_leader(&state);
+
+        let effects = engine.on_local_log_appended(&mut state);
+        assert!(effects.is_empty());
+        assert_eq!(state.commit_index, 1);
+    }
+
+    #[test]
+    fn leader_local_append_emits_replication_for_each_peer() {
+        let cfg = config("n1", &["n2", "n3"], 1, 1, 1);
+        let mut state = RaftProtocolState {
+            current_term: 2,
+            voted_for: Some("n1".to_string()),
+            log: vec![entry(2, b"a"), entry(2, b"b")],
+            commit_index: 0,
+        };
+        let mut engine = RaftRoleEngine::new(cfg, &state).unwrap();
+        engine.bootstrap_single_node_leader(&state);
+        // with peers this stays follower until election; force leader via majority vote path
+        let _ = engine.tick(&mut state);
+        let _ = engine.on_request_vote_response(
+            "n2",
+            RequestVoteResponse {
+                term: state.current_term,
+                vote_granted: true,
+            },
+            &mut state,
+        );
+        assert_eq!(engine.role(), RaftRole::Leader);
+
+        state.log.push(entry(state.current_term, b"new"));
+        let effects = engine.on_local_log_appended(&mut state);
+        assert_eq!(effects.len(), 2);
+        for effect in effects {
+            match effect {
+                RaftEffect::SendAppendEntries { req, .. } => {
+                    assert_eq!(req.term, state.current_term);
+                    assert!(!req.entries.is_empty());
+                }
+                other => panic!("unexpected effect: {other:?}"),
+            }
+        }
     }
 }

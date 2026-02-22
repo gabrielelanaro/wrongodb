@@ -1,15 +1,15 @@
 use std::path::Path;
 
 use crate::core::errors::StorageError;
+use crate::raft::command::RaftCommand;
 use crate::raft::hard_state::{RaftHardState, RaftHardStateStore};
 use crate::raft::log_store::RaftLogStore;
 use crate::raft::protocol::{
     handle_append_entries, handle_request_vote, AppendEntriesRequest, AppendEntriesResponse,
-    RaftProtocolState, RequestVoteRequest, RequestVoteResponse,
+    ProtocolLogEntry, RaftProtocolState, RequestVoteRequest, RequestVoteResponse,
 };
 use crate::raft::role_engine::{RaftEffect, RaftRole, RaftRoleConfig, RaftRoleEngine};
-use crate::storage::wal::{GlobalWal, Lsn};
-use crate::txn::{Timestamp, TxnId};
+use crate::storage::wal::GlobalWal;
 use crate::WrongoDBError;
 
 const LOCAL_NODE_ID: &str = "local";
@@ -72,6 +72,7 @@ pub(crate) struct RaftNodeCore {
     protocol_log_store: RaftLogStore,
     protocol_state: RaftProtocolState,
     role_engine: RaftRoleEngine,
+    last_applied_protocol_index: u64,
     wal: GlobalWal,
 }
 
@@ -100,7 +101,7 @@ impl RaftNodeCore {
             current_term: hard_state.current_term,
             voted_for: hard_state.voted_for.clone(),
             log: protocol_log_store.entries().to_vec(),
-            commit_index: protocol_last_log_index,
+            commit_index: 0,
         };
         let role_engine = RaftRoleEngine::new(
             RaftRoleConfig {
@@ -115,11 +116,15 @@ impl RaftNodeCore {
         )?;
 
         let wal = GlobalWal::open_or_create(db_dir)?;
-        let _last_raft_term = wal.last_raft_term();
+        let _ = wal.last_raft_term();
         let last_raft_index = wal.last_raft_index();
+        let commit_index = protocol_last_log_index.min(last_raft_index);
+        let last_applied_protocol_index = commit_index;
+        let mut protocol_state = protocol_state;
+        protocol_state.commit_index = commit_index;
         let progress = RaftProgress {
-            commit_index: last_raft_index,
-            last_applied: last_raft_index,
+            commit_index,
+            last_applied: last_applied_protocol_index,
         };
         let standalone_mode = cfg.peer_ids.is_empty();
 
@@ -131,6 +136,7 @@ impl RaftNodeCore {
             protocol_log_store,
             protocol_state,
             role_engine,
+            last_applied_protocol_index,
             wal,
         };
 
@@ -144,6 +150,7 @@ impl RaftNodeCore {
         Ok(node)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn current_term(&self) -> u64 {
         self.hard_state.current_term
     }
@@ -226,6 +233,69 @@ impl RaftNodeCore {
         })
     }
 
+    pub(crate) fn propose_command(
+        &mut self,
+        command: &RaftCommand,
+    ) -> Result<(u64, Vec<RaftEffect>), WrongoDBError> {
+        self.ensure_writable_leader()?;
+
+        let previous_term = self.protocol_state.current_term;
+        let previous_vote = self.protocol_state.voted_for.clone();
+        let previous_log = self.protocol_state.log.clone();
+
+        let entry = ProtocolLogEntry {
+            term: self.protocol_state.current_term,
+            payload: command.encode(),
+        };
+        self.protocol_state.log.push(entry);
+        let proposal_index = self.protocol_state.last_log_index();
+
+        let effects = self
+            .role_engine
+            .on_local_log_appended(&mut self.protocol_state);
+
+        self.persist_hard_state_if_changed(previous_term, previous_vote)?;
+        self.persist_protocol_log_if_changed(previous_log)?;
+        self.refresh_progress_from_protocol_state();
+        Ok((proposal_index, effects))
+    }
+
+    pub(crate) fn apply_committed_entries(&mut self) -> Result<u64, WrongoDBError> {
+        while self.last_applied_protocol_index < self.protocol_state.commit_index {
+            let apply_index = self.last_applied_protocol_index + 1;
+            let entry_pos = usize::try_from(apply_index.saturating_sub(1))
+                .map_err(|_| StorageError("raft apply index conversion overflow".into()))?;
+            let entry = self
+                .protocol_state
+                .log
+                .get(entry_pos)
+                .ok_or_else(|| {
+                    StorageError(format!(
+                        "raft apply index {} out of bounds (log_len={})",
+                        apply_index,
+                        self.protocol_state.log.len()
+                    ))
+                })?
+                .clone();
+
+            let command = RaftCommand::decode(&entry.payload)?;
+            self.apply_command_to_wal(&command, entry.term)?;
+            self.last_applied_protocol_index = apply_index;
+        }
+
+        self.refresh_progress_from_protocol_state();
+        Ok(self.last_applied_protocol_index)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn applied_index(&self) -> u64 {
+        self.last_applied_protocol_index
+    }
+
+    pub(crate) fn is_index_committed_and_applied(&self, index: u64) -> bool {
+        self.protocol_state.commit_index >= index && self.last_applied_protocol_index >= index
+    }
+
     #[allow(dead_code)]
     pub(crate) fn tick(&mut self) -> Result<Vec<RaftEffect>, WrongoDBError> {
         let previous_term = self.protocol_state.current_term;
@@ -235,6 +305,7 @@ impl RaftNodeCore {
         let effects = self.role_engine.tick(&mut self.protocol_state);
         self.persist_hard_state_if_changed(previous_term, previous_vote)?;
         self.persist_protocol_log_if_changed(previous_log)?;
+        self.refresh_progress_from_protocol_state();
         Ok(effects)
     }
 
@@ -255,6 +326,7 @@ impl RaftNodeCore {
             &self.protocol_state,
         );
         self.persist_hard_state_if_changed(previous_term, previous_vote)?;
+        self.refresh_progress_from_protocol_state();
         Ok(response)
     }
 
@@ -277,6 +349,7 @@ impl RaftNodeCore {
         );
         self.persist_hard_state_if_changed(previous_term, previous_vote)?;
         self.persist_protocol_log_if_changed(previous_log)?;
+        self.refresh_progress_from_protocol_state();
         Ok(response)
     }
 
@@ -296,6 +369,7 @@ impl RaftNodeCore {
 
         self.persist_hard_state_if_changed(previous_term, previous_vote)?;
         self.persist_protocol_log_if_changed(previous_log)?;
+        self.refresh_progress_from_protocol_state();
         Ok(effects)
     }
 
@@ -315,67 +389,12 @@ impl RaftNodeCore {
 
         self.persist_hard_state_if_changed(previous_term, previous_vote)?;
         self.persist_protocol_log_if_changed(previous_log)?;
+        self.refresh_progress_from_protocol_state();
         Ok(effects)
-    }
-
-    pub(crate) fn log_put(
-        &mut self,
-        store_name: &str,
-        key: &[u8],
-        value: &[u8],
-        txn_id: TxnId,
-    ) -> Result<Lsn, WrongoDBError> {
-        let lsn = self
-            .wal
-            .log_put(store_name, key, value, txn_id, self.current_term())?;
-        self.refresh_progress_from_wal_tail();
-        Ok(lsn)
-    }
-
-    pub(crate) fn log_delete(
-        &mut self,
-        store_name: &str,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<Lsn, WrongoDBError> {
-        let lsn = self
-            .wal
-            .log_delete(store_name, key, txn_id, self.current_term())?;
-        self.refresh_progress_from_wal_tail();
-        Ok(lsn)
-    }
-
-    pub(crate) fn log_txn_commit(
-        &mut self,
-        txn_id: TxnId,
-        commit_ts: Timestamp,
-    ) -> Result<Lsn, WrongoDBError> {
-        let lsn = self
-            .wal
-            .log_txn_commit(txn_id, commit_ts, self.current_term())?;
-        self.refresh_progress_from_wal_tail();
-        Ok(lsn)
-    }
-
-    pub(crate) fn log_txn_abort(&mut self, txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
-        let lsn = self.wal.log_txn_abort(txn_id, self.current_term())?;
-        self.refresh_progress_from_wal_tail();
-        Ok(lsn)
-    }
-
-    pub(crate) fn log_checkpoint(&mut self) -> Result<Lsn, WrongoDBError> {
-        let lsn = self.wal.log_checkpoint(self.current_term())?;
-        self.refresh_progress_from_wal_tail();
-        Ok(lsn)
-    }
-
-    pub(crate) fn set_checkpoint_lsn(&mut self, lsn: Lsn) -> Result<(), WrongoDBError> {
-        self.wal.set_checkpoint_lsn(lsn)
     }
 
     pub(crate) fn truncate_to_checkpoint(&mut self) -> Result<(), WrongoDBError> {
         self.wal.truncate_to_checkpoint()?;
-        self.refresh_progress_from_wal_tail();
         Ok(())
     }
 
@@ -385,10 +404,46 @@ impl RaftNodeCore {
         Ok(())
     }
 
-    fn refresh_progress_from_wal_tail(&mut self) {
-        let last_raft_index = self.wal.last_raft_index();
-        self.progress.commit_index = last_raft_index;
-        self.progress.last_applied = last_raft_index;
+    fn apply_command_to_wal(
+        &mut self,
+        command: &RaftCommand,
+        raft_term: u64,
+    ) -> Result<(), WrongoDBError> {
+        match command {
+            RaftCommand::Put {
+                store_name,
+                key,
+                value,
+                txn_id,
+            } => {
+                let _ = self
+                    .wal
+                    .log_put(store_name, key, value, *txn_id, raft_term)?;
+            }
+            RaftCommand::Delete {
+                store_name,
+                key,
+                txn_id,
+            } => {
+                let _ = self.wal.log_delete(store_name, key, *txn_id, raft_term)?;
+            }
+            RaftCommand::TxnCommit { txn_id, commit_ts } => {
+                let _ = self.wal.log_txn_commit(*txn_id, *commit_ts, raft_term)?;
+            }
+            RaftCommand::TxnAbort { txn_id } => {
+                let _ = self.wal.log_txn_abort(*txn_id, raft_term)?;
+            }
+            RaftCommand::Checkpoint => {
+                let lsn = self.wal.log_checkpoint(raft_term)?;
+                self.wal.set_checkpoint_lsn(lsn)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn refresh_progress_from_protocol_state(&mut self) {
+        self.progress.commit_index = self.protocol_state.commit_index;
+        self.progress.last_applied = self.last_applied_protocol_index;
     }
 
     fn persist_hard_state_if_changed(
@@ -450,6 +505,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::raft::command::RaftCommand;
     use crate::raft::protocol::{AppendEntriesRequest, ProtocolLogEntry, RequestVoteRequest};
     use crate::raft::role_engine::{RaftEffect, RaftRole};
     use crate::storage::wal::{WalReader, WalRecord};
@@ -470,6 +526,35 @@ mod tests {
             heartbeat_interval_ticks: heartbeat,
             timeout_seed: 11,
         }
+    }
+
+    fn elect_with_single_peer(node: &mut RaftNodeCore, peer_id: &str) {
+        let mut effects = Vec::new();
+        for _ in 0..8 {
+            effects = node.tick().unwrap();
+            if !effects.is_empty() {
+                break;
+            }
+        }
+        assert!(!effects.is_empty(), "expected election effects");
+        for effect in effects {
+            match effect {
+                RaftEffect::SendRequestVote { to, req } => {
+                    assert_eq!(to, peer_id);
+                    let _ = node
+                        .handle_request_vote_response_rpc(
+                            &to,
+                            crate::raft::protocol::RequestVoteResponse {
+                                term: req.term,
+                                vote_granted: true,
+                            },
+                        )
+                        .unwrap();
+                }
+                other => panic!("unexpected election effect: {other:?}"),
+            }
+        }
+        assert_eq!(node.role(), RaftRole::Leader);
     }
 
     #[test]
@@ -498,6 +583,95 @@ mod tests {
             WrongoDBError::NotLeader { leader_hint } => assert_eq!(leader_hint, None),
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn leader_proposal_appends_log_and_emits_replication_effects() {
+        let dir = tempdir().unwrap();
+        let mut node =
+            RaftNodeCore::open_with_config(dir.path(), node_cfg("n1", &["n2"], 1, 1, 1)).unwrap();
+        elect_with_single_peer(&mut node, "n2");
+
+        let (proposal_index, effects) = node
+            .propose_command(&RaftCommand::Put {
+                store_name: "users.main.wt".to_string(),
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                txn_id: 1,
+            })
+            .unwrap();
+
+        assert_eq!(proposal_index, 1);
+        assert_eq!(node.protocol_state().last_log_index(), 1);
+        assert_eq!(node.protocol_state().commit_index, 0);
+        assert_eq!(node.applied_index(), 0);
+        assert_eq!(effects.len(), 1);
+        match &effects[0] {
+            RaftEffect::SendAppendEntries { to, req } => {
+                assert_eq!(to, "n2");
+                assert_eq!(req.entries.len(), 1);
+            }
+            other => panic!("unexpected effect: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_committed_entries_is_idempotent_and_ordered() {
+        let dir = tempdir().unwrap();
+        let mut node = RaftNodeCore::open(dir.path()).unwrap();
+
+        node.propose_command(&RaftCommand::Put {
+            store_name: "users.main.wt".to_string(),
+            key: b"k1".to_vec(),
+            value: b"v1".to_vec(),
+            txn_id: 1,
+        })
+        .unwrap();
+        node.propose_command(&RaftCommand::Delete {
+            store_name: "users.main.wt".to_string(),
+            key: b"k1".to_vec(),
+            txn_id: 1,
+        })
+        .unwrap();
+        assert_eq!(node.protocol_state().commit_index, 2);
+        assert_eq!(node.applied_index(), 0);
+
+        node.apply_committed_entries().unwrap();
+        assert_eq!(node.applied_index(), 2);
+        node.apply_committed_entries().unwrap();
+        assert_eq!(node.applied_index(), 2);
+    }
+
+    #[test]
+    fn restart_keeps_uncommitted_protocol_tail_unapplied() {
+        let dir = tempdir().unwrap();
+        {
+            let mut node =
+                RaftNodeCore::open_with_config(dir.path(), node_cfg("n1", &["n2"], 1, 1, 1))
+                    .unwrap();
+            elect_with_single_peer(&mut node, "n2");
+            let (proposal_index, _effects) = node
+                .propose_command(&RaftCommand::Put {
+                    store_name: "users.main.wt".to_string(),
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                    txn_id: 1,
+                })
+                .unwrap();
+            assert_eq!(proposal_index, 1);
+            assert_eq!(node.protocol_state().commit_index, 0);
+            assert_eq!(node.applied_index(), 0);
+            node.sync().unwrap();
+        }
+
+        let reopened =
+            RaftNodeCore::open_with_config(dir.path(), node_cfg("n1", &["n2"], 1, 1, 1)).unwrap();
+        assert_eq!(reopened.protocol_state().last_log_index(), 1);
+        assert_eq!(reopened.protocol_state().commit_index, 0);
+        assert_eq!(reopened.applied_index(), 0);
+
+        let mut reader = WalReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
+        assert!(reader.read_record().unwrap().is_none());
     }
 
     struct InMemoryCluster {
@@ -577,7 +751,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut node = RaftNodeCore::open(dir.path()).unwrap();
         node.set_current_term(5).unwrap();
-        node.log_put("users.main.wt", b"k1", b"v1", 1).unwrap();
+        let (_index, _effects) = node
+            .propose_command(&RaftCommand::Put {
+                store_name: "users.main.wt".to_string(),
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                txn_id: 1,
+            })
+            .unwrap();
+        node.apply_committed_entries().unwrap();
         node.sync().unwrap();
 
         let mut reader = WalReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
@@ -587,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn append_advances_commit_and_apply_progress_monotonically() {
+    fn propose_advances_commit_but_requires_apply_for_last_applied_progress() {
         let dir = tempdir().unwrap();
         let mut node = RaftNodeCore::open(dir.path()).unwrap();
 
@@ -599,21 +781,28 @@ mod tests {
             }
         );
 
-        node.log_put("users.main.wt", b"k1", b"v1", 1).unwrap();
+        let (_idx, _effects) = node
+            .propose_command(&RaftCommand::Put {
+                store_name: "users.main.wt".to_string(),
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                txn_id: 1,
+            })
+            .unwrap();
+        assert_eq!(
+            node.progress(),
+            RaftProgress {
+                commit_index: 1,
+                last_applied: 0
+            }
+        );
+
+        node.apply_committed_entries().unwrap();
         assert_eq!(
             node.progress(),
             RaftProgress {
                 commit_index: 1,
                 last_applied: 1
-            }
-        );
-
-        node.log_txn_commit(1, 1).unwrap();
-        assert_eq!(
-            node.progress(),
-            RaftProgress {
-                commit_index: 2,
-                last_applied: 2
             }
         );
     }
@@ -657,9 +846,24 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut node = RaftNodeCore::open(dir.path()).unwrap();
 
-        node.log_put("users.main.wt", b"k1", b"v1", 1).unwrap();
-        node.log_delete("users.main.wt", b"k1", 1).unwrap();
-        node.log_txn_abort(1).unwrap();
+        let commands = vec![
+            RaftCommand::Put {
+                store_name: "users.main.wt".to_string(),
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                txn_id: 1,
+            },
+            RaftCommand::Delete {
+                store_name: "users.main.wt".to_string(),
+                key: b"k1".to_vec(),
+                txn_id: 1,
+            },
+            RaftCommand::TxnAbort { txn_id: 1 },
+        ];
+        for command in &commands {
+            node.propose_command(command).unwrap();
+        }
+        node.apply_committed_entries().unwrap();
         node.sync().unwrap();
 
         let mut reader = WalReader::open(GlobalWal::path_for_db(dir.path())).unwrap();

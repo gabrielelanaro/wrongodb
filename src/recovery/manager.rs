@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 
 use crate::core::errors::StorageError;
 use crate::engine::RaftMode;
+use crate::raft::command::RaftCommand;
 use crate::raft::node::{RaftNodeConfig, RaftNodeCore};
 use crate::raft::runtime::{RaftInboundMessage, RaftOutboundMessage, RaftRuntime};
 use crate::recovery::txn_table::RecoveryTxnTable;
@@ -101,7 +102,12 @@ impl RecoveryManager {
         if let Some(runtime) = self.raft_runtime.as_ref() {
             let mut runtime = runtime.lock();
             runtime.ensure_writable_leader()?;
-            runtime.node_mut().log_put(store_name, key, value, txn_id)?;
+            runtime.propose(&RaftCommand::Put {
+                store_name: store_name.to_string(),
+                key: key.to_vec(),
+                value: value.to_vec(),
+                txn_id,
+            })?;
         }
         Ok(())
     }
@@ -118,7 +124,11 @@ impl RecoveryManager {
         if let Some(runtime) = self.raft_runtime.as_ref() {
             let mut runtime = runtime.lock();
             runtime.ensure_writable_leader()?;
-            runtime.node_mut().log_delete(store_name, key, txn_id)?;
+            runtime.propose(&RaftCommand::Delete {
+                store_name: store_name.to_string(),
+                key: key.to_vec(),
+                txn_id,
+            })?;
         }
         Ok(())
     }
@@ -134,7 +144,7 @@ impl RecoveryManager {
         if let Some(runtime) = self.raft_runtime.as_ref() {
             let mut runtime = runtime.lock();
             runtime.ensure_writable_leader()?;
-            runtime.node_mut().log_txn_commit(txn_id, commit_ts)?;
+            runtime.propose(&RaftCommand::TxnCommit { txn_id, commit_ts })?;
             runtime.node_mut().sync()?;
         }
         Ok(())
@@ -147,7 +157,7 @@ impl RecoveryManager {
         if let Some(runtime) = self.raft_runtime.as_ref() {
             let mut runtime = runtime.lock();
             runtime.ensure_writable_leader()?;
-            runtime.node_mut().log_txn_abort(txn_id)?;
+            runtime.propose(&RaftCommand::TxnAbort { txn_id })?;
         }
         Ok(())
     }
@@ -160,8 +170,7 @@ impl RecoveryManager {
         if let Some(runtime) = self.raft_runtime.as_ref() {
             let mut runtime = runtime.lock();
             runtime.ensure_writable_leader()?;
-            let checkpoint_lsn = runtime.node_mut().log_checkpoint()?;
-            runtime.node_mut().set_checkpoint_lsn(checkpoint_lsn)?;
+            runtime.propose(&RaftCommand::Checkpoint)?;
             runtime.node_mut().sync()?;
             runtime.node_mut().truncate_to_checkpoint()?;
         }
