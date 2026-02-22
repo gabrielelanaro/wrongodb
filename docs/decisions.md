@@ -1,5 +1,36 @@
 # Decisions
 
+## 2026-02-22: Add pure Raft protocol handlers for RequestVote and AppendEntries
+
+**Decision**
+- Add a new internal module `src/raft/protocol.rs` that contains deterministic,
+  in-memory-only handlers:
+  - `handle_request_vote`
+  - `handle_append_entries`
+- Define protocol-only state and RPC request/response types in that module:
+  - `RaftProtocolState` (`current_term`, `voted_for`, `log`, `commit_index`)
+  - `ProtocolLogEntry` (`term`, opaque `payload`)
+  - `RequestVote*` and `AppendEntries*` message structs
+- Keep protocol log indexing explicitly 1-based with index `0` as the sentinel
+  "before first entry".
+- Implement full Raft voting and log-matching rules, including:
+  - term monotonicity and vote reset on newer term
+  - vote granting based on prior vote and log up-to-date checks
+  - append conflict detection, suffix truncation, and append
+  - commit advance rule `commit_index = max(commit_index, min(leader_commit, last_log_index))`
+- Keep all existing WAL/recovery integration in `RaftNodeCore` unchanged in this slice.
+
+**Why**
+- Isolating protocol semantics from IO/network/persistence makes behavior easy to test
+  and reuse when we add transport adapters and persistent integration later.
+- A pure core reduces coupling and lets us validate Raft safety rules now without
+  introducing distributed-system runtime complexity.
+
+**Notes**
+- APIs remain internal-only (`pub(crate)`); no public crate API changes.
+- Leader election timers, role transitions, networking, and persistence adapters are
+  explicitly out of scope for this slice.
+
 ## 2026-02-22: Add Raft hard-state sidecar and internal Raft node core
 
 **Decision**
