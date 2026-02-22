@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::api::data_handle_cache::DataHandleCache;
 use crate::api::session::Session;
+use crate::engine::RaftMode;
 use crate::recovery::RecoveryManager;
 use crate::storage::wal::WalSink;
 use crate::txn::transaction_manager::TransactionManager;
@@ -13,11 +14,15 @@ use crate::WrongoDBError;
 
 pub struct ConnectionConfig {
     pub wal_enabled: bool,
+    pub raft_mode: RaftMode,
 }
 
 impl Default for ConnectionConfig {
     fn default() -> Self {
-        Self { wal_enabled: true }
+        Self {
+            wal_enabled: true,
+            raft_mode: RaftMode::Standalone,
+        }
     }
 }
 
@@ -28,6 +33,11 @@ impl ConnectionConfig {
 
     pub fn wal_enabled(mut self, enabled: bool) -> Self {
         self.wal_enabled = enabled;
+        self
+    }
+
+    pub fn raft_mode(mut self, mode: RaftMode) -> Self {
+        self.raft_mode = mode;
         self
     }
 }
@@ -63,6 +73,7 @@ impl Connection {
             &base_path,
             config.wal_enabled,
             transaction_manager.clone(),
+            config.raft_mode,
         )?);
 
         let wal_sink = if config.wal_enabled {
@@ -91,5 +102,12 @@ impl Connection {
 
     pub fn base_path(&self) -> &Path {
         &self.base_path
+    }
+
+    pub(crate) fn raft_hello_state(&self) -> (bool, Option<String>) {
+        self.recovery_manager
+            .raft_status()
+            .map(|status| (status.is_writable_primary, status.leader_hint))
+            .unwrap_or((true, None))
     }
 }

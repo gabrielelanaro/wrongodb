@@ -97,12 +97,8 @@ impl Command for InsertCommand {
                         _ => ObjectId::new(),
                     };
                     let json_doc = bson_to_json_document(&doc_with_id);
-                    if coll
-                        .insert_one(&mut session, Value::Object(json_doc))
-                        .is_ok()
-                    {
-                        ids.push(id);
-                    }
+                    coll.insert_one(&mut session, Value::Object(json_doc))?;
+                    ids.push(id);
                 }
             }
             ids

@@ -6,7 +6,9 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::core::errors::StorageError;
-use crate::raft::node::RaftNodeCore;
+use crate::engine::RaftMode;
+use crate::raft::node::{RaftNodeConfig, RaftNodeCore};
+use crate::raft::runtime::{RaftInboundMessage, RaftOutboundMessage, RaftRuntime};
 use crate::recovery::txn_table::RecoveryTxnTable;
 use crate::storage::table::Table;
 use crate::storage::wal::{GlobalWal, RecoveryError, WalReader, WalRecord, WalSink};
@@ -14,10 +16,16 @@ use crate::txn::transaction_manager::TransactionManager;
 use crate::txn::TxnId;
 use crate::WrongoDBError;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RaftStatus {
+    pub(crate) is_writable_primary: bool,
+    pub(crate) leader_hint: Option<String>,
+}
+
 #[derive(Debug)]
 pub(crate) struct RecoveryManager {
     wal_enabled: bool,
-    raft_node: Option<Arc<Mutex<RaftNodeCore>>>,
+    raft_runtime: Option<Arc<Mutex<RaftRuntime>>>,
     txn_manager: Arc<TransactionManager>,
 }
 
@@ -26,20 +34,58 @@ impl RecoveryManager {
         base_path: &Path,
         wal_enabled: bool,
         txn_manager: Arc<TransactionManager>,
+        raft_mode: RaftMode,
     ) -> Result<Self, WrongoDBError> {
         let mut manager = Self {
             wal_enabled,
-            raft_node: None,
+            raft_runtime: None,
             txn_manager,
         };
 
         if manager.wal_enabled {
             warn_legacy_per_table_wal_files(base_path);
             manager.recover(base_path)?;
-            manager.raft_node = Some(Arc::new(Mutex::new(RaftNodeCore::open(base_path)?)));
+            let raft_cfg = raft_node_config_from_mode(raft_mode);
+            let raft_node = RaftNodeCore::open_with_config(base_path, raft_cfg)?;
+            manager.raft_runtime = Some(Arc::new(Mutex::new(RaftRuntime::new(raft_node))));
         }
 
         Ok(manager)
+    }
+
+    pub(crate) fn raft_status(&self) -> Option<RaftStatus> {
+        self.raft_runtime.as_ref().map(|runtime| {
+            let leadership = runtime.lock().leadership();
+            RaftStatus {
+                is_writable_primary: leadership.is_writable_primary(),
+                leader_hint: leadership.leader_id,
+            }
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn raft_tick(&self) -> Result<Vec<RaftOutboundMessage>, WrongoDBError> {
+        let Some(runtime) = self.raft_runtime.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let mut runtime = runtime.lock();
+        runtime.tick()?;
+        Ok(runtime.drain_outbound())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn raft_handle_inbound(
+        &self,
+        msg: RaftInboundMessage,
+    ) -> Result<Vec<RaftOutboundMessage>, WrongoDBError> {
+        let Some(runtime) = self.raft_runtime.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let mut runtime = runtime.lock();
+        runtime.handle_inbound(msg)?;
+        Ok(runtime.drain_outbound())
     }
 
     pub fn log_put(
@@ -52,8 +98,10 @@ impl RecoveryManager {
         if !self.wal_enabled {
             return Ok(());
         }
-        if let Some(raft_node) = self.raft_node.as_ref() {
-            raft_node.lock().log_put(store_name, key, value, txn_id)?;
+        if let Some(runtime) = self.raft_runtime.as_ref() {
+            let mut runtime = runtime.lock();
+            runtime.ensure_writable_leader()?;
+            runtime.node_mut().log_put(store_name, key, value, txn_id)?;
         }
         Ok(())
     }
@@ -67,8 +115,10 @@ impl RecoveryManager {
         if !self.wal_enabled {
             return Ok(());
         }
-        if let Some(raft_node) = self.raft_node.as_ref() {
-            raft_node.lock().log_delete(store_name, key, txn_id)?;
+        if let Some(runtime) = self.raft_runtime.as_ref() {
+            let mut runtime = runtime.lock();
+            runtime.ensure_writable_leader()?;
+            runtime.node_mut().log_delete(store_name, key, txn_id)?;
         }
         Ok(())
     }
@@ -81,10 +131,11 @@ impl RecoveryManager {
         if !self.wal_enabled {
             return Ok(());
         }
-        if let Some(raft_node) = self.raft_node.as_ref() {
-            let mut raft_node = raft_node.lock();
-            raft_node.log_txn_commit(txn_id, commit_ts)?;
-            raft_node.sync()?;
+        if let Some(runtime) = self.raft_runtime.as_ref() {
+            let mut runtime = runtime.lock();
+            runtime.ensure_writable_leader()?;
+            runtime.node_mut().log_txn_commit(txn_id, commit_ts)?;
+            runtime.node_mut().sync()?;
         }
         Ok(())
     }
@@ -93,8 +144,10 @@ impl RecoveryManager {
         if !self.wal_enabled {
             return Ok(());
         }
-        if let Some(raft_node) = self.raft_node.as_ref() {
-            raft_node.lock().log_txn_abort(txn_id)?;
+        if let Some(runtime) = self.raft_runtime.as_ref() {
+            let mut runtime = runtime.lock();
+            runtime.ensure_writable_leader()?;
+            runtime.node_mut().log_txn_abort(txn_id)?;
         }
         Ok(())
     }
@@ -104,12 +157,13 @@ impl RecoveryManager {
             return Ok(());
         }
 
-        if let Some(raft_node) = self.raft_node.as_ref() {
-            let mut raft_node = raft_node.lock();
-            let checkpoint_lsn = raft_node.log_checkpoint()?;
-            raft_node.set_checkpoint_lsn(checkpoint_lsn)?;
-            raft_node.sync()?;
-            raft_node.truncate_to_checkpoint()?;
+        if let Some(runtime) = self.raft_runtime.as_ref() {
+            let mut runtime = runtime.lock();
+            runtime.ensure_writable_leader()?;
+            let checkpoint_lsn = runtime.node_mut().log_checkpoint()?;
+            runtime.node_mut().set_checkpoint_lsn(checkpoint_lsn)?;
+            runtime.node_mut().sync()?;
+            runtime.node_mut().truncate_to_checkpoint()?;
         }
 
         Ok(())
@@ -187,6 +241,20 @@ impl RecoveryManager {
         }
 
         Ok(())
+    }
+}
+
+fn raft_node_config_from_mode(mode: RaftMode) -> RaftNodeConfig {
+    match mode {
+        RaftMode::Standalone => RaftNodeConfig::default(),
+        RaftMode::Cluster {
+            local_node_id,
+            peer_ids,
+        } => RaftNodeConfig {
+            local_node_id,
+            peer_ids,
+            ..RaftNodeConfig::default()
+        },
     }
 }
 
@@ -280,7 +348,9 @@ mod tests {
 
     use super::*;
     use crate::raft::hard_state::RaftHardStateStore;
+    use crate::raft::runtime::{RaftInboundMessage, RaftOutboundMessage};
     use crate::txn::GlobalTxnState;
+    use crate::txn::TXN_NONE;
 
     fn new_txn_manager() -> Arc<TransactionManager> {
         Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())))
@@ -289,7 +359,9 @@ mod tests {
     #[test]
     fn commit_marker_is_persisted_after_sync() {
         let dir = tempdir().unwrap();
-        let manager = RecoveryManager::initialize(dir.path(), true, new_txn_manager()).unwrap();
+        let manager =
+            RecoveryManager::initialize(dir.path(), true, new_txn_manager(), RaftMode::Standalone)
+                .unwrap();
 
         manager.log_txn_commit_sync(7, 7).unwrap();
 
@@ -313,7 +385,9 @@ mod tests {
     #[test]
     fn checkpoint_skip_and_truncate_follow_active_txn_flag() {
         let dir = tempdir().unwrap();
-        let manager = RecoveryManager::initialize(dir.path(), true, new_txn_manager()).unwrap();
+        let manager =
+            RecoveryManager::initialize(dir.path(), true, new_txn_manager(), RaftMode::Standalone)
+                .unwrap();
 
         manager.log_txn_commit_sync(1, 1).unwrap();
 
@@ -336,7 +410,9 @@ mod tests {
         let raft_state_path = RaftHardStateStore::path_for_db(dir.path());
         assert!(!raft_state_path.exists());
 
-        let _manager = RecoveryManager::initialize(dir.path(), true, new_txn_manager()).unwrap();
+        let _manager =
+            RecoveryManager::initialize(dir.path(), true, new_txn_manager(), RaftMode::Standalone)
+                .unwrap();
 
         assert!(raft_state_path.exists());
     }
@@ -347,7 +423,9 @@ mod tests {
         let raft_state_path = RaftHardStateStore::path_for_db(dir.path());
         assert!(!raft_state_path.exists());
 
-        let _manager = RecoveryManager::initialize(dir.path(), false, new_txn_manager()).unwrap();
+        let _manager =
+            RecoveryManager::initialize(dir.path(), false, new_txn_manager(), RaftMode::Standalone)
+                .unwrap();
 
         assert!(!raft_state_path.exists());
     }
@@ -357,7 +435,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let raft_state_path = RaftHardStateStore::path_for_db(dir.path());
 
-        let _manager = RecoveryManager::initialize(dir.path(), true, new_txn_manager()).unwrap();
+        let _manager =
+            RecoveryManager::initialize(dir.path(), true, new_txn_manager(), RaftMode::Standalone)
+                .unwrap();
         assert!(raft_state_path.exists());
 
         let mut file = OpenOptions::new()
@@ -369,7 +449,87 @@ mod tests {
         file.write_all(&[0xFF]).unwrap();
         file.sync_all().unwrap();
 
-        let err = RecoveryManager::initialize(dir.path(), true, new_txn_manager()).unwrap_err();
+        let err =
+            RecoveryManager::initialize(dir.path(), true, new_txn_manager(), RaftMode::Standalone)
+                .unwrap_err();
         assert!(err.to_string().contains("raft hard state"));
+    }
+
+    #[test]
+    fn standalone_mode_reports_writable_primary() {
+        let dir = tempdir().unwrap();
+        let manager =
+            RecoveryManager::initialize(dir.path(), true, new_txn_manager(), RaftMode::Standalone)
+                .unwrap();
+
+        let status = manager.raft_status().unwrap();
+        assert!(status.is_writable_primary);
+        assert_eq!(status.leader_hint.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn clustered_mode_rejects_writes_when_not_leader() {
+        let dir = tempdir().unwrap();
+        let manager = RecoveryManager::initialize(
+            dir.path(),
+            true,
+            new_txn_manager(),
+            RaftMode::Cluster {
+                local_node_id: "n1".to_string(),
+                peer_ids: vec!["n2".to_string()],
+            },
+        )
+        .unwrap();
+
+        let err = manager
+            .log_put("users.main.wt", b"k1", b"v1", TXN_NONE)
+            .unwrap_err();
+        match err {
+            WrongoDBError::NotLeader { leader_hint } => assert_eq!(leader_hint, None),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn runtime_tick_and_inbound_surface_outbound_messages() {
+        let dir = tempdir().unwrap();
+        let manager = RecoveryManager::initialize(
+            dir.path(),
+            true,
+            new_txn_manager(),
+            RaftMode::Cluster {
+                local_node_id: "n1".to_string(),
+                peer_ids: vec!["n2".to_string()],
+            },
+        )
+        .unwrap();
+
+        let mut outbound = Vec::new();
+        for _ in 0..32 {
+            outbound = manager.raft_tick().unwrap();
+            if !outbound.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(outbound.len(), 1);
+        match &outbound[0] {
+            RaftOutboundMessage::RequestVote { to, .. } => assert_eq!(to, "n2"),
+            other => panic!("unexpected outbound message: {other:?}"),
+        }
+
+        let follow_up = manager
+            .raft_handle_inbound(RaftInboundMessage::RequestVoteResponse {
+                from: "n2".to_string(),
+                resp: crate::raft::protocol::RequestVoteResponse {
+                    term: 1,
+                    vote_granted: true,
+                },
+            })
+            .unwrap();
+        assert_eq!(follow_up.len(), 1);
+        match &follow_up[0] {
+            RaftOutboundMessage::AppendEntries { to, .. } => assert_eq!(to, "n2"),
+            other => panic!("unexpected outbound message: {other:?}"),
+        }
     }
 }

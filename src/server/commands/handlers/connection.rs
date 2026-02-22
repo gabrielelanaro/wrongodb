@@ -10,11 +10,12 @@ impl Command for HelloCommand {
         &["hello", "ismaster", "isMaster"]
     }
 
-    fn execute(&self, _doc: &Document, _db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
-        Ok(doc! {
+    fn execute(&self, _doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+        let (is_writable_primary, leader_hint) = db.raft_hello_state();
+        let mut response = doc! {
             "ok": Bson::Double(1.0),
-            "isMaster": Bson::Boolean(true),
-            "isWritablePrimary": Bson::Boolean(true),
+            "isMaster": Bson::Boolean(is_writable_primary),
+            "isWritablePrimary": Bson::Boolean(is_writable_primary),
             "helloOk": Bson::Boolean(true),
             "maxBsonObjectSize": Bson::Int32(16777216),
             "maxMessageSizeBytes": Bson::Int32(48000000),
@@ -22,11 +23,15 @@ impl Command for HelloCommand {
             "localTime": Bson::DateTime(bson::DateTime::now()),
             "minWireVersion": Bson::Int32(0),
             "maxWireVersion": Bson::Int32(13),
-            "readOnly": Bson::Boolean(false),
+            "readOnly": Bson::Boolean(!is_writable_primary),
             "logicalSessionTimeoutMinutes": Bson::Int32(30),
             "connectionId": Bson::Int32(1),
             "compression": Bson::Array(vec![]),
-        })
+        };
+        if let Some(primary) = leader_hint {
+            response.insert("primary", Bson::String(primary));
+        }
+        Ok(response)
     }
 }
 

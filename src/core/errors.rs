@@ -31,6 +31,9 @@ pub enum WrongoDBError {
 
     #[error("no active transaction")]
     NoActiveTransaction,
+
+    #[error("not writable primary")]
+    NotLeader { leader_hint: Option<String> },
 }
 
 #[derive(Debug, Error)]

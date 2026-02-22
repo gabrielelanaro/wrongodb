@@ -5,16 +5,31 @@ use crate::{Connection, ConnectionConfig, Session, WrongoDBError};
 
 use super::collection::Collection;
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RaftMode {
+    #[default]
+    Standalone,
+    Cluster {
+        local_node_id: String,
+        peer_ids: Vec<String>,
+    },
+}
+
 /// Configuration for opening a WrongoDB database.
 #[derive(Debug, Clone)]
 pub struct WrongoDBConfig {
     /// Enable WAL for durability (default: true)
     pub wal_enabled: bool,
+    /// Raft mode used for leader election/write gating.
+    pub raft_mode: RaftMode,
 }
 
 impl Default for WrongoDBConfig {
     fn default() -> Self {
-        Self { wal_enabled: true }
+        Self {
+            wal_enabled: true,
+            raft_mode: RaftMode::Standalone,
+        }
     }
 }
 
@@ -27,6 +42,12 @@ impl WrongoDBConfig {
     /// Enable or disable WAL (default: true).
     pub fn wal_enabled(mut self, enabled: bool) -> Self {
         self.wal_enabled = enabled;
+        self
+    }
+
+    /// Set Raft mode (default: standalone single-node).
+    pub fn raft_mode(mut self, mode: RaftMode) -> Self {
+        self.raft_mode = mode;
         self
     }
 }
@@ -56,6 +77,7 @@ impl WrongoDB {
             base_path,
             ConnectionConfig {
                 wal_enabled: config.wal_enabled,
+                raft_mode: config.raft_mode,
             },
         )?;
         Ok(Self { connection: conn })
@@ -119,5 +141,9 @@ impl WrongoDB {
 
     pub fn base_path(&self) -> &Path {
         self.connection.base_path()
+    }
+
+    pub(crate) fn raft_hello_state(&self) -> (bool, Option<String>) {
+        self.connection.raft_hello_state()
     }
 }

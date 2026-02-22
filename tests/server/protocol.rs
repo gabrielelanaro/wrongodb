@@ -3,7 +3,7 @@ use mongodb::{bson::doc, options::ClientOptions, Client};
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::sync::Mutex;
-use wrongodb::{start_server, WrongoDB};
+use wrongodb::{start_server, RaftMode, WrongoDB, WrongoDBConfig};
 
 #[tokio::test]
 async fn test_mongo_client_connection() {
@@ -187,4 +187,45 @@ async fn test_supported_mongosh_commands() {
             .await
             .unwrap(),
     );
+}
+
+#[tokio::test]
+async fn test_non_leader_mode_rejects_writes_but_keeps_connection_alive() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("test_cluster_non_leader.db");
+    let cfg = WrongoDBConfig::new().raft_mode(RaftMode::Cluster {
+        local_node_id: "n1".to_string(),
+        peer_ids: vec!["n2".to_string()],
+    });
+    let db = WrongoDB::open_with_config(db_path.to_str().unwrap(), cfg).unwrap();
+    let db = Arc::new(Mutex::new(db));
+
+    let db_clone = Arc::clone(&db);
+    tokio::spawn(async move {
+        start_server("127.0.0.1:27020", db_clone).await.unwrap();
+    });
+
+    crate::common::wait_for_server().await;
+
+    let client_options = ClientOptions::parse("mongodb://127.0.0.1:27020")
+        .await
+        .unwrap();
+    let client = Client::with_options(client_options).unwrap();
+    let db_client = client.database("test");
+
+    let hello = db_client.run_command(doc! { "hello": 1 }).await.unwrap();
+    assert_eq!(hello.get_bool("isWritablePrimary").unwrap(), false);
+
+    let write_err = db_client
+        .run_command(doc! { "insert": "test", "documents": [ { "k": "v" } ] })
+        .await
+        .unwrap_err();
+    let write_err_text = write_err.to_string();
+    assert!(
+        write_err_text.contains("NotWritablePrimary")
+            || write_err_text.contains("10107")
+            || write_err_text.contains("not writable primary")
+    );
+
+    db_client.run_command(doc! { "ping": 1 }).await.unwrap();
 }

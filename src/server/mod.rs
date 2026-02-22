@@ -165,7 +165,10 @@ async fn handle_op_msg(
             }
         }
         let mut db_lock = db.lock().await;
-        return registry.execute(&doc, &mut db_lock);
+        return Ok(match registry.execute(&doc, &mut db_lock) {
+            Ok(response) => response,
+            Err(err) => command_error_document(&err),
+        });
     }
 
     Ok(doc! { "ok": Bson::Double(0.0), "errmsg": "No command document" })
@@ -201,7 +204,10 @@ async fn handle_op_query(
 
     if full_coll_name == "admin.$cmd" {
         let mut db_lock = db.lock().await;
-        return registry.execute(&query_doc, &mut db_lock);
+        return Ok(match registry.execute(&query_doc, &mut db_lock) {
+            Ok(response) => response,
+            Err(err) => command_error_document(&err),
+        });
     }
 
     let filter_json = bson_to_value(&query_doc);
@@ -212,7 +218,10 @@ async fn handle_op_query(
         .unwrap_or(full_coll_name.as_str());
     let coll = db_lock.collection(coll_name);
     let mut session = db_lock.open_session();
-    let results = coll.find(&mut session, Some(filter_json))?;
+    let results = match coll.find(&mut session, Some(filter_json)) {
+        Ok(results) => results,
+        Err(err) => return Ok(command_error_document(&err)),
+    };
     let results_bson: Vec<Bson> = results
         .into_iter()
         .map(|d| Bson::Document(value_to_bson(&Value::Object(d))))
@@ -226,6 +235,29 @@ async fn handle_op_query(
             "firstBatch": Bson::Array(results_bson),
         }
     })
+}
+
+fn command_error_document(err: &WrongoDBError) -> Document {
+    match err {
+        WrongoDBError::NotLeader { leader_hint } => {
+            let mut doc = doc! {
+                "ok": Bson::Double(0.0),
+                "errmsg": Bson::String(err.to_string()),
+                "code": Bson::Int32(10107),
+                "codeName": Bson::String("NotWritablePrimary".to_string()),
+            };
+            if let Some(primary) = leader_hint {
+                doc.insert("primary", Bson::String(primary.clone()));
+            }
+            doc
+        }
+        _ => doc! {
+            "ok": Bson::Double(0.0),
+            "errmsg": Bson::String(err.to_string()),
+            "code": Bson::Int32(8000),
+            "codeName": Bson::String("WrongoDBError".to_string()),
+        },
+    }
 }
 
 async fn send_reply(

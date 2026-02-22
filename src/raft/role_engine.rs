@@ -40,6 +40,7 @@ pub(crate) enum RaftEffect {
 pub(crate) struct RaftRoleEngine {
     config: RaftRoleConfig,
     role: RaftRole,
+    leader_id: Option<String>,
     election_elapsed_ticks: u64,
     election_timeout_ticks: u64,
     heartbeat_elapsed_ticks: u64,
@@ -67,6 +68,7 @@ impl RaftRoleEngine {
         let mut engine = Self {
             config,
             role: RaftRole::Follower,
+            leader_id: None,
             election_elapsed_ticks: 0,
             election_timeout_ticks: 1,
             heartbeat_elapsed_ticks: 0,
@@ -82,6 +84,10 @@ impl RaftRoleEngine {
 
     pub(crate) fn role(&self) -> RaftRole {
         self.role
+    }
+
+    pub(crate) fn leader_id(&self) -> Option<&str> {
+        self.leader_id.as_deref()
     }
 
     pub(crate) fn tick(&mut self, protocol_state: &mut RaftProtocolState) -> Vec<RaftEffect> {
@@ -106,6 +112,12 @@ impl RaftRoleEngine {
         }
     }
 
+    pub(crate) fn bootstrap_single_node_leader(&mut self, protocol_state: &RaftProtocolState) {
+        if self.config.peer_ids.is_empty() {
+            self.become_leader(protocol_state);
+        }
+    }
+
     pub(crate) fn on_inbound_request_vote(
         &mut self,
         prev_term: u64,
@@ -115,6 +127,9 @@ impl RaftRoleEngine {
     ) {
         if req.term > prev_term {
             self.become_follower(protocol_state);
+        }
+        if req.term >= protocol_state.current_term {
+            self.leader_id = None;
         }
         if resp.vote_granted {
             self.reset_election_timer();
@@ -128,8 +143,15 @@ impl RaftRoleEngine {
         resp: &AppendEntriesResponse,
         protocol_state: &RaftProtocolState,
     ) {
-        if req.term > prev_term || (resp.success && req.term >= protocol_state.current_term) {
+        if req.term > prev_term || (req.term >= protocol_state.current_term && resp.success) {
             self.become_follower(protocol_state);
+            self.leader_id = Some(req.leader_id.clone());
+            return;
+        }
+
+        if req.term >= protocol_state.current_term {
+            self.reset_election_timer();
+            self.leader_id = Some(req.leader_id.clone());
         }
     }
 
@@ -225,6 +247,7 @@ impl RaftRoleEngine {
 
     fn start_election(&mut self, protocol_state: &mut RaftProtocolState) -> Vec<RaftEffect> {
         self.role = RaftRole::Candidate;
+        self.leader_id = None;
         protocol_state.current_term = protocol_state.current_term.saturating_add(1);
         protocol_state.voted_for = Some(self.config.local_node_id.clone());
 
@@ -258,6 +281,7 @@ impl RaftRoleEngine {
 
     fn become_follower(&mut self, _protocol_state: &RaftProtocolState) {
         self.role = RaftRole::Follower;
+        self.leader_id = None;
         self.candidate_votes.clear();
         self.next_index.clear();
         self.match_index.clear();
@@ -267,6 +291,7 @@ impl RaftRoleEngine {
 
     fn become_leader(&mut self, protocol_state: &RaftProtocolState) {
         self.role = RaftRole::Leader;
+        self.leader_id = Some(self.config.local_node_id.clone());
         self.candidate_votes.clear();
         self.heartbeat_elapsed_ticks = 0;
         self.next_index.clear();
@@ -728,7 +753,33 @@ mod tests {
 
         assert!(effects.is_empty());
         assert_eq!(engine.role(), RaftRole::Leader);
+        assert_eq!(engine.leader_id(), Some("n1"));
         assert_eq!(state.current_term, 1);
         assert_eq!(state.voted_for.as_deref(), Some("n1"));
+    }
+
+    #[test]
+    fn append_entries_from_current_term_tracks_leader_hint() {
+        let cfg = config("n1", &["n2"], 5, 5, 1);
+        let state = RaftProtocolState::default();
+        let mut engine = RaftRoleEngine::new(cfg, &state).unwrap();
+
+        let req = AppendEntriesRequest {
+            term: 0,
+            leader_id: "n2".to_string(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
+        };
+        let resp = AppendEntriesResponse {
+            term: 0,
+            success: true,
+            match_index: 0,
+        };
+
+        engine.on_inbound_append_entries(0, &req, &resp, &state);
+        assert_eq!(engine.role(), RaftRole::Follower);
+        assert_eq!(engine.leader_id(), Some("n2"));
     }
 }

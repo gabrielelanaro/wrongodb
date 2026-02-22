@@ -25,6 +25,20 @@ pub(crate) struct RaftProgress {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RaftLeadershipState {
+    pub role: RaftRole,
+    pub current_term: u64,
+    pub local_node_id: String,
+    pub leader_id: Option<String>,
+}
+
+impl RaftLeadershipState {
+    pub(crate) fn is_writable_primary(&self) -> bool {
+        self.role == RaftRole::Leader
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RaftNodeConfig {
     pub(crate) local_node_id: String,
     pub(crate) peer_ids: Vec<String>,
@@ -62,6 +76,7 @@ pub(crate) struct RaftNodeCore {
 }
 
 impl RaftNodeCore {
+    #[allow(dead_code)]
     pub(crate) fn open<P: AsRef<Path>>(db_dir: P) -> Result<Self, WrongoDBError> {
         Self::open_with_config(db_dir, RaftNodeConfig::default())
     }
@@ -106,8 +121,9 @@ impl RaftNodeCore {
             commit_index: last_raft_index,
             last_applied: last_raft_index,
         };
+        let standalone_mode = cfg.peer_ids.is_empty();
 
-        Ok(Self {
+        let mut node = Self {
             local_node_id: cfg.local_node_id,
             hard_state_store,
             hard_state,
@@ -116,7 +132,16 @@ impl RaftNodeCore {
             protocol_state,
             role_engine,
             wal,
-        })
+        };
+
+        // Standalone mode bootstrap: zero-peer nodes self-elect on startup so writes are
+        // immediately writable without an external tick loop.
+        if standalone_mode {
+            node.role_engine
+                .bootstrap_single_node_leader(&node.protocol_state);
+        }
+
+        Ok(node)
     }
 
     pub(crate) fn current_term(&self) -> u64 {
@@ -167,6 +192,38 @@ impl RaftNodeCore {
     #[allow(dead_code)]
     pub(crate) fn role(&self) -> RaftRole {
         self.role_engine.role()
+    }
+
+    pub(crate) fn leadership(&self) -> RaftLeadershipState {
+        let role = self.role();
+        let leader_id = self
+            .role_engine
+            .leader_id()
+            .map(|id| id.to_string())
+            .or_else(|| {
+                if role == RaftRole::Leader {
+                    Some(self.local_node_id.clone())
+                } else {
+                    None
+                }
+            });
+        RaftLeadershipState {
+            role,
+            current_term: self.protocol_state.current_term,
+            local_node_id: self.local_node_id.clone(),
+            leader_id,
+        }
+    }
+
+    pub(crate) fn ensure_writable_leader(&self) -> Result<(), WrongoDBError> {
+        let leadership = self.leadership();
+        if leadership.is_writable_primary() {
+            return Ok(());
+        }
+
+        Err(WrongoDBError::NotLeader {
+            leader_hint: leadership.leader_id,
+        })
     }
 
     #[allow(dead_code)]
@@ -412,6 +469,34 @@ mod tests {
             election_timeout_max_ticks: max,
             heartbeat_interval_ticks: heartbeat,
             timeout_seed: 11,
+        }
+    }
+
+    #[test]
+    fn standalone_open_bootstraps_to_writable_leader() {
+        let dir = tempdir().unwrap();
+        let node = RaftNodeCore::open(dir.path()).unwrap();
+        let leadership = node.leadership();
+
+        assert_eq!(leadership.role, RaftRole::Leader);
+        assert_eq!(leadership.current_term, 0);
+        assert_eq!(leadership.leader_id.as_deref(), Some("local"));
+        node.ensure_writable_leader().unwrap();
+    }
+
+    #[test]
+    fn clustered_open_starts_non_leader_and_rejects_writes() {
+        let dir = tempdir().unwrap();
+        let node =
+            RaftNodeCore::open_with_config(dir.path(), node_cfg("n1", &["n2", "n3"], 10, 10, 3))
+                .unwrap();
+        let leadership = node.leadership();
+
+        assert_eq!(leadership.role, RaftRole::Follower);
+        let err = node.ensure_writable_leader().unwrap_err();
+        match err {
+            WrongoDBError::NotLeader { leader_hint } => assert_eq!(leader_hint, None),
+            other => panic!("unexpected error: {other}"),
         }
     }
 

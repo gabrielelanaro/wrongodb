@@ -1,5 +1,41 @@
 # Decisions
 
+## 2026-02-22: Add Raft runtime bridge and leader-gated write path with wire-protocol errors
+
+**Decision**
+- Add `src/raft/runtime.rs`, a transport-agnostic runtime adapter around `RaftNodeCore` that:
+  - converts internal `RaftEffect` outputs into outbound request envelopes
+  - accepts inbound request/response envelopes
+  - emits outbound response envelopes for inbound RPC requests
+- Keep runtime stepping manual in this slice (`tick`, `handle_inbound`, `drain_outbound`); no
+  background scheduler or network transport is introduced yet.
+- Add a minimal public cluster-mode selector:
+  - `RaftMode::Standalone` (default)
+  - `RaftMode::Cluster { local_node_id, peer_ids }`
+  wired through `WrongoDBConfig` and `ConnectionConfig`.
+- Enforce leader-only writes in `RecoveryManager` for all WAL mutation calls:
+  - `log_put`, `log_delete`, `log_txn_commit_sync`, `log_txn_abort`, `checkpoint_and_truncate_if_safe`
+  return `WrongoDBError::NotLeader { leader_hint }` when this node is not leader.
+- Bootstrap zero-peer standalone nodes to leader during `RaftNodeCore::open_with_config` so
+  local single-node writes remain immediately available.
+- Surface leadership to clients via Mongo wire protocol:
+  - `hello/isMaster` now returns dynamic `isMaster`/`isWritablePrimary` and `readOnly`
+  - optional `primary` hint is included when known
+  - command execution failures are converted to error documents (no socket drop), with
+    `NotLeader` mapped to code `10107` and `codeName: "NotWritablePrimary"`.
+
+**Why**
+- We need a runnable integration boundary between pure Raft logic and future transport code
+  without committing to networking decisions yet.
+- Leader gating protects Raft safety by preventing follower local divergence at the durability
+  boundary.
+- Single-node auto-election preserves current developer ergonomics.
+- Returning wire-protocol command errors keeps clients connected and retry-capable.
+
+**Notes**
+- This slice does not add RPC transport, background ticking, or multi-node discovery.
+- Follower write proxying is intentionally out of scope; writes are hard-rejected off-leader.
+
 ## 2026-02-22: Add deterministic Raft role/timer engine with outbound effects (no transport)
 
 **Decision**

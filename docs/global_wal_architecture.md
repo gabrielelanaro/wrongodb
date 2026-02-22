@@ -63,6 +63,15 @@ Startup policy:
 - On commit: write `TxnCommit`, then `fsync` WAL, then flip MVCC visibility.
 - On abort: write `TxnAbort` (no mandatory `fsync`).
 
+## Raft leader gate
+
+When WAL is enabled and Raft mode is active, WAL mutation APIs are leader-gated:
+
+- Leader node: append proceeds normally.
+- Non-leader node: mutation APIs fail with `NotLeader` (`code=10107`, `NotWritablePrimary` on wire protocol paths).
+
+This applies to row mutations, txn commit/abort markers, and checkpoint-truncate WAL operations.
+
 ## Recovery flow
 
 Recovery runs once at connection open:
