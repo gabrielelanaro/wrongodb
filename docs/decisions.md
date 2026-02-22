@@ -1,5 +1,30 @@
 # Decisions
 
+## 2026-02-22: Add Raft hard-state sidecar and internal Raft node core
+
+**Decision**
+- Introduce an internal `raft` module with:
+  - `RaftHardStateStore` for persisted hard state (`current_term`, `voted_for`)
+  - `RaftNodeCore` wrapping `GlobalWal` and in-memory progress (`commit_index`, `last_applied`)
+- Persist hard state in `<db_dir>/raft_state.bin` using a binary format with:
+  - magic/version
+  - flags + optional UTF-8 `voted_for`
+  - CRC32 checksum
+- Apply fail-fast safety policy for hard-state corruption:
+  - missing file initializes defaults
+  - invalid/corrupt/unsupported file fails startup
+- Route WAL appends in `RecoveryManager` through `RaftNodeCore` so `raft_term` is sourced from persisted hard state instead of a bootstrap constant.
+- Keep commit/apply runtime behavior unchanged in this slice by advancing in-memory `commit_index` and `last_applied` to the WAL tail after each append.
+
+**Why**
+- Raft election safety requires durable `current_term` and `voted_for`.
+- Separating protocol state from WAL byte-format code keeps responsibilities explicit and reduces future coupling.
+- Corrupt hard state should not be silently reset because that can violate Raft voting invariants after restart.
+
+**Notes**
+- APIs remain internal-only; no new public exports.
+- Multi-node RPC/election/apply-loop behavior remains out of scope for this slice.
+
 ## 2026-02-22: WAL v2 adds Raft term/index identity and snapshot boundary metadata
 
 **Decision**

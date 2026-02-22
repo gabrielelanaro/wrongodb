@@ -8,8 +8,12 @@ Status: Active
 WrongoDB now uses a **single connection-level WAL** per database directory:
 
 - WAL file path: `<db_dir>/global.wal`
+- Raft hard-state sidecar: `<db_dir>/raft_state.bin`
 - Scope: all main tables (`*.main.wt`) and index tables (`*.idx.wt`)
 - Recovery: one pass at `Connection::open`
+
+When WAL is enabled, startup also loads Raft hard state (`current_term`, `voted_for`) from
+`raft_state.bin`.
 
 ## Record model
 
@@ -37,6 +41,20 @@ WAL file header persists both physical and Raft snapshot state:
 - `last_raft_index`
 - `snapshot_last_included_index`
 - `snapshot_last_included_term`
+
+## Raft hard state sidecar
+
+`raft_state.bin` stores:
+
+- `current_term`
+- `voted_for`
+
+with magic/version and CRC32 validation.
+
+Startup policy:
+
+- Missing file: initialize default hard state.
+- Corrupt/invalid file: fail startup (fail-fast safety).
 
 ## Durability boundary
 

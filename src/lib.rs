@@ -2,6 +2,7 @@ mod api;
 mod core;
 mod engine;
 mod index;
+mod raft;
 mod recovery;
 mod server;
 mod storage;

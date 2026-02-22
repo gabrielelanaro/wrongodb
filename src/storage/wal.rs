@@ -1108,6 +1108,14 @@ impl GlobalWal {
     pub fn sync(&mut self) -> Result<(), WrongoDBError> {
         self.file.sync()
     }
+
+    pub fn last_raft_index(&self) -> u64 {
+        self.file.last_raft_index
+    }
+
+    pub fn last_raft_term(&self) -> u64 {
+        self.file.last_record_raft_term
+    }
 }
 
 #[cfg(test)]

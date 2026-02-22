@@ -6,6 +6,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::core::errors::StorageError;
+use crate::raft::node::RaftNodeCore;
 use crate::recovery::txn_table::RecoveryTxnTable;
 use crate::storage::table::Table;
 use crate::storage::wal::{GlobalWal, RecoveryError, WalReader, WalRecord, WalSink};
@@ -13,12 +14,10 @@ use crate::txn::transaction_manager::TransactionManager;
 use crate::txn::TxnId;
 use crate::WrongoDBError;
 
-const BOOTSTRAP_RAFT_TERM: u64 = 0;
-
 #[derive(Debug)]
 pub(crate) struct RecoveryManager {
     wal_enabled: bool,
-    global_wal: Option<Arc<Mutex<GlobalWal>>>,
+    raft_node: Option<Arc<Mutex<RaftNodeCore>>>,
     txn_manager: Arc<TransactionManager>,
 }
 
@@ -30,14 +29,14 @@ impl RecoveryManager {
     ) -> Result<Self, WrongoDBError> {
         let mut manager = Self {
             wal_enabled,
-            global_wal: None,
+            raft_node: None,
             txn_manager,
         };
 
         if manager.wal_enabled {
             warn_legacy_per_table_wal_files(base_path);
             manager.recover(base_path)?;
-            manager.global_wal = Some(Arc::new(Mutex::new(GlobalWal::open_or_create(base_path)?)));
+            manager.raft_node = Some(Arc::new(Mutex::new(RaftNodeCore::open(base_path)?)));
         }
 
         Ok(manager)
@@ -53,10 +52,8 @@ impl RecoveryManager {
         if !self.wal_enabled {
             return Ok(());
         }
-        if let Some(global_wal) = self.global_wal.as_ref() {
-            global_wal
-                .lock()
-                .log_put(store_name, key, value, txn_id, BOOTSTRAP_RAFT_TERM)?;
+        if let Some(raft_node) = self.raft_node.as_ref() {
+            raft_node.lock().log_put(store_name, key, value, txn_id)?;
         }
         Ok(())
     }
@@ -70,10 +67,8 @@ impl RecoveryManager {
         if !self.wal_enabled {
             return Ok(());
         }
-        if let Some(global_wal) = self.global_wal.as_ref() {
-            global_wal
-                .lock()
-                .log_delete(store_name, key, txn_id, BOOTSTRAP_RAFT_TERM)?;
+        if let Some(raft_node) = self.raft_node.as_ref() {
+            raft_node.lock().log_delete(store_name, key, txn_id)?;
         }
         Ok(())
     }
@@ -86,10 +81,10 @@ impl RecoveryManager {
         if !self.wal_enabled {
             return Ok(());
         }
-        if let Some(global_wal) = self.global_wal.as_ref() {
-            let mut wal = global_wal.lock();
-            wal.log_txn_commit(txn_id, commit_ts, BOOTSTRAP_RAFT_TERM)?;
-            wal.sync()?;
+        if let Some(raft_node) = self.raft_node.as_ref() {
+            let mut raft_node = raft_node.lock();
+            raft_node.log_txn_commit(txn_id, commit_ts)?;
+            raft_node.sync()?;
         }
         Ok(())
     }
@@ -98,10 +93,8 @@ impl RecoveryManager {
         if !self.wal_enabled {
             return Ok(());
         }
-        if let Some(global_wal) = self.global_wal.as_ref() {
-            global_wal
-                .lock()
-                .log_txn_abort(txn_id, BOOTSTRAP_RAFT_TERM)?;
+        if let Some(raft_node) = self.raft_node.as_ref() {
+            raft_node.lock().log_txn_abort(txn_id)?;
         }
         Ok(())
     }
@@ -111,12 +104,12 @@ impl RecoveryManager {
             return Ok(());
         }
 
-        if let Some(global_wal) = self.global_wal.as_ref() {
-            let mut wal = global_wal.lock();
-            let checkpoint_lsn = wal.log_checkpoint(BOOTSTRAP_RAFT_TERM)?;
-            wal.set_checkpoint_lsn(checkpoint_lsn)?;
-            wal.sync()?;
-            wal.truncate_to_checkpoint()?;
+        if let Some(raft_node) = self.raft_node.as_ref() {
+            let mut raft_node = raft_node.lock();
+            let checkpoint_lsn = raft_node.log_checkpoint()?;
+            raft_node.set_checkpoint_lsn(checkpoint_lsn)?;
+            raft_node.sync()?;
+            raft_node.truncate_to_checkpoint()?;
         }
 
         Ok(())
@@ -279,22 +272,24 @@ impl WalSink for RecoveryManager {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
     use std::sync::Arc;
 
     use tempfile::tempdir;
 
     use super::*;
+    use crate::raft::hard_state::RaftHardStateStore;
     use crate::txn::GlobalTxnState;
+
+    fn new_txn_manager() -> Arc<TransactionManager> {
+        Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())))
+    }
 
     #[test]
     fn commit_marker_is_persisted_after_sync() {
         let dir = tempdir().unwrap();
-        let manager = RecoveryManager::initialize(
-            dir.path(),
-            true,
-            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new()))),
-        )
-        .unwrap();
+        let manager = RecoveryManager::initialize(dir.path(), true, new_txn_manager()).unwrap();
 
         manager.log_txn_commit_sync(7, 7).unwrap();
 
@@ -318,12 +313,7 @@ mod tests {
     #[test]
     fn checkpoint_skip_and_truncate_follow_active_txn_flag() {
         let dir = tempdir().unwrap();
-        let manager = RecoveryManager::initialize(
-            dir.path(),
-            true,
-            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new()))),
-        )
-        .unwrap();
+        let manager = RecoveryManager::initialize(dir.path(), true, new_txn_manager()).unwrap();
 
         manager.log_txn_commit_sync(1, 1).unwrap();
 
@@ -338,5 +328,48 @@ mod tests {
         manager.checkpoint_and_truncate_if_safe(false).unwrap();
         let after_truncate = std::fs::metadata(&wal_path).unwrap().len();
         assert!(after_truncate <= 512);
+    }
+
+    #[test]
+    fn wal_enabled_startup_creates_raft_hard_state_file() {
+        let dir = tempdir().unwrap();
+        let raft_state_path = RaftHardStateStore::path_for_db(dir.path());
+        assert!(!raft_state_path.exists());
+
+        let _manager = RecoveryManager::initialize(dir.path(), true, new_txn_manager()).unwrap();
+
+        assert!(raft_state_path.exists());
+    }
+
+    #[test]
+    fn wal_disabled_startup_does_not_create_raft_hard_state_file() {
+        let dir = tempdir().unwrap();
+        let raft_state_path = RaftHardStateStore::path_for_db(dir.path());
+        assert!(!raft_state_path.exists());
+
+        let _manager = RecoveryManager::initialize(dir.path(), false, new_txn_manager()).unwrap();
+
+        assert!(!raft_state_path.exists());
+    }
+
+    #[test]
+    fn corrupt_raft_hard_state_fails_startup() {
+        let dir = tempdir().unwrap();
+        let raft_state_path = RaftHardStateStore::path_for_db(dir.path());
+
+        let _manager = RecoveryManager::initialize(dir.path(), true, new_txn_manager()).unwrap();
+        assert!(raft_state_path.exists());
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&raft_state_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&[0xFF]).unwrap();
+        file.sync_all().unwrap();
+
+        let err = RecoveryManager::initialize(dir.path(), true, new_txn_manager()).unwrap_err();
+        assert!(err.to_string().contains("raft hard state"));
     }
 }
