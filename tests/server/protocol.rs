@@ -1,9 +1,17 @@
 use futures_util::stream::{StreamExt, TryStreamExt};
 use mongodb::{bson::doc, options::ClientOptions, Client};
+use std::net::TcpListener;
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::sync::Mutex;
-use wrongodb::{start_server, RaftMode, WrongoDB, WrongoDBConfig};
+use wrongodb::{start_server, RaftMode, RaftPeerConfig, WrongoDB, WrongoDBConfig};
+
+fn free_local_addr() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr.to_string()
+}
 
 #[tokio::test]
 async fn test_mongo_client_connection() {
@@ -193,9 +201,15 @@ async fn test_supported_mongosh_commands() {
 async fn test_non_leader_mode_rejects_writes_but_keeps_connection_alive() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("test_cluster_non_leader.db");
+    let local_raft_addr = free_local_addr();
+    let peer_raft_addr = free_local_addr();
     let cfg = WrongoDBConfig::new().raft_mode(RaftMode::Cluster {
         local_node_id: "n1".to_string(),
-        peer_ids: vec!["n2".to_string()],
+        local_raft_addr,
+        peers: vec![RaftPeerConfig {
+            node_id: "n2".to_string(),
+            raft_addr: peer_raft_addr,
+        }],
     });
     let db = WrongoDB::open_with_config(db_path.to_str().unwrap(), cfg).unwrap();
     let db = Arc::new(Mutex::new(db));

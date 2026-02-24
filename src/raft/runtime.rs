@@ -76,9 +76,17 @@ impl RaftRuntime {
     }
 
     pub(crate) fn propose(&mut self, command: &RaftCommand) -> Result<u64, WrongoDBError> {
+        let proposal_index = self.propose_without_wait(command)?;
+        self.wait_for_commit(proposal_index, DEFAULT_PROPOSAL_WAIT_STEPS)?;
+        Ok(proposal_index)
+    }
+
+    pub(crate) fn propose_without_wait(
+        &mut self,
+        command: &RaftCommand,
+    ) -> Result<u64, WrongoDBError> {
         let (proposal_index, effects) = self.node.propose_command(command)?;
         self.enqueue_effects(effects);
-        self.wait_for_commit(proposal_index, DEFAULT_PROPOSAL_WAIT_STEPS)?;
         Ok(proposal_index)
     }
 
@@ -183,6 +191,22 @@ impl RaftRuntime {
 
     pub(crate) fn drain_outbound(&mut self) -> Vec<RaftOutboundMessage> {
         self.outbound.drain(..).collect()
+    }
+
+    pub(crate) fn apply_committed_entries(&mut self) -> Result<u64, WrongoDBError> {
+        self.node.apply_committed_entries()
+    }
+
+    pub(crate) fn sync_node(&mut self) -> Result<(), WrongoDBError> {
+        self.node.sync()
+    }
+
+    pub(crate) fn truncate_to_checkpoint(&mut self) -> Result<(), WrongoDBError> {
+        self.node.truncate_to_checkpoint()
+    }
+
+    pub(crate) fn is_index_committed_and_applied(&self, index: u64) -> bool {
+        self.node.is_index_committed_and_applied(index)
     }
 
     pub(crate) fn node_mut(&mut self) -> &mut RaftNodeCore {

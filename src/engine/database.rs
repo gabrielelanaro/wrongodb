@@ -5,13 +5,20 @@ use crate::{Connection, ConnectionConfig, Session, WrongoDBError};
 
 use super::collection::Collection;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftPeerConfig {
+    pub node_id: String,
+    pub raft_addr: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RaftMode {
     #[default]
     Standalone,
     Cluster {
         local_node_id: String,
-        peer_ids: Vec<String>,
+        local_raft_addr: String,
+        peers: Vec<RaftPeerConfig>,
     },
 }
 

@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
+use serde::{Deserialize, Serialize};
+
 pub(crate) type NodeId = String;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProtocolLogEntry {
     pub(crate) term: u64,
     pub(crate) payload: Vec<u8>,
@@ -57,7 +59,7 @@ impl RaftProtocolState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RequestVoteRequest {
     pub(crate) term: u64,
     pub(crate) candidate_id: NodeId,
@@ -65,13 +67,13 @@ pub(crate) struct RequestVoteRequest {
     pub(crate) last_log_term: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RequestVoteResponse {
     pub(crate) term: u64,
     pub(crate) vote_granted: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AppendEntriesRequest {
     pub(crate) term: u64,
     pub(crate) leader_id: NodeId,
@@ -81,7 +83,7 @@ pub(crate) struct AppendEntriesRequest {
     pub(crate) leader_commit: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AppendEntriesResponse {
     pub(crate) term: u64,
     pub(crate) success: bool,

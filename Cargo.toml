@@ -16,6 +16,7 @@ name = "wrongodb-server"
 path = "src/bin/server.rs"
 
 [dependencies]
+bincode = "1"
 bson = "2"
 byteorder = "1"
 crc32fast = "1"

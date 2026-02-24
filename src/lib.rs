@@ -15,7 +15,8 @@ pub mod commands {
 pub use crate::api::{Connection, ConnectionConfig, Cursor, CursorKind, Session};
 pub use crate::core::errors::{DocumentValidationError, StorageError, WrongoDBError};
 pub use crate::engine::{
-    Collection, DbStats, IndexInfo, RaftMode, UpdateResult, WrongoDB, WrongoDBConfig,
+    Collection, DbStats, IndexInfo, RaftMode, RaftPeerConfig, UpdateResult, WrongoDB,
+    WrongoDBConfig,
 };
 pub use crate::index::{
     decode_index_id, encode_index_key, encode_range_bounds, encode_scalar_prefix, IndexCatalog,

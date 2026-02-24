@@ -1,5 +1,35 @@
 # Decisions
 
+## 2026-02-22: Add dedicated Raft TCP transport and actor-owned runtime for multi-node quorum writes
+
+**Decision**
+- Introduce `src/raft/transport.rs` with a framed Raft wire protocol:
+  - frame format: `u32_le payload_len` + bincode payload
+  - message envelope: `{ from, to, msg }`
+  - message variants mirror runtime RPCs (`RequestVote`, `AppendEntries`, and responses)
+- Introduce `src/raft/service.rs` as the single owner of `RaftRuntime`:
+  - actor loop drives logical ticks every 50ms
+  - actor loop handles inbound RPCs, outbound sends, and proposal commit waiting
+  - proposal timeout set to 5s for quorum commit
+  - service exposes sync/truncate operations needed by recovery paths
+- Replace `RecoveryManager`’s shared `Arc<Mutex<RaftRuntime>>` with `RaftServiceHandle`.
+- Extend cluster config shape from peer IDs to static peer topology:
+  - `RaftMode::Cluster { local_node_id, local_raft_addr, peers: Vec<RaftPeerConfig> }`
+  - each peer has `{ node_id, raft_addr }`
+  - validate non-empty/parseable addresses, unique peer IDs, unique peer addresses, and no local-node self peer.
+- Keep client semantics for this slice:
+  - follower writes rejected with `NotLeader` / `NotWritablePrimary`
+  - follower reads remain allowed (potentially stale)
+
+**Why**
+- Multi-node quorum commit cannot progress without background ticking and network transport.
+- Single runtime ownership removes lock-based races and centralizes commit progression.
+- Static `id+addr` topology is the smallest decision-complete step for real multi-process clusters.
+
+**Notes**
+- Delivery is fire-and-forget (connect/send/close per outbound message); failed sends are retried by Raft heartbeat/election behavior.
+- Dynamic membership, read-index/linearizable follower reads, and snapshot installation remain out of scope.
+
 ## 2026-02-22: Require quorum-committed Raft proposals before acknowledging WAL mutations
 
 **Decision**
