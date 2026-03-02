@@ -11,15 +11,11 @@ use crate::txn::transaction_manager::TransactionManager;
 use crate::txn::{Transaction, TxnId};
 use crate::WrongoDBError;
 
-struct SessionTxnContext {
-    txn: Transaction,
-}
-
 pub struct Session {
     cache: Arc<DataHandleCache>,
     transaction_manager: Arc<TransactionManager>,
     recovery_manager: Arc<RecoveryManager>,
-    txn: Option<SessionTxnContext>,
+    active_txn: Option<Transaction>,
 }
 
 impl Session {
@@ -32,14 +28,14 @@ impl Session {
             cache,
             transaction_manager,
             recovery_manager,
-            txn: None,
+            active_txn: None,
         }
     }
 
     /// Mark a table as touched in the current transaction.
     fn mark_table_touched(&mut self, uri: &str) {
-        if let Some(ref mut ctx) = self.txn {
-            ctx.txn.mark_table_touched(uri);
+        if let Some(ref mut txn) = self.active_txn {
+            txn.mark_table_touched(uri);
         }
     }
 
@@ -124,22 +120,22 @@ impl Session {
     /// }
     /// ```
     pub fn transaction(&mut self) -> Result<SessionTxn<'_>, WrongoDBError> {
-        if self.txn.is_some() {
+        if self.active_txn.is_some() {
             return Err(WrongoDBError::TransactionAlreadyActive);
         }
         let txn = self.transaction_manager.begin_snapshot_txn();
-        self.txn = Some(SessionTxnContext { txn });
+        self.active_txn = Some(txn);
         Ok(SessionTxn::new(self))
     }
 
     /// Get a reference to the current transaction if one is active.
     pub fn current_txn(&self) -> Option<&Transaction> {
-        self.txn.as_ref().map(|ctx| &ctx.txn)
+        self.active_txn.as_ref()
     }
 
     /// Get a mutable reference to the current transaction if one is active.
     pub fn current_txn_mut(&mut self) -> Option<&mut Transaction> {
-        self.txn.as_mut().map(|ctx| &mut ctx.txn)
+        self.active_txn.as_mut()
     }
 
     pub(crate) fn checkpoint_all(&mut self) -> Result<(), WrongoDBError> {
@@ -203,26 +199,24 @@ impl<'a> SessionTxn<'a> {
     /// After calling this, the transaction handle is consumed and cannot be used again.
     /// Commits the transaction across all touched tables.
     pub fn commit(mut self) -> Result<(), WrongoDBError> {
-        let Some(ctx) = self.session.txn.as_ref() else {
+        let Some(txn) = self.session.active_txn.as_ref() else {
             self.committed = true;
             return Ok(());
         };
-        let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
-        let txn_id = ctx.txn.id();
+        let touched_tables: Vec<String> = txn.touched_tables().iter().cloned().collect();
+        let txn_id = txn.id();
 
         self.session
             .recovery_manager
             .log_txn_commit_sync(txn_id, txn_id)?;
 
-        let ctx =
-            self.session.txn.as_mut().ok_or_else(|| {
+        let txn =
+            self.session.active_txn.as_mut().ok_or_else(|| {
                 StorageError("transaction context disappeared during commit".into())
             })?;
-        self.session
-            .transaction_manager
-            .commit_txn_state(&mut ctx.txn)?;
+        self.session.transaction_manager.commit_txn_state(txn)?;
 
-        self.session.txn = None;
+        self.session.active_txn = None;
         self.committed = true;
 
         if !self.session.recovery_manager.wal_enabled() {
@@ -237,24 +231,22 @@ impl<'a> SessionTxn<'a> {
     /// After calling this, the transaction handle is consumed and cannot be used again.
     /// Aborts the transaction across all touched tables.
     pub fn abort(mut self) -> Result<(), WrongoDBError> {
-        let Some(ctx) = self.session.txn.as_ref() else {
+        let Some(txn) = self.session.active_txn.as_ref() else {
             self.committed = true;
             return Ok(());
         };
-        let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
-        let txn_id = ctx.txn.id();
+        let touched_tables: Vec<String> = txn.touched_tables().iter().cloned().collect();
+        let txn_id = txn.id();
 
         self.session.recovery_manager.log_txn_abort(txn_id)?;
 
-        let ctx =
-            self.session.txn.as_mut().ok_or_else(|| {
+        let txn =
+            self.session.active_txn.as_mut().ok_or_else(|| {
                 StorageError("transaction context disappeared during abort".into())
             })?;
-        self.session
-            .transaction_manager
-            .abort_txn_state(&mut ctx.txn)?;
+        self.session.transaction_manager.abort_txn_state(txn)?;
 
-        self.session.txn = None;
+        self.session.active_txn = None;
         self.committed = true;
 
         if !self.session.recovery_manager.wal_enabled() {
@@ -269,9 +261,8 @@ impl<'a> SessionTxn<'a> {
     /// This is useful for accessing transaction metadata (e.g., txn id).
     pub fn as_mut(&mut self) -> &mut Transaction {
         self.session
-            .txn
+            .active_txn
             .as_mut()
-            .map(|ctx| &mut ctx.txn)
             .expect("transaction should exist")
     }
 
@@ -280,9 +271,8 @@ impl<'a> SessionTxn<'a> {
     /// This is useful for accessing transaction metadata (e.g., txn id).
     pub fn as_ref(&self) -> &Transaction {
         self.session
-            .txn
+            .active_txn
             .as_ref()
-            .map(|ctx| &ctx.txn)
             .expect("transaction should exist")
     }
 
@@ -294,15 +284,11 @@ impl<'a> SessionTxn<'a> {
 impl<'a> Drop for SessionTxn<'a> {
     fn drop(&mut self) {
         if !self.committed {
-            if let Some(mut ctx) = self.session.txn.take() {
-                let touched_tables: Vec<String> =
-                    ctx.txn.touched_tables().iter().cloned().collect();
-                let txn_id = ctx.txn.id();
+            if let Some(mut txn) = self.session.active_txn.take() {
+                let touched_tables: Vec<String> = txn.touched_tables().iter().cloned().collect();
+                let txn_id = txn.id();
                 let _ = self.session.recovery_manager.log_txn_abort(txn_id);
-                let _ = self
-                    .session
-                    .transaction_manager
-                    .abort_txn_state(&mut ctx.txn);
+                let _ = self.session.transaction_manager.abort_txn_state(&mut txn);
                 if !self.session.recovery_manager.wal_enabled() {
                     let _ = self.session.finalize_touched_tables_locally(
                         &touched_tables,
