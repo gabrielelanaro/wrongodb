@@ -11,6 +11,18 @@ use crate::txn::transaction_manager::TransactionManager;
 use crate::txn::{Transaction, TxnId};
 use crate::WrongoDBError;
 
+/// A request-scoped execution context over shared connection infrastructure.
+///
+/// `Connection` owns long-lived shared components (storage handles, global
+/// transaction state, recovery/WAL machinery). `Session` exists to own mutable
+/// per-request state that must not be global, especially the currently active
+/// transaction and its lifecycle.
+///
+/// Why this type exists:
+/// - It gives each unit of work a single owner for begin/commit/abort.
+/// - It keeps request-local mutable state out of shared global state.
+/// - It centralizes transaction visibility + durability orchestration while
+///   lower layers (`Table`, `Cursor`) stay focused on storage access.
 pub struct Session {
     cache: Arc<DataHandleCache>,
     transaction_manager: Arc<TransactionManager>,
