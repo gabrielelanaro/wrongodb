@@ -1,16 +1,52 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::api::data_handle_cache::DataHandleCache;
 use crate::api::session::Session;
+use crate::core::errors::StorageError;
 use crate::engine::RaftMode;
 use crate::recovery::RecoveryManager;
+use crate::storage::store_registry::StoreRegistry;
 use crate::storage::wal::WalSink;
 use crate::txn::transaction_manager::TransactionManager;
 use crate::txn::GlobalTxnState;
 use crate::WrongoDBError;
+
+#[derive(Debug)]
+struct RecoveryWalSink {
+    manager: Weak<RecoveryManager>,
+}
+
+impl WalSink for RecoveryWalSink {
+    fn log_put(
+        &self,
+        store_name: &str,
+        key: &[u8],
+        value: &[u8],
+        txn_id: crate::txn::TxnId,
+    ) -> Result<(), WrongoDBError> {
+        let manager = self
+            .manager
+            .upgrade()
+            .ok_or_else(|| StorageError("recovery manager is not available".into()))?;
+        manager.log_put(store_name, key, value, txn_id)
+    }
+
+    fn log_delete(
+        &self,
+        store_name: &str,
+        key: &[u8],
+        txn_id: crate::txn::TxnId,
+    ) -> Result<(), WrongoDBError> {
+        let manager = self
+            .manager
+            .upgrade()
+            .ok_or_else(|| StorageError("recovery manager is not available".into()))?;
+        manager.log_delete(store_name, key, txn_id)
+    }
+}
 
 pub struct ConnectionConfig {
     pub wal_enabled: bool,
@@ -69,22 +105,28 @@ impl Connection {
 
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+        let store_registry = Arc::new(StoreRegistry::new(
+            base_path.clone(),
+            transaction_manager.clone(),
+        ));
         let recovery_manager = Arc::new(RecoveryManager::initialize(
             &base_path,
             config.wal_enabled,
             transaction_manager.clone(),
+            store_registry.clone(),
             config.raft_mode,
         )?);
 
-        let wal_sink = if config.wal_enabled {
-            Some(recovery_manager.clone() as Arc<dyn WalSink>)
-        } else {
-            None
-        };
+        if config.wal_enabled {
+            let wal_sink = Arc::new(RecoveryWalSink {
+                manager: Arc::downgrade(&recovery_manager),
+            }) as Arc<dyn WalSink>;
+            store_registry.set_wal_sink(Some(wal_sink));
+        }
 
         Ok(Self {
             base_path,
-            dhandle_cache: Arc::new(DataHandleCache::new(transaction_manager.clone(), wal_sink)),
+            dhandle_cache: Arc::new(DataHandleCache::new(store_registry)),
             wal_enabled: config.wal_enabled,
             transaction_manager,
             recovery_manager,
@@ -94,7 +136,6 @@ impl Connection {
     pub fn open_session(&self) -> Session {
         Session::new(
             self.dhandle_cache.clone(),
-            self.base_path.clone(),
             self.transaction_manager.clone(),
             self.recovery_manager.clone(),
         )

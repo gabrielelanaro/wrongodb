@@ -407,7 +407,7 @@ impl RaftRoleEngine {
     }
 
     fn majority_threshold(&self) -> usize {
-        (self.config.peer_ids.len() + 1) / 2 + 1
+        self.config.peer_ids.len().div_ceil(2) + 1
     }
 
     fn reset_election_timer(&mut self) {

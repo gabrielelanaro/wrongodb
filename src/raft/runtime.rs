@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 
 use crate::core::errors::StorageError;
-use crate::raft::command::RaftCommand;
+use crate::raft::command::{CommittedCommand, RaftCommand};
 use crate::raft::node::{RaftLeadershipState, RaftNodeCore};
 use crate::raft::protocol::{
     AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse,
@@ -197,6 +197,10 @@ impl RaftRuntime {
         self.node.apply_committed_entries()
     }
 
+    pub(crate) fn drain_committed_commands(&mut self) -> Vec<CommittedCommand> {
+        self.node.drain_committed_commands()
+    }
+
     pub(crate) fn sync_node(&mut self) -> Result<(), WrongoDBError> {
         self.node.sync()
     }
@@ -207,6 +211,14 @@ impl RaftRuntime {
 
     pub(crate) fn is_index_committed_and_applied(&self, index: u64) -> bool {
         self.node.is_index_committed_and_applied(index)
+    }
+
+    pub(crate) fn is_index_committed(&self, index: u64) -> bool {
+        self.node.is_index_committed(index)
+    }
+
+    pub(crate) fn applied_index(&self) -> u64 {
+        self.node.applied_index()
     }
 
     pub(crate) fn node_mut(&mut self) -> &mut RaftNodeCore {

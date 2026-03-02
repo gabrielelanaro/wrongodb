@@ -45,17 +45,47 @@ impl Cursor {
 
     pub fn insert(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
+        let (store_name, wal_sink) = {
+            let mut table = self.table.write();
+            if table.get_version(key, txn_id)?.is_some() {
+                return Err(crate::core::errors::DocumentValidationError(
+                    "duplicate key error".into(),
+                )
+                .into());
+            }
+            (table.store_name().to_string(), table.wal_sink())
+        };
+        if let Some(wal_sink) = wal_sink {
+            return wal_sink.log_put(&store_name, key, value, txn_id);
+        }
         let mut table = self.table.write();
         if table.get_version(key, txn_id)?.is_some() {
             return Err(
                 crate::core::errors::DocumentValidationError("duplicate key error".into()).into(),
             );
         }
-        table.insert_mvcc(key, value, txn_id)
+        table.local_apply_put_with_txn(key, value, txn_id)
     }
 
     pub fn update(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
+        let (store_name, wal_sink, exists) = {
+            let mut table = self.table.write();
+            (
+                table.store_name().to_string(),
+                table.wal_sink(),
+                table.get_version(key, txn_id)?.is_some(),
+            )
+        };
+        if !exists {
+            return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
+                "key not found for update".to_string(),
+            )));
+        }
+        if let Some(wal_sink) = wal_sink {
+            wal_sink.log_put(&store_name, key, value, txn_id)?;
+            return Ok(());
+        }
         let mut table = self.table.write();
         let result = table.update_mvcc(key, value, txn_id)?;
         if !result {
@@ -68,6 +98,23 @@ impl Cursor {
 
     pub fn delete(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
+        let (store_name, wal_sink, exists) = {
+            let mut table = self.table.write();
+            (
+                table.store_name().to_string(),
+                table.wal_sink(),
+                table.get_version(key, txn_id)?.is_some(),
+            )
+        };
+        if !exists {
+            return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
+                "key not found for delete".to_string(),
+            )));
+        }
+        if let Some(wal_sink) = wal_sink {
+            wal_sink.log_delete(&store_name, key, txn_id)?;
+            return Ok(());
+        }
         let mut table = self.table.write();
         let result = table.delete_mvcc(key, txn_id)?;
         if !result {

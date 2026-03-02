@@ -9,7 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::core::errors::StorageError;
-use crate::raft::command::RaftCommand;
+use crate::raft::command::{CommittedCommand, RaftCommand};
 use crate::raft::node::{RaftLeadershipState, RaftNodeCore};
 use crate::raft::runtime::{RaftInboundMessage, RaftRuntime};
 use crate::raft::transport::{
@@ -21,6 +21,19 @@ const DEFAULT_TICK_INTERVAL: Duration = Duration::from_millis(50);
 const DEFAULT_PROPOSAL_TIMEOUT: Duration = Duration::from_secs(5);
 const LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+pub(crate) trait CommittedCommandExecutor: Send + Sync + std::fmt::Debug {
+    fn execute(&self, cmd: CommittedCommand) -> Result<(), WrongoDBError>;
+}
+
+#[derive(Debug)]
+struct NoopCommittedCommandExecutor;
+
+impl CommittedCommandExecutor for NoopCommittedCommandExecutor {
+    fn execute(&self, _cmd: CommittedCommand) -> Result<(), WrongoDBError> {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct RaftServiceConfig {
     pub(crate) local_node_id: String,
@@ -28,6 +41,7 @@ pub(crate) struct RaftServiceConfig {
     pub(crate) peer_addrs: HashMap<String, String>,
     pub(crate) tick_interval: Duration,
     pub(crate) proposal_timeout: Duration,
+    pub(crate) executor: Arc<dyn CommittedCommandExecutor>,
 }
 
 impl RaftServiceConfig {
@@ -42,6 +56,7 @@ impl RaftServiceConfig {
             peer_addrs,
             tick_interval: DEFAULT_TICK_INTERVAL,
             proposal_timeout: DEFAULT_PROPOSAL_TIMEOUT,
+            executor: Arc::new(NoopCommittedCommandExecutor),
         }
     }
 }
@@ -202,6 +217,32 @@ enum RaftServiceCommand {
 
 type PendingProposal = (RaftCommand, Sender<Result<u64, WrongoDBError>>);
 
+#[derive(Debug, Default)]
+struct ActorState {
+    executor_applied_index: u64,
+    fatal_reason: Option<String>,
+}
+
+fn fatal_error(reason: &str) -> WrongoDBError {
+    StorageError(format!("raft fatal apply: {reason}")).into()
+}
+
+fn current_fatal_error(state: &ActorState) -> Option<WrongoDBError> {
+    state.fatal_reason.as_deref().map(fatal_error)
+}
+
+fn set_fatal_error(state: &mut ActorState, err: WrongoDBError) -> WrongoDBError {
+    if state.fatal_reason.is_none() {
+        state.fatal_reason = Some(err.to_string());
+    }
+    fatal_error(
+        state
+            .fatal_reason
+            .as_deref()
+            .expect("fatal reason should be set"),
+    )
+}
+
 fn run_actor(
     node: RaftNodeCore,
     cfg: RaftServiceConfig,
@@ -209,16 +250,27 @@ fn run_actor(
     shutdown: Arc<AtomicBool>,
 ) {
     let mut runtime = RaftRuntime::new(node);
+    let mut state = ActorState {
+        executor_applied_index: runtime.applied_index(),
+        ..ActorState::default()
+    };
     let mut pending_proposals: VecDeque<PendingProposal> = VecDeque::new();
     let mut running = true;
 
     while running {
+        if let Some(reason) = state.fatal_reason.as_deref() {
+            for (_, reply) in pending_proposals.drain(..) {
+                let _ = reply.send(Err(fatal_error(reason)));
+            }
+        }
+
         if let Some((command, reply)) = pending_proposals.pop_front() {
             running = process_proposal(
                 &mut runtime,
                 &cfg,
                 &rx,
                 &mut pending_proposals,
+                &mut state,
                 command,
                 reply,
             );
@@ -227,11 +279,20 @@ fn run_actor(
 
         match rx.recv_timeout(cfg.tick_interval) {
             Ok(cmd) => {
-                running =
-                    handle_non_proposal_command(&mut runtime, &cfg, &mut pending_proposals, cmd);
+                running = handle_non_proposal_command(
+                    &mut runtime,
+                    &cfg,
+                    &mut pending_proposals,
+                    &mut state,
+                    cmd,
+                );
             }
             Err(RecvTimeoutError::Timeout) => {
-                if let Err(err) = tick_and_flush(&mut runtime, cfg.tick_interval, &cfg) {
+                if state.fatal_reason.is_some() {
+                    continue;
+                }
+                if let Err(err) = tick_and_flush(&mut runtime, cfg.tick_interval, &cfg, &mut state)
+                {
                     eprintln!("raft actor tick failed: {err}");
                 }
             }
@@ -253,25 +314,39 @@ fn process_proposal(
     cfg: &RaftServiceConfig,
     rx: &Receiver<RaftServiceCommand>,
     pending_proposals: &mut VecDeque<PendingProposal>,
+    state: &mut ActorState,
     command: RaftCommand,
     reply: Sender<Result<u64, WrongoDBError>>,
 ) -> bool {
+    if let Some(err) = current_fatal_error(state) {
+        let _ = reply.send(Err(err));
+        return true;
+    }
+
     let proposal_index = match runtime.propose_without_wait(&command) {
         Ok(index) => index,
         Err(err) => {
+            let _ = tick_and_flush(runtime, cfg.tick_interval, cfg, state);
             let _ = reply.send(Err(err));
             return true;
         }
     };
 
-    if let Err(err) = flush_outbound_and_apply(runtime, cfg) {
+    if let Err(err) = flush_outbound_and_apply(runtime, cfg, state) {
         let _ = reply.send(Err(err));
         return true;
     }
 
     let deadline = Instant::now() + cfg.proposal_timeout;
     loop {
-        if runtime.is_index_committed_and_applied(proposal_index) {
+        if let Some(err) = current_fatal_error(state) {
+            let _ = reply.send(Err(err));
+            return true;
+        }
+
+        if runtime.is_index_committed(proposal_index)
+            && state.executor_applied_index >= proposal_index
+        {
             let _ = reply.send(Ok(proposal_index));
             return true;
         }
@@ -293,22 +368,37 @@ fn process_proposal(
                     pending_proposals.push_back((command, reply));
                 }
                 RaftServiceCommand::GetLeadership { reply } => {
-                    let _ = reply.send(Ok(runtime.leadership()));
+                    if let Some(err) = current_fatal_error(state) {
+                        let _ = reply.send(Err(err));
+                    } else {
+                        let _ = reply.send(Ok(runtime.leadership()));
+                    }
                 }
                 RaftServiceCommand::Sync { reply } => {
-                    let _ = reply.send(runtime.sync_node());
+                    if let Some(err) = current_fatal_error(state) {
+                        let _ = reply.send(Err(err));
+                    } else {
+                        let _ = reply.send(runtime.sync_node());
+                    }
                 }
                 RaftServiceCommand::TruncateToCheckpoint { reply } => {
-                    let _ = reply.send(runtime.truncate_to_checkpoint());
+                    if let Some(err) = current_fatal_error(state) {
+                        let _ = reply.send(Err(err));
+                    } else {
+                        let _ = reply.send(runtime.truncate_to_checkpoint());
+                    }
                 }
                 RaftServiceCommand::Tick { reply } => {
-                    let res = tick_and_flush(runtime, cfg.tick_interval, cfg);
+                    let res = tick_and_flush(runtime, cfg.tick_interval, cfg, state);
                     let _ = reply.send(res);
                 }
                 RaftServiceCommand::Inbound { msg } => {
+                    if state.fatal_reason.is_some() {
+                        continue;
+                    }
                     if let Err(err) = runtime.handle_inbound(msg) {
                         eprintln!("raft actor inbound handling failed: {err}");
-                    } else if let Err(err) = flush_outbound_and_apply(runtime, cfg) {
+                    } else if let Err(err) = flush_outbound_and_apply(runtime, cfg, state) {
                         eprintln!("raft actor outbound flush failed: {err}");
                     }
                 }
@@ -319,7 +409,7 @@ fn process_proposal(
                 }
             },
             Err(RecvTimeoutError::Timeout) => {
-                if let Err(err) = tick_and_flush(runtime, cfg.tick_interval, cfg) {
+                if let Err(err) = tick_and_flush(runtime, cfg.tick_interval, cfg, state) {
                     eprintln!("raft actor tick during proposal failed: {err}");
                 }
             }
@@ -338,35 +428,54 @@ fn handle_non_proposal_command(
     runtime: &mut RaftRuntime,
     cfg: &RaftServiceConfig,
     pending_proposals: &mut VecDeque<PendingProposal>,
+    state: &mut ActorState,
     cmd: RaftServiceCommand,
 ) -> bool {
     match cmd {
         RaftServiceCommand::Propose { command, reply } => {
-            pending_proposals.push_back((command, reply));
+            if let Some(err) = current_fatal_error(state) {
+                let _ = reply.send(Err(err));
+            } else {
+                pending_proposals.push_back((command, reply));
+            }
             true
         }
         RaftServiceCommand::GetLeadership { reply } => {
-            let _ = reply.send(Ok(runtime.leadership()));
+            if let Some(err) = current_fatal_error(state) {
+                let _ = reply.send(Err(err));
+            } else {
+                let _ = reply.send(Ok(runtime.leadership()));
+            }
             true
         }
         RaftServiceCommand::Sync { reply } => {
-            let _ = reply.send(runtime.sync_node());
+            if let Some(err) = current_fatal_error(state) {
+                let _ = reply.send(Err(err));
+            } else {
+                let _ = reply.send(runtime.sync_node());
+            }
             true
         }
         RaftServiceCommand::TruncateToCheckpoint { reply } => {
-            let _ = reply.send(runtime.truncate_to_checkpoint());
+            if let Some(err) = current_fatal_error(state) {
+                let _ = reply.send(Err(err));
+            } else {
+                let _ = reply.send(runtime.truncate_to_checkpoint());
+            }
             true
         }
         RaftServiceCommand::Tick { reply } => {
-            let res = tick_and_flush(runtime, cfg.tick_interval, cfg);
+            let res = tick_and_flush(runtime, cfg.tick_interval, cfg, state);
             let _ = reply.send(res);
             true
         }
         RaftServiceCommand::Inbound { msg } => {
-            if let Err(err) = runtime.handle_inbound(msg) {
-                eprintln!("raft actor inbound handling failed: {err}");
-            } else if let Err(err) = flush_outbound_and_apply(runtime, cfg) {
-                eprintln!("raft actor outbound flush failed: {err}");
+            if state.fatal_reason.is_none() {
+                if let Err(err) = runtime.handle_inbound(msg) {
+                    eprintln!("raft actor inbound handling failed: {err}");
+                } else if let Err(err) = flush_outbound_and_apply(runtime, cfg, state) {
+                    eprintln!("raft actor outbound flush failed: {err}");
+                }
             }
             true
         }
@@ -378,15 +487,24 @@ fn tick_and_flush(
     runtime: &mut RaftRuntime,
     _tick_interval: Duration,
     cfg: &RaftServiceConfig,
+    state: &mut ActorState,
 ) -> Result<(), WrongoDBError> {
+    if let Some(err) = current_fatal_error(state) {
+        return Err(err);
+    }
     runtime.tick()?;
-    flush_outbound_and_apply(runtime, cfg)
+    flush_outbound_and_apply(runtime, cfg, state)
 }
 
 fn flush_outbound_and_apply(
     runtime: &mut RaftRuntime,
     cfg: &RaftServiceConfig,
+    state: &mut ActorState,
 ) -> Result<(), WrongoDBError> {
+    if let Some(err) = current_fatal_error(state) {
+        return Err(err);
+    }
+
     let outbound = runtime.drain_outbound();
     for msg in outbound {
         let envelope = outbound_to_wire(&cfg.local_node_id, msg);
@@ -406,6 +524,12 @@ fn flush_outbound_and_apply(
     }
 
     runtime.apply_committed_entries()?;
+    for applied in runtime.drain_committed_commands() {
+        if let Err(err) = cfg.executor.execute(applied.clone()) {
+            return Err(set_fatal_error(state, err));
+        }
+        state.executor_applied_index = applied.index;
+    }
     Ok(())
 }
 
@@ -447,5 +571,113 @@ fn run_listener(
                 thread::sleep(LISTENER_POLL_INTERVAL);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::core::errors::StorageError;
+
+    #[derive(Debug)]
+    struct DelayExecutor {
+        delay: Duration,
+    }
+
+    impl CommittedCommandExecutor for DelayExecutor {
+        fn execute(&self, _cmd: CommittedCommand) -> Result<(), WrongoDBError> {
+            std::thread::sleep(self.delay);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailFirstExecutor {
+        failed_once: AtomicBool,
+    }
+
+    impl CommittedCommandExecutor for FailFirstExecutor {
+        fn execute(&self, _cmd: CommittedCommand) -> Result<(), WrongoDBError> {
+            if !self.failed_once.swap(true, Ordering::SeqCst) {
+                return Err(StorageError("injected apply failure".into()).into());
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn proposal_ack_waits_for_executor_apply() {
+        let dir = tempdir().unwrap();
+        let node = RaftNodeCore::open(dir.path()).unwrap();
+        let delay = Duration::from_millis(150);
+
+        let mut cfg = RaftServiceConfig::with_defaults("n1".to_string(), None, HashMap::new());
+        cfg.proposal_timeout = Duration::from_secs(2);
+        cfg.executor = Arc::new(DelayExecutor { delay });
+
+        let service = RaftServiceHandle::start(node, cfg).unwrap();
+        let start = Instant::now();
+        let index = service
+            .propose(RaftCommand::Put {
+                store_name: "users.main.wt".to_string(),
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                txn_id: 1,
+            })
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(index, 1);
+        assert!(
+            elapsed >= delay,
+            "proposal returned before executor apply delay elapsed: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn apply_failure_enters_fail_stop() {
+        let dir = tempdir().unwrap();
+        let node = RaftNodeCore::open(dir.path()).unwrap();
+
+        let mut cfg = RaftServiceConfig::with_defaults("n1".to_string(), None, HashMap::new());
+        cfg.proposal_timeout = Duration::from_secs(2);
+        cfg.executor = Arc::new(FailFirstExecutor {
+            failed_once: AtomicBool::new(false),
+        });
+
+        let service = RaftServiceHandle::start(node, cfg).unwrap();
+        let err = service
+            .propose(RaftCommand::Put {
+                store_name: "users.main.wt".to_string(),
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                txn_id: 1,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("raft fatal apply"));
+
+        let err = service
+            .propose(RaftCommand::Put {
+                store_name: "users.main.wt".to_string(),
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+                txn_id: 1,
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("raft fatal apply"));
+
+        let err = service.leadership().unwrap_err();
+        assert!(err.to_string().contains("raft fatal apply"));
+        let err = service.sync().unwrap_err();
+        assert!(err.to_string().contains("raft fatal apply"));
+        let err = service.truncate_to_checkpoint().unwrap_err();
+        assert!(err.to_string().contains("raft fatal apply"));
     }
 }

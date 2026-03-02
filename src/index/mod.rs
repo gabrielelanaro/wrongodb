@@ -91,10 +91,24 @@ impl PersistentIndex {
     }
 
     /// Insert a document's field value into the index.
-    fn insert(&mut self, value: &Value, id: &Value) -> Result<(), WrongoDBError> {
+    fn insert(
+        &mut self,
+        value: &Value,
+        id: &Value,
+        txn_id: crate::txn::TxnId,
+    ) -> Result<(), WrongoDBError> {
         if let Some(key) = encode_index_key(value, id)? {
-            let mut table = self.table.write();
-            table.insert_raw_with_txn(&key, &[], crate::txn::TXN_NONE)?;
+            let (store_name, wal_sink) = {
+                let table = self.table.read();
+                (table.store_name().to_string(), table.wal_sink())
+            };
+            if let Some(wal_sink) = wal_sink {
+                wal_sink.log_put(&store_name, &key, &[], txn_id)?;
+            } else {
+                self.table
+                    .write()
+                    .local_apply_put_with_txn(&key, &[], txn_id)?;
+            }
         }
         Ok(())
     }
@@ -121,20 +135,34 @@ impl PersistentIndex {
     }
 
     fn insert_raw(&mut self, key: &[u8], txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
-        let mut table = self.table.write();
-        if txn_id == TXN_NONE {
-            table.insert_raw_with_txn(key, &[], txn_id)
+        let (store_name, wal_sink) = {
+            let table = self.table.read();
+            (table.store_name().to_string(), table.wal_sink())
+        };
+        if let Some(wal_sink) = wal_sink {
+            wal_sink.log_put(&store_name, key, &[], txn_id)
+        } else if txn_id == TXN_NONE {
+            self.table
+                .write()
+                .local_apply_put_with_txn(key, &[], txn_id)
         } else {
-            table.insert_mvcc(key, &[], txn_id)
+            self.table.write().insert_mvcc(key, &[], txn_id)
         }
     }
 
     fn remove_raw(&mut self, key: &[u8], txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
-        let mut table = self.table.write();
-        if txn_id == TXN_NONE {
-            table.delete_raw_with_txn(key, txn_id)?;
+        let (store_name, wal_sink) = {
+            let table = self.table.read();
+            (table.store_name().to_string(), table.wal_sink())
+        };
+        if let Some(wal_sink) = wal_sink {
+            wal_sink.log_delete(&store_name, key, txn_id)?;
+        } else if txn_id == TXN_NONE {
+            self.table
+                .write()
+                .local_apply_delete_with_txn(key, txn_id)?;
         } else {
-            table.delete_mvcc(key, txn_id)?;
+            self.table.write().delete_mvcc(key, txn_id)?;
         }
         Ok(())
     }
@@ -308,6 +336,7 @@ impl IndexCatalog {
         name: &str,
         columns: Vec<String>,
         existing_docs: &[Document],
+        txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
         if self.definitions.contains_key(name) {
             return Ok(());
@@ -337,7 +366,7 @@ impl IndexCatalog {
                     continue;
                 };
                 if let Some(value) = doc.get(field) {
-                    index.insert(value, id)?;
+                    index.insert(value, id, txn_id)?;
                 }
             }
         }
@@ -353,6 +382,13 @@ impl IndexCatalog {
         self.indexes.insert(name.to_string(), index);
         self.save()?;
         Ok(())
+    }
+
+    pub fn set_wal_sink(&mut self, wal_sink: Option<Arc<dyn WalSink>>) {
+        self.wal_sink = wal_sink.clone();
+        for index in self.indexes.values_mut() {
+            index.table.write().set_wal_sink(wal_sink.clone());
+        }
     }
 
     pub fn lookup(&mut self, name: &str, value: &Value) -> Result<Vec<Value>, WrongoDBError> {
@@ -484,6 +520,7 @@ impl IndexCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::txn::TXN_NONE;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -498,9 +535,15 @@ mod tests {
         let (mut index, _created) =
             PersistentIndex::open_or_create(&path, transaction_manager, None).unwrap();
 
-        index.insert(&json!("alice"), &json!("id1")).unwrap();
-        index.insert(&json!("bob"), &json!("id2")).unwrap();
-        index.insert(&json!("alice"), &json!("id3")).unwrap();
+        index
+            .insert(&json!("alice"), &json!("id1"), TXN_NONE)
+            .unwrap();
+        index
+            .insert(&json!("bob"), &json!("id2"), TXN_NONE)
+            .unwrap();
+        index
+            .insert(&json!("alice"), &json!("id3"), TXN_NONE)
+            .unwrap();
 
         let alice_ids = index.lookup(&json!("alice")).unwrap();
         assert_eq!(alice_ids.len(), 2);
@@ -527,7 +570,7 @@ mod tests {
         ];
 
         catalog
-            .add_index("name", vec!["name".to_string()], &docs)
+            .add_index("name", vec!["name".to_string()], &docs, TXN_NONE)
             .unwrap();
         let ids = catalog.lookup("name", &json!("alice")).unwrap();
         assert_eq!(ids.len(), 2);

@@ -1,7 +1,8 @@
+use std::collections::VecDeque;
 use std::path::Path;
 
 use crate::core::errors::StorageError;
-use crate::raft::command::RaftCommand;
+use crate::raft::command::{CommittedCommand, RaftCommand};
 use crate::raft::hard_state::{RaftHardState, RaftHardStateStore};
 use crate::raft::log_store::RaftLogStore;
 use crate::raft::protocol::{
@@ -74,6 +75,7 @@ pub(crate) struct RaftNodeCore {
     role_engine: RaftRoleEngine,
     last_applied_protocol_index: u64,
     wal: GlobalWal,
+    applied_commands: VecDeque<CommittedCommand>,
 }
 
 impl RaftNodeCore {
@@ -118,6 +120,12 @@ impl RaftNodeCore {
         let wal = GlobalWal::open_or_create(db_dir)?;
         let _ = wal.last_raft_term();
         let last_raft_index = wal.last_raft_index();
+        if last_raft_index > protocol_last_log_index {
+            return Err(StorageError(format!(
+                "raft wal index {last_raft_index} exceeds protocol log index {protocol_last_log_index}"
+            ))
+            .into());
+        }
         let commit_index = protocol_last_log_index.min(last_raft_index);
         let last_applied_protocol_index = commit_index;
         let mut protocol_state = protocol_state;
@@ -138,6 +146,7 @@ impl RaftNodeCore {
             role_engine,
             last_applied_protocol_index,
             wal,
+            applied_commands: VecDeque::new(),
         };
 
         // Standalone mode bootstrap: zero-peer nodes self-elect on startup so writes are
@@ -280,6 +289,11 @@ impl RaftNodeCore {
 
             let command = RaftCommand::decode(&entry.payload)?;
             self.apply_command_to_wal(&command, entry.term)?;
+            self.applied_commands.push_back(CommittedCommand {
+                index: apply_index,
+                term: entry.term,
+                command,
+            });
             self.last_applied_protocol_index = apply_index;
         }
 
@@ -294,6 +308,14 @@ impl RaftNodeCore {
 
     pub(crate) fn is_index_committed_and_applied(&self, index: u64) -> bool {
         self.protocol_state.commit_index >= index && self.last_applied_protocol_index >= index
+    }
+
+    pub(crate) fn is_index_committed(&self, index: u64) -> bool {
+        self.protocol_state.commit_index >= index
+    }
+
+    pub(crate) fn drain_committed_commands(&mut self) -> Vec<CommittedCommand> {
+        self.applied_commands.drain(..).collect()
     }
 
     #[allow(dead_code)]
@@ -506,6 +528,7 @@ mod tests {
 
     use super::*;
     use crate::raft::command::RaftCommand;
+    use crate::raft::log_store::RaftLogStore;
     use crate::raft::protocol::{AppendEntriesRequest, ProtocolLogEntry, RequestVoteRequest};
     use crate::raft::role_engine::{RaftEffect, RaftRole};
     use crate::storage::wal::{WalReader, WalRecord};
@@ -672,6 +695,34 @@ mod tests {
 
         let mut reader = WalReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
         assert!(reader.read_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn startup_fails_when_wal_index_exceeds_protocol_log_index() {
+        let dir = tempdir().unwrap();
+        {
+            let mut node = RaftNodeCore::open(dir.path()).unwrap();
+            node.propose_command(&RaftCommand::Put {
+                store_name: "users.main.wt".to_string(),
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                txn_id: 1,
+            })
+            .unwrap();
+            node.apply_committed_entries().unwrap();
+            node.sync().unwrap();
+        }
+
+        {
+            let mut log_store = RaftLogStore::open_or_create(dir.path()).unwrap();
+            log_store.truncate_from(1).unwrap();
+            log_store.sync().unwrap();
+        }
+
+        let err = RaftNodeCore::open(dir.path()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("raft wal index 1 exceeds protocol log index 0"));
     }
 
     struct InMemoryCluster {

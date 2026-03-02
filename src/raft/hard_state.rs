@@ -13,19 +13,10 @@ const RAFT_HARD_STATE_MAGIC: &[u8; 8] = b"RFTHS01\0";
 const RAFT_HARD_STATE_VERSION: u16 = 1;
 const FLAG_VOTED_FOR_PRESENT: u16 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RaftHardState {
     pub current_term: u64,
     pub voted_for: Option<String>,
-}
-
-impl Default for RaftHardState {
-    fn default() -> Self {
-        Self {
-            current_term: 0,
-            voted_for: None,
-        }
-    }
 }
 
 #[derive(Debug)]

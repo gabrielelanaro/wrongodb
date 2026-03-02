@@ -31,6 +31,13 @@ pub(crate) enum RaftCommand {
     Checkpoint,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommittedCommand {
+    pub(crate) index: u64,
+    pub(crate) term: u64,
+    pub(crate) command: RaftCommand,
+}
+
 impl RaftCommand {
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();

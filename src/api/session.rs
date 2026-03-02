@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -9,7 +8,7 @@ use crate::core::errors::StorageError;
 use crate::recovery::RecoveryManager;
 use crate::storage::table::Table;
 use crate::txn::transaction_manager::TransactionManager;
-use crate::txn::Transaction;
+use crate::txn::{Transaction, TxnId};
 use crate::WrongoDBError;
 
 struct SessionTxnContext {
@@ -18,7 +17,6 @@ struct SessionTxnContext {
 
 pub struct Session {
     cache: Arc<DataHandleCache>,
-    base_path: PathBuf,
     transaction_manager: Arc<TransactionManager>,
     recovery_manager: Arc<RecoveryManager>,
     txn: Option<SessionTxnContext>,
@@ -27,13 +25,11 @@ pub struct Session {
 impl Session {
     pub(crate) fn new(
         cache: Arc<DataHandleCache>,
-        base_path: PathBuf,
         transaction_manager: Arc<TransactionManager>,
         recovery_manager: Arc<RecoveryManager>,
     ) -> Self {
         Self {
             cache,
-            base_path,
             transaction_manager,
             recovery_manager,
             txn: None,
@@ -53,9 +49,7 @@ impl Session {
         mark_touched: bool,
     ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
         let uri = format!("table:{}", collection);
-        let table = self
-            .cache
-            .get_or_open_primary(&uri, collection, &self.base_path)?;
+        let table = self.cache.get_or_open_primary(&uri, collection)?;
         if mark_touched {
             self.mark_table_touched(&uri);
         }
@@ -156,6 +150,35 @@ impl Session {
         self.recovery_manager
             .checkpoint_and_truncate_if_safe(self.transaction_manager.has_active_transactions())
     }
+
+    fn finalize_touched_tables_locally(
+        &mut self,
+        touched_tables: &[String],
+        txn_id: TxnId,
+        committed: bool,
+    ) -> Result<(), WrongoDBError> {
+        for uri in touched_tables {
+            if !uri.starts_with("table:") {
+                continue;
+            }
+            let collection = &uri[6..];
+            let table = self.get_primary_table(collection, false)?;
+            let mut table_guard = table.write();
+            if committed {
+                table_guard.local_mark_updates_committed(txn_id)?;
+            } else {
+                table_guard.local_mark_updates_aborted(txn_id)?;
+            }
+            if let Some(catalog) = table_guard.index_catalog_mut() {
+                if committed {
+                    catalog.mark_updates_committed(txn_id)?;
+                } else {
+                    catalog.mark_updates_aborted(txn_id)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// RAII transaction handle for Session.
@@ -180,32 +203,32 @@ impl<'a> SessionTxn<'a> {
     /// After calling this, the transaction handle is consumed and cannot be used again.
     /// Commits the transaction across all touched tables.
     pub fn commit(mut self) -> Result<(), WrongoDBError> {
-        if let Some(mut ctx) = self.session.txn.take() {
-            let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
-            let txn_id = ctx.txn.id();
+        let Some(ctx) = self.session.txn.as_ref() else {
+            self.committed = true;
+            return Ok(());
+        };
+        let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
+        let txn_id = ctx.txn.id();
 
-            self.session
-                .recovery_manager
-                .log_txn_commit_sync(txn_id, txn_id)?;
+        self.session
+            .recovery_manager
+            .log_txn_commit_sync(txn_id, txn_id)?;
 
-            self.session
-                .transaction_manager
-                .commit_txn_state(&mut ctx.txn)?;
+        let ctx =
+            self.session.txn.as_mut().ok_or_else(|| {
+                StorageError("transaction context disappeared during commit".into())
+            })?;
+        self.session
+            .transaction_manager
+            .commit_txn_state(&mut ctx.txn)?;
 
-            for uri in &touched_tables {
-                if !uri.starts_with("table:") {
-                    continue;
-                }
-                let collection = &uri[6..];
-                let table = self.session.get_primary_table(collection, false)?;
-                let mut table_guard = table.write();
-                table_guard.mark_updates_committed(txn_id)?;
-                if let Some(catalog) = table_guard.index_catalog_mut() {
-                    catalog.mark_updates_committed(txn_id)?;
-                }
-            }
-        }
+        self.session.txn = None;
         self.committed = true;
+
+        if !self.session.recovery_manager.wal_enabled() {
+            self.session
+                .finalize_touched_tables_locally(&touched_tables, txn_id, true)?;
+        }
         Ok(())
     }
 
@@ -214,30 +237,30 @@ impl<'a> SessionTxn<'a> {
     /// After calling this, the transaction handle is consumed and cannot be used again.
     /// Aborts the transaction across all touched tables.
     pub fn abort(mut self) -> Result<(), WrongoDBError> {
-        if let Some(mut ctx) = self.session.txn.take() {
-            let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
-            let txn_id = ctx.txn.id();
+        let Some(ctx) = self.session.txn.as_ref() else {
+            self.committed = true;
+            return Ok(());
+        };
+        let touched_tables: Vec<String> = ctx.txn.touched_tables().iter().cloned().collect();
+        let txn_id = ctx.txn.id();
 
-            self.session.recovery_manager.log_txn_abort(txn_id)?;
+        self.session.recovery_manager.log_txn_abort(txn_id)?;
 
-            self.session
-                .transaction_manager
-                .abort_txn_state(&mut ctx.txn)?;
+        let ctx =
+            self.session.txn.as_mut().ok_or_else(|| {
+                StorageError("transaction context disappeared during abort".into())
+            })?;
+        self.session
+            .transaction_manager
+            .abort_txn_state(&mut ctx.txn)?;
 
-            for uri in &touched_tables {
-                if !uri.starts_with("table:") {
-                    continue;
-                }
-                let collection = &uri[6..];
-                let table = self.session.get_primary_table(collection, false)?;
-                let mut table_guard = table.write();
-                table_guard.mark_updates_aborted(txn_id)?;
-                if let Some(catalog) = table_guard.index_catalog_mut() {
-                    catalog.mark_updates_aborted(txn_id)?;
-                }
-            }
-        }
+        self.session.txn = None;
         self.committed = true;
+
+        if !self.session.recovery_manager.wal_enabled() {
+            self.session
+                .finalize_touched_tables_locally(&touched_tables, txn_id, false)?;
+        }
         Ok(())
     }
 
@@ -280,19 +303,12 @@ impl<'a> Drop for SessionTxn<'a> {
                     .session
                     .transaction_manager
                     .abort_txn_state(&mut ctx.txn);
-
-                for uri in &touched_tables {
-                    if !uri.starts_with("table:") {
-                        continue;
-                    }
-                    let collection = &uri[6..];
-                    if let Ok(table) = self.session.get_primary_table(collection, false) {
-                        let mut table_guard = table.write();
-                        let _ = table_guard.mark_updates_aborted(txn_id);
-                        if let Some(catalog) = table_guard.index_catalog_mut() {
-                            let _ = catalog.mark_updates_aborted(txn_id);
-                        }
-                    }
+                if !self.session.recovery_manager.wal_enabled() {
+                    let _ = self.session.finalize_touched_tables_locally(
+                        &touched_tables,
+                        txn_id,
+                        false,
+                    );
                 }
             }
         }

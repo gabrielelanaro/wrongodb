@@ -1,19 +1,23 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use crate::core::errors::StorageError;
 use crate::engine::{RaftMode, RaftPeerConfig};
-use crate::raft::command::RaftCommand;
+use crate::raft::command::{CommittedCommand, RaftCommand};
 use crate::raft::node::{RaftNodeConfig, RaftNodeCore};
-use crate::raft::service::{RaftServiceConfig, RaftServiceHandle};
+use crate::raft::service::{CommittedCommandExecutor, RaftServiceConfig, RaftServiceHandle};
 use crate::recovery::txn_table::RecoveryTxnTable;
-use crate::storage::table::Table;
-use crate::storage::wal::{GlobalWal, RecoveryError, WalReader, WalRecord, WalSink};
+use crate::storage::store_registry::StoreRegistry;
+use crate::storage::wal::{
+    GlobalWal, RecoveryError, WalReader, WalRecord, WalRecordHeader, WalSink,
+};
 use crate::txn::transaction_manager::TransactionManager;
-use crate::txn::TxnId;
+use crate::txn::{TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,26 +30,108 @@ pub(crate) struct RaftStatus {
 pub(crate) struct RecoveryManager {
     wal_enabled: bool,
     raft_service: Option<RaftServiceHandle>,
-    txn_manager: Arc<TransactionManager>,
+    executor: Arc<LiveCommittedCommandExecutor>,
+}
+
+#[derive(Debug)]
+pub(crate) struct LiveCommittedCommandExecutor {
+    store_registry: Arc<StoreRegistry>,
+    touched_stores: Mutex<HashMap<TxnId, HashSet<String>>>,
+}
+
+impl LiveCommittedCommandExecutor {
+    pub(crate) fn new(store_registry: Arc<StoreRegistry>) -> Self {
+        Self {
+            store_registry,
+            touched_stores: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl CommittedCommandExecutor for LiveCommittedCommandExecutor {
+    fn execute(&self, cmd: CommittedCommand) -> Result<(), WrongoDBError> {
+        match cmd.command {
+            RaftCommand::Put {
+                store_name,
+                key,
+                value,
+                txn_id,
+            } => {
+                let table = self.store_registry.resolve_or_open_store(&store_name)?;
+                table
+                    .write()
+                    .local_apply_put_with_txn(&key, &value, txn_id)?;
+                if txn_id != TXN_NONE {
+                    let mut touched = self.touched_stores.lock();
+                    touched.entry(txn_id).or_default().insert(store_name);
+                }
+            }
+            RaftCommand::Delete {
+                store_name,
+                key,
+                txn_id,
+            } => {
+                let table = self.store_registry.resolve_or_open_store(&store_name)?;
+                let _ = table.write().local_apply_delete_with_txn(&key, txn_id)?;
+                if txn_id != TXN_NONE {
+                    let mut touched = self.touched_stores.lock();
+                    touched.entry(txn_id).or_default().insert(store_name);
+                }
+            }
+            RaftCommand::TxnCommit { txn_id, .. } => {
+                if txn_id == TXN_NONE {
+                    return Ok(());
+                }
+                let touched = self
+                    .touched_stores
+                    .lock()
+                    .remove(&txn_id)
+                    .unwrap_or_default();
+                for store_name in touched {
+                    let table = self.store_registry.resolve_or_open_store(&store_name)?;
+                    table.write().local_mark_updates_committed(txn_id)?;
+                }
+            }
+            RaftCommand::TxnAbort { txn_id } => {
+                if txn_id == TXN_NONE {
+                    return Ok(());
+                }
+                let touched = self
+                    .touched_stores
+                    .lock()
+                    .remove(&txn_id)
+                    .unwrap_or_default();
+                for store_name in touched {
+                    let table = self.store_registry.resolve_or_open_store(&store_name)?;
+                    table.write().local_mark_updates_aborted(txn_id)?;
+                }
+            }
+            RaftCommand::Checkpoint => {}
+        }
+        Ok(())
+    }
 }
 
 impl RecoveryManager {
     pub fn initialize(
         base_path: &Path,
         wal_enabled: bool,
-        txn_manager: Arc<TransactionManager>,
+        _txn_manager: Arc<TransactionManager>,
+        store_registry: Arc<StoreRegistry>,
         raft_mode: RaftMode,
     ) -> Result<Self, WrongoDBError> {
+        let executor = Arc::new(LiveCommittedCommandExecutor::new(store_registry));
         let mut manager = Self {
             wal_enabled,
             raft_service: None,
-            txn_manager,
+            executor,
         };
 
         if manager.wal_enabled {
             warn_legacy_per_table_wal_files(base_path);
             manager.recover(base_path)?;
-            let (raft_cfg, service_cfg) = raft_configs_from_mode(raft_mode)?;
+            let (raft_cfg, mut service_cfg) = raft_configs_from_mode(raft_mode)?;
+            service_cfg.executor = manager.executor.clone();
             let raft_node = RaftNodeCore::open_with_config(base_path, raft_cfg)?;
             manager.raft_service = Some(RaftServiceHandle::start(raft_node, service_cfg)?);
         }
@@ -60,6 +146,10 @@ impl RecoveryManager {
                 leader_hint: leadership.leader_id,
             })
         })
+    }
+
+    pub(crate) fn wal_enabled(&self) -> bool {
+        self.wal_enabled
     }
 
     #[allow(dead_code)]
@@ -177,7 +267,8 @@ impl RecoveryManager {
         };
 
         let mut txn_table = RecoveryTxnTable::new();
-        while let Some(record) = next_recovery_record(&mut first_pass_reader, "pass 1")? {
+        while let Some((_header, record)) = next_recovery_record(&mut first_pass_reader, "pass 1")?
+        {
             txn_table.process_record(&record);
         }
         txn_table.finalize_pending();
@@ -190,47 +281,23 @@ impl RecoveryManager {
             }
         };
 
-        let mut replay_tables: HashMap<String, Table> = HashMap::new();
-
-        while let Some(record) = next_recovery_record(&mut second_pass_reader, "pass 2")? {
+        while let Some((header, record)) = next_recovery_record(&mut second_pass_reader, "pass 2")?
+        {
             if !txn_table.should_apply(&record) {
                 continue;
             }
 
-            match record {
-                WalRecord::Put {
-                    store_name,
-                    key,
-                    value,
-                    ..
-                } => {
-                    ensure_replay_table(
-                        &mut replay_tables,
-                        base_path,
-                        &store_name,
-                        self.txn_manager.clone(),
-                    )?
-                    .put_recovery(&key, &value)?;
-                }
-                WalRecord::Delete {
-                    store_name, key, ..
-                } => {
-                    ensure_replay_table(
-                        &mut replay_tables,
-                        base_path,
-                        &store_name,
-                        self.txn_manager.clone(),
-                    )?
-                    .delete_recovery(&key)?;
-                }
-                WalRecord::Checkpoint
-                | WalRecord::TxnCommit { .. }
-                | WalRecord::TxnAbort { .. } => {}
+            if let Some(command) = wal_record_to_recovery_command(record) {
+                self.executor.execute(CommittedCommand {
+                    index: header.raft_index,
+                    term: header.raft_term,
+                    command,
+                })?;
             }
         }
 
-        for table in replay_tables.values_mut() {
-            table.checkpoint()?;
+        for table in self.executor.store_registry.all_handles() {
+            table.write().checkpoint()?;
         }
 
         Ok(())
@@ -352,9 +419,9 @@ fn warn_legacy_per_table_wal_files(base_path: &Path) {
 fn next_recovery_record(
     reader: &mut WalReader,
     pass: &str,
-) -> Result<Option<WalRecord>, WrongoDBError> {
+) -> Result<Option<(WalRecordHeader, WalRecord)>, WrongoDBError> {
     match reader.read_record() {
-        Ok(Some((_header, record))) => Ok(Some(record)),
+        Ok(Some((header, record))) => Ok(Some((header, record))),
         Ok(None) => Ok(None),
         Err(
             err @ (RecoveryError::ChecksumMismatch { .. }
@@ -369,21 +436,28 @@ fn next_recovery_record(
     }
 }
 
-fn ensure_replay_table<'a>(
-    replay_tables: &'a mut HashMap<String, Table>,
-    base_path: &Path,
-    store_name: &str,
-    txn_manager: Arc<TransactionManager>,
-) -> Result<&'a mut Table, WrongoDBError> {
-    if !replay_tables.contains_key(store_name) {
-        let store_path = base_path.join(store_name);
-        let table = Table::open_or_create_index(&store_path, txn_manager, None)?;
-        replay_tables.insert(store_name.to_string(), table);
+fn wal_record_to_recovery_command(record: WalRecord) -> Option<RaftCommand> {
+    match record {
+        WalRecord::Put {
+            store_name,
+            key,
+            value,
+            ..
+        } => Some(RaftCommand::Put {
+            store_name,
+            key,
+            value,
+            txn_id: TXN_NONE,
+        }),
+        WalRecord::Delete {
+            store_name, key, ..
+        } => Some(RaftCommand::Delete {
+            store_name,
+            key,
+            txn_id: TXN_NONE,
+        }),
+        WalRecord::TxnCommit { .. } | WalRecord::TxnAbort { .. } | WalRecord::Checkpoint => None,
     }
-
-    replay_tables
-        .get_mut(store_name)
-        .ok_or_else(|| StorageError(format!("replay table missing for store {store_name}")).into())
 }
 
 impl WalSink for RecoveryManager {
@@ -421,6 +495,24 @@ mod tests {
         Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())))
     }
 
+    fn new_store_registry(
+        dir: &tempfile::TempDir,
+        txn_manager: Arc<TransactionManager>,
+    ) -> Arc<StoreRegistry> {
+        Arc::new(StoreRegistry::new(dir.path().to_path_buf(), txn_manager))
+    }
+
+    fn new_manager(
+        dir: &tempfile::TempDir,
+        wal_enabled: bool,
+        raft_mode: RaftMode,
+    ) -> RecoveryManager {
+        let txn_manager = new_txn_manager();
+        let registry = new_store_registry(dir, txn_manager.clone());
+        RecoveryManager::initialize(dir.path(), wal_enabled, txn_manager, registry, raft_mode)
+            .unwrap()
+    }
+
     fn free_local_addr() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -431,9 +523,7 @@ mod tests {
     #[test]
     fn commit_marker_is_persisted_after_sync() {
         let dir = tempdir().unwrap();
-        let manager =
-            RecoveryManager::initialize(dir.path(), true, new_txn_manager(), RaftMode::Standalone)
-                .unwrap();
+        let manager = new_manager(&dir, true, RaftMode::Standalone);
 
         manager.log_txn_commit_sync(7, 7).unwrap();
 
@@ -457,9 +547,7 @@ mod tests {
     #[test]
     fn checkpoint_skip_and_truncate_follow_active_txn_flag() {
         let dir = tempdir().unwrap();
-        let manager =
-            RecoveryManager::initialize(dir.path(), true, new_txn_manager(), RaftMode::Standalone)
-                .unwrap();
+        let manager = new_manager(&dir, true, RaftMode::Standalone);
 
         manager.log_txn_commit_sync(1, 1).unwrap();
 
@@ -482,9 +570,7 @@ mod tests {
         let raft_state_path = RaftHardStateStore::path_for_db(dir.path());
         assert!(!raft_state_path.exists());
 
-        let _manager =
-            RecoveryManager::initialize(dir.path(), true, new_txn_manager(), RaftMode::Standalone)
-                .unwrap();
+        let _manager = new_manager(&dir, true, RaftMode::Standalone);
 
         assert!(raft_state_path.exists());
     }
@@ -495,9 +581,7 @@ mod tests {
         let raft_state_path = RaftHardStateStore::path_for_db(dir.path());
         assert!(!raft_state_path.exists());
 
-        let _manager =
-            RecoveryManager::initialize(dir.path(), false, new_txn_manager(), RaftMode::Standalone)
-                .unwrap();
+        let _manager = new_manager(&dir, false, RaftMode::Standalone);
 
         assert!(!raft_state_path.exists());
     }
@@ -507,9 +591,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let raft_state_path = RaftHardStateStore::path_for_db(dir.path());
 
-        let _manager =
-            RecoveryManager::initialize(dir.path(), true, new_txn_manager(), RaftMode::Standalone)
-                .unwrap();
+        let _manager = new_manager(&dir, true, RaftMode::Standalone);
         assert!(raft_state_path.exists());
 
         let mut file = OpenOptions::new()
@@ -521,18 +603,23 @@ mod tests {
         file.write_all(&[0xFF]).unwrap();
         file.sync_all().unwrap();
 
-        let err =
-            RecoveryManager::initialize(dir.path(), true, new_txn_manager(), RaftMode::Standalone)
-                .unwrap_err();
+        let txn_manager = new_txn_manager();
+        let registry = new_store_registry(&dir, txn_manager.clone());
+        let err = RecoveryManager::initialize(
+            dir.path(),
+            true,
+            txn_manager,
+            registry,
+            RaftMode::Standalone,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("raft hard state"));
     }
 
     #[test]
     fn standalone_mode_reports_writable_primary() {
         let dir = tempdir().unwrap();
-        let manager =
-            RecoveryManager::initialize(dir.path(), true, new_txn_manager(), RaftMode::Standalone)
-                .unwrap();
+        let manager = new_manager(&dir, true, RaftMode::Standalone);
 
         let status = manager.raft_status().unwrap();
         assert!(status.is_writable_primary);
@@ -542,10 +629,9 @@ mod tests {
     #[test]
     fn clustered_mode_rejects_writes_when_not_leader() {
         let dir = tempdir().unwrap();
-        let manager = RecoveryManager::initialize(
-            dir.path(),
+        let manager = new_manager(
+            &dir,
             true,
-            new_txn_manager(),
             RaftMode::Cluster {
                 local_node_id: "n1".to_string(),
                 local_raft_addr: free_local_addr(),
@@ -554,8 +640,7 @@ mod tests {
                     raft_addr: "127.0.0.1:65001".to_string(),
                 }],
             },
-        )
-        .unwrap();
+        );
 
         let err = manager
             .log_put("users.main.wt", b"k1", b"v1", TXN_NONE)
@@ -569,10 +654,9 @@ mod tests {
     #[test]
     fn runtime_tick_and_inbound_helpers_remain_callable() {
         let dir = tempdir().unwrap();
-        let manager = RecoveryManager::initialize(
-            dir.path(),
+        let manager = new_manager(
+            &dir,
             true,
-            new_txn_manager(),
             RaftMode::Cluster {
                 local_node_id: "n1".to_string(),
                 local_raft_addr: free_local_addr(),
@@ -581,8 +665,7 @@ mod tests {
                     raft_addr: "127.0.0.1:65002".to_string(),
                 }],
             },
-        )
-        .unwrap();
+        );
 
         manager.raft_tick().unwrap();
 

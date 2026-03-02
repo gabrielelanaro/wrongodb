@@ -13,6 +13,7 @@ const RAFT_LOG_MAGIC: &[u8; 8] = b"RFTLOG01";
 const RAFT_LOG_VERSION: u16 = 1;
 const RAFT_LOG_HEADER_SIZE: usize = 16;
 const RAFT_LOG_RECORD_HEADER_SIZE: usize = 16;
+type ScanEntriesResult = (Vec<ProtocolLogEntry>, Vec<u64>, Option<u64>);
 
 #[derive(Debug)]
 pub(crate) struct RaftLogStore {
@@ -30,6 +31,7 @@ impl RaftLogStore {
         let path = Self::path_for_db(db_dir);
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;
@@ -174,9 +176,7 @@ fn read_and_validate_header(file: &mut std::fs::File) -> Result<(), WrongoDBErro
     Ok(())
 }
 
-fn scan_entries(
-    file: &mut std::fs::File,
-) -> Result<(Vec<ProtocolLogEntry>, Vec<u64>, Option<u64>), WrongoDBError> {
+fn scan_entries(file: &mut std::fs::File) -> Result<ScanEntriesResult, WrongoDBError> {
     let mut entries = Vec::new();
     let mut offsets = Vec::new();
     let mut cursor = RAFT_LOG_HEADER_SIZE as u64;

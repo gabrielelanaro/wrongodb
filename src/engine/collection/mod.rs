@@ -46,9 +46,9 @@ impl Collection {
                 txn.commit()?;
                 Ok(value)
             }
-            Err(e) => {
+            Err(err) => {
                 let _ = txn.abort();
-                Err(e)
+                Err(err)
             }
         }
     }
@@ -437,7 +437,7 @@ impl Collection {
             let catalog = table_guard
                 .index_catalog_mut()
                 .ok_or_else(|| crate::core::errors::StorageError("missing index catalog".into()))?;
-            catalog.add_index(field, vec![field.to_string()], &docs)?;
+            catalog.add_index(field, vec![field.to_string()], &docs, txn_id)?;
             Ok(())
         })
     }

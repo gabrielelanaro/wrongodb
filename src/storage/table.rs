@@ -79,6 +79,21 @@ impl Table {
         self.index_catalog.as_mut()
     }
 
+    pub fn store_name(&self) -> &str {
+        &self.store_name
+    }
+
+    pub fn wal_sink(&self) -> Option<Arc<dyn WalSink>> {
+        self.wal_sink.clone()
+    }
+
+    pub fn set_wal_sink(&mut self, wal_sink: Option<Arc<dyn WalSink>>) {
+        self.wal_sink = wal_sink.clone();
+        if let Some(catalog) = self.index_catalog.as_mut() {
+            catalog.set_wal_sink(wal_sink);
+        }
+    }
+
     pub fn scan_range(
         &mut self,
         start_key: Option<&[u8]>,
@@ -142,9 +157,9 @@ impl Table {
     ) -> Result<(), WrongoDBError> {
         if let Some(wal_sink) = self.wal_sink.as_ref() {
             wal_sink.log_put(&self.store_name, key, value, txn_id)?;
+            return Ok(());
         }
-        self.transaction_manager
-            .put(&self.store_name, &mut self.btree, key, value, txn_id)
+        self.local_apply_put_with_txn(key, value, txn_id)
     }
 
     pub fn delete_raw_with_txn(
@@ -154,7 +169,26 @@ impl Table {
     ) -> Result<bool, WrongoDBError> {
         if let Some(wal_sink) = self.wal_sink.as_ref() {
             wal_sink.log_delete(&self.store_name, key, txn_id)?;
+            return Ok(true);
         }
+        self.local_apply_delete_with_txn(key, txn_id)
+    }
+
+    pub fn local_apply_put_with_txn(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        txn_id: crate::txn::TxnId,
+    ) -> Result<(), WrongoDBError> {
+        self.transaction_manager
+            .put(&self.store_name, &mut self.btree, key, value, txn_id)
+    }
+
+    pub fn local_apply_delete_with_txn(
+        &mut self,
+        key: &[u8],
+        txn_id: crate::txn::TxnId,
+    ) -> Result<bool, WrongoDBError> {
         self.transaction_manager
             .delete(&self.store_name, &mut self.btree, key, txn_id)
     }
@@ -176,11 +210,25 @@ impl Table {
         &mut self,
         txn_id: crate::txn::TxnId,
     ) -> Result<(), WrongoDBError> {
+        self.local_mark_updates_committed(txn_id)
+    }
+
+    pub fn local_mark_updates_committed(
+        &mut self,
+        txn_id: crate::txn::TxnId,
+    ) -> Result<(), WrongoDBError> {
         self.transaction_manager
             .mark_updates_committed(&self.store_name, txn_id)
     }
 
     pub fn mark_updates_aborted(&mut self, txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
+        self.local_mark_updates_aborted(txn_id)
+    }
+
+    pub fn local_mark_updates_aborted(
+        &mut self,
+        txn_id: crate::txn::TxnId,
+    ) -> Result<(), WrongoDBError> {
         self.transaction_manager
             .mark_updates_aborted(&self.store_name, txn_id)
     }

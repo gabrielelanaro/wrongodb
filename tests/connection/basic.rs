@@ -78,3 +78,19 @@ fn test_cursor_delete() {
         txn.commit().unwrap();
     }
 }
+
+#[test]
+fn test_cursor_txn_none_visibility_with_wal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let conn = Connection::open(tmp.path().join("test"), ConnectionConfig::default()).unwrap();
+
+    let mut session = conn.open_session();
+    session.create("table:kv").unwrap();
+
+    let mut cursor = session.open_cursor("table:kv").unwrap();
+    cursor.insert(b"k1", b"v1", 0).unwrap();
+    assert_eq!(cursor.get(b"k1", 0).unwrap(), Some(b"v1".to_vec()));
+
+    cursor.delete(b"k1", 0).unwrap();
+    assert_eq!(cursor.get(b"k1", 0).unwrap(), None);
+}

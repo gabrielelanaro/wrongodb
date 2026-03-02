@@ -1,5 +1,43 @@
 # Decisions
 
+## 2026-02-24: Unify runtime apply and recovery replay behind a single committed-command executor
+
+**Decision**
+- Standardize internal mutation flow around committed commands:
+  - runtime path: `API -> propose -> Raft commit -> executor -> local apply -> ACK`
+  - recovery path: `WAL replay -> executor -> local apply`
+- Add `CommittedCommand` and `CommittedCommandExecutor` as the only Raft-service apply boundary.
+- Keep Raft node apply loop authoritative for WAL ordering:
+  - `RaftNodeCore::apply_committed_entries` appends WAL and enqueues committed commands.
+  - `RaftService` drains and executes committed commands in-order.
+- Change proposal ACK semantics to require both:
+  - command index committed in Raft
+  - same index successfully executed locally by the executor.
+- Add fail-stop behavior on executor failure:
+  - first apply error latches fatal state
+  - subsequent propose/leadership/sync/truncate requests fail with explicit fatal error until restart.
+- Keep recovery WAL-only:
+  - pass-1 classification (`RecoveryTxnTable`)
+  - pass-2 replay to the same executor used at runtime
+  - no Raft-tail catch-up replay in recovery.
+- Add startup invariant check:
+  - fail open if `wal_last_raft_index > protocol_last_log_index`
+  - keep conservative clamp `commit_index = min(protocol_last_log_index, wal_last_raft_index)`.
+- Move storage handle ownership to `StoreRegistry`:
+  - storage-owned `store_name -> Table` mapping and alias resolution
+  - runtime/recovery resolve by `store_name`
+  - API cache becomes a thin adapter over registry.
+
+**Why**
+- A single mutator authority removes leader/follower write-path divergence and avoids double-apply behavior.
+- ACK-after-execute aligns client success with local durability/visibility on the serving node.
+- Reusing the same executor for runtime and recovery reduces coupling and replay drift risk.
+- Storage-owned registry removes prior ownership cycles and keeps dependency direction explicit.
+
+**Notes**
+- WAL-disabled mode retains local transaction finalization in `SessionTxn` because no Raft executor is present.
+- Snapshot install, dynamic membership, and read-index linearizability remain out of scope.
+
 ## 2026-02-22: Add dedicated Raft TCP transport and actor-owned runtime for multi-node quorum writes
 
 **Decision**
