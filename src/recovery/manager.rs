@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use crate::api::connection::{RaftMode, RaftPeerConfig};
 use crate::core::errors::StorageError;
-use crate::engine::{RaftMode, RaftPeerConfig};
 use crate::raft::command::{CommittedCommand, RaftCommand};
 use crate::raft::node::{RaftNodeConfig, RaftNodeCore};
 use crate::raft::service::{CommittedCommandExecutor, RaftServiceConfig, RaftServiceHandle};
@@ -238,6 +238,7 @@ impl RecoveryManager {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn checkpoint_and_truncate_if_safe(&self, active_txns: bool) -> Result<(), WrongoDBError> {
         if !self.wal_enabled || active_txns {
             return Ok(());

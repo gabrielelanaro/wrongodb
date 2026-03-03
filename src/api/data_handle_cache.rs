@@ -23,6 +23,7 @@ impl DataHandleCache {
         self.registry.get_or_open_primary(uri, collection)
     }
 
+    #[allow(dead_code)]
     pub fn all_handles(&self) -> Vec<Arc<RwLock<Table>>> {
         self.registry.all_handles()
     }

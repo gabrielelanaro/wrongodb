@@ -9,11 +9,10 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
 
 use self::commands::handlers::crud::{bson_to_value, value_to_bson};
 use self::commands::CommandRegistry;
-use crate::{WrongoDB, WrongoDBError};
+use crate::{document_ops, Connection, WrongoDBError};
 
 const OP_MSG: i32 = 2013;
 const OP_QUERY: i32 = 2004;
@@ -49,7 +48,7 @@ impl MsgHeader {
 
 pub async fn start_server(
     addr: &str,
-    db: Arc<Mutex<WrongoDB>>,
+    conn: Arc<Connection>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     let registry = Arc::new(CommandRegistry::new());
@@ -57,10 +56,10 @@ pub async fn start_server(
 
     loop {
         let (socket, _) = listener.accept().await?;
-        let db_clone = Arc::clone(&db);
+        let conn_clone = Arc::clone(&conn);
         let registry_clone = Arc::clone(&registry);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, db_clone, registry_clone).await {
+            if let Err(e) = handle_connection(socket, conn_clone, registry_clone).await {
                 eprintln!("Connection error: {}", e);
             }
         });
@@ -69,7 +68,7 @@ pub async fn start_server(
 
 async fn handle_connection(
     mut socket: TcpStream,
-    db: Arc<Mutex<WrongoDB>>,
+    conn: Arc<Connection>,
     registry: Arc<CommandRegistry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
@@ -103,11 +102,11 @@ async fn handle_connection(
 
         match header.op_code {
             OP_MSG => {
-                let response = handle_op_msg(&body_buf, &db, &registry).await?;
+                let response = handle_op_msg(&body_buf, &conn, &registry).await?;
                 send_op_msg_response(&mut socket, header.request_id, &response).await?;
             }
             OP_QUERY => {
-                let response = handle_op_query(&body_buf, &db, &registry).await?;
+                let response = handle_op_query(&body_buf, &conn, &registry).await?;
                 send_reply(&mut socket, header.request_id, &response).await?;
             }
             _ => continue,
@@ -117,7 +116,7 @@ async fn handle_connection(
 
 async fn handle_op_msg(
     body_buf: &[u8],
-    db: &Arc<Mutex<WrongoDB>>,
+    conn: &Arc<Connection>,
     registry: &CommandRegistry,
 ) -> Result<Document, WrongoDBError> {
     let mut cursor = Cursor::new(body_buf);
@@ -164,8 +163,7 @@ async fn handle_op_msg(
                 doc.insert("documents", Bson::Array(docs_bson));
             }
         }
-        let mut db_lock = db.lock().await;
-        return Ok(match registry.execute(&doc, &mut db_lock) {
+        return Ok(match registry.execute(&doc, conn.as_ref()) {
             Ok(response) => response,
             Err(err) => command_error_document(&err),
         });
@@ -176,7 +174,7 @@ async fn handle_op_msg(
 
 async fn handle_op_query(
     body_buf: &[u8],
-    db: &Arc<Mutex<WrongoDB>>,
+    conn: &Arc<Connection>,
     registry: &CommandRegistry,
 ) -> Result<Document, WrongoDBError> {
     let mut cursor = Cursor::new(body_buf);
@@ -203,22 +201,19 @@ async fn handle_op_query(
     let query_doc: Document = bson::from_slice(&query_buf).map_err(WrongoDBError::BsonDe)?;
 
     if full_coll_name == "admin.$cmd" {
-        let mut db_lock = db.lock().await;
-        return Ok(match registry.execute(&query_doc, &mut db_lock) {
+        return Ok(match registry.execute(&query_doc, conn.as_ref()) {
             Ok(response) => response,
             Err(err) => command_error_document(&err),
         });
     }
 
     let filter_json = bson_to_value(&query_doc);
-    let db_lock = db.lock().await;
     let coll_name = full_coll_name
         .split_once('.')
         .map(|(_, coll)| coll)
         .unwrap_or(full_coll_name.as_str());
-    let coll = db_lock.collection(coll_name);
-    let mut session = db_lock.open_session();
-    let results = match coll.find(&mut session, Some(filter_json)) {
+    let mut session = conn.open_session();
+    let results = match document_ops::find(&mut session, coll_name, Some(filter_json)) {
         Ok(results) => results,
         Err(err) => return Ok(command_error_document(&err)),
     };

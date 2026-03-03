@@ -7,7 +7,7 @@ use serde_json::json;
 use tempfile::tempdir;
 
 use common::raft_cluster::{build_cluster, find_docs, find_single_leader, insert_doc};
-use wrongodb::{RaftMode, WrongoDB, WrongoDBConfig};
+use wrongodb::{Connection, ConnectionConfig, RaftMode};
 
 #[test]
 fn raft_cluster_restart_recovers_replicated_wal_tail() {
@@ -27,9 +27,9 @@ fn raft_cluster_restart_recovers_replicated_wal_tail() {
     thread::sleep(Duration::from_millis(800));
     nodes[follower].drop_db();
     thread::sleep(Duration::from_millis(200));
-    let recovered = WrongoDB::open_with_config(
+    let recovered = Connection::open(
         &nodes[follower].db_path,
-        WrongoDBConfig::new().raft_mode(RaftMode::Standalone),
+        ConnectionConfig::new().raft_mode(RaftMode::Standalone),
     )
     .unwrap();
 

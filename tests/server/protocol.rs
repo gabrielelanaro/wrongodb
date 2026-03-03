@@ -3,8 +3,7 @@ use mongodb::{bson::doc, options::ClientOptions, Client};
 use std::net::TcpListener;
 use std::sync::Arc;
 use tempfile::tempdir;
-use tokio::sync::Mutex;
-use wrongodb::{start_server, RaftMode, RaftPeerConfig, WrongoDB, WrongoDBConfig};
+use wrongodb::{start_server, Connection, ConnectionConfig, RaftMode, RaftPeerConfig};
 
 fn free_local_addr() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -18,12 +17,12 @@ async fn test_mongo_client_connection() {
     // Start server in background
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("test_server.db");
-    let db = WrongoDB::open(db_path.to_str().unwrap()).unwrap();
-    let db = Arc::new(Mutex::new(db));
+    let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+    let conn = Arc::new(conn);
 
-    let db_clone = Arc::clone(&db);
+    let conn_clone = Arc::clone(&conn);
     tokio::spawn(async move {
-        start_server("127.0.0.1:27018", db_clone).await.unwrap();
+        start_server("127.0.0.1:27018", conn_clone).await.unwrap();
     });
 
     // Wait a bit
@@ -96,12 +95,12 @@ async fn test_mongo_client_connection() {
 async fn test_supported_mongosh_commands() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("test_shell.db");
-    let db = WrongoDB::open(db_path.to_str().unwrap()).unwrap();
-    let db = Arc::new(Mutex::new(db));
+    let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+    let conn = Arc::new(conn);
 
-    let db_clone = Arc::clone(&db);
+    let conn_clone = Arc::clone(&conn);
     tokio::spawn(async move {
-        start_server("127.0.0.1:27019", db_clone).await.unwrap();
+        start_server("127.0.0.1:27019", conn_clone).await.unwrap();
     });
 
     crate::common::wait_for_server().await;
@@ -203,7 +202,7 @@ async fn test_non_leader_mode_rejects_writes_but_keeps_connection_alive() {
     let db_path = tmp.path().join("test_cluster_non_leader.db");
     let local_raft_addr = free_local_addr();
     let peer_raft_addr = free_local_addr();
-    let cfg = WrongoDBConfig::new().raft_mode(RaftMode::Cluster {
+    let cfg = ConnectionConfig::new().raft_mode(RaftMode::Cluster {
         local_node_id: "n1".to_string(),
         local_raft_addr,
         peers: vec![RaftPeerConfig {
@@ -211,12 +210,12 @@ async fn test_non_leader_mode_rejects_writes_but_keeps_connection_alive() {
             raft_addr: peer_raft_addr,
         }],
     });
-    let db = WrongoDB::open_with_config(db_path.to_str().unwrap(), cfg).unwrap();
-    let db = Arc::new(Mutex::new(db));
+    let conn = Connection::open(&db_path, cfg).unwrap();
+    let conn = Arc::new(conn);
 
-    let db_clone = Arc::clone(&db);
+    let conn_clone = Arc::clone(&conn);
     tokio::spawn(async move {
-        start_server("127.0.0.1:27020", db_clone).await.unwrap();
+        start_server("127.0.0.1:27020", conn_clone).await.unwrap();
     });
 
     crate::common::wait_for_server().await;

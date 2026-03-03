@@ -1,6 +1,6 @@
 use super::crud::{bson_to_value, value_to_bson_value};
 use crate::commands::Command;
-use crate::{WrongoDB, WrongoDBError};
+use crate::{document_ops, Connection, WrongoDBError};
 use bson::{doc, Bson, Document};
 use serde_json::Value;
 
@@ -12,14 +12,13 @@ impl Command for CountCommand {
         &["count"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("count").unwrap_or("test");
-        let coll = db.collection(coll_name);
-        let mut session = db.open_session();
+        let mut session = conn.open_session();
         let query = doc.get("query").and_then(|q| q.as_document()).cloned();
         let filter_json = query.map(|d| bson_to_value(&d));
 
-        let count = coll.count(&mut session, filter_json)?;
+        let count = document_ops::count(&mut session, coll_name, filter_json)?;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),
@@ -36,15 +35,14 @@ impl Command for DistinctCommand {
         &["distinct"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("distinct").unwrap_or("test");
-        let coll = db.collection(coll_name);
-        let mut session = db.open_session();
+        let mut session = conn.open_session();
         let key = doc.get_str("key").unwrap_or("_id");
         let query = doc.get("query").and_then(|q| q.as_document()).cloned();
         let filter_json = query.map(|d| bson_to_value(&d));
 
-        let values = coll.distinct(&mut session, key, filter_json)?;
+        let values = document_ops::distinct(&mut session, coll_name, key, filter_json)?;
         let values_bson: Vec<Bson> = values
             .into_iter()
             .map(|v| value_to_bson_value(&v))
@@ -66,18 +64,16 @@ impl Command for AggregateCommand {
         &["aggregate"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("aggregate").unwrap_or("test");
-        let coll = db.collection(coll_name);
-        let mut session = db.open_session();
+        let mut session = conn.open_session();
         let pipeline = doc.get_array("pipeline").cloned().unwrap_or_default();
 
-        // Start with all documents
-        let mut results = coll.find(&mut session, None)?;
+        let mut results = document_ops::find(&mut session, coll_name, None)?;
 
         for stage in pipeline {
             if let Bson::Document(stage_doc) = stage {
-                results = apply_pipeline_stage(&stage_doc, results, db)?;
+                results = apply_pipeline_stage(&stage_doc, results)?;
             }
         }
 
@@ -100,9 +96,7 @@ impl Command for AggregateCommand {
 fn apply_pipeline_stage(
     stage: &Document,
     mut results: Vec<serde_json::Map<String, Value>>,
-    _db: &mut WrongoDB,
 ) -> Result<Vec<serde_json::Map<String, Value>>, WrongoDBError> {
-    // $match - filter documents
     if let Ok(match_doc) = stage.get_document("$match") {
         let filter = bson_to_value(match_doc);
         if let Value::Object(filter_obj) = filter {
@@ -110,21 +104,18 @@ fn apply_pipeline_stage(
         }
     }
 
-    // $limit - limit number of documents
     if let Ok(limit) = stage.get_i64("$limit") {
         results.truncate(limit as usize);
     } else if let Ok(limit) = stage.get_i32("$limit") {
         results.truncate(limit as usize);
     }
 
-    // $skip - skip documents
     if let Ok(skip) = stage.get_i64("$skip") {
         results = results.into_iter().skip(skip as usize).collect();
     } else if let Ok(skip) = stage.get_i32("$skip") {
         results = results.into_iter().skip(skip as usize).collect();
     }
 
-    // $count - return count as a single document
     if let Ok(count_field) = stage.get_str("$count") {
         let count = results.len();
         let mut count_doc = serde_json::Map::new();
@@ -132,7 +123,6 @@ fn apply_pipeline_stage(
         return Ok(vec![count_doc]);
     }
 
-    // $project - basic field projection (include/exclude)
     if let Ok(project_doc) = stage.get_document("$project") {
         let project_filter = bson_to_value(project_doc);
         if let Value::Object(proj_obj) = project_filter {
@@ -141,7 +131,6 @@ fn apply_pipeline_stage(
                 .map(|doc| {
                     let mut new_doc = serde_json::Map::new();
                     for (k, v) in &proj_obj {
-                        // Check if it's an inclusion (1 or true)
                         let include = match v {
                             Value::Number(n) => n.as_i64() == Some(1),
                             Value::Bool(b) => *b,
@@ -153,7 +142,6 @@ fn apply_pipeline_stage(
                             }
                         }
                     }
-                    // Always include _id unless explicitly excluded
                     if !proj_obj.contains_key("_id")
                         || proj_obj.get("_id") != Some(&Value::Number(0.into()))
                     {

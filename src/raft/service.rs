@@ -143,6 +143,7 @@ impl RaftServiceHandle {
             .map_err(|_| StorageError("raft service dropped sync response".into()))?
     }
 
+    #[allow(dead_code)]
     pub(crate) fn truncate_to_checkpoint(&self) -> Result<(), WrongoDBError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.cmd_tx
@@ -203,6 +204,7 @@ enum RaftServiceCommand {
     Sync {
         reply: Sender<Result<(), WrongoDBError>>,
     },
+    #[allow(dead_code)]
     TruncateToCheckpoint {
         reply: Sender<Result<(), WrongoDBError>>,
     },

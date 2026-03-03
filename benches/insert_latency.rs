@@ -1,17 +1,14 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use wrongodb::WrongoDB;
+
+use wrongodb::{Connection, ConnectionConfig};
 
 const VALUE_SIZE: usize = 100;
-
-/// Database sizes to test (number of pre-existing entries)
 const DB_SIZES: &[usize] = &[0, 1_000, 10_000, 100_000];
 
-/// Starting counter for unique key generation (uses high bits to avoid collision with pre-populated keys)
 static KEY_COUNTER: AtomicU64 = AtomicU64::new(1_000_000);
 
 fn bench_data_dir() -> PathBuf {
@@ -30,32 +27,36 @@ fn generate_data(size: usize) -> String {
     "x".repeat(size)
 }
 
-fn create_db(name: &str) -> WrongoDB {
+fn create_db(name: &str) -> Connection {
     let path = db_path(name);
-    // Clean up any existing database first
     let _ = fs::remove_dir_all(&path);
-    // Open with no secondary indexes, sync_every_write: false for performance
-    WrongoDB::open(&path).expect("Failed to create database")
+    Connection::open(&path, ConnectionConfig::default()).expect("Failed to create database")
 }
 
 fn sequential_key(i: usize) -> String {
     format!("key_{:010}", i)
 }
 
-fn pre_populate(db: &WrongoDB, count: usize) {
+fn insert_kv(conn: &Connection, key: &str, value: &str) {
+    let mut session = conn.open_session();
+    let mut txn = session.transaction().expect("begin tx failed");
+    let txn_id = txn.as_ref().id();
+    let mut cursor = txn
+        .session_mut()
+        .open_cursor("table:test")
+        .expect("open cursor failed");
+    cursor
+        .insert(key.as_bytes(), value.as_bytes(), txn_id)
+        .expect("insert failed");
+    txn.commit().expect("commit failed");
+}
+
+fn pre_populate(conn: &Connection, count: usize) {
     let data = generate_data(VALUE_SIZE);
-    let coll = db.collection("test");
-    let mut session = db.open_session();
     for i in 0..count {
         let key = sequential_key(i);
-        let doc = json!({
-            "_id": key,
-            "data": &data
-        });
-        coll.insert_one(&mut session, doc)
-            .expect("Failed to insert");
+        insert_kv(conn, &key, &data);
     }
-    coll.checkpoint(&mut session).expect("Failed to checkpoint");
 }
 
 fn insert_latency(c: &mut Criterion) {
@@ -65,36 +66,25 @@ fn insert_latency(c: &mut Criterion) {
 
     let data = generate_data(VALUE_SIZE);
 
-    // Clean up any stale benchmark data first
     cleanup();
 
     for db_size in DB_SIZES {
         let db_name = format!("bench_{}_entries", db_size);
 
-        // Setup: Create database and pre-populate
-        let db = create_db(&db_name);
-        pre_populate(&db, *db_size);
+        let conn = create_db(&db_name);
+        pre_populate(&conn, *db_size);
 
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{}_entries", db_size)),
             db_size,
             |b, _| {
                 b.iter(|| {
-                    // Generate a unique key for each iteration to avoid duplicate key errors
                     let key = format!(
                         "bench_key_{:016x}",
                         KEY_COUNTER.fetch_add(1, Ordering::SeqCst)
                     );
-                    let doc = json!({
-                        "_id": key,
-                        "data": &data
-                    });
-                    {
-                        let coll = db.collection("test");
-                        let mut session = db.open_session();
-                        coll.insert_one(&mut session, doc).expect("Insert failed");
-                    }
-                    black_box(&db);
+                    insert_kv(&conn, &key, &data);
+                    black_box(&conn);
                 });
             },
         );

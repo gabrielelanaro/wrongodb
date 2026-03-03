@@ -1,5 +1,38 @@
 # Decisions
 
+## 2026-03-02: Remove public `WrongoDB`/`Collection` layer and keep only `Connection`/`Session`/`Cursor`
+
+**Decision**
+- Remove the public high-level wrapper API:
+  - deleted `WrongoDB`, `WrongoDBConfig`, and `Collection` types from crate exports.
+  - removed `src/engine/` wrapper module.
+- Standardize public usage around low-level storage primitives only:
+  - `Connection` for shared infrastructure and open/close lifecycle.
+  - `Session` for request-scoped mutable state and transaction ownership.
+  - `Cursor` for table/index reads and writes.
+- Introduce internal-only document orchestration in `src/document_ops/`:
+  - free functions for insert/find/update/delete/count/distinct/index operations.
+  - keeps document semantics out of the public API while preserving server behavior.
+- Rewire Mongo wire server and command handlers to depend on `&Connection` directly
+  and call internal `document_ops` instead of constructing `Collection` objects.
+- Move Raft configuration types (`RaftMode`, `RaftPeerConfig`) into `src/api/connection.rs`
+  so API/recovery do not depend on the removed engine wrapper module.
+
+**Why**
+- `Collection` represented a higher abstraction level than the core storage/session API and
+  mixed concerns in both public API and server internals.
+- Keeping one public abstraction level makes ownership and layering explicit:
+  connection lifetime, session transaction context, and cursor I/O.
+- This mirrors storage-engine style boundaries (WiredTiger/MongoDB internals):
+  operation context and cursors are primary; document orchestration is an internal adapter.
+
+**Notes**
+- This is an intentional breaking change with no compatibility shim.
+- Integration coverage moved to:
+  - low-level connection/session/cursor tests,
+  - wire-protocol command tests,
+  - internal `document_ops` unit tests.
+
 ## 2026-02-24: Unify runtime apply and recovery replay behind a single committed-command executor
 
 **Decision**

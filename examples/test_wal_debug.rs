@@ -1,26 +1,30 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
-use serde_json::json;
 use tempfile::tempdir;
 
-use wrongodb::WrongoDB;
+use wrongodb::{Connection, ConnectionConfig};
 
 fn main() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("test.db");
 
     {
-        let db = WrongoDB::open(&db_path).unwrap();
-        let coll = db.collection("test");
-        let mut session = db.open_session();
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let mut session = conn.open_session();
+        let mut txn = session.transaction().unwrap();
+        let txn_id = txn.as_ref().id();
+        let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
 
         for i in 0..10 {
-            coll.insert_one(&mut session, json!({"_id": i, "value": format!("v{i}")}))
+            let key = format!("k{i}");
+            let value = format!("v{i}");
+            cursor
+                .insert(key.as_bytes(), value.as_bytes(), txn_id)
                 .unwrap();
         }
 
-        coll.checkpoint(&mut session).unwrap();
+        txn.commit().unwrap();
     }
 
     let wal_path = db_path.join("global.wal");

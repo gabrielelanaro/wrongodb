@@ -1,5 +1,8 @@
+use std::fs;
+use std::path::Path;
+
 use crate::commands::Command;
-use crate::{WrongoDB, WrongoDBError};
+use crate::{document_ops, Connection, WrongoDBError};
 use bson::{doc, spec::BinarySubtype, Binary, Bson, Document};
 
 /// Handles: listDatabases
@@ -10,8 +13,7 @@ impl Command for ListDatabasesCommand {
         &["listDatabases"]
     }
 
-    fn execute(&self, _doc: &Document, _db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
-        // TODO: When multi-database support is added, return actual databases
+    fn execute(&self, _doc: &Document, _conn: &Connection) -> Result<Document, WrongoDBError> {
         Ok(doc! {
             "ok": Bson::Double(1.0),
             "databases": Bson::Array(vec![
@@ -35,13 +37,12 @@ impl Command for ListCollectionsCommand {
         &["listCollections"]
     }
 
-    fn execute(&self, _doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
-        let collections = db.list_collections()?;
+    fn execute(&self, _doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
+        let collections = list_collections(conn.base_path())?;
         let collections_bson: Vec<Bson> = collections
             .into_iter()
             .enumerate()
             .map(|(i, name)| {
-                // Create a UUID-like binary from a simple hash
                 let mut uuid_bytes = [0u8; 16];
                 let name_bytes = name.as_bytes();
                 for (j, &b) in name_bytes.iter().take(16).enumerate() {
@@ -85,17 +86,26 @@ impl Command for DbStatsCommand {
         &["dbStats"]
     }
 
-    fn execute(&self, _doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
-        let stats = db.stats()?;
+    fn execute(&self, _doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
+        let collections = list_collections(conn.base_path())?;
+        let mut document_count = 0usize;
+        let mut index_count = 0usize;
+
+        for name in &collections {
+            let mut session = conn.open_session();
+            document_count += document_ops::count(&mut session, name, None)?;
+            index_count += document_ops::list_indexes(&mut session, name)?.len();
+        }
+
         Ok(doc! {
             "ok": Bson::Double(1.0),
             "db": "test",
-            "collections": Bson::Int32(stats.collection_count as i32),
-            "objects": Bson::Int64(stats.document_count as i64),
+            "collections": Bson::Int32(collections.len() as i32),
+            "objects": Bson::Int64(document_count as i64),
             "avgObjSize": Bson::Double(0.0),
             "dataSize": Bson::Int64(0),
             "storageSize": Bson::Int64(0),
-            "indexes": Bson::Int32(stats.index_count as i32),
+            "indexes": Bson::Int32(index_count as i32),
             "indexSize": Bson::Int64(0),
         })
     }
@@ -109,12 +119,10 @@ impl Command for CollStatsCommand {
         &["collStats"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("collStats").unwrap_or("test");
-        let coll = db.collection(coll_name);
-        let mut session = db.open_session();
-
-        let count = coll.count(&mut session, None)?;
+        let mut session = conn.open_session();
+        let count = document_ops::count(&mut session, coll_name, None)?;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),
@@ -127,4 +135,21 @@ impl Command for CollStatsCommand {
             "totalIndexSize": Bson::Int64(0),
         })
     }
+}
+
+pub(crate) fn list_collections(base: &Path) -> Result<Vec<String>, WrongoDBError> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(base)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let file_name = match file_name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        if let Some(name) = file_name.strip_suffix(".main.wt") {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+    Ok(names)
 }

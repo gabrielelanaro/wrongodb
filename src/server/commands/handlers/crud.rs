@@ -1,11 +1,7 @@
 use crate::commands::Command;
-use crate::{WrongoDB, WrongoDBError};
+use crate::{document_ops, Connection, WrongoDBError};
 use bson::{doc, oid::ObjectId, Bson, Document};
 use serde_json::{Map, Value};
-
-// ============================================================================
-// BSON <-> Value conversion utilities
-// ============================================================================
 
 pub fn bson_to_json_document(doc: &Document) -> Map<String, Value> {
     let mut map = Map::new();
@@ -68,10 +64,6 @@ pub fn value_to_bson_value(value: &Value) -> Bson {
     }
 }
 
-// ============================================================================
-// Insert Command
-// ============================================================================
-
 pub struct InsertCommand;
 
 impl Command for InsertCommand {
@@ -79,15 +71,14 @@ impl Command for InsertCommand {
         &["insert"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("insert").unwrap_or("test");
-        let coll = db.collection(coll_name);
-        let mut session = db.open_session();
+        let mut session = conn.open_session();
 
         let inserted_ids: Vec<ObjectId> = if let Ok(docs) = doc.get_array("documents") {
             let mut ids = Vec::new();
             for doc_bson in docs {
-                if let Bson::Document(ref d) = doc_bson {
+                if let Bson::Document(d) = doc_bson {
                     let mut doc_with_id = d.clone();
                     doc_with_id
                         .entry("_id".to_string())
@@ -97,7 +88,7 @@ impl Command for InsertCommand {
                         _ => ObjectId::new(),
                     };
                     let json_doc = bson_to_json_document(&doc_with_id);
-                    coll.insert_one(&mut session, Value::Object(json_doc))?;
+                    document_ops::insert_one(&mut session, coll_name, Value::Object(json_doc))?;
                     ids.push(id);
                 }
             }
@@ -119,10 +110,6 @@ impl Command for InsertCommand {
     }
 }
 
-// ============================================================================
-// Find Command
-// ============================================================================
-
 pub struct FindCommand;
 
 impl Command for FindCommand {
@@ -130,23 +117,20 @@ impl Command for FindCommand {
         &["find"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("find").unwrap_or("test");
-        let coll = db.collection(coll_name);
-        let mut session = db.open_session();
+        let mut session = conn.open_session();
 
         let filter = doc.get("filter").and_then(|f| f.as_document()).cloned();
         let filter_json = filter.map(|d| bson_to_value(&d));
 
-        let mut results = coll.find(&mut session, filter_json)?;
+        let mut results = document_ops::find(&mut session, coll_name, filter_json)?;
 
-        // Handle skip
         let skip = doc.get("skip").and_then(|v| v.as_i64()).unwrap_or(0);
         if skip > 0 {
             results = results.into_iter().skip(skip as usize).collect();
         }
 
-        // Handle limit and batchSize
         let limit = doc
             .get("limit")
             .and_then(|v| v.as_i64())
@@ -181,10 +165,6 @@ impl Command for FindCommand {
     }
 }
 
-// ============================================================================
-// Update Command
-// ============================================================================
-
 pub struct UpdateCommand;
 
 impl Command for UpdateCommand {
@@ -192,10 +172,9 @@ impl Command for UpdateCommand {
         &["update"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("update").unwrap_or("test");
-        let coll = db.collection(coll_name);
-        let mut session = db.open_session();
+        let mut session = conn.open_session();
         let mut n_matched = 0i32;
         let mut n_modified = 0i32;
 
@@ -213,9 +192,14 @@ impl Command for UpdateCommand {
                     let multi = update_doc.get_bool("multi").unwrap_or(false);
 
                     let result = if multi {
-                        coll.update_many(&mut session, filter_json, update_json)?
+                        document_ops::update_many(
+                            &mut session,
+                            coll_name,
+                            filter_json,
+                            update_json,
+                        )?
                     } else {
-                        coll.update_one(&mut session, filter_json, update_json)?
+                        document_ops::update_one(&mut session, coll_name, filter_json, update_json)?
                     };
 
                     n_matched += result.matched as i32;
@@ -232,10 +216,6 @@ impl Command for UpdateCommand {
     }
 }
 
-// ============================================================================
-// Delete Command
-// ============================================================================
-
 pub struct DeleteCommand;
 
 impl Command for DeleteCommand {
@@ -243,10 +223,9 @@ impl Command for DeleteCommand {
         &["delete"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("delete").unwrap_or("test");
-        let coll = db.collection(coll_name);
-        let mut session = db.open_session();
+        let mut session = conn.open_session();
         let mut n_deleted = 0i32;
 
         if let Ok(deletes) = doc.get_array("deletes") {
@@ -258,9 +237,11 @@ impl Command for DeleteCommand {
                     let limit = delete_doc.get_i32("limit").unwrap_or(0);
 
                     if limit == 1 {
-                        n_deleted += coll.delete_one(&mut session, filter_json)? as i32;
+                        n_deleted +=
+                            document_ops::delete_one(&mut session, coll_name, filter_json)? as i32;
                     } else {
-                        n_deleted += coll.delete_many(&mut session, filter_json)? as i32;
+                        n_deleted +=
+                            document_ops::delete_many(&mut session, coll_name, filter_json)? as i32;
                     }
                 }
             }
