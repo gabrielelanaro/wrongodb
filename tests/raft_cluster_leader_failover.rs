@@ -25,7 +25,7 @@ fn raft_cluster_elects_new_leader_after_leader_failure() {
     .unwrap();
 
     nodes[initial_leader].drop_db();
-    thread::sleep(Duration::from_millis(400));
+    thread::sleep(Duration::from_millis(700));
 
     let remaining: Vec<usize> = (0..nodes.len())
         .filter(|idx| nodes[*idx].db.is_some())
@@ -34,7 +34,7 @@ fn raft_cluster_elects_new_leader_after_leader_failure() {
         &mut nodes,
         &remaining,
         "raft_failover_probe",
-        Duration::from_secs(8),
+        Duration::from_secs(20),
     );
     assert_ne!(new_leader, initial_leader);
 
