@@ -1,85 +1,29 @@
-use serde_json::json;
-use wrongodb::WrongoDB;
+use wrongodb::{Connection, ConnectionConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🔧 Testing checkpoint functionality...\n");
+    println!("Testing low-level Connection/Session/Cursor flow...\n");
 
-    // Open database
-    let db = WrongoDB::open("test_checkpoint")?;
+    let conn = Connection::open("test_checkpoint", ConnectionConfig::default())?;
+    let mut session = conn.open_session();
 
-    {
-        let coll = db.collection("test");
-        let mut session = db.open_session();
+    let mut txn = session.transaction()?;
+    let txn_id = txn.as_ref().id();
+    let mut cursor = txn.session_mut().open_cursor("table:test")?;
 
-        // Clear test collection
-        let _ = coll.delete_many(&mut session, None);
-
-        // Insert 10 documents
-        println!("📝 Inserting 10 documents...");
-        for i in 0..10 {
-            let doc = json!({
-                "_id": i,
-                "name": format!("doc{}", i),
-                "value": i * 10
-            });
-            coll.insert_one(&mut session, doc)?;
-        }
-        println!("   ✅ Inserted 10 documents\n");
-
-        // Find all documents
-        let docs = coll.find(&mut session, None)?;
-        println!("📊 Found {} documents in collection\n", docs.len());
-
-        // Find by _id (uses id BTree index)
-        println!("🔍 Testing id index lookup by _id...");
-        let filter = json!({ "_id": 5 });
-        if let Some(doc) = coll.find_one(&mut session, Some(filter))? {
-            println!("   ✅ Found: {}\n", serde_json::to_string_pretty(&doc)?);
-        }
-
-        // Update a document
-        println!("✏️  Testing update operation...");
-        let update = json!({ "$set": { "value": 999 } });
-        let filter2 = json!({ "_id": 5 });
-        coll.update_one(&mut session, Some(filter2), update)?;
-        let filter3 = json!({ "_id": 5 });
-        let updated = coll.find_one(&mut session, Some(filter3))?;
-        println!(
-            "   ✅ After update: {}\n",
-            serde_json::to_string_pretty(&updated.unwrap())?
-        );
-
-        // Count documents
-        let count = coll.count(&mut session, None)?;
-        println!("📈 Total count: {}\n", count);
-
-        // Test range query with filter
-        println!("🔎 Testing range query (value > 50)...");
-        let range_filter = json!({ "value": { "$gt": 50 } });
-        let range_docs = coll.find(&mut session, Some(range_filter))?;
-        println!(
-            "   ✅ Found {} documents with value > 50\n",
-            range_docs.len()
-        );
-
-        // Test distinct
-        println!("🏷️  Testing distinct on \"name\" field...");
-        let distinct = coll.distinct(&mut session, "name", None)?;
-        println!("   ✅ Found {} distinct names\n", distinct.len());
+    for i in 0..10 {
+        let key = format!("doc:{i}");
+        let value = format!("value:{i}");
+        cursor.insert(key.as_bytes(), value.as_bytes(), txn_id)?;
     }
 
-    // Explicit checkpoint test
-    println!("💾 Testing explicit checkpoint...");
-    let coll = db.collection("test");
-    let mut session = db.open_session();
-    coll.checkpoint(&mut session)?;
-    println!("   ✅ Checkpoint completed!\n");
+    txn.commit()?;
 
-    println!("✅ All operations completed successfully!");
-    println!("\n💡 The checkpoint infrastructure is working internally:");
-    println!("   - BTree id index is being used for _id lookups");
-    println!("   - Index updates are durable through checkpoint");
-    println!("   - Collection::checkpoint() flushes dirty pages to disk");
+    let mut read_cursor = session.open_cursor("table:test")?;
+    let mut count = 0usize;
+    while let Some((_k, _v)) = read_cursor.next(0)? {
+        count += 1;
+    }
 
+    println!("Inserted and scanned {} records", count);
     Ok(())
 }

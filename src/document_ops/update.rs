@@ -3,8 +3,7 @@ use serde_json::Value;
 use crate::Document;
 use crate::WrongoDBError;
 
-/// Apply MongoDB-style update operators or replacement
-pub fn apply_update(doc: &Document, update: &Value) -> Result<Document, WrongoDBError> {
+pub(crate) fn apply_update(doc: &Document, update: &Value) -> Result<Document, WrongoDBError> {
     let update_obj = match update.as_object() {
         Some(obj) => obj,
         None => return Ok(doc.clone()),
@@ -22,21 +21,18 @@ pub fn apply_update(doc: &Document, update: &Value) -> Result<Document, WrongoDB
 
     let mut new_doc = doc.clone();
 
-    // $set
     if let Some(Value::Object(set_fields)) = update_obj.get("$set") {
         for (k, v) in set_fields {
             new_doc.insert(k.clone(), v.clone());
         }
     }
 
-    // $unset
     if let Some(Value::Object(unset_fields)) = update_obj.get("$unset") {
         for k in unset_fields.keys() {
             new_doc.remove(k);
         }
     }
 
-    // $inc
     if let Some(Value::Object(inc_fields)) = update_obj.get("$inc") {
         for (k, v) in inc_fields {
             if let Some(inc_val) = v.as_f64() {
@@ -52,19 +48,17 @@ pub fn apply_update(doc: &Document, update: &Value) -> Result<Document, WrongoDB
         }
     }
 
-    // $push
     if let Some(Value::Object(push_fields)) = update_obj.get("$push") {
         for (k, v) in push_fields {
             let arr = new_doc
                 .entry(k.clone())
                 .or_insert_with(|| Value::Array(vec![]));
-            if let Value::Array(ref mut arr_vec) = arr {
+            if let Value::Array(arr_vec) = arr {
                 arr_vec.push(v.clone());
             }
         }
     }
 
-    // $pull
     if let Some(Value::Object(pull_fields)) = update_obj.get("$pull") {
         for (k, v) in pull_fields {
             if let Some(Value::Array(arr)) = new_doc.get_mut(k) {
@@ -78,8 +72,9 @@ pub fn apply_update(doc: &Document, update: &Value) -> Result<Document, WrongoDB
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn test_apply_update_set() {
@@ -135,6 +130,6 @@ mod tests {
         assert_eq!(result.get("name").unwrap().as_str().unwrap(), "bob");
         assert_eq!(result.get("status").unwrap().as_str().unwrap(), "active");
         assert!(!result.contains_key("age"));
-        assert!(result.contains_key("_id")); // _id preserved
+        assert!(result.contains_key("_id"));
     }
 }

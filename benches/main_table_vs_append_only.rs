@@ -2,14 +2,13 @@ use std::fs::OpenOptions;
 use std::io::Write;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use serde_json::json;
 use tempfile::tempdir;
 
-use wrongodb::WrongoDB;
+use wrongodb::{Connection, ConnectionConfig};
 
-fn docs() -> Vec<serde_json::Value> {
+fn docs() -> Vec<(String, String)> {
     (0..2000)
-        .map(|i| json!({"name": format!("user-{i}"), "age": i % 100}))
+        .map(|i| (format!("user-{i}"), format!("age:{}", i % 100)))
         .collect()
 }
 
@@ -19,13 +18,16 @@ fn bench_main_table(c: &mut Criterion) {
         b.iter(|| {
             let tmp = tempdir().unwrap();
             let base = tmp.path().join("bench");
-            let db = WrongoDB::open(&base).unwrap();
-            let coll = db.collection("test");
-            let mut session = db.open_session();
-            for doc in &docs {
-                coll.insert_one(&mut session, doc.clone()).unwrap();
+            let conn = Connection::open(&base, ConnectionConfig::default()).unwrap();
+
+            for (k, v) in &docs {
+                let mut session = conn.open_session();
+                let mut txn = session.transaction().unwrap();
+                let txn_id = txn.as_ref().id();
+                let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
+                cursor.insert(k.as_bytes(), v.as_bytes(), txn_id).unwrap();
+                txn.commit().unwrap();
             }
-            coll.checkpoint(&mut session).unwrap();
         })
     });
 }
@@ -41,10 +43,9 @@ fn bench_append_only(c: &mut Criterion) {
                 .append(true)
                 .open(&append_path)
                 .unwrap();
-            for doc in &docs {
-                let mut bytes = serde_json::to_vec(doc).unwrap();
-                bytes.push(b'\n');
-                file.write_all(&bytes).unwrap();
+            for (k, v) in &docs {
+                let line = format!("{k}:{v}\n");
+                file.write_all(line.as_bytes()).unwrap();
             }
             file.flush().unwrap();
         })

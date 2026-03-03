@@ -6,13 +6,29 @@ use std::sync::{Arc, Weak};
 use crate::api::data_handle_cache::DataHandleCache;
 use crate::api::session::Session;
 use crate::core::errors::StorageError;
-use crate::engine::RaftMode;
 use crate::recovery::RecoveryManager;
 use crate::storage::store_registry::StoreRegistry;
 use crate::storage::wal::WalSink;
 use crate::txn::transaction_manager::TransactionManager;
 use crate::txn::GlobalTxnState;
 use crate::WrongoDBError;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftPeerConfig {
+    pub node_id: String,
+    pub raft_addr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum RaftMode {
+    #[default]
+    Standalone,
+    Cluster {
+        local_node_id: String,
+        local_raft_addr: String,
+        peers: Vec<RaftPeerConfig>,
+    },
+}
 
 #[derive(Debug)]
 struct RecoveryWalSink {

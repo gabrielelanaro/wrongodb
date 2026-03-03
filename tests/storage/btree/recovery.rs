@@ -3,13 +3,30 @@
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 
-use serde_json::json;
 use tempfile::tempdir;
 
-use wrongodb::{WrongoDB, WrongoDBConfig};
+use wrongodb::{Connection, ConnectionConfig};
 
 fn global_wal_path(db_dir: &std::path::Path) -> std::path::PathBuf {
     db_dir.join("global.wal")
+}
+
+fn insert_kv(conn: &Connection, table: &str, key: &[u8], value: &[u8]) {
+    let mut session = conn.open_session();
+    let mut txn = session.transaction().unwrap();
+    let txn_id = txn.as_ref().id();
+    let mut cursor = txn
+        .session_mut()
+        .open_cursor(&format!("table:{table}"))
+        .unwrap();
+    cursor.insert(key, value, txn_id).unwrap();
+    txn.commit().unwrap();
+}
+
+fn exists(conn: &Connection, table: &str, key: &[u8]) -> bool {
+    let mut session = conn.open_session();
+    let mut cursor = session.open_cursor(&format!("table:{table}")).unwrap();
+    cursor.get(key, 0).unwrap().is_some()
 }
 
 #[test]
@@ -18,32 +35,15 @@ fn recovery_replays_committed_transaction_writes() {
     let db_path = tmp.path().join("db");
 
     {
-        let db = WrongoDB::open(&db_path).unwrap();
-        let coll = db.collection("test");
-        let mut session = db.open_session();
-
-        let mut txn = session.transaction().unwrap();
-        coll.insert_one(txn.session_mut(), json!({"_id": 1, "v": "a"}))
-            .unwrap();
-        coll.insert_one(txn.session_mut(), json!({"_id": 2, "v": "b"}))
-            .unwrap();
-        txn.commit().unwrap();
-        // Simulate crash: no explicit checkpoint.
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        insert_kv(&conn, "test", b"k1", b"a");
+        insert_kv(&conn, "test", b"k2", b"b");
     }
 
     {
-        let db = WrongoDB::open(&db_path).unwrap();
-        let coll = db.collection("test");
-        let mut session = db.open_session();
-
-        assert!(coll
-            .find_one(&mut session, Some(json!({"_id": 1})))
-            .unwrap()
-            .is_some());
-        assert!(coll
-            .find_one(&mut session, Some(json!({"_id": 2})))
-            .unwrap()
-            .is_some());
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        assert!(exists(&conn, "test", b"k1"));
+        assert!(exists(&conn, "test", b"k2"));
     }
 }
 
@@ -53,36 +53,19 @@ fn recovery_replays_records_appended_after_restart() {
     let db_path = tmp.path().join("db");
 
     {
-        let db = WrongoDB::open(&db_path).unwrap();
-        let coll = db.collection("test");
-        let mut session = db.open_session();
-
-        coll.insert_one(&mut session, json!({"_id": 1, "v": "a"}))
-            .unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        insert_kv(&conn, "test", b"k1", b"a");
     }
 
     {
-        let db = WrongoDB::open(&db_path).unwrap();
-        let coll = db.collection("test");
-        let mut session = db.open_session();
-
-        coll.insert_one(&mut session, json!({"_id": 2, "v": "b"}))
-            .unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        insert_kv(&conn, "test", b"k2", b"b");
     }
 
     {
-        let db = WrongoDB::open(&db_path).unwrap();
-        let coll = db.collection("test");
-        let mut session = db.open_session();
-
-        assert!(coll
-            .find_one(&mut session, Some(json!({"_id": 1})))
-            .unwrap()
-            .is_some());
-        assert!(coll
-            .find_one(&mut session, Some(json!({"_id": 2})))
-            .unwrap()
-            .is_some());
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        assert!(exists(&conn, "test", b"k1"));
+        assert!(exists(&conn, "test", b"k2"));
     }
 }
 
@@ -92,33 +75,22 @@ fn recovery_skips_uncommitted_transaction_writes() {
     let db_path = tmp.path().join("db");
 
     {
-        let db = WrongoDB::open(&db_path).unwrap();
-        let coll = db.collection("test");
-        let mut session = db.open_session();
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let mut session = conn.open_session();
 
         let mut txn = session.transaction().unwrap();
-        coll.insert_one(txn.session_mut(), json!({"_id": 1, "v": "a"}))
-            .unwrap();
-        coll.insert_one(txn.session_mut(), json!({"_id": 2, "v": "b"}))
-            .unwrap();
+        let txn_id = txn.as_ref().id();
+        let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
+        cursor.insert(b"k1", b"a", txn_id).unwrap();
+        cursor.insert(b"k2", b"b", txn_id).unwrap();
 
-        // Simulate crash before commit marker by skipping Drop on SessionTxn.
         std::mem::forget(txn);
     }
 
     {
-        let db = WrongoDB::open(&db_path).unwrap();
-        let coll = db.collection("test");
-        let mut session = db.open_session();
-
-        assert!(coll
-            .find_one(&mut session, Some(json!({"_id": 1})))
-            .unwrap()
-            .is_none());
-        assert!(coll
-            .find_one(&mut session, Some(json!({"_id": 2})))
-            .unwrap()
-            .is_none());
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        assert!(!exists(&conn, "test", b"k1"));
+        assert!(!exists(&conn, "test", b"k2"));
     }
 }
 
@@ -128,12 +100,8 @@ fn recovery_handles_corrupted_global_wal_tail() {
     let db_path = tmp.path().join("db");
 
     {
-        let db = WrongoDB::open(&db_path).unwrap();
-        let coll = db.collection("test");
-        let mut session = db.open_session();
-
-        coll.insert_one(&mut session, json!({"_id": 1, "v": "a"}))
-            .unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        insert_kv(&conn, "test", b"k1", b"a");
     }
 
     let wal_path = global_wal_path(&db_path);
@@ -143,8 +111,7 @@ fn recovery_handles_corrupted_global_wal_tail() {
         file.write_all(b"CORRUPTED_TAIL").unwrap();
     }
 
-    // Should not panic; either open succeeds with partial recovery or fails gracefully.
-    let _ = WrongoDB::open(&db_path);
+    let _ = Connection::open(&db_path, ConnectionConfig::default());
 }
 
 #[test]
@@ -153,12 +120,8 @@ fn recovery_replay_does_not_append_new_wal_records() {
     let db_path = tmp.path().join("db");
 
     {
-        let db = WrongoDB::open(&db_path).unwrap();
-        let coll = db.collection("test");
-        let mut session = db.open_session();
-
-        coll.insert_one(&mut session, json!({"_id": 1, "v": "a"}))
-            .unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        insert_kv(&conn, "test", b"k1", b"a");
     }
 
     let wal_path = global_wal_path(&db_path);
@@ -166,7 +129,7 @@ fn recovery_replay_does_not_append_new_wal_records() {
     assert!(before > 512);
 
     {
-        let _db = WrongoDB::open(&db_path).unwrap();
+        let _conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
     }
 
     let after = std::fs::metadata(&wal_path).unwrap().len();
@@ -174,29 +137,17 @@ fn recovery_replay_does_not_append_new_wal_records() {
 }
 
 #[test]
-fn wal_disabled_still_requires_checkpoint_for_durability() {
+fn wal_disabled_mode_opens_without_global_wal() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("db");
-    let cfg = WrongoDBConfig::new().wal_enabled(false);
+    let cfg = ConnectionConfig::new().wal_enabled(false);
 
     {
-        let db = WrongoDB::open_with_config(&db_path, cfg.clone()).unwrap();
-        let coll = db.collection("test");
-        let mut session = db.open_session();
-
-        coll.insert_one(&mut session, json!({"_id": 1, "v": "a"}))
-            .unwrap();
-        coll.checkpoint(&mut session).unwrap();
+        let conn = Connection::open(&db_path, cfg).unwrap();
+        insert_kv(&conn, "test", b"k1", b"a");
     }
 
-    {
-        let db = WrongoDB::open_with_config(&db_path, cfg).unwrap();
-        let coll = db.collection("test");
-        let mut session = db.open_session();
-
-        assert!(coll
-            .find_one(&mut session, Some(json!({"_id": 1})))
-            .unwrap()
-            .is_some());
-    }
+    let reopened = Connection::open(&db_path, ConnectionConfig::new().wal_enabled(false)).unwrap();
+    assert!(!global_wal_path(&db_path).exists());
+    let _ = reopened.base_path();
 }

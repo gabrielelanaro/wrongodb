@@ -1,8 +1,6 @@
 use std::path::PathBuf;
 
-use serde_json::json;
-
-use wrongodb::WrongoDB;
+use wrongodb::{Connection, ConnectionConfig};
 
 fn main() {
     let db_path: PathBuf = "/tmp/test_recovery.db".into();
@@ -11,25 +9,25 @@ fn main() {
 
     println!("=== Creating database ===");
     {
-        let db = WrongoDB::open(&db_path).unwrap();
-        let coll = db.collection("test");
-        let mut session = db.open_session();
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let mut session = conn.open_session();
+        let mut txn = session.transaction().unwrap();
+        let txn_id = txn.as_ref().id();
+        let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
 
         println!("Inserting key0");
-        coll.insert_one(&mut session, json!({"_id": "key0", "v": "value0"}))
-            .unwrap();
+        cursor.insert(b"key0", b"value0", txn_id).unwrap();
+        txn.commit().unwrap();
     }
 
     println!("\n=== Reopening database (recovery) ===");
     {
-        let db = WrongoDB::open(&db_path).unwrap();
-        let coll = db.collection("test");
-        let mut session = db.open_session();
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let mut session = conn.open_session();
+        let mut cursor = session.open_cursor("table:test").unwrap();
 
         println!("Trying to get key0");
-        let found = coll
-            .find_one(&mut session, Some(json!({"_id": "key0"})))
-            .unwrap();
+        let found = cursor.get(b"key0", 0).unwrap();
         println!("Found: {:?}", found);
     }
 }

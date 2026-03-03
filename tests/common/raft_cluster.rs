@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use wrongodb::{RaftMode, RaftPeerConfig, WrongoDB, WrongoDBConfig, WrongoDBError};
+use wrongodb::{Connection, ConnectionConfig, RaftMode, RaftPeerConfig, WrongoDBError};
 
 #[derive(Debug)]
 pub struct ClusterNode {
@@ -16,11 +16,11 @@ pub struct ClusterNode {
     pub raft_addr: String,
     pub db_path: PathBuf,
     pub mode: RaftMode,
-    pub db: Option<WrongoDB>,
+    pub db: Option<Connection>,
 }
 
 impl ClusterNode {
-    pub fn db(&self) -> &WrongoDB {
+    pub fn db(&self) -> &Connection {
         self.db.as_ref().expect("cluster node is not running")
     }
 
@@ -29,9 +29,9 @@ impl ClusterNode {
     }
 
     pub fn restart(&mut self) {
-        let db = WrongoDB::open_with_config(
+        let db = Connection::open(
             &self.db_path,
-            WrongoDBConfig::new().raft_mode(self.mode.clone()),
+            ConnectionConfig::new().raft_mode(self.mode.clone()),
         )
         .unwrap();
         self.db = Some(db);
@@ -60,8 +60,7 @@ pub fn build_cluster(tmp: &TempDir, node_count: usize) -> Vec<ClusterNode> {
         };
         let db_path = tmp.path().join(format!("{}.db", ids[i]));
         let db =
-            WrongoDB::open_with_config(&db_path, WrongoDBConfig::new().raft_mode(mode.clone()))
-                .unwrap();
+            Connection::open(&db_path, ConnectionConfig::new().raft_mode(mode.clone())).unwrap();
         nodes.push(ClusterNode {
             id: ids[i].clone(),
             raft_addr: addrs[i].clone(),
@@ -143,21 +142,63 @@ pub fn find_single_leader_among(
     panic!("failed to identify a single raft leader in subset within {timeout:?}");
 }
 
-pub fn insert_doc(db: &WrongoDB, collection: &str, value: Value) -> Result<(), WrongoDBError> {
-    let coll = db.collection(collection);
+pub fn insert_doc(db: &Connection, collection: &str, value: Value) -> Result<(), WrongoDBError> {
+    let key_value = value.get("_id").cloned().unwrap_or(Value::Null);
+    let key = serde_json::to_vec(&key_value).unwrap();
+    let payload = serde_json::to_vec(&value).unwrap();
+
     let mut session = db.open_session();
-    let _ = coll.insert_one(&mut session, value)?;
+    let mut txn = session.transaction()?;
+    let txn_id = txn.as_ref().id();
+    let mut cursor = txn
+        .session_mut()
+        .open_cursor(&format!("table:{collection}"))?;
+    cursor.insert(&key, &payload, txn_id)?;
+    txn.commit()?;
     Ok(())
 }
 
 pub fn find_docs(
-    db: &WrongoDB,
+    db: &Connection,
     collection: &str,
     filter: Value,
 ) -> Result<Vec<wrongodb::Document>, WrongoDBError> {
-    let coll = db.collection(collection);
+    let filter_obj = match filter {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+
     let mut session = db.open_session();
-    coll.find(&mut session, Some(filter))
+    let mut cursor = session.open_cursor(&format!("table:{collection}"))?;
+
+    if let Some(id) = filter_obj.get("_id") {
+        let key = serde_json::to_vec(id).unwrap();
+        return Ok(match cursor.get(&key, 0)? {
+            Some(bytes) => {
+                let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                match value {
+                    Value::Object(doc) => vec![doc],
+                    _ => Vec::new(),
+                }
+            }
+            None => Vec::new(),
+        });
+    }
+
+    let mut docs = Vec::new();
+    while let Some((_, bytes)) = cursor.next(0)? {
+        let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let Value::Object(doc) = value else {
+            continue;
+        };
+
+        let matches = filter_obj.iter().all(|(k, v)| doc.get(k) == Some(v));
+        if matches {
+            docs.push(doc);
+        }
+    }
+
+    Ok(docs)
 }
 
 fn free_local_addr() -> String {

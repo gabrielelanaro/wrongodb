@@ -26,8 +26,8 @@ A learning-oriented MongoDB-compatible database in Rust, inspired by WiredTiger'
 - **MVCC/Transactions**: Global transaction state, snapshot isolation, version chains, commit/abort
 
 ### API
-- `collection("name")` with `insert_one`, `find_one`, `find`, `update_one`, `delete_one`
-- Secondary indexes with range queries
+- `Connection`/`Session`/`Cursor` low-level storage API
+- Transaction-scoped reads/writes via `Session::transaction()`
 - MongoDB wire protocol server (works with `mongosh`)
 
 ### Future Work
@@ -35,19 +35,18 @@ A learning-oriented MongoDB-compatible database in Rust, inspired by WiredTiger'
 
 ## Source Layout
 
-The codebase is organized by domain to keep storage, engine, and server concerns separate:
+The codebase is organized by domain to keep storage and server concerns separate:
 
 - `src/api/`: connection/session/cursor APIs and handle cache.
 - `src/core/`: shared types/utilities (BSON codec, document helpers, errors).
 - `src/storage/`: on-disk storage (block file, B-tree, WAL, main table).
 - `src/index/`: secondary index implementation and key encoding.
-- `src/engine/`: database API and collection logic.
+- `src/document_ops/`: internal document CRUD/index orchestration used by server handlers.
 - `src/server/`: MongoDB wire-protocol server and command handlers.
 
 Integration tests are grouped under `tests/` with explicit suite entrypoints:
-`tests/engine_suite.rs`, `tests/storage_suite.rs`, `tests/server_suite.rs`,
-`tests/smoke_suite.rs`, and `tests/connection_suite.rs`.
-Each suite loads domain folders such as `tests/engine/` and `tests/storage/`.
+`tests/storage_suite.rs`, `tests/server_suite.rs`, and `tests/connection_suite.rs`.
+Each suite loads domain folders such as `tests/storage/`.
 
 ## Install
 
@@ -63,27 +62,25 @@ This installer installs the `wrongodb-server` binary.
 
 #### As a Library
 ```rust
-use serde_json::json;
-use wrongodb::WrongoDB;
+use wrongodb::{Connection, ConnectionConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Open database (WAL enabled by default)
-    let db = WrongoDB::open("data/db")?;
+    // Open connection (WAL enabled by default)
+    let conn = Connection::open("data/db", ConnectionConfig::default())?;
+    let mut session = conn.open_session();
 
-    // Get collection
-    let coll = db.collection("test");
-    let mut session = db.open_session();
+    // Execute one transactional write unit
+    let mut txn = session.transaction()?;
+    let txn_id = txn.as_ref().id();
+    let mut cursor = txn.session_mut().open_cursor("table:test")?;
+    cursor.insert(b"alice", b"age=30", txn_id)?;
+    cursor.insert(b"bob", b"age=25", txn_id)?;
+    txn.commit()?;
 
-    // Create indexes for faster queries (optional)
-    coll.create_index(&mut session, "name")?;
-
-    // Insert documents
-    coll.insert_one(&mut session, json!({"name": "alice", "age": 30}))?;
-    coll.insert_one(&mut session, json!({"name": "bob", "age": 25}))?;
-
-    // Query (uses index if available, otherwise scans)
-    println!("{:?}", coll.find(&mut session, None)?); // all docs
-    println!("{:?}", coll.find(&mut session, Some(json!({"name": "bob"})))?);
+    // Read back values
+    let mut cursor = session.open_cursor("table:test")?;
+    println!("{:?}", cursor.get(b"alice", 0)?);
+    println!("{:?}", cursor.get(b"bob", 0)?);
     Ok(())
 }
 ```

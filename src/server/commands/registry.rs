@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use bson::{doc, Bson, Document};
 
 use super::{handlers, Command};
-use crate::{WrongoDB, WrongoDBError};
+use crate::{Connection, WrongoDBError};
 
 /// Registry that maps command names to their handlers.
 pub struct CommandRegistry {
@@ -29,10 +29,10 @@ impl CommandRegistry {
         self.handlers.push(handler);
     }
 
-    pub fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    pub fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
         for key in doc.keys() {
             if let Some(&idx) = self.name_to_handler.get(&key.to_lowercase()) {
-                return self.handlers[idx].execute(doc, db);
+                return self.handlers[idx].execute(doc, conn);
             }
         }
         Ok(doc! { "ok": Bson::Double(0.0), "errmsg": "Command not found" })

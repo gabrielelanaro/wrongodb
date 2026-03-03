@@ -31,6 +31,7 @@ pub struct Session {
 }
 
 impl Session {
+    // Public API
     pub(crate) fn new(
         cache: Arc<DataHandleCache>,
         transaction_manager: Arc<TransactionManager>,
@@ -42,34 +43,6 @@ impl Session {
             recovery_manager,
             active_txn: None,
         }
-    }
-
-    /// Mark a table as touched in the current transaction.
-    fn mark_table_touched(&mut self, uri: &str) {
-        if let Some(ref mut txn) = self.active_txn {
-            txn.mark_table_touched(uri);
-        }
-    }
-
-    fn get_primary_table(
-        &mut self,
-        collection: &str,
-        mark_touched: bool,
-    ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
-        let uri = format!("table:{}", collection);
-        let table = self.cache.get_or_open_primary(&uri, collection)?;
-        if mark_touched {
-            self.mark_table_touched(&uri);
-        }
-        Ok(table)
-    }
-
-    pub(crate) fn table_handle(
-        &mut self,
-        collection: &str,
-        mark_touched: bool,
-    ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
-        self.get_primary_table(collection, mark_touched)
     }
 
     pub fn create(&mut self, uri: &str) -> Result<(), WrongoDBError> {
@@ -111,6 +84,14 @@ impl Session {
         ))))
     }
 
+    pub(crate) fn table_handle(
+        &mut self,
+        collection: &str,
+        mark_touched: bool,
+    ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
+        self.get_primary_table(collection, mark_touched)
+    }
+
     /// Begin a new transaction and return an RAII handle.
     ///
     /// The transaction will auto-rollback if not explicitly committed or aborted.
@@ -150,6 +131,7 @@ impl Session {
         self.active_txn.as_mut()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn checkpoint_all(&mut self) -> Result<(), WrongoDBError> {
         let handles = self.cache.all_handles();
         for table in handles {
@@ -157,6 +139,27 @@ impl Session {
         }
         self.recovery_manager
             .checkpoint_and_truncate_if_safe(self.transaction_manager.has_active_transactions())
+    }
+
+    // Private helpers
+    fn get_primary_table(
+        &mut self,
+        collection: &str,
+        mark_touched: bool,
+    ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
+        let uri = format!("table:{}", collection);
+        let table = self.cache.get_or_open_primary(&uri, collection)?;
+        if mark_touched {
+            self.mark_table_touched(&uri);
+        }
+        Ok(table)
+    }
+
+    /// Mark a table as touched in the current transaction.
+    fn mark_table_touched(&mut self, uri: &str) {
+        if let Some(ref mut txn) = self.active_txn {
+            txn.mark_table_touched(uri);
+        }
     }
 
     fn finalize_touched_tables_locally(
@@ -199,13 +202,6 @@ pub struct SessionTxn<'a> {
 }
 
 impl<'a> SessionTxn<'a> {
-    fn new(session: &'a mut Session) -> Self {
-        Self {
-            session,
-            committed: false,
-        }
-    }
-
     /// Commit the transaction.
     ///
     /// After calling this, the transaction handle is consumed and cannot be used again.
@@ -290,6 +286,13 @@ impl<'a> SessionTxn<'a> {
 
     pub fn session_mut(&mut self) -> &mut Session {
         self.session
+    }
+
+    fn new(session: &'a mut Session) -> Self {
+        Self {
+            session,
+            committed: false,
+        }
     }
 }
 

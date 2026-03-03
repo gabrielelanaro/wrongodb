@@ -1,9 +1,8 @@
 use std::net::TcpListener;
 
-use serde_json::json;
 use tempfile::tempdir;
 
-use wrongodb::{RaftMode, RaftPeerConfig, WrongoDB, WrongoDBConfig, WrongoDBError};
+use wrongodb::{Connection, ConnectionConfig, RaftMode, RaftPeerConfig, WrongoDBError};
 
 fn free_local_addr() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -12,20 +11,37 @@ fn free_local_addr() -> String {
     addr.to_string()
 }
 
+fn insert_kv(conn: &Connection, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
+    let mut session = conn.open_session();
+    let mut txn = session.transaction()?;
+    let txn_id = txn.as_ref().id();
+    let mut cursor = txn.session_mut().open_cursor("table:test")?;
+    cursor.insert(key, value, txn_id)?;
+    txn.commit()?;
+    Ok(())
+}
+
 #[test]
 fn standalone_mode_commits_writes_with_majority_one() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("db");
-    let db =
-        WrongoDB::open_with_config(&path, WrongoDBConfig::new().raft_mode(RaftMode::Standalone))
-            .unwrap();
+    let conn = Connection::open(
+        &path,
+        ConnectionConfig::new().raft_mode(RaftMode::Standalone),
+    )
+    .unwrap();
 
-    let coll = db.collection("test");
-    let mut session = db.open_session();
-    let inserted = coll
-        .insert_one(&mut session, json!({"name": "alice"}))
-        .unwrap();
-    assert_eq!(inserted.get("name").unwrap().as_str().unwrap(), "alice");
+    insert_kv(&conn, b"alice", b"value").unwrap();
+
+    let mut session = conn.open_session();
+    let mut txn = session.transaction().unwrap();
+    let txn_id = txn.as_ref().id();
+    let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
+    assert_eq!(
+        cursor.get(b"alice", txn_id).unwrap(),
+        Some(b"value".to_vec())
+    );
+    txn.commit().unwrap();
 }
 
 #[test]
@@ -34,9 +50,9 @@ fn cluster_mode_rejects_write_when_node_is_not_leader() {
     let path = tmp.path().join("db");
     let local_raft_addr = free_local_addr();
     let peer_raft_addr = free_local_addr();
-    let db = WrongoDB::open_with_config(
+    let conn = Connection::open(
         &path,
-        WrongoDBConfig::new().raft_mode(RaftMode::Cluster {
+        ConnectionConfig::new().raft_mode(RaftMode::Cluster {
             local_node_id: "n1".to_string(),
             local_raft_addr,
             peers: vec![RaftPeerConfig {
@@ -47,11 +63,7 @@ fn cluster_mode_rejects_write_when_node_is_not_leader() {
     )
     .unwrap();
 
-    let coll = db.collection("test");
-    let mut session = db.open_session();
-    let err = coll
-        .insert_one(&mut session, json!({"name": "alice"}))
-        .unwrap_err();
+    let err = insert_kv(&conn, b"alice", b"value").unwrap_err();
     match err {
         WrongoDBError::NotLeader { leader_hint } => assert_eq!(leader_hint, None),
         other => panic!("unexpected error: {other}"),

@@ -1,5 +1,5 @@
 use crate::commands::Command;
-use crate::{WrongoDB, WrongoDBError};
+use crate::{document_ops, Connection, WrongoDBError};
 use bson::{doc, Bson, Document};
 
 /// Handles: listIndexes
@@ -10,27 +10,25 @@ impl Command for ListIndexesCommand {
         &["listIndexes"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("listIndexes").unwrap_or("test");
-        let coll = db.collection(coll_name);
-        let mut session = db.open_session();
-        let indexes = coll.list_indexes(&mut session)?;
+        let mut session = conn.open_session();
+        let indexes = document_ops::list_indexes(&mut session, coll_name)?;
 
         let indexes_bson: Vec<Bson> = indexes
             .into_iter()
-            .map(|idx| {
+            .map(|field| {
                 let mut key_doc = Document::new();
-                key_doc.insert(idx.field.clone(), Bson::Int32(1));
+                key_doc.insert(field.clone(), Bson::Int32(1));
                 Bson::Document(doc! {
                     "v": Bson::Int32(2),
                     "key": key_doc,
-                    "name": format!("{}_1", idx.field),
+                    "name": format!("{}_1", field),
                     "ns": format!("test.{}", coll_name),
                 })
             })
             .collect();
 
-        // Always include the _id index
         let mut result_indexes = vec![Bson::Document(doc! {
             "v": Bson::Int32(2),
             "key": { "_id": Bson::Int32(1) },
@@ -58,10 +56,9 @@ impl Command for CreateIndexesCommand {
         &["createIndexes"]
     }
 
-    fn execute(&self, doc: &Document, db: &mut WrongoDB) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("createIndexes").unwrap_or("test");
-        let coll = db.collection(coll_name);
-        let mut session = db.open_session();
+        let mut session = conn.open_session();
         let mut created = 0i32;
 
         if let Ok(indexes) = doc.get_array("indexes") {
@@ -69,7 +66,7 @@ impl Command for CreateIndexesCommand {
                 if let Bson::Document(spec) = index_spec {
                     if let Ok(key_doc) = spec.get_document("key") {
                         for (field, _) in key_doc {
-                            let _ = coll.create_index(&mut session, field);
+                            let _ = document_ops::create_index(&mut session, coll_name, field);
                             created += 1;
                         }
                     }
@@ -77,7 +74,7 @@ impl Command for CreateIndexesCommand {
             }
         }
 
-        let total_indexes = coll.list_indexes(&mut session)?.len() as i32 + 1; // +1 for _id
+        let total_indexes = document_ops::list_indexes(&mut session, coll_name)?.len() as i32 + 1;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),
