@@ -1,6 +1,7 @@
 mod api;
 mod core;
 mod document_ops;
+mod durability;
 mod index;
 mod raft;
 mod recovery;

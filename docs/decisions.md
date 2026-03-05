@@ -1,5 +1,32 @@
 # Decisions
 
+## 2026-03-05: Split startup recovery from runtime durability/replication
+
+**Decision**
+- Keep `RecoveryManager` as a startup-only type:
+  - replays the unapplied WAL tail
+  - resolves transactional recovery via staged replay
+  - checkpoints recovered stores
+- Move long-lived WAL/Raft ownership into a separate `DurabilityManager`:
+  - owns the Raft service handle
+  - accepts runtime writes and transaction markers
+  - exposes Raft status/helpers
+  - handles checkpoint + truncate operations
+- Share table-apply logic through a single `StoreCommandApplier` used by both recovery and
+  runtime durability paths.
+
+**Why**
+- The previous `RecoveryManager` name no longer matched the type's real lifetime and
+  responsibilities once it also owned runtime Raft/WAL behavior.
+- Splitting by startup vs runtime makes the call graph read at one level of abstraction and
+  confines `wal_enabled` to the runtime durability subsystem.
+
+**Notes**
+- This is a structural refactor only; recovery semantics and runtime Raft/WAL behavior are
+  intentionally unchanged.
+- `wal_enabled` remains on `DurabilityManager` for now; removing that runtime smell is a later
+  refactor.
+
 ## 2026-03-05: Recovery replays transactional changes at commit time
 
 **Decision**

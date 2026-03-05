@@ -1,14 +1,13 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use crate::api::data_handle_cache::DataHandleCache;
 use crate::api::session::Session;
-use crate::core::errors::StorageError;
+use crate::durability::{DurabilityManager, StoreCommandApplier};
 use crate::recovery::RecoveryManager;
 use crate::storage::store_registry::StoreRegistry;
-use crate::storage::wal::WalSink;
 use crate::txn::transaction_manager::TransactionManager;
 use crate::txn::GlobalTxnState;
 use crate::WrongoDBError;
@@ -28,40 +27,6 @@ pub enum RaftMode {
         local_raft_addr: String,
         peers: Vec<RaftPeerConfig>,
     },
-}
-
-#[derive(Debug)]
-struct RecoveryWalSink {
-    manager: Weak<RecoveryManager>,
-}
-
-impl WalSink for RecoveryWalSink {
-    fn log_put(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        value: &[u8],
-        txn_id: crate::txn::TxnId,
-    ) -> Result<(), WrongoDBError> {
-        let manager = self
-            .manager
-            .upgrade()
-            .ok_or_else(|| StorageError("recovery manager is not available".into()))?;
-        manager.log_put(store_name, key, value, txn_id)
-    }
-
-    fn log_delete(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        txn_id: crate::txn::TxnId,
-    ) -> Result<(), WrongoDBError> {
-        let manager = self
-            .manager
-            .upgrade()
-            .ok_or_else(|| StorageError("recovery manager is not available".into()))?;
-        manager.log_delete(store_name, key, txn_id)
-    }
 }
 
 pub struct ConnectionConfig {
@@ -99,7 +64,7 @@ pub struct Connection {
     dhandle_cache: Arc<DataHandleCache>,
     wal_enabled: bool,
     transaction_manager: Arc<TransactionManager>,
-    recovery_manager: Arc<RecoveryManager>,
+    durability_manager: Arc<DurabilityManager>,
 }
 
 impl fmt::Debug for Connection {
@@ -125,18 +90,21 @@ impl Connection {
             base_path.clone(),
             transaction_manager.clone(),
         ));
-        let recovery_manager = Arc::new(RecoveryManager::initialize(
+        let applier = Arc::new(StoreCommandApplier::new(store_registry.clone()));
+
+        if config.wal_enabled {
+            RecoveryManager::new(applier.clone()).recover(&base_path)?;
+        }
+
+        let durability_manager = Arc::new(DurabilityManager::initialize(
             &base_path,
             config.wal_enabled,
-            store_registry.clone(),
+            applier,
             config.raft_mode,
         )?);
 
         if config.wal_enabled {
-            let wal_sink = Arc::new(RecoveryWalSink {
-                manager: Arc::downgrade(&recovery_manager),
-            }) as Arc<dyn WalSink>;
-            store_registry.set_wal_sink(Some(wal_sink));
+            store_registry.set_wal_sink(Some(durability_manager.wal_sink()));
         }
 
         Ok(Self {
@@ -144,7 +112,7 @@ impl Connection {
             dhandle_cache: Arc::new(DataHandleCache::new(store_registry)),
             wal_enabled: config.wal_enabled,
             transaction_manager,
-            recovery_manager,
+            durability_manager,
         })
     }
 
@@ -152,7 +120,7 @@ impl Connection {
         Session::new(
             self.dhandle_cache.clone(),
             self.transaction_manager.clone(),
-            self.recovery_manager.clone(),
+            self.durability_manager.clone(),
         )
     }
 
@@ -161,7 +129,7 @@ impl Connection {
     }
 
     pub(crate) fn raft_hello_state(&self) -> (bool, Option<String>) {
-        self.recovery_manager
+        self.durability_manager
             .raft_status()
             .map(|status| (status.is_writable_primary, status.leader_hint))
             .unwrap_or((true, None))

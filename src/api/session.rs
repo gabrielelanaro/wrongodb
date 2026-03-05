@@ -5,7 +5,7 @@ use parking_lot::RwLock;
 use crate::api::cursor::{Cursor, CursorKind};
 use crate::api::data_handle_cache::DataHandleCache;
 use crate::core::errors::StorageError;
-use crate::recovery::RecoveryManager;
+use crate::durability::DurabilityManager;
 use crate::storage::table::Table;
 use crate::txn::transaction_manager::TransactionManager;
 use crate::txn::{Transaction, TxnId};
@@ -14,7 +14,7 @@ use crate::WrongoDBError;
 /// A request-scoped execution context over shared connection infrastructure.
 ///
 /// `Connection` owns long-lived shared components (storage handles, global
-/// transaction state, recovery/WAL machinery). `Session` exists to own mutable
+/// transaction state, and durability machinery). `Session` exists to own mutable
 /// per-request state that must not be global, especially the currently active
 /// transaction and its lifecycle.
 ///
@@ -26,7 +26,7 @@ use crate::WrongoDBError;
 pub struct Session {
     cache: Arc<DataHandleCache>,
     transaction_manager: Arc<TransactionManager>,
-    recovery_manager: Arc<RecoveryManager>,
+    durability_manager: Arc<DurabilityManager>,
     active_txn: Option<Transaction>,
 }
 
@@ -35,12 +35,12 @@ impl Session {
     pub(crate) fn new(
         cache: Arc<DataHandleCache>,
         transaction_manager: Arc<TransactionManager>,
-        recovery_manager: Arc<RecoveryManager>,
+        durability_manager: Arc<DurabilityManager>,
     ) -> Self {
         Self {
             cache,
             transaction_manager,
-            recovery_manager,
+            durability_manager,
             active_txn: None,
         }
     }
@@ -137,7 +137,7 @@ impl Session {
         for table in handles {
             table.write().checkpoint()?;
         }
-        self.recovery_manager
+        self.durability_manager
             .checkpoint_and_truncate_if_safe(self.transaction_manager.has_active_transactions())
     }
 
@@ -215,7 +215,7 @@ impl<'a> SessionTxn<'a> {
         let txn_id = txn.id();
 
         self.session
-            .recovery_manager
+            .durability_manager
             .log_txn_commit_sync(txn_id, txn_id)?;
 
         let txn =
@@ -227,7 +227,7 @@ impl<'a> SessionTxn<'a> {
         self.session.active_txn = None;
         self.committed = true;
 
-        if !self.session.recovery_manager.wal_enabled() {
+        if !self.session.durability_manager.wal_enabled() {
             self.session
                 .finalize_touched_tables_locally(&touched_tables, txn_id, true)?;
         }
@@ -246,7 +246,7 @@ impl<'a> SessionTxn<'a> {
         let touched_tables: Vec<String> = txn.touched_tables().iter().cloned().collect();
         let txn_id = txn.id();
 
-        self.session.recovery_manager.log_txn_abort(txn_id)?;
+        self.session.durability_manager.log_txn_abort(txn_id)?;
 
         let txn =
             self.session.active_txn.as_mut().ok_or_else(|| {
@@ -257,7 +257,7 @@ impl<'a> SessionTxn<'a> {
         self.session.active_txn = None;
         self.committed = true;
 
-        if !self.session.recovery_manager.wal_enabled() {
+        if !self.session.durability_manager.wal_enabled() {
             self.session
                 .finalize_touched_tables_locally(&touched_tables, txn_id, false)?;
         }
@@ -302,9 +302,9 @@ impl<'a> Drop for SessionTxn<'a> {
             if let Some(mut txn) = self.session.active_txn.take() {
                 let touched_tables: Vec<String> = txn.touched_tables().iter().cloned().collect();
                 let txn_id = txn.id();
-                let _ = self.session.recovery_manager.log_txn_abort(txn_id);
+                let _ = self.session.durability_manager.log_txn_abort(txn_id);
                 let _ = self.session.transaction_manager.abort_txn_state(&mut txn);
-                if !self.session.recovery_manager.wal_enabled() {
+                if !self.session.durability_manager.wal_enabled() {
                     let _ = self.session.finalize_touched_tables_locally(
                         &touched_tables,
                         txn_id,
@@ -338,5 +338,3 @@ fn parse_index_uri(uri: &str) -> Result<(&str, &str), WrongoDBError> {
 
 // SAFETY: SessionTxn holds &mut Session, so it's !Send by default.
 // This is correct because Session is not thread-safe.
-// Note: Negative trait bounds (!Send, !Sync) require unstable Rust.
-// For now, we rely on the fact that Session contains non-Send types.
