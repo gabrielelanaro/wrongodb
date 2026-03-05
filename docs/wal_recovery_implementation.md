@@ -12,15 +12,18 @@ architecture and invariants.
 - Single WAL file per database: `<db_dir>/global.wal`
 - Recovery runs once at `Connection::open`
 - Replay is logical (`Put` / `Delete`), routed by `store_name`
-- Replay applies only committed transactions (plus `TXN_NONE` ops)
+- Replay applies non-transactional records immediately and transactional records only when their
+  `TxnCommit` marker is replayed
 
 ## Recovery algorithm
 
 1. Open `global.wal` and validate header/CRC.
-2. First pass: build `RecoveryTxnTable` from `TxnCommit` / `TxnAbort` markers.
-3. Finalize pending transactions as aborted.
-4. Second pass: replay eligible `Put/Delete` records in WAL order.
-5. Checkpoint replayed stores to persist roots.
+2. Read unapplied records once from the checkpoint boundary forward.
+3. Apply `TXN_NONE` `Put/Delete` records immediately.
+4. Stage transactional `Put/Delete` records by `txn_id`.
+5. On `TxnCommit`, replay the staged changes for that transaction and finalize commit visibility.
+6. On `TxnAbort` or end-of-log, discard staged changes for that transaction.
+7. Checkpoint replayed stores to persist roots.
 
 ## Corruption handling
 
@@ -32,3 +35,5 @@ architecture and invariants.
 
 - Per-table `*.wal` files are ignored (hard cutover policy).
 - WAL replay does not use per-table recovery paths anymore.
+- Recovery now follows commit-time transaction visibility, which may differ from original WAL
+  position for interleaved writes.

@@ -23,10 +23,22 @@ fn insert_kv(conn: &Connection, table: &str, key: &[u8], value: &[u8]) {
     txn.commit().unwrap();
 }
 
+fn insert_kv_non_transactional(conn: &Connection, table: &str, key: &[u8], value: &[u8]) {
+    let mut session = conn.open_session();
+    let mut cursor = session.open_cursor(&format!("table:{table}")).unwrap();
+    cursor.insert(key, value, 0).unwrap();
+}
+
 fn exists(conn: &Connection, table: &str, key: &[u8]) -> bool {
     let mut session = conn.open_session();
     let mut cursor = session.open_cursor(&format!("table:{table}")).unwrap();
     cursor.get(key, 0).unwrap().is_some()
+}
+
+fn read_value(conn: &Connection, table: &str, key: &[u8]) -> Option<Vec<u8>> {
+    let mut session = conn.open_session();
+    let mut cursor = session.open_cursor(&format!("table:{table}")).unwrap();
+    cursor.get(key, 0).unwrap()
 }
 
 #[test]
@@ -95,6 +107,55 @@ fn recovery_skips_uncommitted_transaction_writes() {
 }
 
 #[test]
+fn recovery_skips_explicitly_aborted_transaction_writes() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("db");
+
+    {
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let mut session = conn.open_session();
+
+        let mut txn = session.transaction().unwrap();
+        let txn_id = txn.as_ref().id();
+        let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
+        cursor.insert(b"k1", b"a", txn_id).unwrap();
+        txn.abort().unwrap();
+    }
+
+    {
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        assert!(!exists(&conn, "test", b"k1"));
+    }
+}
+
+#[test]
+fn recovery_replays_transactional_writes_at_commit_time() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("db");
+
+    {
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let mut session = conn.open_session();
+
+        let mut txn = session.transaction().unwrap();
+        let txn_id = txn.as_ref().id();
+        let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
+        cursor.insert(b"shared", b"txn", txn_id).unwrap();
+
+        insert_kv_non_transactional(&conn, "test", b"shared", b"plain");
+        txn.commit().unwrap();
+    }
+
+    {
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        assert_eq!(
+            read_value(&conn, "test", b"shared").as_deref(),
+            Some(b"txn".as_slice())
+        );
+    }
+}
+
+#[test]
 fn recovery_handles_corrupted_global_wal_tail() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("db");
@@ -134,6 +195,22 @@ fn recovery_replay_does_not_append_new_wal_records() {
 
     let after = std::fs::metadata(&wal_path).unwrap().len();
     assert_eq!(after, before);
+}
+
+#[test]
+fn recovery_handles_empty_committed_transaction() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("db");
+
+    {
+        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let mut session = conn.open_session();
+        let txn = session.transaction().unwrap();
+        txn.commit().unwrap();
+    }
+
+    let reopened = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+    let _ = reopened.base_path();
 }
 
 #[test]
