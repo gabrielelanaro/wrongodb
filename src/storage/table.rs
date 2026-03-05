@@ -8,7 +8,7 @@ use crate::storage::btree::page::LeafPage;
 use crate::storage::btree::BTree;
 use crate::storage::page_store::{PageStore, PageStoreTrait};
 use crate::storage::wal::WalSink;
-use crate::txn::transaction_manager::TransactionManager;
+use crate::txn::TransactionManager;
 use crate::txn::TxnId;
 use crate::WrongoDBError;
 

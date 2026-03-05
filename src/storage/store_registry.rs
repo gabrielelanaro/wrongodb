@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 
 use crate::storage::table::Table;
 use crate::storage::wal::WalSink;
-use crate::txn::transaction_manager::TransactionManager;
+use crate::txn::TransactionManager;
 use crate::WrongoDBError;
 
 #[derive(Debug)]

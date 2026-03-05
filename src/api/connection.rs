@@ -9,7 +9,7 @@ use crate::core::errors::StorageError;
 use crate::recovery::RecoveryManager;
 use crate::storage::store_registry::StoreRegistry;
 use crate::storage::wal::WalSink;
-use crate::txn::transaction_manager::TransactionManager;
+use crate::txn::TransactionManager;
 use crate::txn::GlobalTxnState;
 use crate::WrongoDBError;
 

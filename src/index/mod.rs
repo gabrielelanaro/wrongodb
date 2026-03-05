@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::storage::table::Table;
 use crate::storage::wal::WalSink;
-use crate::txn::transaction_manager::TransactionManager;
+use crate::txn::TransactionManager;
 use crate::txn::{TxnId, TXN_NONE};
 use crate::{Document, WrongoDBError};
 

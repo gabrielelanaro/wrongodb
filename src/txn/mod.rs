@@ -1,10 +1,11 @@
 pub mod global_txn;
 pub mod snapshot;
 pub mod transaction;
-pub(crate) mod transaction_manager;
+pub(crate) mod manager;
 pub mod update;
 
 pub use global_txn::GlobalTxnState;
+pub(crate) use manager::TransactionManager;
 #[allow(unused_imports)]
 pub use transaction::{IsolationLevel, Transaction, TxnState};
 pub use update::{Update, UpdateChain, UpdateType};

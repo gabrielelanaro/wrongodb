@@ -7,7 +7,7 @@ use crate::api::data_handle_cache::DataHandleCache;
 use crate::core::errors::StorageError;
 use crate::recovery::RecoveryManager;
 use crate::storage::table::Table;
-use crate::txn::transaction_manager::TransactionManager;
+use crate::txn::TransactionManager;
 use crate::txn::{Transaction, TxnId};
 use crate::WrongoDBError;
 

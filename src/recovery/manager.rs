@@ -16,7 +16,7 @@ use crate::storage::store_registry::StoreRegistry;
 use crate::storage::wal::{
     GlobalWal, RecoveryError, WalReader, WalRecord, WalRecordHeader, WalSink,
 };
-use crate::txn::transaction_manager::TransactionManager;
+use crate::txn::TransactionManager;
 use crate::txn::{TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
