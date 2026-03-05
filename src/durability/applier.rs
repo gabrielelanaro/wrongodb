@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::raft::command::{CommittedCommand, RaftCommand};
+use crate::durability::{CommittedDurableOp, DurableOp};
+use crate::raft::command::CommittedCommand;
 use crate::raft::service::CommittedCommandExecutor;
 use crate::storage::store_registry::StoreRegistry;
 use crate::txn::{TxnId, TXN_NONE};
@@ -23,8 +24,8 @@ impl StoreCommandApplier {
         }
     }
 
-    pub(crate) fn apply(&self, cmd: CommittedCommand) -> Result<(), WrongoDBError> {
-        self.execute(cmd)
+    pub(crate) fn apply(&self, cmd: CommittedDurableOp) -> Result<(), WrongoDBError> {
+        self.apply_op(cmd.op)
     }
 
     pub(crate) fn checkpoint_open_stores(&self) -> Result<(), WrongoDBError> {
@@ -33,12 +34,10 @@ impl StoreCommandApplier {
         }
         Ok(())
     }
-}
 
-impl CommittedCommandExecutor for StoreCommandApplier {
-    fn execute(&self, cmd: CommittedCommand) -> Result<(), WrongoDBError> {
-        match cmd.command {
-            RaftCommand::Put {
+    fn apply_op(&self, op: DurableOp) -> Result<(), WrongoDBError> {
+        match op {
+            DurableOp::Put {
                 store_name,
                 key,
                 value,
@@ -53,7 +52,7 @@ impl CommittedCommandExecutor for StoreCommandApplier {
                     touched.entry(txn_id).or_default().insert(store_name);
                 }
             }
-            RaftCommand::Delete {
+            DurableOp::Delete {
                 store_name,
                 key,
                 txn_id,
@@ -65,7 +64,7 @@ impl CommittedCommandExecutor for StoreCommandApplier {
                     touched.entry(txn_id).or_default().insert(store_name);
                 }
             }
-            RaftCommand::TxnCommit { txn_id, .. } => {
+            DurableOp::TxnCommit { txn_id, .. } => {
                 if txn_id == TXN_NONE {
                     return Ok(());
                 }
@@ -79,7 +78,7 @@ impl CommittedCommandExecutor for StoreCommandApplier {
                     table.write().local_mark_updates_committed(txn_id)?;
                 }
             }
-            RaftCommand::TxnAbort { txn_id } => {
+            DurableOp::TxnAbort { txn_id } => {
                 if txn_id == TXN_NONE {
                     return Ok(());
                 }
@@ -93,8 +92,14 @@ impl CommittedCommandExecutor for StoreCommandApplier {
                     table.write().local_mark_updates_aborted(txn_id)?;
                 }
             }
-            RaftCommand::Checkpoint => {}
+            DurableOp::Checkpoint => {}
         }
         Ok(())
+    }
+}
+
+impl CommittedCommandExecutor for StoreCommandApplier {
+    fn execute(&self, cmd: CommittedCommand) -> Result<(), WrongoDBError> {
+        self.apply(cmd.into())
     }
 }

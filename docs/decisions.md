@@ -1,5 +1,41 @@
 # Decisions
 
+## 2026-03-05: Replace runtime durability manager with backend-oriented durability API
+
+**Decision**
+- Remove `DurabilityManager` as the shared runtime entry point and replace it with
+  `DurabilityBackend`.
+- Model runtime durability writes as `DurableOp` values:
+  - `Put`
+  - `Delete`
+  - `TxnCommit`
+  - `TxnAbort`
+  - `Checkpoint`
+- Keep the backend surface durability-centric:
+  - `record(op, guarantee)`
+  - `is_enabled()`
+  - `status()`
+  - `wal_sink()`
+  - `truncate_to_checkpoint()`
+- Implement the current runtime as a closed backend enum:
+  - `Disabled`
+  - `Raft(RaftDurabilityBackend)`
+- Keep checkpoint policy in `Session` instead of the durability backend:
+  the backend performs checkpoint/truncate commands, while the caller decides whether active
+  transactions make truncation unsafe.
+
+**Why**
+- The previous type did little runtime coordination and mostly acted as a thin adapter over
+  Raft-backed durability, so the `Manager` name overstated its responsibility.
+- A backend-oriented API makes the call sites read in storage terms instead of consensus terms.
+- Moving checkpoint policy to `Session` keeps transaction-safety decisions with the transaction
+  owner instead of hiding them in the durability transport layer.
+
+**Notes**
+- This is a structural refactor; Raft replication and WAL semantics are intentionally unchanged.
+- `RaftCommand` remains an internal replication detail; non-Raft runtime code now speaks in
+  `DurableOp`.
+
 ## 2026-03-05: Split startup recovery from runtime durability/replication
 
 **Decision**

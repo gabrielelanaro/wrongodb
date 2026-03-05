@@ -5,8 +5,7 @@ use std::sync::{Arc, Weak};
 
 use crate::api::connection::{RaftMode, RaftPeerConfig};
 use crate::core::errors::StorageError;
-use crate::durability::StoreCommandApplier;
-use crate::raft::command::RaftCommand;
+use crate::durability::{DurableOp, StoreCommandApplier};
 use crate::raft::node::{RaftNodeConfig, RaftNodeCore};
 use crate::raft::service::{RaftServiceConfig, RaftServiceHandle};
 use crate::recovery::manager::warn_legacy_per_table_wal_files;
@@ -29,15 +28,26 @@ pub(crate) struct RaftStatus {
     pub(crate) leader_hint: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurabilityGuarantee {
+    Buffered,
+    Sync,
+}
+
 #[derive(Debug)]
-pub(crate) struct DurabilityManager {
-    wal_enabled: bool,
-    raft_service: Option<RaftServiceHandle>,
+pub(crate) enum DurabilityBackend {
+    Disabled,
+    Raft(RaftDurabilityBackend),
+}
+
+#[derive(Debug)]
+pub(crate) struct RaftDurabilityBackend {
+    raft_service: RaftServiceHandle,
 }
 
 #[derive(Debug)]
 struct DurabilityWalSink {
-    manager: Weak<DurabilityManager>,
+    backend: Weak<DurabilityBackend>,
 }
 
 impl WalSink for DurabilityWalSink {
@@ -48,166 +58,157 @@ impl WalSink for DurabilityWalSink {
         value: &[u8],
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
-        let manager = self
-            .manager
+        let backend = self
+            .backend
             .upgrade()
-            .ok_or_else(|| StorageError("durability manager is not available".into()))?;
-        manager.log_put(store_name, key, value, txn_id)
+            .ok_or_else(|| StorageError("durability backend is not available".into()))?;
+        backend.record(
+            DurableOp::Put {
+                store_name: store_name.to_string(),
+                key: key.to_vec(),
+                value: value.to_vec(),
+                txn_id,
+            },
+            DurabilityGuarantee::Buffered,
+        )
     }
 
     fn log_delete(&self, store_name: &str, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
-        let manager = self
-            .manager
+        let backend = self
+            .backend
             .upgrade()
-            .ok_or_else(|| StorageError("durability manager is not available".into()))?;
-        manager.log_delete(store_name, key, txn_id)
+            .ok_or_else(|| StorageError("durability backend is not available".into()))?;
+        backend.record(
+            DurableOp::Delete {
+                store_name: store_name.to_string(),
+                key: key.to_vec(),
+                txn_id,
+            },
+            DurabilityGuarantee::Buffered,
+        )
     }
 }
 
-impl DurabilityManager {
-    pub(crate) fn initialize(
+impl DurabilityBackend {
+    pub(crate) fn open(
         base_path: &Path,
         wal_enabled: bool,
         applier: Arc<StoreCommandApplier>,
         raft_mode: RaftMode,
     ) -> Result<Self, WrongoDBError> {
-        let mut manager = Self {
-            wal_enabled,
-            raft_service: None,
-        };
-
-        if manager.wal_enabled {
-            warn_legacy_per_table_wal_files(base_path);
-            let (raft_cfg, mut service_cfg) = raft_configs_from_mode(raft_mode)?;
-            service_cfg.executor = applier;
-            let raft_node = RaftNodeCore::open_with_config(base_path, raft_cfg)?;
-            manager.raft_service = Some(RaftServiceHandle::start(raft_node, service_cfg)?);
+        if !wal_enabled {
+            return Ok(Self::Disabled);
         }
 
-        Ok(manager)
+        warn_legacy_per_table_wal_files(base_path);
+        Ok(Self::Raft(RaftDurabilityBackend::open(
+            base_path, applier, raft_mode,
+        )?))
+    }
+
+    pub(crate) fn record(
+        &self,
+        op: DurableOp,
+        guarantee: DurabilityGuarantee,
+    ) -> Result<(), WrongoDBError> {
+        match self {
+            Self::Disabled => Ok(()),
+            Self::Raft(backend) => backend.record(op, guarantee),
+        }
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    pub(crate) fn status(&self) -> Option<RaftStatus> {
+        match self {
+            Self::Disabled => None,
+            Self::Raft(backend) => Some(backend.status()),
+        }
     }
 
     pub(crate) fn wal_sink(self: &Arc<Self>) -> Arc<dyn WalSink> {
         Arc::new(DurabilityWalSink {
-            manager: Arc::downgrade(self),
+            backend: Arc::downgrade(self),
         })
     }
 
-    pub(crate) fn raft_status(&self) -> Option<RaftStatus> {
-        self.raft_service.as_ref().and_then(|service| {
-            service.leadership().ok().map(|leadership| RaftStatus {
-                is_writable_primary: leadership.is_writable_primary(),
-                leader_hint: leadership.leader_id,
-            })
-        })
+    pub(crate) fn truncate_to_checkpoint(&self) -> Result<(), WrongoDBError> {
+        match self {
+            Self::Disabled => Ok(()),
+            Self::Raft(backend) => backend.truncate_to_checkpoint(),
+        }
     }
 
-    pub(crate) fn wal_enabled(&self) -> bool {
-        self.wal_enabled
-    }
-
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn raft_tick(&self) -> Result<(), WrongoDBError> {
-        let Some(service) = self.raft_service.as_ref() else {
-            return Ok(());
-        };
-
-        service.force_tick()
+        match self {
+            Self::Disabled => Ok(()),
+            Self::Raft(backend) => backend.raft_tick(),
+        }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn raft_handle_inbound(
         &self,
         msg: crate::raft::runtime::RaftInboundMessage,
     ) -> Result<(), WrongoDBError> {
-        let Some(service) = self.raft_service.as_ref() else {
-            return Ok(());
-        };
+        match self {
+            Self::Disabled => Ok(()),
+            Self::Raft(backend) => backend.raft_handle_inbound(msg),
+        }
+    }
+}
 
-        service.inject_inbound(msg)
+impl RaftDurabilityBackend {
+    fn open(
+        base_path: &Path,
+        applier: Arc<StoreCommandApplier>,
+        raft_mode: RaftMode,
+    ) -> Result<Self, WrongoDBError> {
+        let (raft_cfg, mut service_cfg) = raft_configs_from_mode(raft_mode)?;
+        service_cfg.executor = applier;
+        let raft_node = RaftNodeCore::open_with_config(base_path, raft_cfg)?;
+        Ok(Self {
+            raft_service: RaftServiceHandle::start(raft_node, service_cfg)?,
+        })
     }
 
-    pub(crate) fn log_put(
+    fn record(&self, op: DurableOp, guarantee: DurabilityGuarantee) -> Result<(), WrongoDBError> {
+        self.raft_service.propose(op.into())?;
+        if guarantee == DurabilityGuarantee::Sync {
+            self.raft_service.sync()?;
+        }
+        Ok(())
+    }
+
+    fn status(&self) -> RaftStatus {
+        let leadership = self
+            .raft_service
+            .leadership()
+            .expect("raft service should return leadership while backend is alive");
+        RaftStatus {
+            is_writable_primary: leadership.is_writable_primary(),
+            leader_hint: leadership.leader_id,
+        }
+    }
+
+    fn truncate_to_checkpoint(&self) -> Result<(), WrongoDBError> {
+        self.raft_service.truncate_to_checkpoint()
+    }
+
+    #[cfg(test)]
+    fn raft_tick(&self) -> Result<(), WrongoDBError> {
+        self.raft_service.force_tick()
+    }
+
+    #[cfg(test)]
+    fn raft_handle_inbound(
         &self,
-        store_name: &str,
-        key: &[u8],
-        value: &[u8],
-        txn_id: TxnId,
+        msg: crate::raft::runtime::RaftInboundMessage,
     ) -> Result<(), WrongoDBError> {
-        if !self.wal_enabled {
-            return Ok(());
-        }
-        if let Some(service) = self.raft_service.as_ref() {
-            service.propose(RaftCommand::Put {
-                store_name: store_name.to_string(),
-                key: key.to_vec(),
-                value: value.to_vec(),
-                txn_id,
-            })?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn log_delete(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        if !self.wal_enabled {
-            return Ok(());
-        }
-        if let Some(service) = self.raft_service.as_ref() {
-            service.propose(RaftCommand::Delete {
-                store_name: store_name.to_string(),
-                key: key.to_vec(),
-                txn_id,
-            })?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn log_txn_commit_sync(
-        &self,
-        txn_id: TxnId,
-        commit_ts: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        if !self.wal_enabled {
-            return Ok(());
-        }
-        if let Some(service) = self.raft_service.as_ref() {
-            service.propose(RaftCommand::TxnCommit { txn_id, commit_ts })?;
-            service.sync()?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn log_txn_abort(&self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        if !self.wal_enabled {
-            return Ok(());
-        }
-        if let Some(service) = self.raft_service.as_ref() {
-            service.propose(RaftCommand::TxnAbort { txn_id })?;
-        }
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn checkpoint_and_truncate_if_safe(
-        &self,
-        active_txns: bool,
-    ) -> Result<(), WrongoDBError> {
-        if !self.wal_enabled || active_txns {
-            return Ok(());
-        }
-
-        if let Some(service) = self.raft_service.as_ref() {
-            service.propose(RaftCommand::Checkpoint)?;
-            service.sync()?;
-            service.truncate_to_checkpoint()?;
-        }
-
-        Ok(())
+        self.raft_service.inject_inbound(msg)
     }
 }
 
@@ -321,15 +322,15 @@ mod tests {
         Arc::new(StoreRegistry::new(dir.path().to_path_buf(), txn_manager))
     }
 
-    fn new_durability_manager(
+    fn new_durability_backend(
         dir: &tempfile::TempDir,
         wal_enabled: bool,
         raft_mode: RaftMode,
-    ) -> DurabilityManager {
+    ) -> DurabilityBackend {
         let txn_manager = new_txn_manager();
         let registry = new_store_registry(dir, txn_manager);
         let applier = Arc::new(StoreCommandApplier::new(registry));
-        DurabilityManager::initialize(dir.path(), wal_enabled, applier, raft_mode).unwrap()
+        DurabilityBackend::open(dir.path(), wal_enabled, applier, raft_mode).unwrap()
     }
 
     fn free_local_addr() -> String {
@@ -340,11 +341,39 @@ mod tests {
     }
 
     #[test]
+    fn disabled_backend_is_noop_and_reports_disabled() {
+        let dir = tempdir().unwrap();
+        let backend = new_durability_backend(&dir, false, RaftMode::Standalone);
+
+        assert!(!backend.is_enabled());
+        assert_eq!(backend.status(), None);
+        backend
+            .record(
+                DurableOp::Put {
+                    store_name: "users.main.wt".to_string(),
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                    txn_id: TXN_NONE,
+                },
+                DurabilityGuarantee::Buffered,
+            )
+            .unwrap();
+    }
+
+    #[test]
     fn commit_marker_is_persisted_after_sync() {
         let dir = tempdir().unwrap();
-        let manager = new_durability_manager(&dir, true, RaftMode::Standalone);
+        let backend = new_durability_backend(&dir, true, RaftMode::Standalone);
 
-        manager.log_txn_commit_sync(7, 7).unwrap();
+        backend
+            .record(
+                DurableOp::TxnCommit {
+                    txn_id: 7,
+                    commit_ts: 7,
+                },
+                DurabilityGuarantee::Sync,
+            )
+            .unwrap();
 
         let wal_path = GlobalWal::path_for_db(dir.path());
         let mut reader = WalReader::open(wal_path).unwrap();
@@ -364,21 +393,29 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_skip_and_truncate_follow_active_txn_flag() {
+    fn checkpoint_truncate_works_when_invoked_by_caller() {
         let dir = tempdir().unwrap();
-        let manager = new_durability_manager(&dir, true, RaftMode::Standalone);
+        let backend = new_durability_backend(&dir, true, RaftMode::Standalone);
 
-        manager.log_txn_commit_sync(1, 1).unwrap();
+        backend
+            .record(
+                DurableOp::TxnCommit {
+                    txn_id: 1,
+                    commit_ts: 1,
+                },
+                DurabilityGuarantee::Sync,
+            )
+            .unwrap();
 
         let wal_path = GlobalWal::path_for_db(dir.path());
         let before = std::fs::metadata(&wal_path).unwrap().len();
         assert!(before > 512);
 
-        manager.checkpoint_and_truncate_if_safe(true).unwrap();
-        let after_skip = std::fs::metadata(&wal_path).unwrap().len();
-        assert_eq!(after_skip, before);
+        backend
+            .record(DurableOp::Checkpoint, DurabilityGuarantee::Sync)
+            .unwrap();
+        backend.truncate_to_checkpoint().unwrap();
 
-        manager.checkpoint_and_truncate_if_safe(false).unwrap();
         let after_truncate = std::fs::metadata(&wal_path).unwrap().len();
         assert!(after_truncate <= 512);
     }
@@ -389,7 +426,7 @@ mod tests {
         let raft_state_path = RaftHardStateStore::path_for_db(dir.path());
         assert!(!raft_state_path.exists());
 
-        let _manager = new_durability_manager(&dir, true, RaftMode::Standalone);
+        let _backend = new_durability_backend(&dir, true, RaftMode::Standalone);
 
         assert!(raft_state_path.exists());
     }
@@ -400,7 +437,7 @@ mod tests {
         let raft_state_path = RaftHardStateStore::path_for_db(dir.path());
         assert!(!raft_state_path.exists());
 
-        let _manager = new_durability_manager(&dir, false, RaftMode::Standalone);
+        let _backend = new_durability_backend(&dir, false, RaftMode::Standalone);
 
         assert!(!raft_state_path.exists());
     }
@@ -410,7 +447,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let raft_state_path = RaftHardStateStore::path_for_db(dir.path());
 
-        let _manager = new_durability_manager(&dir, true, RaftMode::Standalone);
+        let _backend = new_durability_backend(&dir, true, RaftMode::Standalone);
         assert!(raft_state_path.exists());
 
         let mut file = OpenOptions::new()
@@ -425,17 +462,17 @@ mod tests {
         let txn_manager = new_txn_manager();
         let registry = new_store_registry(&dir, txn_manager);
         let applier = Arc::new(StoreCommandApplier::new(registry));
-        let err = DurabilityManager::initialize(dir.path(), true, applier, RaftMode::Standalone)
-            .unwrap_err();
+        let err =
+            DurabilityBackend::open(dir.path(), true, applier, RaftMode::Standalone).unwrap_err();
         assert!(err.to_string().contains("raft hard state"));
     }
 
     #[test]
     fn standalone_mode_reports_writable_primary() {
         let dir = tempdir().unwrap();
-        let manager = new_durability_manager(&dir, true, RaftMode::Standalone);
+        let backend = new_durability_backend(&dir, true, RaftMode::Standalone);
 
-        let status = manager.raft_status().unwrap();
+        let status = backend.status().unwrap();
         assert!(status.is_writable_primary);
         assert_eq!(status.leader_hint.as_deref(), Some("local"));
     }
@@ -443,7 +480,7 @@ mod tests {
     #[test]
     fn clustered_mode_rejects_writes_when_not_leader() {
         let dir = tempdir().unwrap();
-        let manager = new_durability_manager(
+        let backend = new_durability_backend(
             &dir,
             true,
             RaftMode::Cluster {
@@ -456,8 +493,16 @@ mod tests {
             },
         );
 
-        let err = manager
-            .log_put("users.main.wt", b"k1", b"v1", TXN_NONE)
+        let err = backend
+            .record(
+                DurableOp::Put {
+                    store_name: "users.main.wt".to_string(),
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                    txn_id: TXN_NONE,
+                },
+                DurabilityGuarantee::Buffered,
+            )
             .unwrap_err();
         match err {
             WrongoDBError::NotLeader { leader_hint } => assert_eq!(leader_hint, None),
@@ -468,7 +513,7 @@ mod tests {
     #[test]
     fn runtime_tick_and_inbound_helpers_remain_callable() {
         let dir = tempdir().unwrap();
-        let manager = new_durability_manager(
+        let backend = new_durability_backend(
             &dir,
             true,
             RaftMode::Cluster {
@@ -481,9 +526,9 @@ mod tests {
             },
         );
 
-        manager.raft_tick().unwrap();
+        backend.raft_tick().unwrap();
 
-        manager
+        backend
             .raft_handle_inbound(RaftInboundMessage::RequestVoteResponse {
                 from: "n2".to_string(),
                 resp: crate::raft::protocol::RequestVoteResponse {

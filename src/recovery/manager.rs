@@ -4,8 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::core::errors::StorageError;
-use crate::durability::StoreCommandApplier;
-use crate::raft::command::{CommittedCommand, RaftCommand};
+use crate::durability::{CommittedDurableOp, DurableOp, StoreCommandApplier};
 use crate::storage::wal::{GlobalWal, RecoveryError, WalReader, WalRecord, WalRecordHeader};
 use crate::txn::{TxnId, TXN_NONE};
 use crate::WrongoDBError;
@@ -17,14 +16,14 @@ pub(crate) struct RecoveryManager {
 
 #[derive(Debug)]
 enum RecoveryAction {
-    ApplyChange(CommittedCommand),
+    ApplyChange(CommittedDurableOp),
     StageTransactionChange {
         txn_id: TxnId,
         change: BufferedRecoveryChange,
     },
     ApplyBufferedTransaction {
         txn_id: TxnId,
-        commit: CommittedCommand,
+        commit: CommittedDurableOp,
     },
     DiscardBufferedTransaction {
         txn_id: TxnId,
@@ -36,15 +35,15 @@ enum RecoveryAction {
 struct BufferedRecoveryChange {
     index: u64,
     term: u64,
-    command: RaftCommand,
+    op: DurableOp,
 }
 
 impl BufferedRecoveryChange {
-    fn into_committed_command(self) -> CommittedCommand {
-        CommittedCommand {
+    fn into_committed_op(self) -> CommittedDurableOp {
+        CommittedDurableOp {
             index: self.index,
             term: self.term,
-            command: self.command,
+            op: self.op,
         }
     }
 }
@@ -135,7 +134,7 @@ impl RecoveryManager {
         Ok(Some(classify_recovery_action(header, record)))
     }
 
-    fn apply_change(&self, command: CommittedCommand) -> Result<(), WrongoDBError> {
+    fn apply_change(&self, command: CommittedDurableOp) -> Result<(), WrongoDBError> {
         self.applier.apply(command)
     }
 
@@ -152,10 +151,10 @@ impl RecoveryManager {
         &self,
         staged_changes: &mut StagedRecoveryChanges,
         txn_id: TxnId,
-        commit: CommittedCommand,
+        commit: CommittedDurableOp,
     ) -> Result<(), WrongoDBError> {
         for change in staged_changes.release(txn_id) {
-            self.apply_change(change.into_committed_command())?;
+            self.apply_change(change.into_committed_op())?;
         }
         self.apply_change(commit)
     }
@@ -234,10 +233,10 @@ fn classify_recovery_action(header: WalRecordHeader, record: WalRecord) -> Recov
             key,
             value,
             txn_id,
-        } if txn_id == TXN_NONE => RecoveryAction::ApplyChange(CommittedCommand {
+        } if txn_id == TXN_NONE => RecoveryAction::ApplyChange(CommittedDurableOp {
             index: header.raft_index,
             term: header.raft_term,
-            command: RaftCommand::Put {
+            op: DurableOp::Put {
                 store_name,
                 key,
                 value,
@@ -254,7 +253,7 @@ fn classify_recovery_action(header: WalRecordHeader, record: WalRecord) -> Recov
             change: BufferedRecoveryChange {
                 index: header.raft_index,
                 term: header.raft_term,
-                command: RaftCommand::Put {
+                op: DurableOp::Put {
                     store_name,
                     key,
                     value,
@@ -266,10 +265,10 @@ fn classify_recovery_action(header: WalRecordHeader, record: WalRecord) -> Recov
             store_name,
             key,
             txn_id,
-        } if txn_id == TXN_NONE => RecoveryAction::ApplyChange(CommittedCommand {
+        } if txn_id == TXN_NONE => RecoveryAction::ApplyChange(CommittedDurableOp {
             index: header.raft_index,
             term: header.raft_term,
-            command: RaftCommand::Delete {
+            op: DurableOp::Delete {
                 store_name,
                 key,
                 txn_id,
@@ -284,7 +283,7 @@ fn classify_recovery_action(header: WalRecordHeader, record: WalRecord) -> Recov
             change: BufferedRecoveryChange {
                 index: header.raft_index,
                 term: header.raft_term,
-                command: RaftCommand::Delete {
+                op: DurableOp::Delete {
                     store_name,
                     key,
                     txn_id,
@@ -293,10 +292,10 @@ fn classify_recovery_action(header: WalRecordHeader, record: WalRecord) -> Recov
         },
         WalRecord::TxnCommit { txn_id, commit_ts } => RecoveryAction::ApplyBufferedTransaction {
             txn_id,
-            commit: CommittedCommand {
+            commit: CommittedDurableOp {
                 index: header.raft_index,
                 term: header.raft_term,
-                command: RaftCommand::TxnCommit { txn_id, commit_ts },
+                op: DurableOp::TxnCommit { txn_id, commit_ts },
             },
         },
         WalRecord::TxnAbort { txn_id } => RecoveryAction::DiscardBufferedTransaction { txn_id },
@@ -312,7 +311,7 @@ mod tests {
         BufferedRecoveryChange {
             index: txn_id,
             term: 1,
-            command: RaftCommand::Put {
+            op: DurableOp::Put {
                 store_name: "test.main.wt".to_string(),
                 key: key.to_vec(),
                 value: value.to_vec(),

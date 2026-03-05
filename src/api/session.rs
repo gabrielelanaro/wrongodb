@@ -5,7 +5,7 @@ use parking_lot::RwLock;
 use crate::api::cursor::{Cursor, CursorKind};
 use crate::api::data_handle_cache::DataHandleCache;
 use crate::core::errors::StorageError;
-use crate::durability::DurabilityManager;
+use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp};
 use crate::storage::table::Table;
 use crate::txn::transaction_manager::TransactionManager;
 use crate::txn::{Transaction, TxnId};
@@ -26,7 +26,7 @@ use crate::WrongoDBError;
 pub struct Session {
     cache: Arc<DataHandleCache>,
     transaction_manager: Arc<TransactionManager>,
-    durability_manager: Arc<DurabilityManager>,
+    durability_backend: Arc<DurabilityBackend>,
     active_txn: Option<Transaction>,
 }
 
@@ -35,12 +35,12 @@ impl Session {
     pub(crate) fn new(
         cache: Arc<DataHandleCache>,
         transaction_manager: Arc<TransactionManager>,
-        durability_manager: Arc<DurabilityManager>,
+        durability_backend: Arc<DurabilityBackend>,
     ) -> Self {
         Self {
             cache,
             transaction_manager,
-            durability_manager,
+            durability_backend,
             active_txn: None,
         }
     }
@@ -137,8 +137,15 @@ impl Session {
         for table in handles {
             table.write().checkpoint()?;
         }
-        self.durability_manager
-            .checkpoint_and_truncate_if_safe(self.transaction_manager.has_active_transactions())
+        if self.transaction_manager.has_active_transactions()
+            || !self.durability_backend.is_enabled()
+        {
+            return Ok(());
+        }
+
+        self.durability_backend
+            .record(DurableOp::Checkpoint, DurabilityGuarantee::Sync)?;
+        self.durability_backend.truncate_to_checkpoint()
     }
 
     // Private helpers
@@ -214,9 +221,13 @@ impl<'a> SessionTxn<'a> {
         let touched_tables: Vec<String> = txn.touched_tables().iter().cloned().collect();
         let txn_id = txn.id();
 
-        self.session
-            .durability_manager
-            .log_txn_commit_sync(txn_id, txn_id)?;
+        self.session.durability_backend.record(
+            DurableOp::TxnCommit {
+                txn_id,
+                commit_ts: txn_id,
+            },
+            DurabilityGuarantee::Sync,
+        )?;
 
         let txn =
             self.session.active_txn.as_mut().ok_or_else(|| {
@@ -227,7 +238,7 @@ impl<'a> SessionTxn<'a> {
         self.session.active_txn = None;
         self.committed = true;
 
-        if !self.session.durability_manager.wal_enabled() {
+        if !self.session.durability_backend.is_enabled() {
             self.session
                 .finalize_touched_tables_locally(&touched_tables, txn_id, true)?;
         }
@@ -246,7 +257,10 @@ impl<'a> SessionTxn<'a> {
         let touched_tables: Vec<String> = txn.touched_tables().iter().cloned().collect();
         let txn_id = txn.id();
 
-        self.session.durability_manager.log_txn_abort(txn_id)?;
+        self.session.durability_backend.record(
+            DurableOp::TxnAbort { txn_id },
+            DurabilityGuarantee::Buffered,
+        )?;
 
         let txn =
             self.session.active_txn.as_mut().ok_or_else(|| {
@@ -257,7 +271,7 @@ impl<'a> SessionTxn<'a> {
         self.session.active_txn = None;
         self.committed = true;
 
-        if !self.session.durability_manager.wal_enabled() {
+        if !self.session.durability_backend.is_enabled() {
             self.session
                 .finalize_touched_tables_locally(&touched_tables, txn_id, false)?;
         }
@@ -302,9 +316,12 @@ impl<'a> Drop for SessionTxn<'a> {
             if let Some(mut txn) = self.session.active_txn.take() {
                 let touched_tables: Vec<String> = txn.touched_tables().iter().cloned().collect();
                 let txn_id = txn.id();
-                let _ = self.session.durability_manager.log_txn_abort(txn_id);
+                let _ = self.session.durability_backend.record(
+                    DurableOp::TxnAbort { txn_id },
+                    DurabilityGuarantee::Buffered,
+                );
                 let _ = self.session.transaction_manager.abort_txn_state(&mut txn);
-                if !self.session.durability_manager.wal_enabled() {
+                if !self.session.durability_backend.is_enabled() {
                     let _ = self.session.finalize_touched_tables_locally(
                         &touched_tables,
                         txn_id,
@@ -338,3 +355,65 @@ fn parse_index_uri(uri: &str) -> Result<(&str, &str), WrongoDBError> {
 
 // SAFETY: SessionTxn holds &mut Session, so it's !Send by default.
 // This is correct because Session is not thread-safe.
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use crate::api::connection::{Connection, ConnectionConfig};
+    use crate::storage::wal::GlobalWal;
+
+    #[test]
+    fn checkpoint_all_skips_truncate_when_transaction_active() {
+        let dir = tempdir().unwrap();
+        let conn = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
+
+        let mut session = conn.open_session();
+        session.create("table:items").unwrap();
+
+        {
+            let mut cursor = session.open_cursor("table:items").unwrap();
+            let txn = session.transaction().unwrap();
+            let txn_id = txn.as_ref().id();
+            cursor.insert(b"k1", b"v1", txn_id).unwrap();
+            txn.commit().unwrap();
+        }
+
+        let wal_path = GlobalWal::path_for_db(dir.path());
+        let before = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(before > 512);
+
+        let mut active_session = conn.open_session();
+        let _txn = active_session.transaction().unwrap();
+        session.checkpoint_all().unwrap();
+
+        let after = std::fs::metadata(&wal_path).unwrap().len();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn checkpoint_all_truncates_when_no_active_transactions() {
+        let dir = tempdir().unwrap();
+        let conn = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
+
+        let mut session = conn.open_session();
+        session.create("table:items").unwrap();
+
+        {
+            let mut cursor = session.open_cursor("table:items").unwrap();
+            let txn = session.transaction().unwrap();
+            let txn_id = txn.as_ref().id();
+            cursor.insert(b"k1", b"v1", txn_id).unwrap();
+            txn.commit().unwrap();
+        }
+
+        let wal_path = GlobalWal::path_for_db(dir.path());
+        let before = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(before > 512);
+
+        session.checkpoint_all().unwrap();
+
+        let after = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(after <= 512);
+    }
+}

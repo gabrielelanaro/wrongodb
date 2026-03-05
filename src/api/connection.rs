@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::api::data_handle_cache::DataHandleCache;
 use crate::api::session::Session;
-use crate::durability::{DurabilityManager, StoreCommandApplier};
+use crate::durability::{DurabilityBackend, StoreCommandApplier};
 use crate::recovery::RecoveryManager;
 use crate::storage::store_registry::StoreRegistry;
 use crate::txn::transaction_manager::TransactionManager;
@@ -64,7 +64,7 @@ pub struct Connection {
     dhandle_cache: Arc<DataHandleCache>,
     wal_enabled: bool,
     transaction_manager: Arc<TransactionManager>,
-    durability_manager: Arc<DurabilityManager>,
+    durability_backend: Arc<DurabilityBackend>,
 }
 
 impl fmt::Debug for Connection {
@@ -96,7 +96,7 @@ impl Connection {
             RecoveryManager::new(applier.clone()).recover(&base_path)?;
         }
 
-        let durability_manager = Arc::new(DurabilityManager::initialize(
+        let durability_backend = Arc::new(DurabilityBackend::open(
             &base_path,
             config.wal_enabled,
             applier,
@@ -104,7 +104,7 @@ impl Connection {
         )?);
 
         if config.wal_enabled {
-            store_registry.set_wal_sink(Some(durability_manager.wal_sink()));
+            store_registry.set_wal_sink(Some(durability_backend.wal_sink()));
         }
 
         Ok(Self {
@@ -112,7 +112,7 @@ impl Connection {
             dhandle_cache: Arc::new(DataHandleCache::new(store_registry)),
             wal_enabled: config.wal_enabled,
             transaction_manager,
-            durability_manager,
+            durability_backend,
         })
     }
 
@@ -120,7 +120,7 @@ impl Connection {
         Session::new(
             self.dhandle_cache.clone(),
             self.transaction_manager.clone(),
-            self.durability_manager.clone(),
+            self.durability_backend.clone(),
         )
     }
 
@@ -129,8 +129,8 @@ impl Connection {
     }
 
     pub(crate) fn raft_hello_state(&self) -> (bool, Option<String>) {
-        self.durability_manager
-            .raft_status()
+        self.durability_backend
+            .status()
             .map(|status| (status.is_writable_primary, status.leader_hint))
             .unwrap_or((true, None))
     }
