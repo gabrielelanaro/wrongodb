@@ -15,9 +15,11 @@ use crate::storage::store_registry::StoreRegistry;
 use crate::storage::wal::{
     GlobalWal, RecoveryError, WalReader, WalRecord, WalRecordHeader, WalSink,
 };
-use crate::txn::transaction_manager::TransactionManager;
 use crate::txn::{TxnId, TXN_NONE};
 use crate::WrongoDBError;
+
+#[cfg(test)]
+use crate::txn::transaction_manager::TransactionManager;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RaftStatus {
@@ -176,7 +178,6 @@ impl RecoveryManager {
     pub fn initialize(
         base_path: &Path,
         wal_enabled: bool,
-        _txn_manager: Arc<TransactionManager>,
         store_registry: Arc<StoreRegistry>,
         raft_mode: RaftMode,
     ) -> Result<Self, WrongoDBError> {
@@ -673,8 +674,7 @@ mod tests {
     ) -> RecoveryManager {
         let txn_manager = new_txn_manager();
         let registry = new_store_registry(dir, txn_manager.clone());
-        RecoveryManager::initialize(dir.path(), wal_enabled, txn_manager, registry, raft_mode)
-            .unwrap()
+        RecoveryManager::initialize(dir.path(), wal_enabled, registry, raft_mode).unwrap()
     }
 
     fn free_local_addr() -> String {
@@ -820,14 +820,8 @@ mod tests {
 
         let txn_manager = new_txn_manager();
         let registry = new_store_registry(&dir, txn_manager.clone());
-        let err = RecoveryManager::initialize(
-            dir.path(),
-            true,
-            txn_manager,
-            registry,
-            RaftMode::Standalone,
-        )
-        .unwrap_err();
+        let err = RecoveryManager::initialize(dir.path(), true, registry, RaftMode::Standalone)
+            .unwrap_err();
         assert!(err.to_string().contains("raft hard state"));
     }
 

@@ -128,7 +128,6 @@ impl Connection {
         let recovery_manager = Arc::new(RecoveryManager::initialize(
             &base_path,
             config.wal_enabled,
-            transaction_manager.clone(),
             store_registry.clone(),
             config.raft_mode,
         )?);
