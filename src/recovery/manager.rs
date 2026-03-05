@@ -13,9 +13,7 @@ use crate::raft::node::{RaftNodeConfig, RaftNodeCore};
 use crate::raft::service::{CommittedCommandExecutor, RaftServiceConfig, RaftServiceHandle};
 use crate::recovery::txn_table::RecoveryTxnTable;
 use crate::storage::store_registry::StoreRegistry;
-use crate::storage::wal::{
-    GlobalWal, RecoveryError, WalReader, WalRecord, WalRecordHeader, WalSink,
-};
+use crate::storage::wal::{GlobalWal, RecoveryError, WalReader, WalRecord, WalRecordHeader};
 use crate::txn::TransactionManager;
 use crate::txn::{TxnId, TXN_NONE};
 use crate::WrongoDBError;
@@ -458,22 +456,6 @@ fn wal_record_to_recovery_command(record: WalRecord) -> Option<RaftCommand> {
             txn_id: TXN_NONE,
         }),
         WalRecord::TxnCommit { .. } | WalRecord::TxnAbort { .. } | WalRecord::Checkpoint => None,
-    }
-}
-
-impl WalSink for RecoveryManager {
-    fn log_put(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        value: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        RecoveryManager::log_put(self, store_name, key, value, txn_id)
-    }
-
-    fn log_delete(&self, store_name: &str, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
-        RecoveryManager::log_delete(self, store_name, key, txn_id)
     }
 }
 

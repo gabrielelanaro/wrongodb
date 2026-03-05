@@ -448,58 +448,89 @@ fn apply_index_remove(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::*;
     use crate::{Connection, ConnectionConfig};
 
+    fn run_with_timeout<F>(timeout: Duration, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(())) => {}
+            Ok(Err(payload)) => std::panic::resume_unwind(payload),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("test timed out after {:?}", timeout)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("test worker disconnected before reporting result")
+            }
+        }
+    }
+
     #[test]
     fn insert_find_update_delete_roundtrip() {
-        let tmp = tempdir().unwrap();
-        let conn = Connection::open(tmp.path().join("db"), ConnectionConfig::default()).unwrap();
-        let mut session = conn.open_session();
+        run_with_timeout(Duration::from_secs(20), || {
+            let tmp = tempdir().unwrap();
+            let conn =
+                Connection::open(tmp.path().join("db"), ConnectionConfig::default()).unwrap();
+            let mut session = conn.open_session();
 
-        let inserted =
-            insert_one(&mut session, "test", json!({"name": "alice", "age": 30})).unwrap();
-        let id = inserted.get("_id").unwrap().clone();
+            let inserted =
+                insert_one(&mut session, "test", json!({"name": "alice", "age": 30})).unwrap();
+            let id = inserted.get("_id").unwrap().clone();
 
-        let fetched = find_one(&mut session, "test", Some(json!({"_id": id.clone()})))
-            .unwrap()
+            let fetched = find_one(&mut session, "test", Some(json!({"_id": id.clone()})))
+                .unwrap()
+                .unwrap();
+            assert_eq!(fetched.get("name").unwrap().as_str().unwrap(), "alice");
+
+            let updated = update_one(
+                &mut session,
+                "test",
+                Some(json!({"_id": id.clone()})),
+                json!({"$set": {"age": 31}}),
+            )
             .unwrap();
-        assert_eq!(fetched.get("name").unwrap().as_str().unwrap(), "alice");
+            assert_eq!(updated.matched, 1);
+            assert_eq!(updated.modified, 1);
 
-        let updated = update_one(
-            &mut session,
-            "test",
-            Some(json!({"_id": id.clone()})),
-            json!({"$set": {"age": 31}}),
-        )
-        .unwrap();
-        assert_eq!(updated.matched, 1);
-        assert_eq!(updated.modified, 1);
+            let fetched = find_one(&mut session, "test", Some(json!({"_id": id.clone()})))
+                .unwrap()
+                .unwrap();
+            assert_eq!(fetched.get("age").unwrap().as_i64().unwrap(), 31);
 
-        let fetched = find_one(&mut session, "test", Some(json!({"_id": id.clone()})))
-            .unwrap()
-            .unwrap();
-        assert_eq!(fetched.get("age").unwrap().as_i64().unwrap(), 31);
-
-        let deleted = delete_one(&mut session, "test", Some(json!({"_id": id}))).unwrap();
-        assert_eq!(deleted, 1);
-        let missing = find_one(&mut session, "test", Some(json!({"name": "alice"}))).unwrap();
-        assert!(missing.is_none());
+            let deleted = delete_one(&mut session, "test", Some(json!({"_id": id}))).unwrap();
+            assert_eq!(deleted, 1);
+            let missing = find_one(&mut session, "test", Some(json!({"name": "alice"}))).unwrap();
+            assert!(missing.is_none());
+        });
     }
 
     #[test]
     fn create_and_list_indexes() {
-        let tmp = tempdir().unwrap();
-        let conn = Connection::open(tmp.path().join("db"), ConnectionConfig::default()).unwrap();
-        let mut session = conn.open_session();
+        run_with_timeout(Duration::from_secs(20), || {
+            let tmp = tempdir().unwrap();
+            let conn =
+                Connection::open(tmp.path().join("db"), ConnectionConfig::default()).unwrap();
+            let mut session = conn.open_session();
 
-        insert_one(&mut session, "test", json!({"name": "alice"})).unwrap();
-        create_index(&mut session, "test", "name").unwrap();
+            insert_one(&mut session, "test", json!({"name": "alice"})).unwrap();
+            create_index(&mut session, "test", "name").unwrap();
 
-        let indexes = list_indexes(&mut session, "test").unwrap();
-        assert!(indexes.iter().any(|idx| idx == "name"));
+            let indexes = list_indexes(&mut session, "test").unwrap();
+            assert!(indexes.iter().any(|idx| idx == "name"));
+        });
     }
 }

@@ -6,11 +6,11 @@ use std::sync::{Arc, Weak};
 use crate::api::data_handle_cache::DataHandleCache;
 use crate::api::session::Session;
 use crate::core::errors::StorageError;
+use crate::hooks::{MutationHooks, NoopMutationHooks};
 use crate::recovery::RecoveryManager;
 use crate::storage::store_registry::StoreRegistry;
-use crate::storage::wal::WalSink;
-use crate::txn::TransactionManager;
 use crate::txn::GlobalTxnState;
+use crate::txn::TransactionManager;
 use crate::WrongoDBError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,12 +31,12 @@ pub enum RaftMode {
 }
 
 #[derive(Debug)]
-struct RecoveryWalSink {
+struct RecoveryMutationHooks {
     manager: Weak<RecoveryManager>,
 }
 
-impl WalSink for RecoveryWalSink {
-    fn log_put(
+impl MutationHooks for RecoveryMutationHooks {
+    fn before_put(
         &self,
         store_name: &str,
         key: &[u8],
@@ -50,7 +50,7 @@ impl WalSink for RecoveryWalSink {
         manager.log_put(store_name, key, value, txn_id)
     }
 
-    fn log_delete(
+    fn before_delete(
         &self,
         store_name: &str,
         key: &[u8],
@@ -61,6 +61,30 @@ impl WalSink for RecoveryWalSink {
             .upgrade()
             .ok_or_else(|| StorageError("recovery manager is not available".into()))?;
         manager.log_delete(store_name, key, txn_id)
+    }
+
+    fn before_commit(
+        &self,
+        txn_id: crate::txn::TxnId,
+        commit_ts: crate::txn::TxnId,
+    ) -> Result<(), WrongoDBError> {
+        let manager = self
+            .manager
+            .upgrade()
+            .ok_or_else(|| StorageError("recovery manager is not available".into()))?;
+        manager.log_txn_commit_sync(txn_id, commit_ts)
+    }
+
+    fn before_abort(&self, txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
+        let manager = self
+            .manager
+            .upgrade()
+            .ok_or_else(|| StorageError("recovery manager is not available".into()))?;
+        manager.log_txn_abort(txn_id)
+    }
+
+    fn should_apply_locally(&self) -> bool {
+        false
     }
 }
 
@@ -100,6 +124,7 @@ pub struct Connection {
     wal_enabled: bool,
     transaction_manager: Arc<TransactionManager>,
     recovery_manager: Arc<RecoveryManager>,
+    mutation_hooks: Arc<dyn MutationHooks>,
 }
 
 impl fmt::Debug for Connection {
@@ -133,12 +158,14 @@ impl Connection {
             config.raft_mode,
         )?);
 
-        if config.wal_enabled {
-            let wal_sink = Arc::new(RecoveryWalSink {
+        let mutation_hooks: Arc<dyn MutationHooks> = if config.wal_enabled {
+            Arc::new(RecoveryMutationHooks {
                 manager: Arc::downgrade(&recovery_manager),
-            }) as Arc<dyn WalSink>;
-            store_registry.set_wal_sink(Some(wal_sink));
-        }
+            })
+        } else {
+            Arc::new(NoopMutationHooks::default())
+        };
+        store_registry.set_mutation_hooks(mutation_hooks.clone());
 
         Ok(Self {
             base_path,
@@ -146,6 +173,7 @@ impl Connection {
             wal_enabled: config.wal_enabled,
             transaction_manager,
             recovery_manager,
+            mutation_hooks,
         })
     }
 
@@ -154,6 +182,7 @@ impl Connection {
             self.dhandle_cache.clone(),
             self.transaction_manager.clone(),
             self.recovery_manager.clone(),
+            self.mutation_hooks.clone(),
         )
     }
 

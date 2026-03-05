@@ -1,7 +1,7 @@
 pub mod global_txn;
+pub(crate) mod manager;
 pub mod snapshot;
 pub mod transaction;
-pub(crate) mod manager;
 pub mod update;
 
 pub use global_txn::GlobalTxnState;

@@ -5,6 +5,7 @@ use parking_lot::RwLock;
 use crate::api::cursor::{Cursor, CursorKind};
 use crate::api::data_handle_cache::DataHandleCache;
 use crate::core::errors::StorageError;
+use crate::hooks::MutationHooks;
 use crate::recovery::RecoveryManager;
 use crate::storage::table::Table;
 use crate::txn::TransactionManager;
@@ -27,6 +28,7 @@ pub struct Session {
     cache: Arc<DataHandleCache>,
     transaction_manager: Arc<TransactionManager>,
     recovery_manager: Arc<RecoveryManager>,
+    mutation_hooks: Arc<dyn MutationHooks>,
     active_txn: Option<Transaction>,
 }
 
@@ -36,11 +38,13 @@ impl Session {
         cache: Arc<DataHandleCache>,
         transaction_manager: Arc<TransactionManager>,
         recovery_manager: Arc<RecoveryManager>,
+        mutation_hooks: Arc<dyn MutationHooks>,
     ) -> Self {
         Self {
             cache,
             transaction_manager,
             recovery_manager,
+            mutation_hooks,
             active_txn: None,
         }
     }
@@ -214,9 +218,7 @@ impl<'a> SessionTxn<'a> {
         let touched_tables: Vec<String> = txn.touched_tables().iter().cloned().collect();
         let txn_id = txn.id();
 
-        self.session
-            .recovery_manager
-            .log_txn_commit_sync(txn_id, txn_id)?;
+        self.session.mutation_hooks.before_commit(txn_id, txn_id)?;
 
         let txn =
             self.session.active_txn.as_mut().ok_or_else(|| {
@@ -246,7 +248,7 @@ impl<'a> SessionTxn<'a> {
         let touched_tables: Vec<String> = txn.touched_tables().iter().cloned().collect();
         let txn_id = txn.id();
 
-        self.session.recovery_manager.log_txn_abort(txn_id)?;
+        self.session.mutation_hooks.before_abort(txn_id)?;
 
         let txn =
             self.session.active_txn.as_mut().ok_or_else(|| {
@@ -302,7 +304,7 @@ impl<'a> Drop for SessionTxn<'a> {
             if let Some(mut txn) = self.session.active_txn.take() {
                 let touched_tables: Vec<String> = txn.touched_tables().iter().cloned().collect();
                 let txn_id = txn.id();
-                let _ = self.session.recovery_manager.log_txn_abort(txn_id);
+                let _ = self.session.mutation_hooks.before_abort(txn_id);
                 let _ = self.session.transaction_manager.abort_txn_state(&mut txn);
                 if !self.session.recovery_manager.wal_enabled() {
                     let _ = self.session.finalize_touched_tables_locally(

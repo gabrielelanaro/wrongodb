@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::hooks::{MutationHooks, NoopMutationHooks};
 use crate::storage::table::Table;
-use crate::storage::wal::WalSink;
 use crate::txn::TransactionManager;
 use crate::WrongoDBError;
 
@@ -13,7 +13,8 @@ use crate::WrongoDBError;
 pub struct StoreRegistry {
     base_path: PathBuf,
     transaction_manager: Arc<TransactionManager>,
-    wal_sink: RwLock<Option<Arc<dyn WalSink>>>,
+    mutation_hooks: RwLock<Arc<dyn MutationHooks>>,
+    apply_mutations_locally: RwLock<bool>,
     handles_by_store: RwLock<HashMap<String, Arc<RwLock<Table>>>>,
     uri_aliases: RwLock<HashMap<String, String>>,
 }
@@ -23,14 +24,20 @@ impl StoreRegistry {
         Self {
             base_path,
             transaction_manager,
-            wal_sink: RwLock::new(None),
+            mutation_hooks: RwLock::new(Arc::new(NoopMutationHooks)),
+            apply_mutations_locally: RwLock::new(true),
             handles_by_store: RwLock::new(HashMap::new()),
             uri_aliases: RwLock::new(HashMap::new()),
         }
     }
 
-    pub fn set_wal_sink(&self, wal_sink: Option<Arc<dyn WalSink>>) {
-        *self.wal_sink.write() = wal_sink.clone();
+    pub fn set_mutation_hooks(
+        &self,
+        mutation_hooks: Arc<dyn MutationHooks>,
+        apply_mutations_locally: bool,
+    ) {
+        *self.mutation_hooks.write() = mutation_hooks.clone();
+        *self.apply_mutations_locally.write() = apply_mutations_locally;
         let handles: Vec<_> = self
             .handles_by_store
             .read()
@@ -38,7 +45,9 @@ impl StoreRegistry {
             .map(Arc::clone)
             .collect();
         for handle in handles {
-            handle.write().set_wal_sink(wal_sink.clone());
+            let mut table = handle.write();
+            table.set_mutation_hooks(mutation_hooks.clone());
+            table.set_apply_mutations_locally(apply_mutations_locally);
         }
     }
 
@@ -70,7 +79,8 @@ impl StoreRegistry {
             return Ok(handle.clone());
         }
 
-        let wal_sink = self.wal_sink.read().clone();
+        let mutation_hooks = self.mutation_hooks.read().clone();
+        let apply_mutations_locally = *self.apply_mutations_locally.read();
         let mut handles = self.handles_by_store.write();
         if let Some(handle) = handles.get(store_name) {
             return Ok(handle.clone());
@@ -81,11 +91,17 @@ impl StoreRegistry {
                 collection,
                 &self.base_path,
                 self.transaction_manager.clone(),
-                wal_sink,
+                mutation_hooks,
+                apply_mutations_locally,
             )?
         } else {
             let path = self.base_path.join(store_name);
-            Table::open_or_create_index(path, self.transaction_manager.clone(), wal_sink)?
+            Table::open_or_create_index(
+                path,
+                self.transaction_manager.clone(),
+                mutation_hooks,
+                apply_mutations_locally,
+            )?
         };
         let table = Arc::new(RwLock::new(table));
         handles.insert(store_name.to_string(), table.clone());

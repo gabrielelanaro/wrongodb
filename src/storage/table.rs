@@ -2,12 +2,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::core::errors::StorageError;
+use crate::hooks::MutationHooks;
 use crate::index::IndexCatalog;
 use crate::storage::block::file::NONE_BLOCK_ID;
 use crate::storage::btree::page::LeafPage;
 use crate::storage::btree::BTree;
 use crate::storage::page_store::{PageStore, PageStoreTrait};
-use crate::storage::wal::WalSink;
 use crate::txn::TransactionManager;
 use crate::txn::TxnId;
 use crate::WrongoDBError;
@@ -24,7 +24,8 @@ pub struct Table {
     btree: BTree,
     store_name: String,
     transaction_manager: Arc<TransactionManager>,
-    wal_sink: Option<Arc<dyn WalSink>>,
+    mutation_hooks: Arc<dyn MutationHooks>,
+    apply_mutations_locally: bool,
     index_catalog: Option<IndexCatalog>,
 }
 
@@ -33,7 +34,8 @@ impl Table {
         collection: &str,
         db_dir: P,
         transaction_manager: Arc<TransactionManager>,
-        wal_sink: Option<Arc<dyn WalSink>>,
+        mutation_hooks: Arc<dyn MutationHooks>,
+        apply_mutations_locally: bool,
     ) -> Result<Self, WrongoDBError> {
         let db_dir = db_dir.as_ref();
         let path = db_dir.join(format!("{}.main.wt", collection));
@@ -43,13 +45,15 @@ impl Table {
             collection,
             db_dir,
             transaction_manager.clone(),
-            wal_sink.clone(),
+            mutation_hooks.clone(),
+            apply_mutations_locally,
         )?;
         Ok(Self {
             btree,
             store_name,
             transaction_manager,
-            wal_sink,
+            mutation_hooks,
+            apply_mutations_locally,
             index_catalog: Some(index_catalog),
         })
     }
@@ -57,7 +61,8 @@ impl Table {
     pub fn open_or_create_index<P: AsRef<Path>>(
         path: P,
         transaction_manager: Arc<TransactionManager>,
-        wal_sink: Option<Arc<dyn WalSink>>,
+        mutation_hooks: Arc<dyn MutationHooks>,
+        apply_mutations_locally: bool,
     ) -> Result<Self, WrongoDBError> {
         let path = path.as_ref();
         let btree = Self::open_or_create_btree(path)?;
@@ -66,7 +71,8 @@ impl Table {
             btree,
             store_name,
             transaction_manager,
-            wal_sink,
+            mutation_hooks,
+            apply_mutations_locally,
             index_catalog: None,
         })
     }
@@ -83,14 +89,25 @@ impl Table {
         &self.store_name
     }
 
-    pub fn wal_sink(&self) -> Option<Arc<dyn WalSink>> {
-        self.wal_sink.clone()
+    pub fn mutation_hooks(&self) -> Arc<dyn MutationHooks> {
+        self.mutation_hooks.clone()
     }
 
-    pub fn set_wal_sink(&mut self, wal_sink: Option<Arc<dyn WalSink>>) {
-        self.wal_sink = wal_sink.clone();
+    pub fn apply_mutations_locally(&self) -> bool {
+        self.apply_mutations_locally
+    }
+
+    pub fn set_mutation_hooks(&mut self, mutation_hooks: Arc<dyn MutationHooks>) {
+        self.mutation_hooks = mutation_hooks.clone();
         if let Some(catalog) = self.index_catalog.as_mut() {
-            catalog.set_wal_sink(wal_sink);
+            catalog.set_mutation_hooks(mutation_hooks);
+        }
+    }
+
+    pub fn set_apply_mutations_locally(&mut self, apply_mutations_locally: bool) {
+        self.apply_mutations_locally = apply_mutations_locally;
+        if let Some(catalog) = self.index_catalog.as_mut() {
+            catalog.set_apply_mutations_locally(apply_mutations_locally);
         }
     }
 
@@ -155,8 +172,9 @@ impl Table {
         value: &[u8],
         txn_id: crate::txn::TxnId,
     ) -> Result<(), WrongoDBError> {
-        if let Some(wal_sink) = self.wal_sink.as_ref() {
-            wal_sink.log_put(&self.store_name, key, value, txn_id)?;
+        self.mutation_hooks
+            .before_put(&self.store_name, key, value, txn_id)?;
+        if !self.apply_mutations_locally {
             return Ok(());
         }
         self.local_apply_put_with_txn(key, value, txn_id)
@@ -167,8 +185,9 @@ impl Table {
         key: &[u8],
         txn_id: crate::txn::TxnId,
     ) -> Result<bool, WrongoDBError> {
-        if let Some(wal_sink) = self.wal_sink.as_ref() {
-            wal_sink.log_delete(&self.store_name, key, txn_id)?;
+        self.mutation_hooks
+            .before_delete(&self.store_name, key, txn_id)?;
+        if !self.apply_mutations_locally {
             return Ok(true);
         }
         self.local_apply_delete_with_txn(key, txn_id)
@@ -334,7 +353,7 @@ mod tests {
     use crate::txn::{GlobalTxnState, TXN_NONE};
 
     #[derive(Debug, Default)]
-    struct MockWalSink {
+    struct MockMutationHooks {
         ops: Mutex<Vec<MockWalOp>>,
     }
 
@@ -353,8 +372,8 @@ mod tests {
         },
     }
 
-    impl WalSink for MockWalSink {
-        fn log_put(
+    impl MutationHooks for MockMutationHooks {
+        fn before_put(
             &self,
             store_name: &str,
             key: &[u8],
@@ -370,7 +389,7 @@ mod tests {
             Ok(())
         }
 
-        fn log_delete(
+        fn before_delete(
             &self,
             store_name: &str,
             key: &[u8],
@@ -386,48 +405,50 @@ mod tests {
     }
 
     #[test]
-    fn table_mutations_log_through_wal_sink() {
+    fn table_mutations_invoke_mutation_hooks() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("table.idx.wt");
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let wal_sink = Arc::new(MockWalSink::default());
+        let mutation_hooks = Arc::new(MockMutationHooks::default());
 
         let mut table = Table::open_or_create_index(
             &path,
             transaction_manager,
-            Some(wal_sink.clone() as Arc<dyn WalSink>),
+            mutation_hooks.clone() as Arc<dyn MutationHooks>,
+            true,
         )
         .unwrap();
 
         table.insert_raw_with_txn(b"k1", b"v1", TXN_NONE).unwrap();
         table.delete_raw_with_txn(b"k1", TXN_NONE).unwrap();
 
-        let ops = wal_sink.ops.lock();
+        let ops = mutation_hooks.ops.lock();
         assert_eq!(ops.len(), 2);
         assert!(matches!(&ops[0], MockWalOp::Put { .. }));
         assert!(matches!(&ops[1], MockWalOp::Delete { .. }));
     }
 
     #[test]
-    fn recovery_apply_does_not_log_through_wal_sink() {
+    fn recovery_apply_does_not_invoke_mutation_hooks() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("table.idx.wt");
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let wal_sink = Arc::new(MockWalSink::default());
+        let mutation_hooks = Arc::new(MockMutationHooks::default());
 
         let mut table = Table::open_or_create_index(
             &path,
             transaction_manager,
-            Some(wal_sink.clone() as Arc<dyn WalSink>),
+            mutation_hooks.clone() as Arc<dyn MutationHooks>,
+            true,
         )
         .unwrap();
 
         table.put_recovery(b"k1", b"v1").unwrap();
         table.delete_recovery(b"k1").unwrap();
 
-        let ops = wal_sink.ops.lock();
+        let ops = mutation_hooks.ops.lock();
         assert!(ops.is_empty());
     }
 }

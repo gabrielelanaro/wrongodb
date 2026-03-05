@@ -1182,3 +1182,17 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - **Leaf-only pinning** minimizes pin count but may re-read parent pages during iteration if they're evicted.
 - **Full-path pinning** would keep the entire path from root to leaf pinned, preventing any re-reads but consuming more cache capacity.
 - Current implementation uses leaf-only pinning for simplicity; full-path pinning can be added later if needed for performance.
+
+## 2026-03-05: Replace `WalSink` with generic `MutationHooks`
+
+**Decision**
+- Remove internal `WalSink` from `src/storage/wal.rs` and introduce `MutationHooks` in `src/hooks.rs`.
+- Move hook injection to an always-present object (`Arc<dyn MutationHooks>`) with `NoopMutationHooks` as default.
+- Route `put/delete` through table-level `before_put/before_delete` hooks.
+- Route transaction `commit/abort` through the same hook object with `before_commit/before_abort`.
+- Keep recovery replay paths (`put_recovery/delete_recovery`) bypassing hooks.
+
+**Why**
+- Reduces coupling between storage mutation code and WAL internals.
+- Removes duplicated forwarding paths (`RecoveryWalSink` + `impl WalSink for RecoveryManager`).
+- Creates a single boundary for pre-mutation behavior while preserving current durability behavior.
