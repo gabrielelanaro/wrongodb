@@ -76,9 +76,12 @@ This applies to row mutations, txn commit/abort markers, and checkpoint-truncate
 
 Recovery runs once at connection open:
 
-1. Pass 1: scan WAL and build transaction table (`committed`, `aborted`, pending).
-2. Pass 2: replay `Put/Delete` only for `TXN_NONE` or committed transactions.
-3. Checkpoint replayed stores to persist new roots.
+1. Read WAL records from the checkpoint boundary forward.
+2. Apply `TXN_NONE` `Put/Delete` immediately.
+3. Stage transactional `Put/Delete` by `txn_id`.
+4. On `TxnCommit`, replay staged changes for that transaction and finalize commit visibility.
+5. On `TxnAbort` or EOF, discard staged changes for that transaction.
+6. Checkpoint replayed stores to persist new roots.
 
 ## Checkpoint and truncation
 

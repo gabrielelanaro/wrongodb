@@ -1,5 +1,28 @@
 # Decisions
 
+## 2026-03-05: Recovery replays transactional changes at commit time
+
+**Decision**
+- Replace the previous two-pass recovery flow with one-pass staged replay:
+  - transactional `Put/Delete` records are buffered by `txn_id`
+  - `TxnCommit` releases and applies the buffered changes, then finalizes commit visibility
+  - `TxnAbort` and end-of-log discard buffered changes
+- Keep recovery owned by `RecoveryManager`; do not introduce a separate top-level recovery pipeline type.
+- Keep recovery on the existing executor/local-apply path so runtime and recovery still use the
+  same mutation boundary when a change is actually applied.
+
+**Why**
+- The recovery story should match transaction semantics directly: a transaction's writes become
+  effective when its durable commit marker is replayed, not when its earlier data records are seen.
+- This makes `recover()` readable at a single abstraction level:
+  read -> apply/stage/commit/discard -> checkpoint.
+
+**Notes**
+- This supersedes the earlier recovery-specific assumption of pass-1 txn classification plus
+  pass-2 replay in original WAL record order.
+- Interleaved writes may now recover according to commit-time transaction visibility rather than
+  original WAL position.
+
 ## 2026-03-02: Remove public `WrongoDB`/`Collection` layer and keep only `Connection`/`Session`/`Cursor`
 
 **Decision**

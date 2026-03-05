@@ -5,10 +5,11 @@ Status: Active
 
 ## Alignment
 
-Both systems use logical WAL replay with transaction marker filtering.
+Both systems use logical WAL replay with transaction marker filtering, but WrongoDB now stages
+transactional changes until commit replay instead of doing a separate preclassification pass.
 
 ```text
-WAL scan -> txn table (commit/abort) -> replay logical ops in order
+WAL scan -> stage txn changes -> commit/abort decides replay or discard
 ```
 
 ## Minimongo (current)
@@ -17,6 +18,7 @@ WAL scan -> txn table (commit/abort) -> replay logical ops in order
 - Data records include `store_name` to target main/index B-trees
 - Recovery runs at connection open
 - Only committed txns are replayed
+- Transactional changes become effective when `TxnCommit` is replayed
 
 ## WiredTiger (reference shape)
 

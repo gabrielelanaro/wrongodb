@@ -11,7 +11,6 @@ use crate::core::errors::StorageError;
 use crate::raft::command::{CommittedCommand, RaftCommand};
 use crate::raft::node::{RaftNodeConfig, RaftNodeCore};
 use crate::raft::service::{CommittedCommandExecutor, RaftServiceConfig, RaftServiceHandle};
-use crate::recovery::txn_table::RecoveryTxnTable;
 use crate::storage::store_registry::StoreRegistry;
 use crate::storage::wal::{
     GlobalWal, RecoveryError, WalReader, WalRecord, WalRecordHeader, WalSink,
@@ -109,6 +108,67 @@ impl CommittedCommandExecutor for LiveCommittedCommandExecutor {
             RaftCommand::Checkpoint => {}
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+enum RecoveryAction {
+    ApplyChange(CommittedCommand),
+    StageTransactionChange {
+        txn_id: TxnId,
+        change: BufferedRecoveryChange,
+    },
+    ApplyBufferedTransaction {
+        txn_id: TxnId,
+        commit: CommittedCommand,
+    },
+    DiscardBufferedTransaction {
+        txn_id: TxnId,
+    },
+    Ignore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BufferedRecoveryChange {
+    index: u64,
+    term: u64,
+    command: RaftCommand,
+}
+
+impl BufferedRecoveryChange {
+    fn into_committed_command(self) -> CommittedCommand {
+        CommittedCommand {
+            index: self.index,
+            term: self.term,
+            command: self.command,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct StagedRecoveryChanges {
+    changes_by_txn: HashMap<TxnId, Vec<BufferedRecoveryChange>>,
+}
+
+impl StagedRecoveryChanges {
+    fn stage(&mut self, txn_id: TxnId, change: BufferedRecoveryChange) {
+        self.changes_by_txn.entry(txn_id).or_default().push(change);
+    }
+
+    fn release(&mut self, txn_id: TxnId) -> Vec<BufferedRecoveryChange> {
+        self.changes_by_txn.remove(&txn_id).unwrap_or_default()
+    }
+
+    fn discard(&mut self, txn_id: TxnId) {
+        self.changes_by_txn.remove(&txn_id);
+    }
+
+    fn discard_all(&mut self) {
+        self.changes_by_txn.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.changes_by_txn.is_empty()
     }
 }
 
@@ -254,53 +314,103 @@ impl RecoveryManager {
     }
 
     pub fn recover(&self, base_path: &Path) -> Result<(), WrongoDBError> {
+        let Some(mut reader) = self.read_unapplied_records(base_path)? else {
+            return Ok(());
+        };
+
+        let mut staged_changes = StagedRecoveryChanges::default();
+        while let Some(action) = self.read_next_recovery_action(&mut reader)? {
+            match action {
+                RecoveryAction::ApplyChange(command) => self.apply_change(command)?,
+                RecoveryAction::StageTransactionChange { txn_id, change } => {
+                    self.stage_transaction_change(&mut staged_changes, txn_id, change);
+                }
+                RecoveryAction::ApplyBufferedTransaction { txn_id, commit } => {
+                    self.apply_buffered_transaction(&mut staged_changes, txn_id, commit)?;
+                }
+                RecoveryAction::DiscardBufferedTransaction { txn_id } => {
+                    self.discard_buffered_transaction(&mut staged_changes, txn_id);
+                }
+                RecoveryAction::Ignore => {}
+            }
+        }
+
+        self.discard_incomplete_transactions(&mut staged_changes);
+        self.checkpoint_open_stores()?;
+
+        Ok(())
+    }
+
+    fn read_unapplied_records(&self, base_path: &Path) -> Result<Option<WalReader>, WrongoDBError> {
         let wal_path = GlobalWal::path_for_db(base_path);
         if !wal_path.exists() {
-            return Ok(());
+            return Ok(None);
         }
 
-        let mut first_pass_reader = match WalReader::open(&wal_path) {
-            Ok(reader) => reader,
+        match WalReader::open(&wal_path) {
+            Ok(reader) => Ok(Some(reader)),
             Err(err) => {
                 eprintln!("Skipping global WAL recovery (failed to open WAL): {err}");
-                return Ok(());
-            }
-        };
-
-        let mut txn_table = RecoveryTxnTable::new();
-        while let Some((_header, record)) = next_recovery_record(&mut first_pass_reader, "pass 1")?
-        {
-            txn_table.process_record(&record);
-        }
-        txn_table.finalize_pending();
-
-        let mut second_pass_reader = match WalReader::open(&wal_path) {
-            Ok(reader) => reader,
-            Err(err) => {
-                eprintln!("Skipping global WAL recovery (failed to reopen WAL): {err}");
-                return Ok(());
-            }
-        };
-
-        while let Some((header, record)) = next_recovery_record(&mut second_pass_reader, "pass 2")?
-        {
-            if !txn_table.should_apply(&record) {
-                continue;
-            }
-
-            if let Some(command) = wal_record_to_recovery_command(record) {
-                self.executor.execute(CommittedCommand {
-                    index: header.raft_index,
-                    term: header.raft_term,
-                    command,
-                })?;
+                Ok(None)
             }
         }
+    }
 
+    fn read_next_recovery_action(
+        &self,
+        reader: &mut WalReader,
+    ) -> Result<Option<RecoveryAction>, WrongoDBError> {
+        let Some((header, record)) = next_recovery_record(reader, "recovery")? else {
+            return Ok(None);
+        };
+
+        Ok(Some(classify_recovery_action(header, record)))
+    }
+
+    fn apply_change(&self, command: CommittedCommand) -> Result<(), WrongoDBError> {
+        self.executor.execute(command)
+    }
+
+    fn stage_transaction_change(
+        &self,
+        staged_changes: &mut StagedRecoveryChanges,
+        txn_id: TxnId,
+        change: BufferedRecoveryChange,
+    ) {
+        staged_changes.stage(txn_id, change);
+    }
+
+    fn apply_buffered_transaction(
+        &self,
+        staged_changes: &mut StagedRecoveryChanges,
+        txn_id: TxnId,
+        commit: CommittedCommand,
+    ) -> Result<(), WrongoDBError> {
+        for change in staged_changes.release(txn_id) {
+            self.apply_change(change.into_committed_command())?;
+        }
+        self.apply_change(commit)
+    }
+
+    fn discard_buffered_transaction(
+        &self,
+        staged_changes: &mut StagedRecoveryChanges,
+        txn_id: TxnId,
+    ) {
+        staged_changes.discard(txn_id);
+    }
+
+    fn discard_incomplete_transactions(&self, staged_changes: &mut StagedRecoveryChanges) {
+        if staged_changes.is_empty() {
+            return;
+        }
+        staged_changes.discard_all();
+    }
+
+    fn checkpoint_open_stores(&self) -> Result<(), WrongoDBError> {
         for table in self.executor.store_registry.all_handles() {
             table.write().checkpoint()?;
         }
-
         Ok(())
     }
 }
@@ -437,27 +547,80 @@ fn next_recovery_record(
     }
 }
 
-fn wal_record_to_recovery_command(record: WalRecord) -> Option<RaftCommand> {
+fn classify_recovery_action(header: WalRecordHeader, record: WalRecord) -> RecoveryAction {
     match record {
         WalRecord::Put {
             store_name,
             key,
             value,
-            ..
-        } => Some(RaftCommand::Put {
+            txn_id,
+        } if txn_id == TXN_NONE => RecoveryAction::ApplyChange(CommittedCommand {
+            index: header.raft_index,
+            term: header.raft_term,
+            command: RaftCommand::Put {
+                store_name,
+                key,
+                value,
+                txn_id,
+            },
+        }),
+        WalRecord::Put {
             store_name,
             key,
             value,
-            txn_id: TXN_NONE,
-        }),
+            txn_id,
+        } => RecoveryAction::StageTransactionChange {
+            txn_id,
+            change: BufferedRecoveryChange {
+                index: header.raft_index,
+                term: header.raft_term,
+                command: RaftCommand::Put {
+                    store_name,
+                    key,
+                    value,
+                    txn_id,
+                },
+            },
+        },
         WalRecord::Delete {
-            store_name, key, ..
-        } => Some(RaftCommand::Delete {
             store_name,
             key,
-            txn_id: TXN_NONE,
+            txn_id,
+        } if txn_id == TXN_NONE => RecoveryAction::ApplyChange(CommittedCommand {
+            index: header.raft_index,
+            term: header.raft_term,
+            command: RaftCommand::Delete {
+                store_name,
+                key,
+                txn_id,
+            },
         }),
-        WalRecord::TxnCommit { .. } | WalRecord::TxnAbort { .. } | WalRecord::Checkpoint => None,
+        WalRecord::Delete {
+            store_name,
+            key,
+            txn_id,
+        } => RecoveryAction::StageTransactionChange {
+            txn_id,
+            change: BufferedRecoveryChange {
+                index: header.raft_index,
+                term: header.raft_term,
+                command: RaftCommand::Delete {
+                    store_name,
+                    key,
+                    txn_id,
+                },
+            },
+        },
+        WalRecord::TxnCommit { txn_id, commit_ts } => RecoveryAction::ApplyBufferedTransaction {
+            txn_id,
+            commit: CommittedCommand {
+                index: header.raft_index,
+                term: header.raft_term,
+                command: RaftCommand::TxnCommit { txn_id, commit_ts },
+            },
+        },
+        WalRecord::TxnAbort { txn_id } => RecoveryAction::DiscardBufferedTransaction { txn_id },
+        WalRecord::Checkpoint => RecoveryAction::Ignore,
     }
 }
 
@@ -519,6 +682,57 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
         addr.to_string()
+    }
+
+    fn buffered_put_change(txn_id: TxnId, key: &[u8], value: &[u8]) -> BufferedRecoveryChange {
+        BufferedRecoveryChange {
+            index: txn_id,
+            term: 1,
+            command: RaftCommand::Put {
+                store_name: "test.main.wt".to_string(),
+                key: key.to_vec(),
+                value: value.to_vec(),
+                txn_id,
+            },
+        }
+    }
+
+    #[test]
+    fn staged_recovery_changes_release_preserves_transaction_order() {
+        let mut staged = StagedRecoveryChanges::default();
+        let first = buffered_put_change(7, b"k1", b"v1");
+        let second = buffered_put_change(7, b"k2", b"v2");
+
+        staged.stage(7, first.clone());
+        staged.stage(7, second.clone());
+
+        assert_eq!(staged.release(7), vec![first, second]);
+        assert!(staged.is_empty());
+    }
+
+    #[test]
+    fn staged_recovery_changes_discard_removes_only_target_transaction() {
+        let mut staged = StagedRecoveryChanges::default();
+        let keep = buffered_put_change(8, b"k8", b"v8");
+
+        staged.stage(7, buffered_put_change(7, b"k7", b"v7"));
+        staged.stage(8, keep.clone());
+        staged.discard(7);
+
+        assert!(staged.release(7).is_empty());
+        assert_eq!(staged.release(8), vec![keep]);
+        assert!(staged.is_empty());
+    }
+
+    #[test]
+    fn staged_recovery_changes_discard_all_clears_incomplete_transactions() {
+        let mut staged = StagedRecoveryChanges::default();
+
+        staged.stage(7, buffered_put_change(7, b"k7", b"v7"));
+        staged.stage(8, buffered_put_change(8, b"k8", b"v8"));
+        staged.discard_all();
+
+        assert!(staged.is_empty());
     }
 
     #[test]
