@@ -45,7 +45,7 @@ impl Cursor {
 
     pub fn insert(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
-        let (store_name, wal_sink) = {
+        let (store_name, mutation_hooks) = {
             let mut table = self.table.write();
             if table.get_version(key, txn_id)?.is_some() {
                 return Err(crate::core::errors::DocumentValidationError(
@@ -53,10 +53,11 @@ impl Cursor {
                 )
                 .into());
             }
-            (table.store_name().to_string(), table.wal_sink())
+            (table.store_name().to_string(), table.mutation_hooks())
         };
-        if let Some(wal_sink) = wal_sink {
-            return wal_sink.log_put(&store_name, key, value, txn_id);
+        mutation_hooks.before_put(&store_name, key, value, txn_id)?;
+        if !mutation_hooks.should_apply_locally() {
+            return Ok(());
         }
         let mut table = self.table.write();
         if table.get_version(key, txn_id)?.is_some() {
@@ -69,11 +70,11 @@ impl Cursor {
 
     pub fn update(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
-        let (store_name, wal_sink, exists) = {
+        let (store_name, mutation_hooks, exists) = {
             let mut table = self.table.write();
             (
                 table.store_name().to_string(),
-                table.wal_sink(),
+                table.mutation_hooks(),
                 table.get_version(key, txn_id)?.is_some(),
             )
         };
@@ -82,27 +83,26 @@ impl Cursor {
                 "key not found for update".to_string(),
             )));
         }
-        if let Some(wal_sink) = wal_sink {
-            wal_sink.log_put(&store_name, key, value, txn_id)?;
+        mutation_hooks.before_put(&store_name, key, value, txn_id)?;
+        if !mutation_hooks.should_apply_locally() {
             return Ok(());
         }
         let mut table = self.table.write();
-        let result = table.update_mvcc(key, value, txn_id)?;
-        if !result {
+        if table.get_version(key, txn_id)?.is_none() {
             return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
                 "key not found for update".to_string(),
             )));
         }
-        Ok(())
+        table.local_apply_put_with_txn(key, value, txn_id)
     }
 
     pub fn delete(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
-        let (store_name, wal_sink, exists) = {
+        let (store_name, mutation_hooks, exists) = {
             let mut table = self.table.write();
             (
                 table.store_name().to_string(),
-                table.wal_sink(),
+                table.mutation_hooks(),
                 table.get_version(key, txn_id)?.is_some(),
             )
         };
@@ -111,12 +111,17 @@ impl Cursor {
                 "key not found for delete".to_string(),
             )));
         }
-        if let Some(wal_sink) = wal_sink {
-            wal_sink.log_delete(&store_name, key, txn_id)?;
+        mutation_hooks.before_delete(&store_name, key, txn_id)?;
+        if !mutation_hooks.should_apply_locally() {
             return Ok(());
         }
         let mut table = self.table.write();
-        let result = table.delete_mvcc(key, txn_id)?;
+        if table.get_version(key, txn_id)?.is_none() {
+            return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
+                "key not found for delete".to_string(),
+            )));
+        }
+        let result = table.local_apply_delete_with_txn(key, txn_id)?;
         if !result {
             return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
                 "key not found for delete".to_string(),

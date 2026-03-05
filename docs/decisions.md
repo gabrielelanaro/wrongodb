@@ -1,5 +1,34 @@
 # Decisions
 
+## 2026-03-05: Use storage-facing mutation hooks on top of the durability backend
+
+**Decision**
+- Replace the storage-layer `WalSink` interface with a generic `MutationHooks` boundary:
+  - `before_put`
+  - `before_delete`
+  - `before_commit`
+  - `before_abort`
+  - `should_apply_locally()`
+- Keep `DurabilityBackend` as the runtime durability boundary and expose a
+  `mutation_hooks()` adapter from it.
+- Route table, index, cursor, and session write paths through `MutationHooks` instead of
+  calling durability/WAL APIs directly.
+- Keep local application explicit:
+  - durable backends return `should_apply_locally() == false`
+  - disabled durability returns `should_apply_locally() == true`
+  - recovery still uses explicit local-apply methods and does not invoke hooks
+
+**Why**
+- `WalSink` encoded one concrete implementation detail into the storage layer.
+- `MutationHooks` keeps storage code focused on “a mutation is about to happen” while
+  `DurabilityBackend` remains responsible for deciding how that mutation becomes durable.
+- This also gives transaction commit/abort the same interception boundary as put/delete,
+  which makes the call graph more uniform and easier to follow.
+
+**Notes**
+- The runtime durability backend still owns checkpoint/status/truncation behavior.
+- The storage layer no longer knows about WAL-specific naming.
+
 ## 2026-03-05: Replace runtime durability manager with backend-oriented durability API
 
 **Decision**
@@ -15,7 +44,7 @@
   - `record(op, guarantee)`
   - `is_enabled()`
   - `status()`
-  - `wal_sink()`
+  - `mutation_hooks()`
   - `truncate_to_checkpoint()`
 - Implement the current runtime as a closed backend enum:
   - `Disabled`

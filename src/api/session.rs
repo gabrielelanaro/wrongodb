@@ -6,9 +6,9 @@ use crate::api::cursor::{Cursor, CursorKind};
 use crate::api::data_handle_cache::DataHandleCache;
 use crate::core::errors::StorageError;
 use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp};
+use crate::hooks::MutationHooks;
 use crate::storage::table::Table;
-use crate::txn::transaction_manager::TransactionManager;
-use crate::txn::{Transaction, TxnId};
+use crate::txn::{Transaction, TransactionManager, TxnId};
 use crate::WrongoDBError;
 
 /// A request-scoped execution context over shared connection infrastructure.
@@ -27,6 +27,7 @@ pub struct Session {
     cache: Arc<DataHandleCache>,
     transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
+    mutation_hooks: Arc<dyn MutationHooks>,
     active_txn: Option<Transaction>,
 }
 
@@ -36,11 +37,13 @@ impl Session {
         cache: Arc<DataHandleCache>,
         transaction_manager: Arc<TransactionManager>,
         durability_backend: Arc<DurabilityBackend>,
+        mutation_hooks: Arc<dyn MutationHooks>,
     ) -> Self {
         Self {
             cache,
             transaction_manager,
             durability_backend,
+            mutation_hooks,
             active_txn: None,
         }
     }
@@ -221,13 +224,7 @@ impl<'a> SessionTxn<'a> {
         let touched_tables: Vec<String> = txn.touched_tables().iter().cloned().collect();
         let txn_id = txn.id();
 
-        self.session.durability_backend.record(
-            DurableOp::TxnCommit {
-                txn_id,
-                commit_ts: txn_id,
-            },
-            DurabilityGuarantee::Sync,
-        )?;
+        self.session.mutation_hooks.before_commit(txn_id, txn_id)?;
 
         let txn =
             self.session.active_txn.as_mut().ok_or_else(|| {
@@ -238,7 +235,7 @@ impl<'a> SessionTxn<'a> {
         self.session.active_txn = None;
         self.committed = true;
 
-        if !self.session.durability_backend.is_enabled() {
+        if self.session.mutation_hooks.should_apply_locally() {
             self.session
                 .finalize_touched_tables_locally(&touched_tables, txn_id, true)?;
         }
@@ -257,10 +254,7 @@ impl<'a> SessionTxn<'a> {
         let touched_tables: Vec<String> = txn.touched_tables().iter().cloned().collect();
         let txn_id = txn.id();
 
-        self.session.durability_backend.record(
-            DurableOp::TxnAbort { txn_id },
-            DurabilityGuarantee::Buffered,
-        )?;
+        self.session.mutation_hooks.before_abort(txn_id)?;
 
         let txn =
             self.session.active_txn.as_mut().ok_or_else(|| {
@@ -271,7 +265,7 @@ impl<'a> SessionTxn<'a> {
         self.session.active_txn = None;
         self.committed = true;
 
-        if !self.session.durability_backend.is_enabled() {
+        if self.session.mutation_hooks.should_apply_locally() {
             self.session
                 .finalize_touched_tables_locally(&touched_tables, txn_id, false)?;
         }
@@ -316,12 +310,9 @@ impl<'a> Drop for SessionTxn<'a> {
             if let Some(mut txn) = self.session.active_txn.take() {
                 let touched_tables: Vec<String> = txn.touched_tables().iter().cloned().collect();
                 let txn_id = txn.id();
-                let _ = self.session.durability_backend.record(
-                    DurableOp::TxnAbort { txn_id },
-                    DurabilityGuarantee::Buffered,
-                );
+                let _ = self.session.mutation_hooks.before_abort(txn_id);
                 let _ = self.session.transaction_manager.abort_txn_state(&mut txn);
-                if !self.session.durability_backend.is_enabled() {
+                if self.session.mutation_hooks.should_apply_locally() {
                     let _ = self.session.finalize_touched_tables_locally(
                         &touched_tables,
                         txn_id,

@@ -2,6 +2,7 @@ mod api;
 mod core;
 mod document_ops;
 mod durability;
+mod hooks;
 mod index;
 mod raft;
 mod recovery;

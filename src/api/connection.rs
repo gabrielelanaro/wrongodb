@@ -6,10 +6,10 @@ use std::sync::Arc;
 use crate::api::data_handle_cache::DataHandleCache;
 use crate::api::session::Session;
 use crate::durability::{DurabilityBackend, StoreCommandApplier};
+use crate::hooks::MutationHooks;
 use crate::recovery::RecoveryManager;
 use crate::storage::store_registry::StoreRegistry;
-use crate::txn::transaction_manager::TransactionManager;
-use crate::txn::GlobalTxnState;
+use crate::txn::{GlobalTxnState, TransactionManager};
 use crate::WrongoDBError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +65,7 @@ pub struct Connection {
     wal_enabled: bool,
     transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
+    mutation_hooks: Arc<dyn MutationHooks>,
 }
 
 impl fmt::Debug for Connection {
@@ -102,10 +103,8 @@ impl Connection {
             applier,
             config.raft_mode,
         )?);
-
-        if config.wal_enabled {
-            store_registry.set_wal_sink(Some(durability_backend.wal_sink()));
-        }
+        let mutation_hooks = durability_backend.mutation_hooks();
+        store_registry.set_mutation_hooks(mutation_hooks.clone());
 
         Ok(Self {
             base_path,
@@ -113,6 +112,7 @@ impl Connection {
             wal_enabled: config.wal_enabled,
             transaction_manager,
             durability_backend,
+            mutation_hooks,
         })
     }
 
@@ -121,6 +121,7 @@ impl Connection {
             self.dhandle_cache.clone(),
             self.transaction_manager.clone(),
             self.durability_backend.clone(),
+            self.mutation_hooks.clone(),
         )
     }
 

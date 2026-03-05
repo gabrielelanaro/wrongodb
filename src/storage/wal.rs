@@ -12,19 +12,6 @@ use crc32fast::Hasher;
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::txn::{Timestamp, TxnId};
 
-/// Internal trait for WAL logging used by storage tables.
-pub trait WalSink: Send + Sync + std::fmt::Debug {
-    fn log_put(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        value: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError>;
-
-    fn log_delete(&self, store_name: &str, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError>;
-}
-
 /// Global WAL file name.
 const GLOBAL_WAL_FILE_NAME: &str = "global.wal";
 /// WAL file magic bytes (8 bytes)

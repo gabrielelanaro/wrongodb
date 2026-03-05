@@ -9,10 +9,9 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::hooks::MutationHooks;
 use crate::storage::table::Table;
-use crate::storage::wal::WalSink;
-use crate::txn::transaction_manager::TransactionManager;
-use crate::txn::{TxnId, TXN_NONE};
+use crate::txn::{TransactionManager, TxnId};
 use crate::{Document, WrongoDBError};
 
 pub use key::{decode_index_id, encode_index_key, encode_range_bounds, encode_scalar_prefix};
@@ -74,10 +73,10 @@ impl PersistentIndex {
     fn open_or_create(
         path: &Path,
         transaction_manager: Arc<TransactionManager>,
-        wal_sink: Option<Arc<dyn WalSink>>,
+        mutation_hooks: Arc<dyn MutationHooks>,
     ) -> Result<(Self, bool), WrongoDBError> {
         let existed = path.exists();
-        let table = Table::open_or_create_index(path, transaction_manager, wal_sink)?;
+        let table = Table::open_or_create_index(path, transaction_manager, mutation_hooks)?;
         Ok((
             Self {
                 table: Arc::new(RwLock::new(table)),
@@ -98,13 +97,12 @@ impl PersistentIndex {
         txn_id: crate::txn::TxnId,
     ) -> Result<(), WrongoDBError> {
         if let Some(key) = encode_index_key(value, id)? {
-            let (store_name, wal_sink) = {
+            let (store_name, mutation_hooks) = {
                 let table = self.table.read();
-                (table.store_name().to_string(), table.wal_sink())
+                (table.store_name().to_string(), table.mutation_hooks())
             };
-            if let Some(wal_sink) = wal_sink {
-                wal_sink.log_put(&store_name, &key, &[], txn_id)?;
-            } else {
+            mutation_hooks.before_put(&store_name, &key, &[], txn_id)?;
+            if mutation_hooks.should_apply_locally() {
                 self.table
                     .write()
                     .local_apply_put_with_txn(&key, &[], txn_id)?;
@@ -135,34 +133,30 @@ impl PersistentIndex {
     }
 
     fn insert_raw(&mut self, key: &[u8], txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
-        let (store_name, wal_sink) = {
+        let (store_name, mutation_hooks) = {
             let table = self.table.read();
-            (table.store_name().to_string(), table.wal_sink())
+            (table.store_name().to_string(), table.mutation_hooks())
         };
-        if let Some(wal_sink) = wal_sink {
-            wal_sink.log_put(&store_name, key, &[], txn_id)
-        } else if txn_id == TXN_NONE {
+        mutation_hooks.before_put(&store_name, key, &[], txn_id)?;
+        if mutation_hooks.should_apply_locally() {
             self.table
                 .write()
                 .local_apply_put_with_txn(key, &[], txn_id)
         } else {
-            self.table.write().insert_mvcc(key, &[], txn_id)
+            Ok(())
         }
     }
 
     fn remove_raw(&mut self, key: &[u8], txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
-        let (store_name, wal_sink) = {
+        let (store_name, mutation_hooks) = {
             let table = self.table.read();
-            (table.store_name().to_string(), table.wal_sink())
+            (table.store_name().to_string(), table.mutation_hooks())
         };
-        if let Some(wal_sink) = wal_sink {
-            wal_sink.log_delete(&store_name, key, txn_id)?;
-        } else if txn_id == TXN_NONE {
+        mutation_hooks.before_delete(&store_name, key, txn_id)?;
+        if mutation_hooks.should_apply_locally() {
             self.table
                 .write()
                 .local_apply_delete_with_txn(key, txn_id)?;
-        } else {
-            self.table.write().delete_mvcc(key, txn_id)?;
         }
         Ok(())
     }
@@ -203,7 +197,7 @@ pub struct IndexCatalog {
     definitions: BTreeMap<String, IndexDefinition>,
     indexes: BTreeMap<String, PersistentIndex>,
     transaction_manager: Arc<TransactionManager>,
-    wal_sink: Option<Arc<dyn WalSink>>,
+    mutation_hooks: Arc<dyn MutationHooks>,
 }
 
 impl IndexCatalog {
@@ -211,7 +205,7 @@ impl IndexCatalog {
         collection: &str,
         db_dir: P,
         transaction_manager: Arc<TransactionManager>,
-        wal_sink: Option<Arc<dyn WalSink>>,
+        mutation_hooks: Arc<dyn MutationHooks>,
     ) -> Result<Self, WrongoDBError> {
         let db_dir = db_dir.as_ref().to_path_buf();
         let meta_path = db_dir.join(format!("{}.meta.json", collection));
@@ -273,7 +267,7 @@ impl IndexCatalog {
             let (index, _created) = PersistentIndex::open_or_create(
                 &index_path,
                 transaction_manager.clone(),
-                wal_sink.clone(),
+                mutation_hooks.clone(),
             )?;
             indexes.insert(def.name.clone(), index);
         }
@@ -284,7 +278,7 @@ impl IndexCatalog {
             definitions,
             indexes,
             transaction_manager,
-            wal_sink,
+            mutation_hooks,
         })
     }
 
@@ -292,7 +286,7 @@ impl IndexCatalog {
         collection: &str,
         db_dir: P,
         transaction_manager: Arc<TransactionManager>,
-        wal_sink: Option<Arc<dyn WalSink>>,
+        mutation_hooks: Arc<dyn MutationHooks>,
     ) -> Self {
         Self {
             collection: collection.to_string(),
@@ -300,7 +294,7 @@ impl IndexCatalog {
             definitions: BTreeMap::new(),
             indexes: BTreeMap::new(),
             transaction_manager,
-            wal_sink,
+            mutation_hooks,
         }
     }
 
@@ -356,7 +350,7 @@ impl IndexCatalog {
         let (mut index, created) = PersistentIndex::open_or_create(
             &index_path,
             self.transaction_manager.clone(),
-            self.wal_sink.clone(),
+            self.mutation_hooks.clone(),
         )?;
 
         if !index_exists || created {
@@ -384,10 +378,13 @@ impl IndexCatalog {
         Ok(())
     }
 
-    pub fn set_wal_sink(&mut self, wal_sink: Option<Arc<dyn WalSink>>) {
-        self.wal_sink = wal_sink.clone();
+    pub fn set_mutation_hooks(&mut self, mutation_hooks: Arc<dyn MutationHooks>) {
+        self.mutation_hooks = mutation_hooks.clone();
         for index in self.indexes.values_mut() {
-            index.table.write().set_wal_sink(wal_sink.clone());
+            index
+                .table
+                .write()
+                .set_mutation_hooks(mutation_hooks.clone());
         }
     }
 
@@ -520,6 +517,7 @@ impl IndexCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::NoopMutationHooks;
     use crate::txn::TXN_NONE;
     use serde_json::json;
     use tempfile::tempdir;
@@ -532,8 +530,12 @@ mod tests {
             crate::txn::GlobalTxnState::new(),
         )));
 
-        let (mut index, _created) =
-            PersistentIndex::open_or_create(&path, transaction_manager, None).unwrap();
+        let (mut index, _created) = PersistentIndex::open_or_create(
+            &path,
+            transaction_manager,
+            Arc::new(NoopMutationHooks),
+        )
+        .unwrap();
 
         index
             .insert(&json!("alice"), &json!("id1"), TXN_NONE)
@@ -561,7 +563,12 @@ mod tests {
         let transaction_manager = Arc::new(TransactionManager::new(Arc::new(
             crate::txn::GlobalTxnState::new(),
         )));
-        let mut catalog = IndexCatalog::empty("coll", tmp.path(), transaction_manager, None);
+        let mut catalog = IndexCatalog::empty(
+            "coll",
+            tmp.path(),
+            transaction_manager,
+            Arc::new(NoopMutationHooks),
+        );
 
         let docs: Vec<Document> = vec![
             serde_json::from_value(json!({"_id": "a1", "name": "alice"})).unwrap(),

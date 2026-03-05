@@ -6,19 +6,19 @@ use std::sync::{Arc, Weak};
 use crate::api::connection::{RaftMode, RaftPeerConfig};
 use crate::core::errors::StorageError;
 use crate::durability::{DurableOp, StoreCommandApplier};
+use crate::hooks::MutationHooks;
 use crate::raft::node::{RaftNodeConfig, RaftNodeCore};
 use crate::raft::service::{RaftServiceConfig, RaftServiceHandle};
 use crate::recovery::manager::warn_legacy_per_table_wal_files;
-use crate::storage::wal::WalSink;
 use crate::txn::TxnId;
 use crate::WrongoDBError;
 
 #[cfg(test)]
 use crate::storage::store_registry::StoreRegistry;
 #[cfg(test)]
-use crate::txn::transaction_manager::TransactionManager;
-#[cfg(test)]
 use crate::txn::GlobalTxnState;
+#[cfg(test)]
+use crate::txn::TransactionManager;
 #[cfg(test)]
 use crate::txn::TXN_NONE;
 
@@ -46,12 +46,12 @@ pub(crate) struct RaftDurabilityBackend {
 }
 
 #[derive(Debug)]
-struct DurabilityWalSink {
+struct DurabilityMutationHooks {
     backend: Weak<DurabilityBackend>,
 }
 
-impl WalSink for DurabilityWalSink {
-    fn log_put(
+impl MutationHooks for DurabilityMutationHooks {
+    fn before_put(
         &self,
         store_name: &str,
         key: &[u8],
@@ -73,7 +73,12 @@ impl WalSink for DurabilityWalSink {
         )
     }
 
-    fn log_delete(&self, store_name: &str, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+    fn before_delete(
+        &self,
+        store_name: &str,
+        key: &[u8],
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError> {
         let backend = self
             .backend
             .upgrade()
@@ -86,6 +91,35 @@ impl WalSink for DurabilityWalSink {
             },
             DurabilityGuarantee::Buffered,
         )
+    }
+
+    fn before_commit(&self, txn_id: TxnId, commit_ts: TxnId) -> Result<(), WrongoDBError> {
+        let backend = self
+            .backend
+            .upgrade()
+            .ok_or_else(|| StorageError("durability backend is not available".into()))?;
+        backend.record(
+            DurableOp::TxnCommit { txn_id, commit_ts },
+            DurabilityGuarantee::Sync,
+        )
+    }
+
+    fn before_abort(&self, txn_id: TxnId) -> Result<(), WrongoDBError> {
+        let backend = self
+            .backend
+            .upgrade()
+            .ok_or_else(|| StorageError("durability backend is not available".into()))?;
+        backend.record(
+            DurableOp::TxnAbort { txn_id },
+            DurabilityGuarantee::Buffered,
+        )
+    }
+
+    fn should_apply_locally(&self) -> bool {
+        self.backend
+            .upgrade()
+            .map(|backend| !backend.is_enabled())
+            .unwrap_or(false)
     }
 }
 
@@ -128,8 +162,8 @@ impl DurabilityBackend {
         }
     }
 
-    pub(crate) fn wal_sink(self: &Arc<Self>) -> Arc<dyn WalSink> {
-        Arc::new(DurabilityWalSink {
+    pub(crate) fn mutation_hooks(self: &Arc<Self>) -> Arc<dyn MutationHooks> {
+        Arc::new(DurabilityMutationHooks {
             backend: Arc::downgrade(self),
         })
     }
