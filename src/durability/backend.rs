@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+
+#[cfg(test)]
+use parking_lot::Mutex;
 
 use crate::api::connection::{RaftMode, RaftPeerConfig};
 use crate::core::errors::StorageError;
 use crate::durability::{DurableOp, StoreCommandApplier};
-use crate::hooks::MutationHooks;
 use crate::raft::node::{RaftNodeConfig, RaftNodeCore};
 use crate::raft::service::{RaftServiceConfig, RaftServiceHandle};
 use crate::recovery::manager::warn_legacy_per_table_wal_files;
-use crate::txn::TxnId;
 use crate::WrongoDBError;
 
 #[cfg(test)]
@@ -34,10 +35,18 @@ pub(crate) enum DurabilityGuarantee {
     Sync,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestApplyMode {
+    LocalNow,
+    DeferredCommittedApply,
+}
+
 #[derive(Debug)]
 pub(crate) enum DurabilityBackend {
     Disabled,
     Raft(RaftDurabilityBackend),
+    #[cfg(test)]
+    Test(TestDurabilityBackend),
 }
 
 #[derive(Debug)]
@@ -45,82 +54,11 @@ pub(crate) struct RaftDurabilityBackend {
     raft_service: RaftServiceHandle,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
-struct DurabilityMutationHooks {
-    backend: Weak<DurabilityBackend>,
-}
-
-impl MutationHooks for DurabilityMutationHooks {
-    fn before_put(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        value: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        let backend = self
-            .backend
-            .upgrade()
-            .ok_or_else(|| StorageError("durability backend is not available".into()))?;
-        backend.record(
-            DurableOp::Put {
-                store_name: store_name.to_string(),
-                key: key.to_vec(),
-                value: value.to_vec(),
-                txn_id,
-            },
-            DurabilityGuarantee::Buffered,
-        )
-    }
-
-    fn before_delete(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        let backend = self
-            .backend
-            .upgrade()
-            .ok_or_else(|| StorageError("durability backend is not available".into()))?;
-        backend.record(
-            DurableOp::Delete {
-                store_name: store_name.to_string(),
-                key: key.to_vec(),
-                txn_id,
-            },
-            DurabilityGuarantee::Buffered,
-        )
-    }
-
-    fn before_commit(&self, txn_id: TxnId, commit_ts: TxnId) -> Result<(), WrongoDBError> {
-        let backend = self
-            .backend
-            .upgrade()
-            .ok_or_else(|| StorageError("durability backend is not available".into()))?;
-        backend.record(
-            DurableOp::TxnCommit { txn_id, commit_ts },
-            DurabilityGuarantee::Sync,
-        )
-    }
-
-    fn before_abort(&self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        let backend = self
-            .backend
-            .upgrade()
-            .ok_or_else(|| StorageError("durability backend is not available".into()))?;
-        backend.record(
-            DurableOp::TxnAbort { txn_id },
-            DurabilityGuarantee::Buffered,
-        )
-    }
-
-    fn should_apply_locally(&self) -> bool {
-        self.backend
-            .upgrade()
-            .map(|backend| !backend.is_enabled())
-            .unwrap_or(false)
-    }
+pub(crate) struct TestDurabilityBackend {
+    request_apply_mode: RequestApplyMode,
+    recorded_ops: Arc<Mutex<Vec<(DurableOp, DurabilityGuarantee)>>>,
 }
 
 impl DurabilityBackend {
@@ -148,30 +86,49 @@ impl DurabilityBackend {
         match self {
             Self::Disabled => Ok(()),
             Self::Raft(backend) => backend.record(op, guarantee),
+            #[cfg(test)]
+            Self::Test(backend) => {
+                backend.recorded_ops.lock().push((op, guarantee));
+                Ok(())
+            }
         }
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
-        !matches!(self, Self::Disabled)
+        match self {
+            Self::Disabled => false,
+            Self::Raft(_) => true,
+            #[cfg(test)]
+            Self::Test(backend) => {
+                backend.request_apply_mode == RequestApplyMode::DeferredCommittedApply
+            }
+        }
     }
 
     pub(crate) fn status(&self) -> Option<RaftStatus> {
         match self {
             Self::Disabled => None,
             Self::Raft(backend) => Some(backend.status()),
+            #[cfg(test)]
+            Self::Test(_) => None,
         }
     }
 
-    pub(crate) fn mutation_hooks(self: &Arc<Self>) -> Arc<dyn MutationHooks> {
-        Arc::new(DurabilityMutationHooks {
-            backend: Arc::downgrade(self),
-        })
+    pub(crate) fn request_apply_mode(&self) -> RequestApplyMode {
+        match self {
+            Self::Disabled => RequestApplyMode::LocalNow,
+            Self::Raft(_) => RequestApplyMode::DeferredCommittedApply,
+            #[cfg(test)]
+            Self::Test(backend) => backend.request_apply_mode,
+        }
     }
 
     pub(crate) fn truncate_to_checkpoint(&self) -> Result<(), WrongoDBError> {
         match self {
             Self::Disabled => Ok(()),
             Self::Raft(backend) => backend.truncate_to_checkpoint(),
+            #[cfg(test)]
+            Self::Test(_) => Ok(()),
         }
     }
 
@@ -180,6 +137,8 @@ impl DurabilityBackend {
         match self {
             Self::Disabled => Ok(()),
             Self::Raft(backend) => backend.raft_tick(),
+            #[cfg(test)]
+            Self::Test(_) => Ok(()),
         }
     }
 
@@ -191,7 +150,26 @@ impl DurabilityBackend {
         match self {
             Self::Disabled => Ok(()),
             Self::Raft(backend) => backend.raft_handle_inbound(msg),
+            #[cfg(test)]
+            Self::Test(_) => {
+                let _ = msg;
+                Ok(())
+            }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_backend(
+        request_apply_mode: RequestApplyMode,
+    ) -> (Self, Arc<Mutex<Vec<(DurableOp, DurabilityGuarantee)>>>) {
+        let recorded_ops = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self::Test(TestDurabilityBackend {
+                request_apply_mode,
+                recorded_ops: recorded_ops.clone(),
+            }),
+            recorded_ops,
+        )
     }
 }
 

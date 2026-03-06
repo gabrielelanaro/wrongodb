@@ -143,18 +143,8 @@ pub fn find_single_leader_among(
 }
 
 pub fn insert_doc(db: &Connection, collection: &str, value: Value) -> Result<(), WrongoDBError> {
-    let key_value = value.get("_id").cloned().unwrap_or(Value::Null);
-    let key = serde_json::to_vec(&key_value).unwrap();
-    let payload = serde_json::to_vec(&value).unwrap();
-
     let mut session = db.open_session();
-    let mut txn = session.transaction()?;
-    let txn_id = txn.as_ref().id();
-    let mut cursor = txn
-        .session_mut()
-        .open_cursor(&format!("table:{collection}"))?;
-    cursor.insert(&key, &payload, txn_id)?;
-    txn.commit()?;
+    session.insert_one(collection, value)?;
     Ok(())
 }
 
@@ -169,36 +159,7 @@ pub fn find_docs(
     };
 
     let mut session = db.open_session();
-    let mut cursor = session.open_cursor(&format!("table:{collection}"))?;
-
-    if let Some(id) = filter_obj.get("_id") {
-        let key = serde_json::to_vec(id).unwrap();
-        return Ok(match cursor.get(&key, 0)? {
-            Some(bytes) => {
-                let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-                match value {
-                    Value::Object(doc) => vec![doc],
-                    _ => Vec::new(),
-                }
-            }
-            None => Vec::new(),
-        });
-    }
-
-    let mut docs = Vec::new();
-    while let Some((_, bytes)) = cursor.next(0)? {
-        let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        let Value::Object(doc) = value else {
-            continue;
-        };
-
-        let matches = filter_obj.iter().all(|(k, v)| doc.get(k) == Some(v));
-        if matches {
-            docs.push(doc);
-        }
-    }
-
-    Ok(docs)
+    session.find(collection, Some(Value::Object(filter_obj)))
 }
 
 fn free_local_addr() -> String {

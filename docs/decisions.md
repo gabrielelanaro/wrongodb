@@ -1,5 +1,35 @@
 # Decisions
 
+## 2026-03-06: Remove hook-owned apply policy and make `Session` the durable write orchestrator
+
+**Decision**
+- Remove the `MutationHooks` abstraction and the `should_apply_locally()` flag entirely.
+- Put the request-path apply decision on `DurabilityBackend` as an explicit
+  `RequestApplyMode`:
+  - `LocalNow`
+  - `DeferredCommittedApply`
+- Make `Session` the only durable write orchestrator:
+  - request-time writes either apply locally now or record `DurableOp` values for committed apply
+  - transaction commit/abort use the same mode split
+- Keep `StoreCommandApplier` as the only deferred/replay applier.
+- Make `Cursor` an internal crate-private store helper and remove it from the public API.
+
+**Why**
+- `should_apply_locally()` was not really a hook concern; it was an execution-policy flag hidden
+  behind a hook interface.
+- That made the same public cursor write call mean two different things depending on backend:
+  local mutation in disabled-durability mode versus record-now/apply-later in Raft mode.
+- Moving the branch up to `Session` makes the write path readable in one place and restores a
+  clearer split:
+  `Session` orchestrates durable writes, `Cursor` mutates one store locally, and
+  `StoreCommandApplier` applies committed durable ops.
+
+**Notes**
+- Public supported write operations now live on `Session`; low-level raw cursor writes are no
+  longer part of the crate API.
+- Raft semantics are unchanged: proposal acknowledgement still waits for quorum commit plus local
+  committed apply; `Sync` remains the extra flush barrier for sync-grade operations.
+
 ## 2026-03-06: Make MVCC cleanup checkpoint-owned reconciliation
 
 **Decision**

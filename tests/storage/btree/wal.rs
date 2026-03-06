@@ -2,6 +2,7 @@
 
 use std::fs;
 
+use serde_json::json;
 use tempfile::tempdir;
 
 use wrongodb::{Connection, ConnectionConfig};
@@ -12,14 +13,15 @@ fn global_wal_path(db_dir: &std::path::Path) -> std::path::PathBuf {
 
 fn insert_kv(conn: &Connection, table: &str, key: &[u8], value: &[u8]) {
     let mut session = conn.open_session();
-    let mut txn = session.transaction().unwrap();
-    let txn_id = txn.as_ref().id();
-    let mut cursor = txn
-        .session_mut()
-        .open_cursor(&format!("table:{table}"))
+    session
+        .insert_one(
+            table,
+            json!({
+                "_id": String::from_utf8_lossy(key).to_string(),
+                "value": String::from_utf8_lossy(value).to_string(),
+            }),
+        )
         .unwrap();
-    cursor.insert(key, value, txn_id).unwrap();
-    txn.commit().unwrap();
 }
 
 #[test]

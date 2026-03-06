@@ -2,7 +2,6 @@ mod api;
 mod core;
 mod document_ops;
 mod durability;
-mod hooks;
 mod index;
 mod raft;
 mod recovery;
@@ -15,7 +14,7 @@ pub mod commands {
     pub use crate::server::commands::*;
 }
 
-pub use crate::api::{Connection, ConnectionConfig, Cursor, RaftMode, RaftPeerConfig, Session};
+pub use crate::api::{Connection, ConnectionConfig, RaftMode, RaftPeerConfig, Session};
 pub use crate::core::errors::{DocumentValidationError, StorageError, WrongoDBError};
 pub use crate::index::{
     decode_index_id, encode_index_key, encode_range_bounds, encode_scalar_prefix,

@@ -24,6 +24,10 @@ pub(crate) struct CollectionSchema {
 }
 
 impl CollectionSchema {
+    pub(crate) fn primary_store(&self) -> &str {
+        &self.primary_store
+    }
+
     pub(crate) fn index_names(&self) -> Vec<String> {
         self.indexes.keys().cloned().collect()
     }

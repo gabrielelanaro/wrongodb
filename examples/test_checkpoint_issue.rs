@@ -1,3 +1,4 @@
+use serde_json::json;
 use tempfile::tempdir;
 use wrongodb::{Connection, ConnectionConfig};
 
@@ -14,15 +15,14 @@ fn main() {
         session.create("table:test").unwrap();
 
         let mut txn = session.transaction().unwrap();
-        let txn_id = txn.as_mut().id();
-        let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
 
         for i in 0..5 {
-            let key = format!("key{}", i);
-            let value = format!("value{}", i);
-            println!("Inserting: {}", key);
-            cursor
-                .insert(key.as_bytes(), value.as_bytes(), txn_id)
+            println!("Inserting: key{}", i);
+            txn.session_mut()
+                .insert_one(
+                    "test",
+                    json!({"_id": format!("key{i}"), "value": format!("value{i}")}),
+                )
                 .unwrap();
         }
 
@@ -35,15 +35,14 @@ fn main() {
         let mut session = conn.open_session();
 
         let mut txn = session.transaction().unwrap();
-        let txn_id = txn.as_mut().id();
-        let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
 
         for i in 5..10 {
-            let key = format!("key{}", i);
-            let value = format!("value{}", i);
-            println!("Inserting: {}", key);
-            cursor
-                .insert(key.as_bytes(), value.as_bytes(), txn_id)
+            println!("Inserting: key{}", i);
+            txn.session_mut()
+                .insert_one(
+                    "test",
+                    json!({"_id": format!("key{i}"), "value": format!("value{i}")}),
+                )
                 .unwrap();
         }
 
@@ -58,16 +57,14 @@ fn main() {
     {
         let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
         let mut session = conn.open_session();
-        let mut cursor = session.open_cursor("table:test").unwrap();
-
-        let mut txn = session.transaction().unwrap();
-        let txn_id = txn.as_mut().id();
 
         for i in 0..10 {
             let key = format!("key{}", i);
-            let result = cursor.get(key.as_bytes(), txn_id).unwrap();
+            let result = session
+                .find_one("test", Some(json!({"_id": key.clone()})))
+                .unwrap();
             match &result {
-                Some(v) => println!("{} -> {:?}", key, String::from_utf8_lossy(v)),
+                Some(doc) => println!("{} -> {:?}", key, doc.get("value")),
                 None => println!("{} -> MISSING", key),
             }
         }

@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
-use crate::hooks::MutationHooks;
 use crate::storage::table::Table;
 use crate::txn::{TxnId, TXN_NONE};
 use crate::WrongoDBError;
@@ -51,10 +50,9 @@ impl StoreWriteTracker {
     }
 }
 
-pub struct Cursor {
+pub(crate) struct Cursor {
     table: Arc<RwLock<Table>>,
     store_name: String,
-    mutation_hooks: Arc<dyn MutationHooks>,
     write_tracker: StoreWriteTracker,
     buffered_entries: Vec<CursorEntry>,
     buffer_pos: usize,
@@ -67,13 +65,11 @@ impl Cursor {
     pub(crate) fn new(
         table: Arc<RwLock<Table>>,
         store_name: String,
-        mutation_hooks: Arc<dyn MutationHooks>,
         write_tracker: StoreWriteTracker,
     ) -> Self {
         Self {
             table,
             store_name,
-            mutation_hooks,
             write_tracker,
             buffered_entries: Vec::new(),
             buffer_pos: 0,
@@ -83,13 +79,18 @@ impl Cursor {
         }
     }
 
-    pub fn set_range(&mut self, start: Option<Vec<u8>>, end: Option<Vec<u8>>) {
+    pub(crate) fn set_range(&mut self, start: Option<Vec<u8>>, end: Option<Vec<u8>>) {
         self.range_start = start;
         self.range_end = end;
         self.reset();
     }
 
-    pub fn insert(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+    pub(crate) fn insert(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError> {
         let exists = {
             let mut table = self.table.write();
             table.contains_key(key, txn_id)?
@@ -98,13 +99,6 @@ impl Cursor {
             return Err(
                 crate::core::errors::DocumentValidationError("duplicate key error".into()).into(),
             );
-        }
-
-        self.mutation_hooks
-            .before_put(&self.store_name, key, value, txn_id)?;
-        if !self.mutation_hooks.should_apply_locally() {
-            self.write_tracker.record(&self.store_name, txn_id);
-            return Ok(());
         }
 
         let mut table = self.table.write();
@@ -118,7 +112,12 @@ impl Cursor {
         Ok(())
     }
 
-    pub fn update(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+    pub(crate) fn update(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError> {
         let exists = {
             let mut table = self.table.write();
             table.contains_key(key, txn_id)?
@@ -127,13 +126,6 @@ impl Cursor {
             return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
                 "key not found for update".to_string(),
             )));
-        }
-
-        self.mutation_hooks
-            .before_put(&self.store_name, key, value, txn_id)?;
-        if !self.mutation_hooks.should_apply_locally() {
-            self.write_tracker.record(&self.store_name, txn_id);
-            return Ok(());
         }
 
         let mut table = self.table.write();
@@ -147,7 +139,7 @@ impl Cursor {
         Ok(())
     }
 
-    pub fn delete(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+    pub(crate) fn delete(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         let exists = {
             let mut table = self.table.write();
             table.contains_key(key, txn_id)?
@@ -156,13 +148,6 @@ impl Cursor {
             return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
                 "key not found for delete".to_string(),
             )));
-        }
-
-        self.mutation_hooks
-            .before_delete(&self.store_name, key, txn_id)?;
-        if !self.mutation_hooks.should_apply_locally() {
-            self.write_tracker.record(&self.store_name, txn_id);
-            return Ok(());
         }
 
         let mut table = self.table.write();
@@ -181,12 +166,16 @@ impl Cursor {
         Ok(())
     }
 
-    pub fn get(&mut self, key: &[u8], txn_id: TxnId) -> Result<Option<Vec<u8>>, WrongoDBError> {
+    pub(crate) fn get(
+        &mut self,
+        key: &[u8],
+        txn_id: TxnId,
+    ) -> Result<Option<Vec<u8>>, WrongoDBError> {
         let mut table = self.table.write();
         table.get_version(key, txn_id)
     }
 
-    pub fn next(&mut self, txn_id: TxnId) -> Result<Option<CursorEntry>, WrongoDBError> {
+    pub(crate) fn next(&mut self, txn_id: TxnId) -> Result<Option<CursorEntry>, WrongoDBError> {
         if self.exhausted {
             return Ok(None);
         }
@@ -252,7 +241,7 @@ impl Cursor {
     }
 
     /// Reset the cursor position to the beginning.
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.buffered_entries.clear();
         self.buffer_pos = 0;
         self.exhausted = false;
@@ -267,74 +256,7 @@ mod tests {
     use tempfile::{tempdir, TempDir};
 
     use super::*;
-    use crate::hooks::MutationHooks;
     use crate::txn::{GlobalTxnState, TransactionManager, TXN_NONE};
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum HookOp {
-        Put {
-            store_name: String,
-            key: Vec<u8>,
-            value: Vec<u8>,
-            txn_id: TxnId,
-        },
-        Delete {
-            store_name: String,
-            key: Vec<u8>,
-            txn_id: TxnId,
-        },
-    }
-
-    #[derive(Debug)]
-    struct MockHooks {
-        apply_locally: bool,
-        ops: Mutex<Vec<HookOp>>,
-    }
-
-    impl MockHooks {
-        fn new(apply_locally: bool) -> Self {
-            Self {
-                apply_locally,
-                ops: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl MutationHooks for MockHooks {
-        fn before_put(
-            &self,
-            store_name: &str,
-            key: &[u8],
-            value: &[u8],
-            txn_id: TxnId,
-        ) -> Result<(), WrongoDBError> {
-            self.ops.lock().push(HookOp::Put {
-                store_name: store_name.to_string(),
-                key: key.to_vec(),
-                value: value.to_vec(),
-                txn_id,
-            });
-            Ok(())
-        }
-
-        fn before_delete(
-            &self,
-            store_name: &str,
-            key: &[u8],
-            txn_id: TxnId,
-        ) -> Result<(), WrongoDBError> {
-            self.ops.lock().push(HookOp::Delete {
-                store_name: store_name.to_string(),
-                key: key.to_vec(),
-                txn_id,
-            });
-            Ok(())
-        }
-
-        fn should_apply_locally(&self) -> bool {
-            self.apply_locally
-        }
-    }
 
     fn open_index_table() -> (TempDir, Arc<RwLock<Table>>, String) {
         let tmp = tempdir().unwrap();
@@ -349,46 +271,42 @@ mod tests {
     }
 
     #[test]
-    fn insert_calls_hooks_and_skips_local_apply_when_disabled() {
-        let hooks = Arc::new(MockHooks::new(false));
+    fn insert_applies_locally() {
         let (_tmp, table, store_name) = open_index_table();
-        let mut cursor = Cursor::new(
-            table.clone(),
-            store_name,
-            hooks.clone(),
-            StoreWriteTracker::new(),
-        );
+        let mut cursor = Cursor::new(table.clone(), store_name, StoreWriteTracker::new());
 
         cursor.insert(b"k1", b"v1", TXN_NONE).unwrap();
 
-        let ops = hooks.ops.lock();
-        assert_eq!(ops.len(), 1);
-        assert!(matches!(&ops[0], HookOp::Put { .. }));
-        drop(ops);
-        assert_eq!(table.write().get_version(b"k1", TXN_NONE).unwrap(), None);
+        assert_eq!(
+            table.write().get_version(b"k1", TXN_NONE).unwrap(),
+            Some(b"v1".to_vec())
+        );
     }
 
     #[test]
-    fn delete_calls_hooks_and_applies_locally_when_enabled() {
-        let hooks = Arc::new(MockHooks::new(true));
+    fn delete_applies_locally() {
         let (_tmp, table, store_name) = open_index_table();
         table
             .write()
             .local_apply_put_with_txn(b"k1", b"v1", TXN_NONE)
             .unwrap();
-        let mut cursor = Cursor::new(
-            table.clone(),
-            store_name,
-            hooks.clone(),
-            StoreWriteTracker::new(),
-        );
+        let mut cursor = Cursor::new(table.clone(), store_name, StoreWriteTracker::new());
 
         cursor.delete(b"k1", TXN_NONE).unwrap();
 
-        let ops = hooks.ops.lock();
-        assert_eq!(ops.len(), 1);
-        assert!(matches!(&ops[0], HookOp::Delete { .. }));
-        drop(ops);
         assert_eq!(table.write().get_version(b"k1", TXN_NONE).unwrap(), None);
+    }
+
+    #[test]
+    fn write_tracker_records_touched_store_for_transactional_writes() {
+        let (_tmp, table, store_name) = open_index_table();
+        let touched_stores = Arc::new(Mutex::new(HashSet::new()));
+        let write_tracker = StoreWriteTracker::new();
+        write_tracker.begin(7, touched_stores.clone());
+        let mut cursor = Cursor::new(table, store_name.clone(), write_tracker);
+
+        cursor.insert(b"k1", b"v1", 7).unwrap();
+
+        assert!(touched_stores.lock().contains(&store_name));
     }
 }

@@ -1,3 +1,4 @@
+use serde_json::json;
 use wrongodb::{Connection, ConnectionConfig};
 
 #[test]
@@ -8,15 +9,18 @@ fn test_connection_basic() {
     let mut session = conn.open_session();
     session.create("table:test").unwrap();
 
-    // Open cursor first, then transaction
-    let mut cursor = session.open_cursor("table:test").unwrap();
     {
-        let txn = session.transaction().unwrap();
-        let txn_id = txn.as_ref().id();
-        cursor.insert(b"key1", b"value1", txn_id).unwrap();
+        let mut txn = session.transaction().unwrap();
+        txn.session_mut()
+            .insert_one("test", json!({"_id": "key1", "value": "value1"}))
+            .unwrap();
 
-        let value = cursor.get(b"key1", txn_id).unwrap().unwrap();
-        assert_eq!(value, b"value1");
+        let value = txn
+            .session_mut()
+            .find_one("test", Some(json!({"_id": "key1"})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.get("value"), Some(&json!("value1")));
 
         txn.commit().unwrap();
     }
@@ -31,66 +35,103 @@ fn test_connection_with_config() {
     let mut session = conn.open_session();
     session.create("table:users").unwrap();
 
-    // Open cursor first, then transaction
-    let mut cursor = session.open_cursor("table:users").unwrap();
     {
-        let txn = session.transaction().unwrap();
-        let txn_id = txn.as_ref().id();
-        cursor.insert(b"user1", b"alice", txn_id).unwrap();
-        cursor.insert(b"user2", b"bob", txn_id).unwrap();
+        let mut txn = session.transaction().unwrap();
+        txn.session_mut()
+            .insert_one("users", json!({"_id": "user1", "name": "alice"}))
+            .unwrap();
+        txn.session_mut()
+            .insert_one("users", json!({"_id": "user2", "name": "bob"}))
+            .unwrap();
 
-        let value = cursor.get(b"user1", txn_id).unwrap().unwrap();
-        assert_eq!(value, b"alice");
+        let value = txn
+            .session_mut()
+            .find_one("users", Some(json!({"_id": "user1"})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.get("name"), Some(&json!("alice")));
 
-        let value = cursor.get(b"user2", txn_id).unwrap().unwrap();
-        assert_eq!(value, b"bob");
+        let value = txn
+            .session_mut()
+            .find_one("users", Some(json!({"_id": "user2"})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.get("name"), Some(&json!("bob")));
 
         txn.commit().unwrap();
     }
 }
 
 #[test]
-fn test_cursor_delete() {
+fn test_session_delete() {
     let tmp = tempfile::tempdir().unwrap();
     let conn = Connection::open(tmp.path().join("test"), ConnectionConfig::default()).unwrap();
 
     let mut session = conn.open_session();
     session.create("table:items").unwrap();
 
-    // Open cursor first, then transaction
-    let mut cursor = session.open_cursor("table:items").unwrap();
     {
-        let txn = session.transaction().unwrap();
-        let txn_id = txn.as_ref().id();
-        cursor.insert(b"item1", b"apple", txn_id).unwrap();
-        cursor.insert(b"item2", b"banana", txn_id).unwrap();
+        let mut txn = session.transaction().unwrap();
+        txn.session_mut()
+            .insert_one("items", json!({"_id": "item1", "value": "apple"}))
+            .unwrap();
+        txn.session_mut()
+            .insert_one("items", json!({"_id": "item2", "value": "banana"}))
+            .unwrap();
 
-        let value = cursor.get(b"item1", txn_id).unwrap().unwrap();
-        assert_eq!(value, b"apple");
+        let value = txn
+            .session_mut()
+            .find_one("items", Some(json!({"_id": "item1"})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.get("value"), Some(&json!("apple")));
 
-        cursor.delete(b"item1", txn_id).unwrap();
+        txn.session_mut()
+            .delete_one("items", Some(json!({"_id": "item1"})))
+            .unwrap();
 
-        assert!(cursor.get(b"item1", txn_id).unwrap().is_none());
+        assert!(txn
+            .session_mut()
+            .find_one("items", Some(json!({"_id": "item1"})))
+            .unwrap()
+            .is_none());
 
-        let value = cursor.get(b"item2", txn_id).unwrap().unwrap();
-        assert_eq!(value, b"banana");
+        let value = txn
+            .session_mut()
+            .find_one("items", Some(json!({"_id": "item2"})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(value.get("value"), Some(&json!("banana")));
 
         txn.commit().unwrap();
     }
 }
 
 #[test]
-fn test_cursor_txn_none_visibility_with_wal() {
+fn test_session_autocommit_visibility_with_wal() {
     let tmp = tempfile::tempdir().unwrap();
     let conn = Connection::open(tmp.path().join("test"), ConnectionConfig::default()).unwrap();
 
     let mut session = conn.open_session();
     session.create("table:kv").unwrap();
 
-    let mut cursor = session.open_cursor("table:kv").unwrap();
-    cursor.insert(b"k1", b"v1", 0).unwrap();
-    assert_eq!(cursor.get(b"k1", 0).unwrap(), Some(b"v1".to_vec()));
+    session
+        .insert_one("kv", json!({"_id": "k1", "value": "v1"}))
+        .unwrap();
+    assert_eq!(
+        session
+            .find_one("kv", Some(json!({"_id": "k1"})))
+            .unwrap()
+            .unwrap()
+            .get("value"),
+        Some(&json!("v1"))
+    );
 
-    cursor.delete(b"k1", 0).unwrap();
-    assert_eq!(cursor.get(b"k1", 0).unwrap(), None);
+    session
+        .delete_one("kv", Some(json!({"_id": "k1"})))
+        .unwrap();
+    assert!(session
+        .find_one("kv", Some(json!({"_id": "k1"})))
+        .unwrap()
+        .is_none());
 }

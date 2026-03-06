@@ -9,8 +9,7 @@ use crate::core::bson::{decode_document, encode_document, encode_id_value};
 use crate::core::document::{normalize_document_in_place, validate_is_object};
 use crate::core::errors::StorageError;
 use crate::document_ops::update::apply_update;
-use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp};
-use crate::hooks::MutationHooks;
+use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp, RequestApplyMode};
 use crate::index::{decode_index_id, encode_index_key, encode_range_bounds};
 use crate::schema::SchemaCatalog;
 use crate::storage::table_cache::TableCache;
@@ -41,7 +40,6 @@ pub struct Session {
     schema_catalog: Arc<SchemaCatalog>,
     transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
-    mutation_hooks: Arc<dyn MutationHooks>,
     write_tracker: StoreWriteTracker,
     active_txn: Option<ActiveTxn>,
 }
@@ -52,14 +50,12 @@ impl Session {
         schema_catalog: Arc<SchemaCatalog>,
         transaction_manager: Arc<TransactionManager>,
         durability_backend: Arc<DurabilityBackend>,
-        mutation_hooks: Arc<dyn MutationHooks>,
     ) -> Self {
         Self {
             table_cache,
             schema_catalog,
             transaction_manager,
             durability_backend,
-            mutation_hooks,
             write_tracker: StoreWriteTracker::new(),
             active_txn: None,
         }
@@ -77,7 +73,7 @@ impl Session {
         Ok(())
     }
 
-    pub fn open_cursor(&mut self, uri: &str) -> Result<Cursor, WrongoDBError> {
+    pub(crate) fn open_cursor(&mut self, uri: &str) -> Result<Cursor, WrongoDBError> {
         let store_name = self.schema_catalog.resolve_uri(uri)?;
         self.open_store_cursor(&store_name)
     }
@@ -158,9 +154,12 @@ impl Session {
             })?;
             let key = encode_id_value(id)?;
             let value = encode_document(&updated_doc)?;
-
-            let mut cursor = session.open_cursor(&format!("table:{collection}"))?;
-            cursor.update(&key, &value, txn_id)?;
+            let primary_store = session
+                .schema_catalog
+                .collection_schema(collection)?
+                .primary_store()
+                .to_string();
+            session.update_store_value(&primary_store, &key, &value, txn_id)?;
 
             session.apply_index_remove(collection, doc, txn_id)?;
             session.apply_index_add(collection, &updated_doc, txn_id)?;
@@ -196,9 +195,12 @@ impl Session {
                 })?;
                 let key = encode_id_value(id)?;
                 let value = encode_document(&updated_doc)?;
-
-                let mut cursor = session.open_cursor(&format!("table:{collection}"))?;
-                cursor.update(&key, &value, txn_id)?;
+                let primary_store = session
+                    .schema_catalog
+                    .collection_schema(collection)?
+                    .primary_store()
+                    .to_string();
+                session.update_store_value(&primary_store, &key, &value, txn_id)?;
 
                 session.apply_index_remove(collection, &doc, txn_id)?;
                 session.apply_index_add(collection, &updated_doc, txn_id)?;
@@ -229,9 +231,12 @@ impl Session {
                 return Ok(0);
             };
             let key = encode_id_value(id)?;
-
-            let mut cursor = session.open_cursor(&format!("table:{collection}"))?;
-            cursor.delete(&key, txn_id)?;
+            let primary_store = session
+                .schema_catalog
+                .collection_schema(collection)?
+                .primary_store()
+                .to_string();
+            session.delete_store_value(&primary_store, &key, txn_id)?;
             session.apply_index_remove(collection, doc, txn_id)?;
             Ok(1)
         })
@@ -255,9 +260,12 @@ impl Session {
                     continue;
                 };
                 let key = encode_id_value(id)?;
-
-                let mut cursor = session.open_cursor(&format!("table:{collection}"))?;
-                cursor.delete(&key, txn_id)?;
+                let primary_store = session
+                    .schema_catalog
+                    .collection_schema(collection)?
+                    .primary_store()
+                    .to_string();
+                session.delete_store_value(&primary_store, &key, txn_id)?;
                 session.apply_index_remove(collection, &doc, txn_id)?;
                 deleted += 1;
             }
@@ -282,7 +290,6 @@ impl Session {
                 return Ok(());
             };
 
-            let mut cursor = session.open_store_cursor(&store_name)?;
             for doc in docs {
                 let Some(id) = doc.get("_id") else {
                     continue;
@@ -293,7 +300,7 @@ impl Session {
                 let Some(key) = encode_index_key(value, id)? else {
                     continue;
                 };
-                cursor.insert(&key, &[], txn_id)?;
+                session.insert_store_value(&store_name, &key, &[], txn_id)?;
             }
 
             Ok(())
@@ -340,6 +347,141 @@ impl Session {
         self.durability_backend.truncate_to_checkpoint()
     }
 
+    fn request_apply_mode(&self) -> RequestApplyMode {
+        self.durability_backend.request_apply_mode()
+    }
+
+    fn record_put(
+        &self,
+        store_name: &str,
+        key: &[u8],
+        value: &[u8],
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError> {
+        self.durability_backend.record(
+            DurableOp::Put {
+                store_name: store_name.to_string(),
+                key: key.to_vec(),
+                value: value.to_vec(),
+                txn_id,
+            },
+            DurabilityGuarantee::Buffered,
+        )
+    }
+
+    fn record_delete(
+        &self,
+        store_name: &str,
+        key: &[u8],
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError> {
+        self.durability_backend.record(
+            DurableOp::Delete {
+                store_name: store_name.to_string(),
+                key: key.to_vec(),
+                txn_id,
+            },
+            DurabilityGuarantee::Buffered,
+        )
+    }
+
+    fn record_commit(&self, txn_id: TxnId) -> Result<(), WrongoDBError> {
+        self.durability_backend.record(
+            DurableOp::TxnCommit {
+                txn_id,
+                commit_ts: txn_id,
+            },
+            DurabilityGuarantee::Sync,
+        )
+    }
+
+    fn record_abort(&self, txn_id: TxnId) -> Result<(), WrongoDBError> {
+        self.durability_backend.record(
+            DurableOp::TxnAbort { txn_id },
+            DurabilityGuarantee::Buffered,
+        )
+    }
+
+    fn store_contains_key(
+        &self,
+        store_name: &str,
+        key: &[u8],
+        txn_id: TxnId,
+    ) -> Result<bool, WrongoDBError> {
+        let table = self.table_cache.get_or_open_store(store_name)?;
+        let mut table = table.write();
+        table.contains_key(key, txn_id)
+    }
+
+    fn insert_store_value(
+        &mut self,
+        store_name: &str,
+        key: &[u8],
+        value: &[u8],
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError> {
+        match self.request_apply_mode() {
+            RequestApplyMode::LocalNow => {
+                let mut cursor = self.open_store_cursor(store_name)?;
+                cursor.insert(key, value, txn_id)
+            }
+            RequestApplyMode::DeferredCommittedApply => {
+                if self.store_contains_key(store_name, key, txn_id)? {
+                    return Err(crate::core::errors::DocumentValidationError(
+                        "duplicate key error".into(),
+                    )
+                    .into());
+                }
+                self.record_put(store_name, key, value, txn_id)
+            }
+        }
+    }
+
+    fn update_store_value(
+        &mut self,
+        store_name: &str,
+        key: &[u8],
+        value: &[u8],
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError> {
+        match self.request_apply_mode() {
+            RequestApplyMode::LocalNow => {
+                let mut cursor = self.open_store_cursor(store_name)?;
+                cursor.update(key, value, txn_id)
+            }
+            RequestApplyMode::DeferredCommittedApply => {
+                if !self.store_contains_key(store_name, key, txn_id)? {
+                    return Err(WrongoDBError::Storage(StorageError(
+                        "key not found for update".to_string(),
+                    )));
+                }
+                self.record_put(store_name, key, value, txn_id)
+            }
+        }
+    }
+
+    fn delete_store_value(
+        &mut self,
+        store_name: &str,
+        key: &[u8],
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError> {
+        match self.request_apply_mode() {
+            RequestApplyMode::LocalNow => {
+                let mut cursor = self.open_store_cursor(store_name)?;
+                cursor.delete(key, txn_id)
+            }
+            RequestApplyMode::DeferredCommittedApply => {
+                if !self.store_contains_key(store_name, key, txn_id)? {
+                    return Err(WrongoDBError::Storage(StorageError(
+                        "key not found for delete".to_string(),
+                    )));
+                }
+                self.record_delete(store_name, key, txn_id)
+            }
+        }
+    }
+
     fn with_txn<R, F>(&mut self, f: F) -> Result<R, WrongoDBError>
     where
         F: FnOnce(&mut Session) -> Result<R, WrongoDBError>,
@@ -378,8 +520,12 @@ impl Session {
         let value = encode_document(&obj)?;
         let txn_id = self.require_txn_id()?;
 
-        let mut cursor = self.open_cursor(&format!("table:{collection}"))?;
-        cursor.insert(&key, &value, txn_id)?;
+        let primary_store = self
+            .schema_catalog
+            .collection_schema(collection)?
+            .primary_store()
+            .to_string();
+        self.insert_store_value(&primary_store, &key, &value, txn_id)?;
         self.apply_index_add(collection, &obj, txn_id)?;
         Ok(obj)
     }
@@ -521,11 +667,10 @@ impl Session {
             let Some(key) = encode_index_key(value, id)? else {
                 continue;
             };
-            let mut cursor = self.open_store_cursor(&def.source)?;
             if is_add {
-                cursor.insert(&key, &[], txn_id)?;
+                self.insert_store_value(&def.source, &key, &[], txn_id)?;
             } else {
-                cursor.delete(&key, txn_id)?;
+                self.delete_store_value(&def.source, &key, txn_id)?;
             }
         }
         Ok(())
@@ -536,7 +681,6 @@ impl Session {
         Ok(Cursor::new(
             table,
             store_name.to_string(),
-            self.mutation_hooks.clone(),
             self.write_tracker.clone(),
         ))
     }
@@ -581,7 +725,9 @@ impl<'a> SessionTxn<'a> {
         let touched_stores: Vec<String> = active.touched_stores.lock().iter().cloned().collect();
         let txn_id = active.txn.id();
 
-        self.session.mutation_hooks.before_commit(txn_id, txn_id)?;
+        if self.session.request_apply_mode() == RequestApplyMode::DeferredCommittedApply {
+            self.session.record_commit(txn_id)?;
+        }
 
         let active =
             self.session.active_txn.as_mut().ok_or_else(|| {
@@ -595,7 +741,7 @@ impl<'a> SessionTxn<'a> {
         self.session.write_tracker.clear();
         self.committed = true;
 
-        if self.session.mutation_hooks.should_apply_locally() {
+        if self.session.request_apply_mode() == RequestApplyMode::LocalNow {
             self.session
                 .finalize_touched_stores_locally(&touched_stores, txn_id, true)?;
         }
@@ -611,7 +757,9 @@ impl<'a> SessionTxn<'a> {
         let touched_stores: Vec<String> = active.touched_stores.lock().iter().cloned().collect();
         let txn_id = active.txn.id();
 
-        self.session.mutation_hooks.before_abort(txn_id)?;
+        if self.session.request_apply_mode() == RequestApplyMode::DeferredCommittedApply {
+            self.session.record_abort(txn_id)?;
+        }
 
         let active =
             self.session.active_txn.as_mut().ok_or_else(|| {
@@ -625,7 +773,7 @@ impl<'a> SessionTxn<'a> {
         self.session.write_tracker.clear();
         self.committed = true;
 
-        if self.session.mutation_hooks.should_apply_locally() {
+        if self.session.request_apply_mode() == RequestApplyMode::LocalNow {
             self.session
                 .finalize_touched_stores_locally(&touched_stores, txn_id, false)?;
         }
@@ -672,13 +820,15 @@ impl<'a> Drop for SessionTxn<'a> {
             let touched_stores: Vec<String> =
                 active.touched_stores.lock().iter().cloned().collect();
             let txn_id = active.txn.id();
-            let _ = self.session.mutation_hooks.before_abort(txn_id);
+            if self.session.request_apply_mode() == RequestApplyMode::DeferredCommittedApply {
+                let _ = self.session.record_abort(txn_id);
+            }
             let _ = self
                 .session
                 .transaction_manager
                 .abort_txn_state(&mut active.txn);
             self.session.write_tracker.clear();
-            if self.session.mutation_hooks.should_apply_locally() {
+            if self.session.request_apply_mode() == RequestApplyMode::LocalNow {
                 let _ =
                     self.session
                         .finalize_touched_stores_locally(&touched_stores, txn_id, false);
@@ -691,59 +841,33 @@ impl<'a> Drop for SessionTxn<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use parking_lot::Mutex;
     use serde_json::json;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     use super::*;
     use crate::api::connection::{Connection, ConnectionConfig};
+    use crate::core::bson::{encode_document, encode_id_value};
     use crate::durability::DurabilityBackend;
-    use crate::hooks::MutationHooks;
     use crate::storage::wal::{WalReader, WalRecord};
     use crate::txn::GlobalTxnState;
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum HookCall {
-        Commit { txn_id: TxnId, commit_ts: TxnId },
-        Abort { txn_id: TxnId },
-    }
-
-    #[derive(Debug, Default)]
-    struct MockHooks {
-        calls: Mutex<Vec<HookCall>>,
-    }
-
-    impl MutationHooks for MockHooks {
-        fn before_commit(&self, txn_id: TxnId, commit_ts: TxnId) -> Result<(), WrongoDBError> {
-            self.calls
-                .lock()
-                .push(HookCall::Commit { txn_id, commit_ts });
-            Ok(())
-        }
-
-        fn before_abort(&self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-            self.calls.lock().push(HookCall::Abort { txn_id });
-            Ok(())
-        }
-    }
-
-    fn new_session_with_hooks(hooks: Arc<dyn MutationHooks>) -> Session {
+    fn new_session_with_backend(backend: DurabilityBackend) -> Session {
         let dir = tempdir().unwrap();
+        let base_path = dir.path().to_path_buf();
+        std::mem::forget(dir);
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
         let table_cache = Arc::new(TableCache::new(
-            dir.path().to_path_buf(),
+            base_path.clone(),
             transaction_manager.clone(),
         ));
-        let schema_catalog = Arc::new(SchemaCatalog::new(dir.path().to_path_buf()));
+        let schema_catalog = Arc::new(SchemaCatalog::new(base_path));
         Session::new(
             table_cache,
             schema_catalog,
             transaction_manager,
-            Arc::new(DurabilityBackend::Disabled),
-            hooks,
+            Arc::new(backend),
         )
     }
 
@@ -766,9 +890,9 @@ mod tests {
 
         {
             let mut txn = session.transaction().unwrap();
-            let txn_id = txn.as_ref().id();
-            let mut cursor = txn.session_mut().open_cursor("table:items").unwrap();
-            cursor.insert(b"k1", b"v1", txn_id).unwrap();
+            txn.session_mut()
+                .insert_one("items", json!({"_id": "k1", "value": "v1"}))
+                .unwrap();
         }
 
         let wal_path = dir.path().join("global.wal");
@@ -792,9 +916,9 @@ mod tests {
 
         {
             let mut txn = session.transaction().unwrap();
-            let txn_id = txn.as_ref().id();
-            let mut cursor = txn.session_mut().open_cursor("table:items").unwrap();
-            cursor.insert(b"k1", b"v1", txn_id).unwrap();
+            txn.session_mut()
+                .insert_one("items", json!({"_id": "k1", "value": "v1"}))
+                .unwrap();
             txn.commit().unwrap();
         }
 
@@ -808,47 +932,137 @@ mod tests {
     }
 
     #[test]
-    fn commit_calls_before_commit_hook() {
-        let hooks = Arc::new(MockHooks::default());
-        let mut session = new_session_with_hooks(hooks.clone());
-        let txn = session.transaction().unwrap();
-        let txn_id = txn.as_ref().id();
+    fn local_mode_commit_finalizes_touched_stores() {
+        let mut session = new_session_with_backend(DurabilityBackend::Disabled);
+        let mut txn = session.transaction().unwrap();
+        txn.session_mut()
+            .insert_one("items", json!({"_id": "k1", "value": "v1"}))
+            .unwrap();
 
         txn.commit().unwrap();
 
-        let calls = hooks.calls.lock();
+        let doc = session
+            .find_one("items", Some(json!({"_id": "k1"})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.get("value"), Some(&json!("v1")));
+    }
+
+    #[test]
+    fn local_mode_abort_discards_touched_stores() {
+        let mut session = new_session_with_backend(DurabilityBackend::Disabled);
+        let mut txn = session.transaction().unwrap();
+        txn.session_mut()
+            .insert_one("items", json!({"_id": "k1", "value": "v1"}))
+            .unwrap();
+
+        txn.abort().unwrap();
+
+        assert!(session
+            .find_one("items", Some(json!({"_id": "k1"})))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn deferred_mode_records_commit_after_write_ops() {
+        let (backend, recorded_ops) =
+            DurabilityBackend::test_backend(RequestApplyMode::DeferredCommittedApply);
+        let mut session = new_session_with_backend(backend);
+        let mut txn = session.transaction().unwrap();
+        let txn_id = txn.as_ref().id();
+        let doc = json!({"_id": "k1", "value": "v1"});
+        let encoded_key = encode_id_value(&json!("k1")).unwrap();
+        let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
+
+        txn.session_mut().insert_one("items", doc).unwrap();
+        txn.commit().unwrap();
+
         assert_eq!(
-            *calls,
-            vec![HookCall::Commit {
-                txn_id,
-                commit_ts: txn_id
-            }]
+            *recorded_ops.lock(),
+            vec![
+                (
+                    DurableOp::Put {
+                        store_name: "items.main.wt".to_string(),
+                        key: encoded_key,
+                        value: encoded_doc,
+                        txn_id,
+                    },
+                    DurabilityGuarantee::Buffered,
+                ),
+                (
+                    DurableOp::TxnCommit {
+                        txn_id,
+                        commit_ts: txn_id,
+                    },
+                    DurabilityGuarantee::Sync,
+                ),
+            ]
         );
     }
 
     #[test]
-    fn abort_and_drop_call_before_abort_hook() {
-        let hooks = Arc::new(MockHooks::default());
-        let mut session = new_session_with_hooks(hooks.clone());
-        let txn = session.transaction().unwrap();
-        let abort_txn_id = txn.as_ref().id();
-        txn.abort().unwrap();
+    fn deferred_mode_records_abort_for_explicit_and_drop_abort() {
+        let (backend, recorded_ops) =
+            DurabilityBackend::test_backend(RequestApplyMode::DeferredCommittedApply);
+        let mut session = new_session_with_backend(backend);
 
         {
-            let dropped = session.transaction().unwrap();
-            let drop_txn_id = dropped.as_ref().id();
+            let mut txn = session.transaction().unwrap();
+            let txn_id = txn.as_ref().id();
+            let doc = json!({"_id": "abort-me", "value": "v1"});
+            let encoded_key = encode_id_value(&json!("abort-me")).unwrap();
+            let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
+            txn.session_mut().insert_one("items", doc).unwrap();
+            txn.abort().unwrap();
+
+            assert_eq!(
+                *recorded_ops.lock(),
+                vec![
+                    (
+                        DurableOp::Put {
+                            store_name: "items.main.wt".to_string(),
+                            key: encoded_key,
+                            value: encoded_doc,
+                            txn_id,
+                        },
+                        DurabilityGuarantee::Buffered,
+                    ),
+                    (
+                        DurableOp::TxnAbort { txn_id },
+                        DurabilityGuarantee::Buffered
+                    ),
+                ]
+            );
+        }
+
+        recorded_ops.lock().clear();
+
+        {
+            let mut dropped = session.transaction().unwrap();
+            let txn_id = dropped.as_ref().id();
+            let doc = json!({"_id": "drop-me", "value": "v2"});
+            let encoded_key = encode_id_value(&json!("drop-me")).unwrap();
+            let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
+            dropped.session_mut().insert_one("items", doc).unwrap();
             drop(dropped);
 
-            let calls = hooks.calls.lock();
             assert_eq!(
-                *calls,
+                *recorded_ops.lock(),
                 vec![
-                    HookCall::Abort {
-                        txn_id: abort_txn_id
-                    },
-                    HookCall::Abort {
-                        txn_id: drop_txn_id
-                    }
+                    (
+                        DurableOp::Put {
+                            store_name: "items.main.wt".to_string(),
+                            key: encoded_key,
+                            value: encoded_doc,
+                            txn_id,
+                        },
+                        DurabilityGuarantee::Buffered,
+                    ),
+                    (
+                        DurableOp::TxnAbort { txn_id },
+                        DurabilityGuarantee::Buffered
+                    ),
                 ]
             );
         }

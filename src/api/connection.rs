@@ -120,7 +120,6 @@ impl Connection {
             self.schema_catalog.clone(),
             self.transaction_manager.clone(),
             self.durability_backend.clone(),
-            self.durability_backend.mutation_hooks(),
         )
     }
 

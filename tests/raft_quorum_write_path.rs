@@ -1,5 +1,6 @@
 use std::net::TcpListener;
 
+use serde_json::json;
 use tempfile::tempdir;
 
 use wrongodb::{Connection, ConnectionConfig, RaftMode, RaftPeerConfig, WrongoDBError};
@@ -13,11 +14,13 @@ fn free_local_addr() -> String {
 
 fn insert_kv(conn: &Connection, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
     let mut session = conn.open_session();
-    let mut txn = session.transaction()?;
-    let txn_id = txn.as_ref().id();
-    let mut cursor = txn.session_mut().open_cursor("table:test")?;
-    cursor.insert(key, value, txn_id)?;
-    txn.commit()?;
+    session.insert_one(
+        "test",
+        json!({
+            "_id": String::from_utf8_lossy(key).to_string(),
+            "value": String::from_utf8_lossy(value).to_string(),
+        }),
+    )?;
     Ok(())
 }
 
@@ -34,14 +37,11 @@ fn standalone_mode_commits_writes_with_majority_one() {
     insert_kv(&conn, b"alice", b"value").unwrap();
 
     let mut session = conn.open_session();
-    let mut txn = session.transaction().unwrap();
-    let txn_id = txn.as_ref().id();
-    let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
-    assert_eq!(
-        cursor.get(b"alice", txn_id).unwrap(),
-        Some(b"value".to_vec())
-    );
-    txn.commit().unwrap();
+    let doc = session
+        .find_one("test", Some(json!({"_id": "alice"})))
+        .unwrap()
+        .unwrap();
+    assert_eq!(doc.get("value"), Some(&json!("value")));
 }
 
 #[test]
