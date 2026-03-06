@@ -34,7 +34,9 @@ pub trait MutationHooks: Send + Sync + std::fmt::Debug {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct NoopMutationHooks;
 
+#[cfg(test)]
 impl MutationHooks for NoopMutationHooks {}

@@ -6,20 +6,20 @@ use parking_lot::Mutex;
 use crate::durability::{CommittedDurableOp, DurableOp};
 use crate::raft::command::CommittedCommand;
 use crate::raft::service::CommittedCommandExecutor;
-use crate::storage::store_registry::StoreRegistry;
+use crate::storage::table_cache::TableCache;
 use crate::txn::{TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
 #[derive(Debug)]
 pub(crate) struct StoreCommandApplier {
-    store_registry: Arc<StoreRegistry>,
+    table_cache: Arc<TableCache>,
     touched_stores: Mutex<HashMap<TxnId, HashSet<String>>>,
 }
 
 impl StoreCommandApplier {
-    pub(crate) fn new(store_registry: Arc<StoreRegistry>) -> Self {
+    pub(crate) fn new(table_cache: Arc<TableCache>) -> Self {
         Self {
-            store_registry,
+            table_cache,
             touched_stores: Mutex::new(HashMap::new()),
         }
     }
@@ -29,7 +29,7 @@ impl StoreCommandApplier {
     }
 
     pub(crate) fn checkpoint_open_stores(&self) -> Result<(), WrongoDBError> {
-        for table in self.store_registry.all_handles() {
+        for table in self.table_cache.all_handles() {
             table.write().checkpoint()?;
         }
         Ok(())
@@ -43,7 +43,7 @@ impl StoreCommandApplier {
                 value,
                 txn_id,
             } => {
-                let table = self.store_registry.resolve_or_open_store(&store_name)?;
+                let table = self.table_cache.get_or_open_store(&store_name)?;
                 table
                     .write()
                     .local_apply_put_with_txn(&key, &value, txn_id)?;
@@ -57,7 +57,7 @@ impl StoreCommandApplier {
                 key,
                 txn_id,
             } => {
-                let table = self.store_registry.resolve_or_open_store(&store_name)?;
+                let table = self.table_cache.get_or_open_store(&store_name)?;
                 let _ = table.write().local_apply_delete_with_txn(&key, txn_id)?;
                 if txn_id != TXN_NONE {
                     let mut touched = self.touched_stores.lock();
@@ -74,7 +74,7 @@ impl StoreCommandApplier {
                     .remove(&txn_id)
                     .unwrap_or_default();
                 for store_name in touched {
-                    let table = self.store_registry.resolve_or_open_store(&store_name)?;
+                    let table = self.table_cache.get_or_open_store(&store_name)?;
                     table.write().local_mark_updates_committed(txn_id)?;
                 }
             }
@@ -88,7 +88,7 @@ impl StoreCommandApplier {
                     .remove(&txn_id)
                     .unwrap_or_default();
                 for store_name in touched {
-                    let table = self.store_registry.resolve_or_open_store(&store_name)?;
+                    let table = self.table_cache.get_or_open_store(&store_name)?;
                     table.write().local_mark_updates_aborted(txn_id)?;
                 }
             }

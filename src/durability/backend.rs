@@ -14,7 +14,7 @@ use crate::txn::TxnId;
 use crate::WrongoDBError;
 
 #[cfg(test)]
-use crate::storage::store_registry::StoreRegistry;
+use crate::storage::table_cache::TableCache;
 #[cfg(test)]
 use crate::txn::GlobalTxnState;
 #[cfg(test)]
@@ -349,11 +349,11 @@ mod tests {
         Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())))
     }
 
-    fn new_store_registry(
+    fn new_table_cache(
         dir: &tempfile::TempDir,
         txn_manager: Arc<TransactionManager>,
-    ) -> Arc<StoreRegistry> {
-        Arc::new(StoreRegistry::new(dir.path().to_path_buf(), txn_manager))
+    ) -> Arc<TableCache> {
+        Arc::new(TableCache::new(dir.path().to_path_buf(), txn_manager))
     }
 
     fn new_durability_backend(
@@ -362,8 +362,8 @@ mod tests {
         raft_mode: RaftMode,
     ) -> DurabilityBackend {
         let txn_manager = new_txn_manager();
-        let registry = new_store_registry(dir, txn_manager);
-        let applier = Arc::new(StoreCommandApplier::new(registry));
+        let table_cache = new_table_cache(dir, txn_manager);
+        let applier = Arc::new(StoreCommandApplier::new(table_cache));
         DurabilityBackend::open(dir.path(), wal_enabled, applier, raft_mode).unwrap()
     }
 
@@ -494,8 +494,8 @@ mod tests {
         file.sync_all().unwrap();
 
         let txn_manager = new_txn_manager();
-        let registry = new_store_registry(&dir, txn_manager);
-        let applier = Arc::new(StoreCommandApplier::new(registry));
+        let table_cache = new_table_cache(&dir, txn_manager);
+        let applier = Arc::new(StoreCommandApplier::new(table_cache));
         let err =
             DurabilityBackend::open(dir.path(), true, applier, RaftMode::Standalone).unwrap_err();
         assert!(err.to_string().contains("raft hard state"));

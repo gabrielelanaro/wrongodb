@@ -2,7 +2,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::core::errors::StorageError;
-use crate::hooks::MutationHooks;
 use crate::index::IndexCatalog;
 use crate::storage::block::file::NONE_BLOCK_ID;
 use crate::storage::btree::page::LeafPage;
@@ -23,7 +22,6 @@ pub struct Table {
     btree: BTree,
     store_name: String,
     transaction_manager: Arc<TransactionManager>,
-    mutation_hooks: Arc<dyn MutationHooks>,
     index_catalog: Option<IndexCatalog>,
 }
 
@@ -32,23 +30,17 @@ impl Table {
         collection: &str,
         db_dir: P,
         transaction_manager: Arc<TransactionManager>,
-        mutation_hooks: Arc<dyn MutationHooks>,
     ) -> Result<Self, WrongoDBError> {
         let db_dir = db_dir.as_ref();
         let path = db_dir.join(format!("{}.main.wt", collection));
         let btree = Self::open_or_create_btree(&path)?;
         let store_name = store_name_from_path(&path)?;
-        let index_catalog = IndexCatalog::load_or_init(
-            collection,
-            db_dir,
-            transaction_manager.clone(),
-            mutation_hooks.clone(),
-        )?;
+        let index_catalog =
+            IndexCatalog::load_or_init(collection, db_dir, transaction_manager.clone())?;
         Ok(Self {
             btree,
             store_name,
             transaction_manager,
-            mutation_hooks,
             index_catalog: Some(index_catalog),
         })
     }
@@ -56,7 +48,6 @@ impl Table {
     pub fn open_or_create_index<P: AsRef<Path>>(
         path: P,
         transaction_manager: Arc<TransactionManager>,
-        mutation_hooks: Arc<dyn MutationHooks>,
     ) -> Result<Self, WrongoDBError> {
         let path = path.as_ref();
         let btree = Self::open_or_create_btree(path)?;
@@ -65,7 +56,6 @@ impl Table {
             btree,
             store_name,
             transaction_manager,
-            mutation_hooks,
             index_catalog: None,
         })
     }
@@ -80,17 +70,6 @@ impl Table {
 
     pub fn store_name(&self) -> &str {
         &self.store_name
-    }
-
-    pub fn mutation_hooks(&self) -> Arc<dyn MutationHooks> {
-        self.mutation_hooks.clone()
-    }
-
-    pub fn set_mutation_hooks(&mut self, mutation_hooks: Arc<dyn MutationHooks>) {
-        self.mutation_hooks = mutation_hooks.clone();
-        if let Some(catalog) = self.index_catalog.as_mut() {
-            catalog.set_mutation_hooks(mutation_hooks);
-        }
     }
 
     pub fn scan_range(
@@ -135,44 +114,6 @@ impl Table {
             catalog.checkpoint()?;
         }
         Ok(())
-    }
-
-    /// Insert a key/value pair without MVCC (used by index tables).
-    pub fn insert_raw(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
-        self.insert_raw_with_txn(key, value, crate::txn::TXN_NONE)
-    }
-
-    /// Delete a key without MVCC (used by index tables).
-    pub fn delete_raw(&mut self, key: &[u8]) -> Result<(), WrongoDBError> {
-        let _ = self.delete_raw_with_txn(key, crate::txn::TXN_NONE)?;
-        Ok(())
-    }
-
-    pub fn insert_raw_with_txn(
-        &mut self,
-        key: &[u8],
-        value: &[u8],
-        txn_id: crate::txn::TxnId,
-    ) -> Result<(), WrongoDBError> {
-        self.mutation_hooks
-            .before_put(&self.store_name, key, value, txn_id)?;
-        if !self.mutation_hooks.should_apply_locally() {
-            return Ok(());
-        }
-        self.local_apply_put_with_txn(key, value, txn_id)
-    }
-
-    pub fn delete_raw_with_txn(
-        &mut self,
-        key: &[u8],
-        txn_id: crate::txn::TxnId,
-    ) -> Result<bool, WrongoDBError> {
-        self.mutation_hooks
-            .before_delete(&self.store_name, key, txn_id)?;
-        if !self.mutation_hooks.should_apply_locally() {
-            return Ok(true);
-        }
-        self.local_apply_delete_with_txn(key, txn_id)
     }
 
     pub fn local_apply_put_with_txn(
@@ -300,119 +241,33 @@ fn store_name_from_path(path: &Path) -> Result<String, WrongoDBError> {
 mod tests {
     use std::sync::Arc;
 
-    use parking_lot::Mutex;
     use tempfile::tempdir;
 
     use super::*;
-    use crate::hooks::MutationHooks;
     use crate::txn::{GlobalTxnState, TXN_NONE};
 
-    #[derive(Debug, Default)]
-    struct MockMutationHooks {
-        apply_locally: bool,
-        ops: Mutex<Vec<MockWalOp>>,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum MockWalOp {
-        Put {
-            store_name: String,
-            key: Vec<u8>,
-            value: Vec<u8>,
-            txn_id: TxnId,
-        },
-        Delete {
-            store_name: String,
-            key: Vec<u8>,
-            txn_id: TxnId,
-        },
-    }
-
-    impl MutationHooks for MockMutationHooks {
-        fn before_put(
-            &self,
-            store_name: &str,
-            key: &[u8],
-            value: &[u8],
-            txn_id: TxnId,
-        ) -> Result<(), WrongoDBError> {
-            self.ops.lock().push(MockWalOp::Put {
-                store_name: store_name.to_string(),
-                key: key.to_vec(),
-                value: value.to_vec(),
-                txn_id,
-            });
-            Ok(())
-        }
-
-        fn before_delete(
-            &self,
-            store_name: &str,
-            key: &[u8],
-            txn_id: TxnId,
-        ) -> Result<(), WrongoDBError> {
-            self.ops.lock().push(MockWalOp::Delete {
-                store_name: store_name.to_string(),
-                key: key.to_vec(),
-                txn_id,
-            });
-            Ok(())
-        }
-
-        fn should_apply_locally(&self) -> bool {
-            self.apply_locally
-        }
-    }
-
     #[test]
-    fn table_mutations_flow_through_mutation_hooks() {
+    fn local_apply_and_recovery_writes_do_not_depend_on_hooks() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("table.idx.wt");
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let mutation_hooks = Arc::new(MockMutationHooks {
-            apply_locally: false,
-            ops: Mutex::new(Vec::new()),
-        });
+        let mut table = Table::open_or_create_index(&path, transaction_manager).unwrap();
 
-        let mut table = Table::open_or_create_index(
-            &path,
-            transaction_manager,
-            mutation_hooks.clone() as Arc<dyn MutationHooks>,
-        )
-        .unwrap();
-
-        table.insert_raw_with_txn(b"k1", b"v1", TXN_NONE).unwrap();
-        table.delete_raw_with_txn(b"k1", TXN_NONE).unwrap();
-
-        let ops = mutation_hooks.ops.lock();
-        assert_eq!(ops.len(), 2);
-        assert!(matches!(&ops[0], MockWalOp::Put { .. }));
-        assert!(matches!(&ops[1], MockWalOp::Delete { .. }));
-    }
-
-    #[test]
-    fn recovery_apply_does_not_log_through_mutation_hooks() {
-        let tmp = tempdir().unwrap();
-        let path = tmp.path().join("table.idx.wt");
-        let transaction_manager =
-            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let mutation_hooks = Arc::new(MockMutationHooks {
-            apply_locally: false,
-            ops: Mutex::new(Vec::new()),
-        });
-
-        let mut table = Table::open_or_create_index(
-            &path,
-            transaction_manager,
-            mutation_hooks.clone() as Arc<dyn MutationHooks>,
-        )
-        .unwrap();
+        table
+            .local_apply_put_with_txn(b"k1", b"v1", TXN_NONE)
+            .unwrap();
+        assert_eq!(
+            table.get_version(b"k1", TXN_NONE).unwrap(),
+            Some(b"v1".to_vec())
+        );
+        let deleted = table.local_apply_delete_with_txn(b"k1", TXN_NONE).unwrap();
+        assert!(deleted);
+        assert_eq!(table.get_version(b"k1", TXN_NONE).unwrap(), None);
 
         table.put_recovery(b"k1", b"v1").unwrap();
+        assert_eq!(table.btree.get(b"k1").unwrap(), Some(b"v1".to_vec()));
         table.delete_recovery(b"k1").unwrap();
-
-        let ops = mutation_hooks.ops.lock();
-        assert!(ops.is_empty());
+        assert_eq!(table.btree.get(b"k1").unwrap(), None);
     }
 }

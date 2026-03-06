@@ -3,11 +3,11 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::api::cursor::{Cursor, CursorKind};
-use crate::api::data_handle_cache::DataHandleCache;
 use crate::core::errors::StorageError;
 use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp};
 use crate::hooks::MutationHooks;
 use crate::storage::table::Table;
+use crate::storage::table_cache::TableCache;
 use crate::txn::{Transaction, TransactionManager, TxnId};
 use crate::WrongoDBError;
 
@@ -24,7 +24,7 @@ use crate::WrongoDBError;
 /// - It centralizes transaction visibility + durability orchestration while
 ///   lower layers (`Table`, `Cursor`) stay focused on storage access.
 pub struct Session {
-    cache: Arc<DataHandleCache>,
+    table_cache: Arc<TableCache>,
     transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
     mutation_hooks: Arc<dyn MutationHooks>,
@@ -34,13 +34,13 @@ pub struct Session {
 impl Session {
     // Public API
     pub(crate) fn new(
-        cache: Arc<DataHandleCache>,
+        table_cache: Arc<TableCache>,
         transaction_manager: Arc<TransactionManager>,
         durability_backend: Arc<DurabilityBackend>,
         mutation_hooks: Arc<dyn MutationHooks>,
     ) -> Self {
         Self {
-            cache,
+            table_cache,
             transaction_manager,
             durability_backend,
             mutation_hooks,
@@ -63,7 +63,11 @@ impl Session {
     pub fn open_cursor(&mut self, uri: &str) -> Result<Cursor, WrongoDBError> {
         if let Some(collection) = uri.strip_prefix("table:") {
             let table = self.get_primary_table(collection, true)?;
-            return Ok(Cursor::new(table, CursorKind::Table));
+            return Ok(Cursor::new(
+                table,
+                CursorKind::Table,
+                self.mutation_hooks.clone(),
+            ));
         }
 
         if uri.starts_with("index:") {
@@ -78,7 +82,11 @@ impl Session {
                     .index_handle(index_name)
                     .ok_or_else(|| StorageError("unknown index".into()))?
             };
-            return Ok(Cursor::new(index_table, CursorKind::Index));
+            return Ok(Cursor::new(
+                index_table,
+                CursorKind::Index,
+                self.mutation_hooks.clone(),
+            ));
         }
 
         Err(WrongoDBError::Storage(StorageError(format!(
@@ -93,6 +101,10 @@ impl Session {
         mark_touched: bool,
     ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
         self.get_primary_table(collection, mark_touched)
+    }
+
+    pub(crate) fn mutation_hooks(&self) -> &dyn MutationHooks {
+        self.mutation_hooks.as_ref()
     }
 
     /// Begin a new transaction and return an RAII handle.
@@ -136,7 +148,7 @@ impl Session {
 
     #[allow(dead_code)]
     pub(crate) fn checkpoint_all(&mut self) -> Result<(), WrongoDBError> {
-        let handles = self.cache.all_handles();
+        let handles = self.table_cache.all_handles();
         for table in handles {
             table.write().checkpoint()?;
         }
@@ -157,10 +169,9 @@ impl Session {
         collection: &str,
         mark_touched: bool,
     ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
-        let uri = format!("table:{}", collection);
-        let table = self.cache.get_or_open_primary(&uri, collection)?;
+        let table = self.table_cache.get_or_open_primary(collection)?;
         if mark_touched {
-            self.mark_table_touched(&uri);
+            self.mark_table_touched(&format!("table:{}", collection));
         }
         Ok(table)
     }
@@ -349,10 +360,59 @@ fn parse_index_uri(uri: &str) -> Result<(&str, &str), WrongoDBError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
     use tempfile::tempdir;
 
+    use super::*;
     use crate::api::connection::{Connection, ConnectionConfig};
+    use crate::durability::DurabilityBackend;
+    use crate::hooks::MutationHooks;
+    use crate::storage::table_cache::TableCache;
     use crate::storage::wal::GlobalWal;
+    use crate::txn::GlobalTxnState;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum HookCall {
+        Commit { txn_id: TxnId, commit_ts: TxnId },
+        Abort { txn_id: TxnId },
+    }
+
+    #[derive(Debug, Default)]
+    struct MockHooks {
+        calls: Mutex<Vec<HookCall>>,
+    }
+
+    impl MutationHooks for MockHooks {
+        fn before_commit(&self, txn_id: TxnId, commit_ts: TxnId) -> Result<(), WrongoDBError> {
+            self.calls
+                .lock()
+                .push(HookCall::Commit { txn_id, commit_ts });
+            Ok(())
+        }
+
+        fn before_abort(&self, txn_id: TxnId) -> Result<(), WrongoDBError> {
+            self.calls.lock().push(HookCall::Abort { txn_id });
+            Ok(())
+        }
+    }
+
+    fn new_session_with_hooks(hooks: Arc<dyn MutationHooks>) -> Session {
+        let dir = tempdir().unwrap();
+        let transaction_manager =
+            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+        let table_cache = Arc::new(TableCache::new(
+            dir.path().to_path_buf(),
+            transaction_manager.clone(),
+        ));
+        Session::new(
+            table_cache,
+            transaction_manager,
+            Arc::new(DurabilityBackend::Disabled),
+            hooks,
+        )
+    }
 
     #[test]
     fn checkpoint_all_skips_truncate_when_transaction_active() {
@@ -406,5 +466,52 @@ mod tests {
 
         let after = std::fs::metadata(&wal_path).unwrap().len();
         assert!(after <= 512);
+    }
+
+    #[test]
+    fn commit_calls_before_commit_hook() {
+        let hooks = Arc::new(MockHooks::default());
+        let mut session = new_session_with_hooks(hooks.clone());
+        let txn = session.transaction().unwrap();
+        let txn_id = txn.as_ref().id();
+
+        txn.commit().unwrap();
+
+        let calls = hooks.calls.lock();
+        assert_eq!(
+            *calls,
+            vec![HookCall::Commit {
+                txn_id,
+                commit_ts: txn_id
+            }]
+        );
+    }
+
+    #[test]
+    fn abort_and_drop_call_before_abort_hook() {
+        let hooks = Arc::new(MockHooks::default());
+        let mut session = new_session_with_hooks(hooks.clone());
+        let txn = session.transaction().unwrap();
+        let abort_txn_id = txn.as_ref().id();
+        txn.abort().unwrap();
+
+        {
+            let dropped = session.transaction().unwrap();
+            let drop_txn_id = dropped.as_ref().id();
+            drop(dropped);
+
+            let calls = hooks.calls.lock();
+            assert_eq!(
+                *calls,
+                vec![
+                    HookCall::Abort {
+                        txn_id: abort_txn_id
+                    },
+                    HookCall::Abort {
+                        txn_id: drop_txn_id
+                    }
+                ]
+            );
+        }
     }
 }

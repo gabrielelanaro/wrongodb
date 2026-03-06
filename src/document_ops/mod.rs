@@ -245,7 +245,13 @@ pub(crate) fn create_index(
         let catalog = table_guard
             .index_catalog_mut()
             .ok_or_else(|| StorageError("missing index catalog".into()))?;
-        catalog.add_index(field, vec![field.to_string()], &docs, txn_id)?;
+        catalog.add_index(
+            field,
+            vec![field.to_string()],
+            &docs,
+            txn_id,
+            session.mutation_hooks(),
+        )?;
         Ok(())
     })
 }
@@ -427,7 +433,7 @@ fn apply_index_add(
     let catalog = table_guard
         .index_catalog_mut()
         .ok_or_else(|| StorageError("missing index catalog".into()))?;
-    catalog.add_doc(doc, txn_id)?;
+    catalog.add_doc(doc, txn_id, session.mutation_hooks())?;
     Ok(())
 }
 
@@ -442,7 +448,7 @@ fn apply_index_remove(
     let catalog = table_guard
         .index_catalog_mut()
         .ok_or_else(|| StorageError("missing index catalog".into()))?;
-    catalog.remove_doc(doc, txn_id)?;
+    catalog.remove_doc(doc, txn_id, session.mutation_hooks())?;
     Ok(())
 }
 

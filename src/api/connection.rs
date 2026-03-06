@@ -3,12 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::api::data_handle_cache::DataHandleCache;
 use crate::api::session::Session;
 use crate::durability::{DurabilityBackend, StoreCommandApplier};
-use crate::hooks::MutationHooks;
 use crate::recovery::RecoveryManager;
-use crate::storage::store_registry::StoreRegistry;
+use crate::storage::table_cache::TableCache;
 use crate::txn::{GlobalTxnState, TransactionManager};
 use crate::WrongoDBError;
 
@@ -61,11 +59,10 @@ impl ConnectionConfig {
 
 pub struct Connection {
     base_path: PathBuf,
-    dhandle_cache: Arc<DataHandleCache>,
+    table_cache: Arc<TableCache>,
     wal_enabled: bool,
     transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
-    mutation_hooks: Arc<dyn MutationHooks>,
 }
 
 impl fmt::Debug for Connection {
@@ -87,11 +84,11 @@ impl Connection {
 
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let store_registry = Arc::new(StoreRegistry::new(
+        let table_cache = Arc::new(TableCache::new(
             base_path.clone(),
             transaction_manager.clone(),
         ));
-        let applier = Arc::new(StoreCommandApplier::new(store_registry.clone()));
+        let applier = Arc::new(StoreCommandApplier::new(table_cache.clone()));
 
         if config.wal_enabled {
             RecoveryManager::new(applier.clone()).recover(&base_path)?;
@@ -103,25 +100,22 @@ impl Connection {
             applier,
             config.raft_mode,
         )?);
-        let mutation_hooks = durability_backend.mutation_hooks();
-        store_registry.set_mutation_hooks(mutation_hooks.clone());
 
         Ok(Self {
             base_path,
-            dhandle_cache: Arc::new(DataHandleCache::new(store_registry)),
+            table_cache,
             wal_enabled: config.wal_enabled,
             transaction_manager,
             durability_backend,
-            mutation_hooks,
         })
     }
 
     pub fn open_session(&self) -> Session {
         Session::new(
-            self.dhandle_cache.clone(),
+            self.table_cache.clone(),
             self.transaction_manager.clone(),
             self.durability_backend.clone(),
-            self.mutation_hooks.clone(),
+            self.durability_backend.mutation_hooks(),
         )
     }
 

@@ -1,5 +1,34 @@
 # Decisions
 
+## 2026-03-05: Collapse storage handle caching into `TableCache` and make durability hooks explicit
+
+**Decision**
+- Replace the overlapping `DataHandleCache` and `StoreRegistry` types with a single
+  `TableCache`.
+- Make `Table` storage-only:
+  - remove stored `MutationHooks`
+  - keep only explicit local-apply and recovery methods
+- Move durability interception to the orchestration edges:
+  - `Cursor` calls `before_put` / `before_delete` explicitly before local mutation
+  - `IndexCatalog` and `PersistentIndex` take `&dyn MutationHooks` on mutating calls
+  - `Session` owns the shared hooks instance for a request/session
+- Keep committed apply and recovery on the same local-apply path through
+  `StoreCommandApplier -> TableCache -> Table`.
+
+**Why**
+- `DataHandleCache` and `StoreRegistry` represented the same responsibility at two different
+  abstraction levels, which made the ownership graph harder to follow than the code required.
+- Storing `MutationHooks` inside `Table` hid durability behavior inside cached storage handles.
+  Making hook calls explicit keeps durability policy in the write orchestrators instead of the
+  storage primitive.
+- `TableCache` is the readability-first name for what the type actually does: cache/open table
+  handles for both request-time writes and committed apply.
+
+**Notes**
+- This is an internal readability refactor only; WAL, recovery, and Raft semantics are unchanged.
+- The weak-backed durability hook adapter remains in place to avoid reintroducing a strong
+  ownership cycle through cached tables/hooks.
+
 ## 2026-03-05: Use storage-facing mutation hooks on top of the durability backend
 
 **Decision**

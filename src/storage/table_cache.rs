@@ -4,73 +4,39 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::hooks::{MutationHooks, NoopMutationHooks};
 use crate::storage::table::Table;
 use crate::txn::TransactionManager;
 use crate::WrongoDBError;
 
 #[derive(Debug)]
-pub struct StoreRegistry {
+pub struct TableCache {
     base_path: PathBuf,
     transaction_manager: Arc<TransactionManager>,
-    mutation_hooks: RwLock<Arc<dyn MutationHooks>>,
     handles_by_store: RwLock<HashMap<String, Arc<RwLock<Table>>>>,
-    uri_aliases: RwLock<HashMap<String, String>>,
 }
 
-impl StoreRegistry {
+impl TableCache {
     pub fn new(base_path: PathBuf, transaction_manager: Arc<TransactionManager>) -> Self {
         Self {
             base_path,
             transaction_manager,
-            mutation_hooks: RwLock::new(Arc::new(NoopMutationHooks)),
             handles_by_store: RwLock::new(HashMap::new()),
-            uri_aliases: RwLock::new(HashMap::new()),
-        }
-    }
-
-    pub fn set_mutation_hooks(&self, mutation_hooks: Arc<dyn MutationHooks>) {
-        *self.mutation_hooks.write() = mutation_hooks.clone();
-        let handles: Vec<_> = self
-            .handles_by_store
-            .read()
-            .values()
-            .map(Arc::clone)
-            .collect();
-        for handle in handles {
-            handle.write().set_mutation_hooks(mutation_hooks.clone());
         }
     }
 
     pub fn get_or_open_primary(
         &self,
-        uri: &str,
         collection: &str,
     ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
-        if let Some(store_name) = self.uri_aliases.read().get(uri).cloned() {
-            if let Some(handle) = self.handles_by_store.read().get(&store_name) {
-                return Ok(handle.clone());
-            }
-        }
-
         let store_name = format!("{collection}.main.wt");
-        let table = self.resolve_or_open_store(&store_name)?;
-        self.uri_aliases
-            .write()
-            .insert(uri.to_string(), store_name.clone());
-        self.register_index_handles(&table);
-        Ok(table)
+        self.get_or_open_store(&store_name)
     }
 
-    pub fn resolve_or_open_store(
-        &self,
-        store_name: &str,
-    ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
+    pub fn get_or_open_store(&self, store_name: &str) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
         if let Some(handle) = self.handles_by_store.read().get(store_name) {
             return Ok(handle.clone());
         }
 
-        let mutation_hooks = self.mutation_hooks.read().clone();
         let mut handles = self.handles_by_store.write();
         if let Some(handle) = handles.get(store_name) {
             return Ok(handle.clone());
@@ -81,11 +47,10 @@ impl StoreRegistry {
                 collection,
                 &self.base_path,
                 self.transaction_manager.clone(),
-                mutation_hooks,
             )?
         } else {
             let path = self.base_path.join(store_name);
-            Table::open_or_create_index(path, self.transaction_manager.clone(), mutation_hooks)?
+            Table::open_or_create_index(path, self.transaction_manager.clone())?
         };
         let table = Arc::new(RwLock::new(table));
         handles.insert(store_name.to_string(), table.clone());
