@@ -109,6 +109,7 @@ impl UpdateChain {
 
     /// Remove obsolete updates from the chain, keeping only visible ones.
     /// Returns the number of updates removed.
+    #[allow(dead_code)]
     pub fn truncate_obsolete(&mut self, oldest_active_txn_id: TxnId) -> usize {
         let mut removed = 0;
 
@@ -144,6 +145,7 @@ impl UpdateChain {
     }
 
     /// Check if the chain is empty.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.head.is_none()
     }

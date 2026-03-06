@@ -6,6 +6,7 @@ mod hooks;
 mod index;
 mod raft;
 mod recovery;
+mod schema;
 mod server;
 mod storage;
 mod txn;
@@ -14,13 +15,10 @@ pub mod commands {
     pub use crate::server::commands::*;
 }
 
-pub use crate::api::{
-    Connection, ConnectionConfig, Cursor, CursorKind, RaftMode, RaftPeerConfig, Session,
-};
+pub use crate::api::{Connection, ConnectionConfig, Cursor, RaftMode, RaftPeerConfig, Session};
 pub use crate::core::errors::{DocumentValidationError, StorageError, WrongoDBError};
 pub use crate::index::{
-    decode_index_id, encode_index_key, encode_range_bounds, encode_scalar_prefix, IndexCatalog,
-    IndexDefinition, IndexOpRecord, IndexOpType,
+    decode_index_id, encode_index_key, encode_range_bounds, encode_scalar_prefix,
 };
 pub use crate::server::commands::CommandRegistry;
 pub use crate::server::start_server;

@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use self::commands::handlers::crud::{bson_to_value, value_to_bson};
 use self::commands::CommandRegistry;
-use crate::{document_ops, Connection, WrongoDBError};
+use crate::{Connection, WrongoDBError};
 
 const OP_MSG: i32 = 2013;
 const OP_QUERY: i32 = 2004;
@@ -213,7 +213,7 @@ async fn handle_op_query(
         .map(|(_, coll)| coll)
         .unwrap_or(full_coll_name.as_str());
     let mut session = conn.open_session();
-    let results = match document_ops::find(&mut session, coll_name, Some(filter_json)) {
+    let results = match session.find(coll_name, Some(filter_json)) {
         Ok(results) => results,
         Err(err) => return Ok(command_error_document(&err)),
     };

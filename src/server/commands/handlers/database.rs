@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::commands::Command;
-use crate::{document_ops, Connection, WrongoDBError};
+use crate::{Connection, WrongoDBError};
 use bson::{doc, spec::BinarySubtype, Binary, Bson, Document};
 
 /// Handles: listDatabases
@@ -93,8 +93,8 @@ impl Command for DbStatsCommand {
 
         for name in &collections {
             let mut session = conn.open_session();
-            document_count += document_ops::count(&mut session, name, None)?;
-            index_count += document_ops::list_indexes(&mut session, name)?.len();
+            document_count += session.count(name, None)?;
+            index_count += session.list_indexes(name)?.len();
         }
 
         Ok(doc! {
@@ -122,7 +122,7 @@ impl Command for CollStatsCommand {
     fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("collStats").unwrap_or("test");
         let mut session = conn.open_session();
-        let count = document_ops::count(&mut session, coll_name, None)?;
+        let count = session.count(coll_name, None)?;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),

@@ -1,5 +1,5 @@
 use crate::commands::Command;
-use crate::{document_ops, Connection, WrongoDBError};
+use crate::{Connection, WrongoDBError};
 use bson::{doc, oid::ObjectId, Bson, Document};
 use serde_json::{Map, Value};
 
@@ -88,7 +88,7 @@ impl Command for InsertCommand {
                         _ => ObjectId::new(),
                     };
                     let json_doc = bson_to_json_document(&doc_with_id);
-                    document_ops::insert_one(&mut session, coll_name, Value::Object(json_doc))?;
+                    session.insert_one(coll_name, Value::Object(json_doc))?;
                     ids.push(id);
                 }
             }
@@ -124,7 +124,7 @@ impl Command for FindCommand {
         let filter = doc.get("filter").and_then(|f| f.as_document()).cloned();
         let filter_json = filter.map(|d| bson_to_value(&d));
 
-        let mut results = document_ops::find(&mut session, coll_name, filter_json)?;
+        let mut results = session.find(coll_name, filter_json)?;
 
         let skip = doc.get("skip").and_then(|v| v.as_i64()).unwrap_or(0);
         if skip > 0 {
@@ -192,14 +192,9 @@ impl Command for UpdateCommand {
                     let multi = update_doc.get_bool("multi").unwrap_or(false);
 
                     let result = if multi {
-                        document_ops::update_many(
-                            &mut session,
-                            coll_name,
-                            filter_json,
-                            update_json,
-                        )?
+                        session.update_many(coll_name, filter_json, update_json)?
                     } else {
-                        document_ops::update_one(&mut session, coll_name, filter_json, update_json)?
+                        session.update_one(coll_name, filter_json, update_json)?
                     };
 
                     n_matched += result.matched as i32;
@@ -237,11 +232,9 @@ impl Command for DeleteCommand {
                     let limit = delete_doc.get_i32("limit").unwrap_or(0);
 
                     if limit == 1 {
-                        n_deleted +=
-                            document_ops::delete_one(&mut session, coll_name, filter_json)? as i32;
+                        n_deleted += session.delete_one(coll_name, filter_json)? as i32;
                     } else {
-                        n_deleted +=
-                            document_ops::delete_many(&mut session, coll_name, filter_json)? as i32;
+                        n_deleted += session.delete_many(coll_name, filter_json)? as i32;
                     }
                 }
             }

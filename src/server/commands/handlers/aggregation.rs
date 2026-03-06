@@ -1,6 +1,6 @@
 use super::crud::{bson_to_value, value_to_bson_value};
 use crate::commands::Command;
-use crate::{document_ops, Connection, WrongoDBError};
+use crate::{Connection, WrongoDBError};
 use bson::{doc, Bson, Document};
 use serde_json::Value;
 
@@ -18,7 +18,7 @@ impl Command for CountCommand {
         let query = doc.get("query").and_then(|q| q.as_document()).cloned();
         let filter_json = query.map(|d| bson_to_value(&d));
 
-        let count = document_ops::count(&mut session, coll_name, filter_json)?;
+        let count = session.count(coll_name, filter_json)?;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),
@@ -42,7 +42,7 @@ impl Command for DistinctCommand {
         let query = doc.get("query").and_then(|q| q.as_document()).cloned();
         let filter_json = query.map(|d| bson_to_value(&d));
 
-        let values = document_ops::distinct(&mut session, coll_name, key, filter_json)?;
+        let values = session.distinct(coll_name, key, filter_json)?;
         let values_bson: Vec<Bson> = values
             .into_iter()
             .map(|v| value_to_bson_value(&v))
@@ -69,7 +69,7 @@ impl Command for AggregateCommand {
         let mut session = conn.open_session();
         let pipeline = doc.get_array("pipeline").cloned().unwrap_or_default();
 
-        let mut results = document_ops::find(&mut session, coll_name, None)?;
+        let mut results = session.find(coll_name, None)?;
 
         for stage in pipeline {
             if let Bson::Document(stage_doc) = stage {

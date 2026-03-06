@@ -30,7 +30,7 @@ impl StoreCommandApplier {
 
     pub(crate) fn checkpoint_open_stores(&self) -> Result<(), WrongoDBError> {
         for table in self.table_cache.all_handles() {
-            table.write().checkpoint()?;
+            table.write().checkpoint_store()?;
         }
         Ok(())
     }

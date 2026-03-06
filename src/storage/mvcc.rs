@@ -27,6 +27,7 @@ impl MvccState {
 
     /// Run garbage collection on all update chains.
     /// Returns (chains_cleaned, updates_removed, chains_dropped).
+    #[allow(dead_code)]
     pub fn run_gc(&mut self) -> (usize, usize, usize) {
         let threshold = self.global.oldest_active_txn_id();
         let mut chains_cleaned = 0;

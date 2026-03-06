@@ -205,6 +205,7 @@ impl TransactionManager {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn run_gc_for_store(&self, store_name: &str) -> (usize, usize, usize) {
         let mut stores = self.stores.write();
         stores

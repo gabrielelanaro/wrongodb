@@ -6,6 +6,7 @@ use std::sync::Arc;
 use crate::api::session::Session;
 use crate::durability::{DurabilityBackend, StoreCommandApplier};
 use crate::recovery::RecoveryManager;
+use crate::schema::SchemaCatalog;
 use crate::storage::table_cache::TableCache;
 use crate::txn::{GlobalTxnState, TransactionManager};
 use crate::WrongoDBError;
@@ -59,6 +60,7 @@ impl ConnectionConfig {
 
 pub struct Connection {
     base_path: PathBuf,
+    schema_catalog: Arc<SchemaCatalog>,
     table_cache: Arc<TableCache>,
     wal_enabled: bool,
     transaction_manager: Arc<TransactionManager>,
@@ -84,6 +86,7 @@ impl Connection {
 
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+        let schema_catalog = Arc::new(SchemaCatalog::new(base_path.clone()));
         let table_cache = Arc::new(TableCache::new(
             base_path.clone(),
             transaction_manager.clone(),
@@ -103,6 +106,7 @@ impl Connection {
 
         Ok(Self {
             base_path,
+            schema_catalog,
             table_cache,
             wal_enabled: config.wal_enabled,
             transaction_manager,
@@ -113,6 +117,7 @@ impl Connection {
     pub fn open_session(&self) -> Session {
         Session::new(
             self.table_cache.clone(),
+            self.schema_catalog.clone(),
             self.transaction_manager.clone(),
             self.durability_backend.clone(),
             self.durability_backend.mutation_hooks(),

@@ -2,7 +2,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::core::errors::StorageError;
-use crate::index::IndexCatalog;
 use crate::storage::block::file::NONE_BLOCK_ID;
 use crate::storage::btree::page::LeafPage;
 use crate::storage::btree::BTree;
@@ -22,30 +21,10 @@ pub struct Table {
     btree: BTree,
     store_name: String,
     transaction_manager: Arc<TransactionManager>,
-    index_catalog: Option<IndexCatalog>,
 }
 
 impl Table {
-    pub fn open_or_create_primary<P: AsRef<Path>>(
-        collection: &str,
-        db_dir: P,
-        transaction_manager: Arc<TransactionManager>,
-    ) -> Result<Self, WrongoDBError> {
-        let db_dir = db_dir.as_ref();
-        let path = db_dir.join(format!("{}.main.wt", collection));
-        let btree = Self::open_or_create_btree(&path)?;
-        let store_name = store_name_from_path(&path)?;
-        let index_catalog =
-            IndexCatalog::load_or_init(collection, db_dir, transaction_manager.clone())?;
-        Ok(Self {
-            btree,
-            store_name,
-            transaction_manager,
-            index_catalog: Some(index_catalog),
-        })
-    }
-
-    pub fn open_or_create_index<P: AsRef<Path>>(
+    pub fn open_or_create_store<P: AsRef<Path>>(
         path: P,
         transaction_manager: Arc<TransactionManager>,
     ) -> Result<Self, WrongoDBError> {
@@ -56,20 +35,7 @@ impl Table {
             btree,
             store_name,
             transaction_manager,
-            index_catalog: None,
         })
-    }
-
-    pub fn index_catalog(&self) -> Option<&IndexCatalog> {
-        self.index_catalog.as_ref()
-    }
-
-    pub fn index_catalog_mut(&mut self) -> Option<&mut IndexCatalog> {
-        self.index_catalog.as_mut()
-    }
-
-    pub fn store_name(&self) -> &str {
-        &self.store_name
     }
 
     pub fn scan_range(
@@ -106,14 +72,10 @@ impl Table {
         Ok(out)
     }
 
-    pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
+    pub fn checkpoint_store(&mut self) -> Result<(), WrongoDBError> {
         self.transaction_manager
             .materialize_committed_updates(&self.store_name, &mut self.btree)?;
-        self.btree.checkpoint()?;
-        if let Some(catalog) = self.index_catalog.as_mut() {
-            catalog.checkpoint()?;
-        }
-        Ok(())
+        self.btree.checkpoint()
     }
 
     pub fn local_apply_put_with_txn(
@@ -135,24 +97,15 @@ impl Table {
             .delete(&self.store_name, &mut self.btree, key, txn_id)
     }
 
-    pub fn sync_all(&mut self) -> Result<(), WrongoDBError> {
-        self.btree.sync_all()
-    }
-
+    #[allow(dead_code)]
     pub fn put_recovery(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
         self.btree.put(key, value)
     }
 
+    #[allow(dead_code)]
     pub fn delete_recovery(&mut self, key: &[u8]) -> Result<(), WrongoDBError> {
         let _ = self.btree.delete(key)?;
         Ok(())
-    }
-
-    pub fn mark_updates_committed(
-        &mut self,
-        txn_id: crate::txn::TxnId,
-    ) -> Result<(), WrongoDBError> {
-        self.local_mark_updates_committed(txn_id)
     }
 
     pub fn local_mark_updates_committed(
@@ -161,10 +114,6 @@ impl Table {
     ) -> Result<(), WrongoDBError> {
         self.transaction_manager
             .mark_updates_committed(&self.store_name, txn_id)
-    }
-
-    pub fn mark_updates_aborted(&mut self, txn_id: crate::txn::TxnId) -> Result<(), WrongoDBError> {
-        self.local_mark_updates_aborted(txn_id)
     }
 
     pub fn local_mark_updates_aborted(
@@ -184,18 +133,9 @@ impl Table {
             .get(&self.store_name, &mut self.btree, key, txn_id)
     }
 
-    pub fn run_gc(&mut self) -> (usize, usize, usize) {
-        let (chains, updates, dropped) =
-            self.transaction_manager.run_gc_for_store(&self.store_name);
-        if let Some(catalog) = self.index_catalog.as_mut() {
-            let (idx_chains, idx_updates, idx_dropped) = catalog.run_gc();
-            return (
-                chains + idx_chains,
-                updates + idx_updates,
-                dropped + idx_dropped,
-            );
-        }
-        (chains, updates, dropped)
+    #[allow(dead_code)]
+    pub fn run_store_gc(&mut self) -> (usize, usize, usize) {
+        self.transaction_manager.run_gc_for_store(&self.store_name)
     }
 
     fn open_or_create_btree(path: &Path) -> Result<BTree, WrongoDBError> {
@@ -252,7 +192,7 @@ mod tests {
         let path = tmp.path().join("table.idx.wt");
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let mut table = Table::open_or_create_index(&path, transaction_manager).unwrap();
+        let mut table = Table::open_or_create_store(&path, transaction_manager).unwrap();
 
         table
             .local_apply_put_with_txn(b"k1", b"v1", TXN_NONE)

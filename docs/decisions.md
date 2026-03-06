@@ -1,5 +1,45 @@
 # Decisions
 
+## 2026-03-06: Make `Session` the document/index controller and `Table` a pure store handle
+
+**Decision**
+- Introduce an internal `SchemaCatalog` that owns collection/index metadata and URI resolution:
+  - `table:<collection>` resolves to the primary store
+  - `index:<collection>:<index>` resolves to the backing index store
+- Make `Table` a one-store primitive only:
+  - own `BTree`, `store_name`, and `TransactionManager`
+  - remove embedded index metadata and index fan-out behavior
+  - keep only store-local MVCC and maintenance methods
+- Make `TableCache` a generic store-handle cache with `get_or_open_store(store_name)`.
+- Make `Cursor` a plain store cursor:
+  - no `CursorKind`
+  - no primary/index special casing
+  - explicit store-write tracking for transaction finalization
+- Move document/index orchestration into `Session`:
+  - CRUD methods
+  - index creation/backfill
+  - checkpoint fan-out over all known stores
+  - transaction finalization over touched stores
+- Reduce `document_ops` to update-expression helpers only.
+
+**Why**
+- The previous model mixed store-level and collection-level responsibilities:
+  `Table` wrapped a single store but also owned index metadata and recursive maintenance logic.
+- That made the write path harder to follow because collection semantics were hidden behind a
+  low-level handle type.
+- The new split is closer to the WiredTiger mental model:
+  `Session` owns request/transaction orchestration, `Cursor` mutates one store, and `Table`
+  implements one store.
+- Moving schema/index relationships into `SchemaCatalog` makes the object graph easier to read:
+  cursors talk to tables, sessions talk to schema, and tables no longer reach sideways into
+  collection metadata.
+
+**Notes**
+- This is a readability/ownership refactor only; WAL format, recovery behavior, and Raft
+  semantics are unchanged.
+- Direct index-store cursors remain supported by design.
+- `Session::open_cursor(uri)` stays stable as the low-level API surface.
+
 ## 2026-03-05: Collapse storage handle caching into `TableCache` and make durability hooks explicit
 
 **Decision**
