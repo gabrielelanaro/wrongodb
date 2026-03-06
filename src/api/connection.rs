@@ -103,7 +103,6 @@ impl Connection {
             applier,
             config.raft_mode,
         )?);
-        transaction_manager.set_local_write_durability(durability_backend.local_write_durability());
 
         Ok(Self {
             base_path,

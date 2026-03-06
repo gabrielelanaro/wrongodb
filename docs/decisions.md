@@ -1,5 +1,36 @@
 # Decisions
 
+## 2026-03-06: Move local WAL durability into a Mongo-style recovery unit
+
+**Decision**
+- Remove the `LocalWriteDurability` hook from `TransactionManager`.
+- Introduce internal `RecoveryUnit` and `WriteUnitOfWork` types:
+  - `RecoveryUnit` owns local WAL marker emission for local-store writes
+  - `WriteUnitOfWork` owns the active transaction, touched stores, and recovery unit handle
+- Keep `SessionTxn` as the public transaction handle, but make it a thin wrapper over the
+  internal `WriteUnitOfWork`.
+- Keep `Cursor` WT-like:
+  - local/store-only semantics
+  - writable cursors record local WAL through the session recovery unit
+  - no deferred-replication policy branching inside the cursor
+
+**Why**
+- The previous refactor fixed the public cursor semantics, but it pushed local durability down
+  into `TransactionManager`, which made the MVCC layer own part of the storage-recovery policy.
+- Mongo keeps that seam above the storage engine with `WriteUnitOfWork` and `RecoveryUnit`,
+  while WiredTiger keeps the cursor/storage API boring and stable.
+- Moving local WAL logging into a session-owned recovery unit restores the intended split:
+  `TransactionManager` owns MVCC, `SessionTxn` owns transaction orchestration, and `Cursor`
+  remains a one-store access path.
+
+**Notes**
+- Local WAL `Put` / `Delete` / `TxnCommit` / `TxnAbort` markers now flow through
+  `RecoveryUnit`, not `TransactionManager`.
+- Deferred RAFT writes remain unchanged: they still go through `DurabilityBackend::record(...)`
+  and `StoreCommandApplier`.
+- This supersedes the note in the previous same-day decision that described local WAL logging as
+  happening through the transaction manager.
+
 ## 2026-03-06: Split standalone local durability from RAFT replication and keep the public cursor WT-like
 
 **Decision**
@@ -25,8 +56,7 @@
   mean “mutate this one store”.
 
 **Notes**
-- Local WAL `Put`/`Delete` logging now happens below the cursor boundary through the
-  transaction manager, while `TxnCommit`/`TxnAbort`/`Checkpoint` markers remain session-owned.
+- Local WAL logging now happens below the cursor boundary through a session-owned recovery unit.
 - The previous same-day decision about restoring a WT-style public cursor API is superseded here:
   the public cursor stays, but only with strictly local/store semantics.
 - Old integration tests that used the public cursor as a replicated write API were removed and

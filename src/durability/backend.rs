@@ -12,7 +12,7 @@ use crate::raft::node::{RaftNodeConfig, RaftNodeCore};
 use crate::raft::service::{RaftServiceConfig, RaftServiceHandle};
 use crate::recovery::manager::warn_legacy_per_table_wal_files;
 use crate::storage::wal::GlobalWal;
-use crate::txn::LocalWriteDurability;
+use crate::txn::{NoopRecoveryUnit, RecoveryUnit, WalRecoveryUnit};
 use crate::WrongoDBError;
 
 #[cfg(test)]
@@ -59,11 +59,6 @@ pub(crate) struct LocalWalDurabilityBackend {
 #[derive(Debug)]
 pub(crate) struct RaftDurabilityBackend {
     raft_service: RaftServiceHandle,
-}
-
-#[derive(Debug)]
-struct LocalWalWriteDurability {
-    wal: Arc<Mutex<GlobalWal>>,
 }
 
 #[cfg(test)]
@@ -142,10 +137,13 @@ impl DurabilityBackend {
         }
     }
 
-    pub(crate) fn local_write_durability(&self) -> Option<Arc<dyn LocalWriteDurability>> {
+    pub(crate) fn new_recovery_unit(&self) -> Arc<dyn RecoveryUnit> {
         match self {
-            Self::LocalWal(backend) => Some(backend.local_write_durability()),
-            _ => None,
+            Self::Disabled => Arc::new(NoopRecoveryUnit),
+            Self::LocalWal(backend) => backend.new_recovery_unit(),
+            Self::Raft(_) => Arc::new(NoopRecoveryUnit),
+            #[cfg(test)]
+            Self::Test(_) => Arc::new(NoopRecoveryUnit),
         }
     }
 
@@ -247,10 +245,8 @@ impl LocalWalDurabilityBackend {
         self.wal.lock().truncate_to_checkpoint()
     }
 
-    fn local_write_durability(&self) -> Arc<dyn LocalWriteDurability> {
-        Arc::new(LocalWalWriteDurability {
-            wal: self.wal.clone(),
-        })
+    fn new_recovery_unit(&self) -> Arc<dyn RecoveryUnit> {
+        Arc::new(WalRecoveryUnit::new(self.wal.clone()))
     }
 }
 
@@ -302,29 +298,6 @@ impl RaftDurabilityBackend {
         msg: crate::raft::runtime::RaftInboundMessage,
     ) -> Result<(), WrongoDBError> {
         self.raft_service.inject_inbound(msg)
-    }
-}
-
-impl LocalWriteDurability for LocalWalWriteDurability {
-    fn record_put(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        value: &[u8],
-        txn_id: u64,
-    ) -> Result<(), WrongoDBError> {
-        self.wal.lock().log_put(store_name, key, value, txn_id, 0)?;
-        Ok(())
-    }
-
-    fn record_delete(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        txn_id: u64,
-    ) -> Result<(), WrongoDBError> {
-        self.wal.lock().log_delete(store_name, key, txn_id, 0)?;
-        Ok(())
     }
 }
 

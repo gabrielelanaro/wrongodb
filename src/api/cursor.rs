@@ -5,7 +5,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::core::errors::{DocumentValidationError, StorageError};
 use crate::storage::table::Table;
-use crate::txn::{TxnId, TXN_NONE};
+use crate::txn::{RecoveryUnit, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
 pub type CursorEntry = (Vec<u8>, Vec<u8>);
@@ -60,6 +60,7 @@ pub(crate) enum CursorWriteAccess {
 pub struct Cursor {
     table: Arc<RwLock<Table>>,
     store_name: String,
+    recovery_unit: Arc<dyn RecoveryUnit>,
     write_tracker: StoreWriteTracker,
     write_access: CursorWriteAccess,
     buffered_entries: Vec<CursorEntry>,
@@ -73,12 +74,14 @@ impl Cursor {
     pub(crate) fn new(
         table: Arc<RwLock<Table>>,
         store_name: String,
+        recovery_unit: Arc<dyn RecoveryUnit>,
         write_tracker: StoreWriteTracker,
         write_access: CursorWriteAccess,
     ) -> Self {
         Self {
             table,
             store_name,
+            recovery_unit,
             write_tracker,
             write_access,
             buffered_entries: Vec::new(),
@@ -111,6 +114,8 @@ impl Cursor {
         if table.contains_key(key, txn_id)? {
             return Err(DocumentValidationError("duplicate key error".into()).into());
         }
+        self.recovery_unit
+            .record_put(&self.store_name, key, value, txn_id)?;
         table.local_apply_put_with_txn(key, value, txn_id)?;
         drop(table);
         self.write_tracker.record(&self.store_name, txn_id);
@@ -125,6 +130,8 @@ impl Cursor {
                 "key not found for update".to_string(),
             )));
         }
+        self.recovery_unit
+            .record_put(&self.store_name, key, value, txn_id)?;
         table.local_apply_put_with_txn(key, value, txn_id)?;
         drop(table);
         self.write_tracker.record(&self.store_name, txn_id);
@@ -139,6 +146,8 @@ impl Cursor {
                 "key not found for delete".to_string(),
             )));
         }
+        self.recovery_unit
+            .record_delete(&self.store_name, key, txn_id)?;
         let deleted = table.local_apply_delete_with_txn(key, txn_id)?;
         if !deleted {
             return Err(WrongoDBError::Storage(StorageError(
@@ -236,7 +245,7 @@ mod tests {
     use tempfile::{tempdir, TempDir};
 
     use super::*;
-    use crate::txn::{GlobalTxnState, TransactionManager, TXN_NONE};
+    use crate::txn::{GlobalTxnState, NoopRecoveryUnit, TransactionManager, TXN_NONE};
 
     fn open_index_table() -> (TempDir, Arc<RwLock<Table>>, String) {
         let tmp = tempdir().unwrap();
@@ -256,6 +265,7 @@ mod tests {
         let mut cursor = Cursor::new(
             table.clone(),
             store_name,
+            Arc::new(NoopRecoveryUnit),
             StoreWriteTracker::new(),
             CursorWriteAccess::ReadWrite,
         );
@@ -278,6 +288,7 @@ mod tests {
         let mut cursor = Cursor::new(
             table.clone(),
             store_name,
+            Arc::new(NoopRecoveryUnit),
             StoreWriteTracker::new(),
             CursorWriteAccess::ReadWrite,
         );
@@ -296,6 +307,7 @@ mod tests {
         let mut cursor = Cursor::new(
             table,
             store_name.clone(),
+            Arc::new(NoopRecoveryUnit),
             write_tracker,
             CursorWriteAccess::ReadWrite,
         );
@@ -311,6 +323,7 @@ mod tests {
         let mut cursor = Cursor::new(
             table,
             store_name,
+            Arc::new(NoopRecoveryUnit),
             StoreWriteTracker::new(),
             CursorWriteAccess::ReadOnly,
         );

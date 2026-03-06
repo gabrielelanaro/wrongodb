@@ -1,21 +1,12 @@
-use std::collections::HashSet;
 use std::sync::Arc;
-
-use parking_lot::Mutex;
 
 use crate::api::cursor::{Cursor, CursorWriteAccess, StoreWriteTracker};
 use crate::core::errors::StorageError;
 use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp, WritePathMode};
 use crate::schema::{CollectionSchema, SchemaCatalog};
 use crate::storage::table_cache::TableCache;
-use crate::txn::{Transaction, TransactionManager, TxnId};
+use crate::txn::{RecoveryUnit, Transaction, TransactionManager, TxnId, WriteUnitOfWork};
 use crate::WrongoDBError;
-
-#[derive(Debug)]
-struct ActiveTxn {
-    txn: Transaction,
-    touched_stores: Arc<Mutex<HashSet<String>>>,
-}
 
 /// A request-scoped execution context over shared connection infrastructure.
 ///
@@ -29,8 +20,9 @@ pub struct Session {
     schema_catalog: Arc<SchemaCatalog>,
     transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
+    recovery_unit: Arc<dyn RecoveryUnit>,
     write_tracker: StoreWriteTracker,
-    active_txn: Option<ActiveTxn>,
+    active_txn: Option<WriteUnitOfWork>,
 }
 
 impl Session {
@@ -40,10 +32,12 @@ impl Session {
         transaction_manager: Arc<TransactionManager>,
         durability_backend: Arc<DurabilityBackend>,
     ) -> Self {
+        let recovery_unit = durability_backend.new_recovery_unit();
         Self {
             table_cache,
             schema_catalog,
             transaction_manager,
+            recovery_unit,
             durability_backend,
             write_tracker: StoreWriteTracker::new(),
             active_txn: None,
@@ -89,21 +83,19 @@ impl Session {
         }
 
         let txn = self.transaction_manager.begin_snapshot_txn();
-        let touched_stores = Arc::new(Mutex::new(HashSet::new()));
-        self.write_tracker.begin(txn.id(), touched_stores.clone());
-        self.active_txn = Some(ActiveTxn {
-            txn,
-            touched_stores,
-        });
+        let write_unit = WriteUnitOfWork::new(txn, self.recovery_unit.clone());
+        self.write_tracker
+            .begin(write_unit.txn().id(), write_unit.touched_stores());
+        self.active_txn = Some(write_unit);
         Ok(SessionTxn::new(self))
     }
 
     pub fn current_txn(&self) -> Option<&Transaction> {
-        self.active_txn.as_ref().map(|active| &active.txn)
+        self.active_txn.as_ref().map(WriteUnitOfWork::txn)
     }
 
     pub fn current_txn_mut(&mut self) -> Option<&mut Transaction> {
-        self.active_txn.as_mut().map(|active| &mut active.txn)
+        self.active_txn.as_mut().map(WriteUnitOfWork::txn_mut)
     }
 
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
@@ -338,6 +330,7 @@ impl Session {
         Ok(Cursor::new(
             table,
             store_name.to_string(),
+            self.recovery_unit.clone(),
             self.write_tracker.clone(),
             write_access,
         ))
@@ -380,11 +373,12 @@ impl<'a> SessionTxn<'a> {
             self.committed = true;
             return Ok(());
         };
-        let touched_stores: Vec<String> = active.touched_stores.lock().iter().cloned().collect();
-        let txn_id = active.txn.id();
+        let touched_stores: Vec<String> = active.touched_stores().lock().iter().cloned().collect();
+        let txn_id = active.txn().id();
 
-        if self.session.durability_backend.is_enabled() {
-            self.session.record_commit(txn_id)?;
+        match self.session.write_path_mode() {
+            WritePathMode::LocalApply => active.recovery_unit().record_commit(txn_id, txn_id)?,
+            WritePathMode::DeferredReplication => self.session.record_commit(txn_id)?,
         }
 
         let active =
@@ -393,7 +387,7 @@ impl<'a> SessionTxn<'a> {
             })?;
         self.session
             .transaction_manager
-            .commit_txn_state(&mut active.txn)?;
+            .commit_txn_state(active.txn_mut())?;
 
         self.session.active_txn = None;
         self.session.write_tracker.clear();
@@ -412,11 +406,12 @@ impl<'a> SessionTxn<'a> {
             self.committed = true;
             return Ok(());
         };
-        let touched_stores: Vec<String> = active.touched_stores.lock().iter().cloned().collect();
-        let txn_id = active.txn.id();
+        let touched_stores: Vec<String> = active.touched_stores().lock().iter().cloned().collect();
+        let txn_id = active.txn().id();
 
-        if self.session.durability_backend.is_enabled() {
-            self.session.record_abort(txn_id)?;
+        match self.session.write_path_mode() {
+            WritePathMode::LocalApply => active.recovery_unit().record_abort(txn_id)?,
+            WritePathMode::DeferredReplication => self.session.record_abort(txn_id)?,
         }
 
         let active =
@@ -425,7 +420,7 @@ impl<'a> SessionTxn<'a> {
             })?;
         self.session
             .transaction_manager
-            .abort_txn_state(&mut active.txn)?;
+            .abort_txn_state(active.txn_mut())?;
 
         self.session.active_txn = None;
         self.session.write_tracker.clear();
@@ -439,21 +434,21 @@ impl<'a> SessionTxn<'a> {
     }
 
     pub fn as_mut(&mut self) -> &mut Transaction {
-        &mut self
+        let active = self
             .session
             .active_txn
             .as_mut()
-            .expect("transaction should exist")
-            .txn
+            .expect("transaction should exist");
+        active.txn_mut()
     }
 
     pub fn as_ref(&self) -> &Transaction {
-        &self
+        let active = self
             .session
             .active_txn
             .as_ref()
-            .expect("transaction should exist")
-            .txn
+            .expect("transaction should exist");
+        active.txn()
     }
 
     pub fn session_mut(&mut self) -> &mut Session {
@@ -476,15 +471,20 @@ impl<'a> Drop for SessionTxn<'a> {
 
         if let Some(mut active) = self.session.active_txn.take() {
             let touched_stores: Vec<String> =
-                active.touched_stores.lock().iter().cloned().collect();
-            let txn_id = active.txn.id();
-            if self.session.durability_backend.is_enabled() {
-                let _ = self.session.record_abort(txn_id);
+                active.touched_stores().lock().iter().cloned().collect();
+            let txn_id = active.txn().id();
+            match self.session.write_path_mode() {
+                WritePathMode::LocalApply => {
+                    let _ = active.recovery_unit().record_abort(txn_id);
+                }
+                WritePathMode::DeferredReplication => {
+                    let _ = self.session.record_abort(txn_id);
+                }
             }
             let _ = self
                 .session
                 .transaction_manager
-                .abort_txn_state(&mut active.txn);
+                .abort_txn_state(active.txn_mut());
             self.session.write_tracker.clear();
             if self.session.write_path_mode() == WritePathMode::LocalApply {
                 let _ =
@@ -665,6 +665,69 @@ mod tests {
         txn.abort().unwrap();
 
         assert!(find_one(&mut session, "items", json!({"_id": "k1"})).is_none());
+    }
+
+    #[test]
+    fn local_wal_mode_records_write_and_commit_markers() {
+        let dir = tempdir().unwrap();
+        let conn = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
+        let mut session = conn.open_session();
+        session.create("table:items").unwrap();
+        let expected_key = encode_id_value(&json!("k1")).unwrap();
+        let expected_value =
+            encode_document(json!({"_id": "k1", "value": "v1"}).as_object().unwrap()).unwrap();
+
+        let mut txn = session.transaction().unwrap();
+        let txn_id = txn.as_ref().id();
+        insert_one(
+            txn.session_mut(),
+            "items",
+            json!({"_id": "k1", "value": "v1"}),
+        );
+        txn.commit().unwrap();
+
+        let records = read_wal_records(dir.path());
+        assert!(records.iter().any(|record| matches!(
+            record,
+            WalRecord::Put {
+                store_name,
+                key,
+                value,
+                txn_id: record_txn_id,
+            } if store_name == "items.main.wt"
+                && key == &expected_key
+                && value == &expected_value
+                && *record_txn_id == txn_id
+        )));
+        assert!(records.iter().any(|record| matches!(
+            record,
+            WalRecord::TxnCommit {
+                txn_id: record_txn_id,
+                commit_ts,
+            } if *record_txn_id == txn_id && *commit_ts == txn_id
+        )));
+    }
+
+    #[test]
+    fn local_wal_mode_does_not_recover_aborted_write() {
+        let dir = tempdir().unwrap();
+        {
+            let conn = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
+            let mut session = conn.open_session();
+            session.create("table:items").unwrap();
+
+            let mut txn = session.transaction().unwrap();
+            insert_one(
+                txn.session_mut(),
+                "items",
+                json!({"_id": "abort-me", "value": "v1"}),
+            );
+            txn.abort().unwrap();
+        }
+
+        let reopened = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
+        let mut session = reopened.open_session();
+        assert!(find_one(&mut session, "items", json!({"_id": "abort-me"})).is_none());
     }
 
     #[test]
