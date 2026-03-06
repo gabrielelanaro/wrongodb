@@ -5,7 +5,7 @@ use crate::core::errors::StorageError;
 use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp, WritePathMode};
 use crate::schema::{CollectionSchema, SchemaCatalog};
 use crate::storage::table_cache::TableCache;
-use crate::txn::{RecoveryUnit, Transaction, TransactionManager, TxnId, WriteUnitOfWork};
+use crate::txn::{ActiveWriteUnit, RecoveryUnit, Transaction, TransactionManager, TxnId};
 use crate::WrongoDBError;
 
 /// A request-scoped execution context over shared connection infrastructure.
@@ -22,7 +22,7 @@ pub struct Session {
     durability_backend: Arc<DurabilityBackend>,
     recovery_unit: Arc<dyn RecoveryUnit>,
     write_tracker: StoreWriteTracker,
-    active_txn: Option<WriteUnitOfWork>,
+    active_txn: Option<ActiveWriteUnit>,
 }
 
 impl Session {
@@ -77,25 +77,28 @@ impl Session {
         self.open_store_cursor_with_access(&store_name, write_access)
     }
 
-    pub fn transaction(&mut self) -> Result<SessionTxn<'_>, WrongoDBError> {
+    pub fn transaction(&mut self) -> Result<WriteUnitOfWork<'_>, WrongoDBError> {
         if self.active_txn.is_some() {
             return Err(WrongoDBError::TransactionAlreadyActive);
         }
 
         let txn = self.transaction_manager.begin_snapshot_txn();
-        let write_unit = WriteUnitOfWork::new(txn, self.recovery_unit.clone());
-        self.write_tracker
-            .begin(write_unit.txn().id(), write_unit.touched_stores());
-        self.active_txn = Some(write_unit);
-        Ok(SessionTxn::new(self))
+        self.recovery_unit.begin_unit_of_work()?;
+        let active_write_unit = ActiveWriteUnit::new(txn);
+        self.write_tracker.begin(
+            active_write_unit.txn().id(),
+            active_write_unit.touched_stores(),
+        );
+        self.active_txn = Some(active_write_unit);
+        Ok(WriteUnitOfWork::new(self))
     }
 
     pub fn current_txn(&self) -> Option<&Transaction> {
-        self.active_txn.as_ref().map(WriteUnitOfWork::txn)
+        self.active_txn.as_ref().map(ActiveWriteUnit::txn)
     }
 
     pub fn current_txn_mut(&mut self) -> Option<&mut Transaction> {
-        self.active_txn.as_mut().map(WriteUnitOfWork::txn_mut)
+        self.active_txn.as_mut().map(ActiveWriteUnit::txn_mut)
     }
 
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
@@ -360,13 +363,13 @@ impl Session {
     }
 }
 
-/// RAII transaction handle for Session.
-pub struct SessionTxn<'a> {
+/// RAII write unit of work for Session.
+pub struct WriteUnitOfWork<'a> {
     session: &'a mut Session,
     committed: bool,
 }
 
-impl<'a> SessionTxn<'a> {
+impl<'a> WriteUnitOfWork<'a> {
     pub fn commit(mut self) -> Result<(), WrongoDBError> {
         let Some(active) = self.session.active_txn.as_ref() else {
             self.session.write_tracker.clear();
@@ -377,7 +380,10 @@ impl<'a> SessionTxn<'a> {
         let txn_id = active.txn().id();
 
         match self.session.write_path_mode() {
-            WritePathMode::LocalApply => active.recovery_unit().record_commit(txn_id, txn_id)?,
+            WritePathMode::LocalApply => self
+                .session
+                .recovery_unit
+                .commit_unit_of_work(txn_id, txn_id)?,
             WritePathMode::DeferredReplication => self.session.record_commit(txn_id)?,
         }
 
@@ -410,7 +416,7 @@ impl<'a> SessionTxn<'a> {
         let txn_id = active.txn().id();
 
         match self.session.write_path_mode() {
-            WritePathMode::LocalApply => active.recovery_unit().record_abort(txn_id)?,
+            WritePathMode::LocalApply => self.session.recovery_unit.abort_unit_of_work(txn_id)?,
             WritePathMode::DeferredReplication => self.session.record_abort(txn_id)?,
         }
 
@@ -433,24 +439,6 @@ impl<'a> SessionTxn<'a> {
         Ok(())
     }
 
-    pub fn as_mut(&mut self) -> &mut Transaction {
-        let active = self
-            .session
-            .active_txn
-            .as_mut()
-            .expect("transaction should exist");
-        active.txn_mut()
-    }
-
-    pub fn as_ref(&self) -> &Transaction {
-        let active = self
-            .session
-            .active_txn
-            .as_ref()
-            .expect("transaction should exist");
-        active.txn()
-    }
-
     pub fn session_mut(&mut self) -> &mut Session {
         self.session
     }
@@ -463,7 +451,7 @@ impl<'a> SessionTxn<'a> {
     }
 }
 
-impl<'a> Drop for SessionTxn<'a> {
+impl<'a> Drop for WriteUnitOfWork<'a> {
     fn drop(&mut self) {
         if self.committed {
             return;
@@ -475,7 +463,7 @@ impl<'a> Drop for SessionTxn<'a> {
             let txn_id = active.txn().id();
             match self.session.write_path_mode() {
                 WritePathMode::LocalApply => {
-                    let _ = active.recovery_unit().record_abort(txn_id);
+                    let _ = self.session.recovery_unit.abort_unit_of_work(txn_id);
                 }
                 WritePathMode::DeferredReplication => {
                     let _ = self.session.record_abort(txn_id);
@@ -494,6 +482,28 @@ impl<'a> Drop for SessionTxn<'a> {
         } else {
             self.session.write_tracker.clear();
         }
+    }
+}
+
+impl<'a> AsRef<Transaction> for WriteUnitOfWork<'a> {
+    fn as_ref(&self) -> &Transaction {
+        let active = self
+            .session
+            .active_txn
+            .as_ref()
+            .expect("transaction should exist");
+        active.txn()
+    }
+}
+
+impl<'a> AsMut<Transaction> for WriteUnitOfWork<'a> {
+    fn as_mut(&mut self) -> &mut Transaction {
+        let active = self
+            .session
+            .active_txn
+            .as_mut()
+            .expect("transaction should exist");
+        active.txn_mut()
     }
 }
 

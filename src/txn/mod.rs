@@ -1,11 +1,12 @@
+pub(crate) mod active_write_unit;
 pub mod global_txn;
 pub(crate) mod manager;
 pub(crate) mod recovery_unit;
 pub mod snapshot;
 pub mod transaction;
 pub mod update;
-pub(crate) mod write_unit_of_work;
 
+pub(crate) use active_write_unit::ActiveWriteUnit;
 pub use global_txn::GlobalTxnState;
 #[allow(unused_imports)]
 pub(crate) use manager::TransactionManager;
@@ -14,8 +15,6 @@ pub(crate) use recovery_unit::{NoopRecoveryUnit, RecoveryUnit, WalRecoveryUnit};
 #[allow(unused_imports)]
 pub use transaction::{IsolationLevel, Transaction, TxnState};
 pub use update::{Update, UpdateChain, UpdateType};
-#[allow(unused_imports)]
-pub(crate) use write_unit_of_work::WriteUnitOfWork;
 
 pub type TxnId = u64;
 pub const TXN_NONE: TxnId = 0;

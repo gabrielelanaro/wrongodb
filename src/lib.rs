@@ -17,6 +17,7 @@ pub mod commands {
 
 pub use crate::api::{
     Connection, ConnectionConfig, Cursor, CursorEntry, RaftMode, RaftPeerConfig, Session,
+    WriteUnitOfWork,
 };
 pub use crate::core::errors::{DocumentValidationError, StorageError, WrongoDBError};
 pub use crate::index::{

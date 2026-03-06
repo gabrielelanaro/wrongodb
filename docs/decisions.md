@@ -1,14 +1,43 @@
 # Decisions
 
+## 2026-03-06: Make the public transaction guard the actual `WriteUnitOfWork`
+
+**Decision**
+- Make `Session::transaction()` return the public RAII guard `WriteUnitOfWork`.
+- Rename the old passive state bag to an internal `ActiveWriteUnit`.
+- Keep `Session` as the owner of the `RecoveryUnit`, closer to Mongo's
+  `OperationContext -> RecoveryUnit` relationship.
+- Expand `RecoveryUnit` to own unit-of-work lifecycle hooks:
+  - `begin_unit_of_work`
+  - `commit_unit_of_work`
+  - `abort_unit_of_work`
+- Keep `Cursor` unchanged in responsibility: it remains a WT-style one-store access path and only
+  uses the session recovery unit for local WAL record emission.
+
+**Why**
+- The previous step fixed the storage boundary but still left the names inverted:
+  the public RAII handle was `SessionTxn` while an internal passive state bag was called
+  `WriteUnitOfWork`.
+- Mongo's `WriteUnitOfWork` is the actual begin/commit/abort boundary, and the recovery unit is
+  session/request-owned, not nested inside a state bag.
+- Flipping the names to match the responsibilities makes the transaction flow read like the
+  Mongo/WT split we are imitating: `Session` owns context, `WriteUnitOfWork` owns the unit of
+  work, `RecoveryUnit` owns local durability hooks, and `TransactionManager` stays MVCC-only.
+
+**Notes**
+- Deferred RAFT writes still do not use `RecoveryUnit` for commit markers; they continue to go
+  through `DurabilityBackend::record(...)`.
+- This supersedes the previous same-day note that described `SessionTxn` as the public handle over
+  an internal `WriteUnitOfWork`.
+
 ## 2026-03-06: Move local WAL durability into a Mongo-style recovery unit
 
 **Decision**
 - Remove the `LocalWriteDurability` hook from `TransactionManager`.
 - Introduce internal `RecoveryUnit` and `WriteUnitOfWork` types:
   - `RecoveryUnit` owns local WAL marker emission for local-store writes
-  - `WriteUnitOfWork` owns the active transaction, touched stores, and recovery unit handle
-- Keep `SessionTxn` as the public transaction handle, but make it a thin wrapper over the
-  internal `WriteUnitOfWork`.
+  - `WriteUnitOfWork` initially owned the active transaction, touched stores, and recovery unit handle
+- Keep `SessionTxn` as the public transaction handle in that intermediate refactor.
 - Keep `Cursor` WT-like:
   - local/store-only semantics
   - writable cursors record local WAL through the session recovery unit
@@ -20,7 +49,7 @@
 - Mongo keeps that seam above the storage engine with `WriteUnitOfWork` and `RecoveryUnit`,
   while WiredTiger keeps the cursor/storage API boring and stable.
 - Moving local WAL logging into a session-owned recovery unit restores the intended split:
-  `TransactionManager` owns MVCC, `SessionTxn` owns transaction orchestration, and `Cursor`
+  `TransactionManager` owns MVCC, the public transaction guard owns transaction orchestration, and `Cursor`
   remains a one-store access path.
 
 **Notes**
