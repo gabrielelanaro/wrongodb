@@ -8,6 +8,13 @@ use crate::storage::table::Table;
 use crate::txn::{RecoveryUnit, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
+/// A single key/value entry returned by [`Cursor::next`].
+///
+/// The public cursor surface is deliberately key/value-shaped because it is the
+/// low-level storage API, not the document/query API.
+///
+/// This type alias exists to keep that low-level API readable without
+/// introducing a heavier public wrapper type.
 pub type CursorEntry = (Vec<u8>, Vec<u8>);
 
 #[derive(Debug, Clone)]
@@ -57,6 +64,20 @@ pub(crate) enum CursorWriteAccess {
     ReadWrite,
 }
 
+/// Cursor over a single physical store.
+///
+/// A cursor is always bound to one store and one transaction context. Cursors
+/// opened from [`Session`](crate::Session) are non-transactional; cursors
+/// opened from [`WriteUnitOfWork`](crate::WriteUnitOfWork) are bound to the
+/// active transaction.
+///
+/// The reason this type exists publicly is to expose a small, explicit
+/// storage interface for one store at a time. It is intentionally not
+/// responsible for collection semantics, replication policy, or
+/// commit/abort orchestration.
+///
+/// If a caller needs document-level writes or replicated write orchestration,
+/// they should go through the higher-level command path, not extend this type.
 pub struct Cursor {
     table: Arc<RwLock<Table>>,
     store_name: String,
@@ -95,6 +116,13 @@ impl Cursor {
         }
     }
 
+    /// Restrict iteration to the given half-open key range.
+    ///
+    /// Range state lives on the cursor so scans can be resumed incrementally
+    /// without pushing iterator state into `Session`.
+    ///
+    /// The method exists on `Cursor` because scan position is cursor-local
+    /// state, not session state.
     pub fn set_range(&mut self, start: Option<Vec<u8>>, end: Option<Vec<u8>>) {
         self.range_start = start;
         self.range_end = end;
@@ -111,6 +139,15 @@ impl Cursor {
         )))
     }
 
+    /// Insert a new key/value pair into the bound store.
+    ///
+    /// The cursor performs only store-local semantics here: duplicate-key
+    /// validation, local durability recording for local write modes, and MVCC
+    /// application through the bound transaction context.
+    ///
+    /// It exists on `Cursor` because insert is a one-store mutation. Higher
+    /// layers remain responsible for multi-store work such as index maintenance
+    /// or replicated write orchestration.
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
         let txn_id = self.bound_txn_id;
         self.ensure_writable()?;
@@ -126,6 +163,13 @@ impl Cursor {
         Ok(())
     }
 
+    /// Replace the value for an existing key in the bound store.
+    ///
+    /// Missing-key validation happens here because this is still a one-store
+    /// operation. Higher-level document/index orchestration lives elsewhere.
+    ///
+    /// This separation keeps update semantics local to one store and prevents
+    /// `Cursor` from turning into a document write controller.
     pub fn update(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
         let txn_id = self.bound_txn_id;
         self.ensure_writable()?;
@@ -143,6 +187,14 @@ impl Cursor {
         Ok(())
     }
 
+    /// Delete an existing key from the bound store.
+    ///
+    /// In deferred replication mode this method is intentionally unavailable:
+    /// low-level cursor writes are local-store operations, not the replicated
+    /// write API.
+    ///
+    /// That restriction exists to keep the cursor contract stable instead of
+    /// letting it silently switch between local apply and deferred apply.
     pub fn delete(&mut self, key: &[u8]) -> Result<(), WrongoDBError> {
         let txn_id = self.bound_txn_id;
         self.ensure_writable()?;
@@ -165,6 +217,13 @@ impl Cursor {
         Ok(())
     }
 
+    /// Fetch the visible value for `key` in the cursor's bound transaction.
+    ///
+    /// Reads stay on the low-level cursor API in every durability mode because
+    /// they do not participate in the replicated write path split.
+    ///
+    /// The method lives here because visibility is still a one-store,
+    /// one-transaction question.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, WrongoDBError> {
         let txn_id = self.bound_txn_id;
         let mut table = self.table.write();
@@ -172,6 +231,13 @@ impl Cursor {
     }
 
     #[allow(clippy::should_implement_trait)]
+    /// Return the next visible key/value pair in the configured range.
+    ///
+    /// Iteration is cursor-owned so callers can scan a store incrementally
+    /// without materializing all results in `Session`.
+    ///
+    /// Keeping this state on the cursor is what makes the cursor abstraction
+    /// useful in the first place.
     pub fn next(&mut self) -> Result<Option<CursorEntry>, WrongoDBError> {
         let txn_id = self.bound_txn_id;
         if self.exhausted {
@@ -239,6 +305,12 @@ impl Cursor {
     }
 
     /// Reset the cursor position to the beginning.
+    ///
+    /// This keeps cursor state reusable for repeated scans over the same store
+    /// without reopening the cursor.
+    ///
+    /// The method exists because cursor position is mutable operational state,
+    /// not part of the store itself.
     pub fn reset(&mut self) {
         self.buffered_entries.clear();
         self.buffer_pos = 0;

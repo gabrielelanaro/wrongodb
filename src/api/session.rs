@@ -12,8 +12,18 @@ use crate::WrongoDBError;
 ///
 /// `Connection` owns long-lived shared components (storage handles, schema
 /// metadata, global transaction state, and durability machinery). `Session`
-/// exists to own mutable per-request state that must not be global, especially
-/// the active transaction, cursor creation, and checkpoint entrypoint.
+/// exists to own mutable per-request state that must not be global.
+///
+/// `Session` is where callers:
+/// - open cursors
+/// - start transactions
+/// - trigger checkpoint
+///
+/// It intentionally does not own document write orchestration or the replicated
+/// write path. Those live in higher internal layers.
+///
+/// In practice this means `Session` answers "what can this request do right
+/// now?" while `Connection` answers "what engine are we attached to?".
 pub struct Session {
     table_cache: Arc<TableCache>,
     schema_catalog: Arc<SchemaCatalog>,
@@ -43,6 +53,16 @@ impl Session {
         }
     }
 
+    /// Ensure the primary store for `table:<collection>` exists.
+    ///
+    /// This method exists so callers can bootstrap a table through the same
+    /// session object they use to open cursors, instead of forcing schema
+    /// creation through the higher-level document write path.
+    ///
+    /// Only `table:...` URIs are supported publicly. Index creation stays
+    /// internal because it is not a single-store operation: it has to update
+    /// schema metadata and backfill index entries from existing collection
+    /// data.
     pub fn create(&mut self, uri: &str) -> Result<(), WrongoDBError> {
         if let Some(collection) = uri.strip_prefix("table:") {
             let store_name = self.schema_catalog.primary_store_name(collection);
@@ -55,11 +75,33 @@ impl Session {
         ))))
     }
 
+    /// Open a non-transactional cursor bound to `TXN_NONE`.
+    ///
+    /// This method intentionally has the same name as
+    /// [`WriteUnitOfWork::open_cursor`]. The duplication is deliberate:
+    /// transaction scope is expressed by the receiver instead of by exposing
+    /// raw transaction ids in the public cursor API.
+    ///
+    /// `Session::open_cursor` means "open a cursor outside any transaction".
+    /// [`WriteUnitOfWork::open_cursor`] means "open the same kind of cursor,
+    /// but bound to the active transaction".
+    ///
+    /// The method lives on `Session` because non-transactional access is still
+    /// a first-class storage API and should not require creating a transaction
+    /// boundary object just to read or perform local writes.
     pub fn open_cursor(&self, uri: &str) -> Result<Cursor, WrongoDBError> {
         let store_name = self.schema_catalog.resolve_uri(uri)?;
         self.open_store_cursor_with_access(&store_name, TXN_NONE, self.cursor_write_access())
     }
 
+    /// Start a transactional write unit of work.
+    ///
+    /// This exists as a separate step so commit/abort ordering, local WAL
+    /// markers, and transaction-bound cursor opening all flow through a single
+    /// RAII boundary instead of being spread across the public API.
+    ///
+    /// The public API deliberately makes transaction scope explicit here rather
+    /// than letting cursor methods take raw transaction ids.
     pub fn transaction(&mut self) -> Result<WriteUnitOfWork<'_>, WrongoDBError> {
         if self.active_txn.is_some() {
             return Err(WrongoDBError::TransactionAlreadyActive);
@@ -76,6 +118,14 @@ impl Session {
         Ok(WriteUnitOfWork::new(self))
     }
 
+    /// Reconcile and checkpoint all known stores.
+    ///
+    /// Checkpoint is session-level because it coordinates many stores and, when
+    /// durability is enabled, emits the matching durability marker only after
+    /// the storage-level reconciliation pass has finished.
+    ///
+    /// It lives on `Session` instead of `Cursor` or `Table` because checkpoint
+    /// is not a one-store concern.
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         for store_name in self.schema_catalog.all_store_names()? {
             let table = self.table_cache.get_or_open_store(&store_name)?;
@@ -156,13 +206,35 @@ impl Session {
     }
 }
 
-/// RAII write unit of work for Session.
+/// Public handle for one active transaction started from [`Session::transaction`].
+///
+/// This type exists so the public API has an explicit transaction scope:
+/// while a write unit of work is alive, callers open cursors from it and those
+/// cursors are automatically bound to the active transaction.
+///
+/// That is why this type is separate from [`Session`]. It keeps commit/abort
+/// ownership and transaction-bound cursor opening behind a single object,
+/// instead of exposing raw transaction ids or letting callers keep reaching
+/// back into `Session` during a transaction.
+///
+/// The type is intentionally narrow: it is the transaction boundary, not a
+/// second general-purpose session object.
 pub struct WriteUnitOfWork<'a> {
     session: &'a mut Session,
     committed: bool,
+    write_path_mode: WritePathMode,
 }
 
 impl<'a> WriteUnitOfWork<'a> {
+    /// Open a cursor bound to this transaction.
+    ///
+    /// This duplicates [`Session::open_cursor`] by design. The reason is API
+    /// clarity: a caller should choose transaction scope by opening the cursor
+    /// from the transaction boundary, not by reaching back into `Session` and
+    /// not by threading transaction ids through every cursor method.
+    ///
+    /// The duplication is about binding, not behavior: both methods open the
+    /// same kind of cursor, but they bind it to different transaction scopes.
     pub fn open_cursor(&mut self, uri: &str) -> Result<Cursor, WrongoDBError> {
         let store_name = self.session.schema_catalog.resolve_uri(uri)?;
         self.session.open_store_cursor_with_access(
@@ -172,6 +244,14 @@ impl<'a> WriteUnitOfWork<'a> {
         )
     }
 
+    /// Commit the transaction and consume this write unit of work.
+    ///
+    /// Consuming `self` makes the transaction boundary single-use and avoids
+    /// partially committed public states. This is also where durability ordering
+    /// is enforced before local transaction state is advanced.
+    ///
+    /// The method lives here, not on `Session`, because commit is part of the
+    /// transaction boundary's responsibility.
     pub fn commit(mut self) -> Result<(), WrongoDBError> {
         let Some(active) = self.session.active_txn.as_ref() else {
             self.session.write_tracker.clear();
@@ -181,7 +261,7 @@ impl<'a> WriteUnitOfWork<'a> {
         let touched_stores: Vec<String> = active.touched_stores().lock().iter().cloned().collect();
         let txn_id = active.txn().id();
 
-        match self.session.write_path_mode() {
+        match self.write_path_mode {
             WritePathMode::LocalApply => self
                 .session
                 .recovery_unit
@@ -201,13 +281,22 @@ impl<'a> WriteUnitOfWork<'a> {
         self.session.write_tracker.clear();
         self.committed = true;
 
-        if self.session.write_path_mode() == WritePathMode::LocalApply {
+        if self.write_path_mode == WritePathMode::LocalApply {
             self.session
                 .finalize_touched_stores_locally(&touched_stores, txn_id, true)?;
         }
         Ok(())
     }
 
+    /// Abort the transaction and consume this write unit of work.
+    ///
+    /// Like [`commit`](Self::commit), this consumes the boundary so rollback is
+    /// a terminal operation. The method exists separately from `Drop` so callers
+    /// can observe an explicit abort result instead of relying on best-effort
+    /// cleanup.
+    ///
+    /// It exists for the same reason as [`commit`](Self::commit): abort belongs
+    /// to the transaction boundary, not to the general session object.
     pub fn abort(mut self) -> Result<(), WrongoDBError> {
         let Some(active) = self.session.active_txn.as_ref() else {
             self.session.write_tracker.clear();
@@ -217,7 +306,7 @@ impl<'a> WriteUnitOfWork<'a> {
         let touched_stores: Vec<String> = active.touched_stores().lock().iter().cloned().collect();
         let txn_id = active.txn().id();
 
-        match self.session.write_path_mode() {
+        match self.write_path_mode {
             WritePathMode::LocalApply => self.session.recovery_unit.abort_unit_of_work(txn_id)?,
             WritePathMode::DeferredReplication => self.session.record_abort(txn_id)?,
         }
@@ -234,7 +323,7 @@ impl<'a> WriteUnitOfWork<'a> {
         self.session.write_tracker.clear();
         self.committed = true;
 
-        if self.session.write_path_mode() == WritePathMode::LocalApply {
+        if self.write_path_mode == WritePathMode::LocalApply {
             self.session
                 .finalize_touched_stores_locally(&touched_stores, txn_id, false)?;
         }
@@ -242,9 +331,11 @@ impl<'a> WriteUnitOfWork<'a> {
     }
 
     fn new(session: &'a mut Session) -> Self {
+        let write_path_mode = session.write_path_mode();
         Self {
             session,
             committed: false,
+            write_path_mode,
         }
     }
 
@@ -279,7 +370,7 @@ impl<'a> Drop for WriteUnitOfWork<'a> {
             let touched_stores: Vec<String> =
                 active.touched_stores().lock().iter().cloned().collect();
             let txn_id = active.txn().id();
-            match self.session.write_path_mode() {
+            match self.write_path_mode {
                 WritePathMode::LocalApply => {
                     let _ = self.session.recovery_unit.abort_unit_of_work(txn_id);
                 }
@@ -292,7 +383,7 @@ impl<'a> Drop for WriteUnitOfWork<'a> {
                 .transaction_manager
                 .abort_txn_state(active.txn_mut());
             self.session.write_tracker.clear();
-            if self.session.write_path_mode() == WritePathMode::LocalApply {
+            if self.write_path_mode == WritePathMode::LocalApply {
                 let _ =
                     self.session
                         .finalize_touched_stores_locally(&touched_stores, txn_id, false);

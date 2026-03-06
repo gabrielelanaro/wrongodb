@@ -14,25 +14,57 @@ use crate::store_write_path::StoreWritePath;
 use crate::txn::{GlobalTxnState, TransactionManager};
 use crate::WrongoDBError;
 
+/// Network identity for a remote RAFT peer.
+///
+/// This is part of the public configuration surface because clustered mode
+/// needs an explicit startup-time description of the peer set. WrongoDB does
+/// not do peer discovery dynamically, so callers provide this directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RaftPeerConfig {
+    /// Stable node identifier used in RAFT protocol messages.
     pub node_id: String,
+    /// Socket address used for RAFT transport.
     pub raft_addr: String,
 }
 
+/// Durability/replication mode for a connection.
+///
+/// This exists to keep the public API honest about the two supported write
+/// paths:
+/// - local durability on a single node
+/// - deferred apply through clustered RAFT replication
+///
+/// Callers choose this once at connection startup because it changes the
+/// meaning of write execution, recovery, and which low-level APIs remain
+/// writable.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RaftMode {
+    /// Single-node mode with local durability only.
     #[default]
     Standalone,
+    /// Multi-node RAFT replication mode.
     Cluster {
+        /// Stable identifier for the local node.
         local_node_id: String,
+        /// Socket address the local RAFT service listens on.
         local_raft_addr: String,
+        /// Static peer list for the cluster.
         peers: Vec<RaftPeerConfig>,
     },
 }
 
+/// Configuration used when opening a [`Connection`].
+///
+/// The public connection constructor stays intentionally small. This struct is
+/// where callers choose the coarse durability mode without having to know
+/// about the internal storage, recovery, or replication wiring.
 pub struct ConnectionConfig {
+    /// Enables local durability and crash recovery.
+    ///
+    /// This is separate from `raft_mode` because standalone durability and
+    /// clustered replication are distinct concerns.
     pub wal_enabled: bool,
+    /// Selects standalone or clustered write replication behavior.
     pub raft_mode: RaftMode,
 }
 
@@ -46,21 +78,42 @@ impl Default for ConnectionConfig {
 }
 
 impl ConnectionConfig {
+    /// Create a config with the default durable standalone settings.
+    ///
+    /// This exists so callers can start from the common case and override only
+    /// the coarse durability/replication knobs they care about.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Override whether local durability is enabled.
+    ///
+    /// This stays on the config builder so durability mode is chosen before the
+    /// engine is opened, not mutated later at runtime.
     pub fn wal_enabled(mut self, enabled: bool) -> Self {
         self.wal_enabled = enabled;
         self
     }
 
+    /// Override the replication mode.
+    ///
+    /// This exists because replication mode affects startup wiring, not just
+    /// request-time behavior.
     pub fn raft_mode(mut self, mode: RaftMode) -> Self {
         self.raft_mode = mode;
         self
     }
 }
 
+/// Top-level database handle that owns shared engine state.
+///
+/// `Connection` exists so sessions can stay cheap and request-scoped. Long-lived
+/// components such as schema metadata, open store handles, MVCC state, and
+/// durability machinery live here once, and every [`Session`](crate::Session)
+/// borrows that shared infrastructure instead of rebuilding it.
+///
+/// In other words: `Connection` owns the engine, [`Session`](crate::Session)
+/// owns request-local state.
 pub struct Connection {
     base_path: PathBuf,
     wal_enabled: bool,
@@ -82,6 +135,14 @@ impl fmt::Debug for Connection {
 }
 
 impl Connection {
+    /// Open or create a database rooted at `path`.
+    ///
+    /// This is the only supported way to construct the database because it
+    /// wires recovery, local durability, replication mode, schema state, and
+    /// shared caches together consistently before any session is opened.
+    ///
+    /// The constructor does this eagerly so callers never have to reason about
+    /// partially initialized engine state.
     pub fn open<P>(path: P, config: ConnectionConfig) -> Result<Self, WrongoDBError>
     where
         P: AsRef<Path>,
@@ -128,6 +189,14 @@ impl Connection {
         })
     }
 
+    /// Open a fresh request-scoped [`Session`](crate::Session).
+    ///
+    /// Sessions are intentionally lightweight. They hold mutable per-request
+    /// state such as the active transaction and bound cursors, while
+    /// `Connection` retains the shared engine state.
+    ///
+    /// This separation is the reason session creation is cheap and why multiple
+    /// sessions can share one opened database safely.
     pub fn open_session(&self) -> Session {
         Session::new(
             self.table_cache.clone(),

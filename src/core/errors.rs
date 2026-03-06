@@ -1,5 +1,10 @@
 use thiserror::Error;
 
+/// Top-level error type returned by the supported public API.
+///
+/// This type exists so callers can handle one error surface while still
+/// preserving the distinction between validation failures, storage failures,
+/// protocol problems, and transaction-state errors.
 #[derive(Debug, Error)]
 pub enum WrongoDBError {
     #[error("document validation error: {0}")]
@@ -36,10 +41,17 @@ pub enum WrongoDBError {
     NotLeader { leader_hint: Option<String> },
 }
 
+/// Error returned when user data violates a database rule.
+///
+/// This is separate from [`StorageError`] so callers can distinguish invalid
+/// input from engine or persistence failures.
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub struct DocumentValidationError(pub String);
 
+/// Error returned when the storage engine cannot carry out a requested action.
+///
+/// This is the low-level operational error surface for the public API.
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub struct StorageError(pub String);
