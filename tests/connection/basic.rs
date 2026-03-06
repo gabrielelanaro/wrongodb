@@ -1,4 +1,4 @@
-use serde_json::json;
+use crate::common::kv::{delete_kv_in_session, get_kv, get_kv_in_session, insert_kv_in_session};
 use wrongodb::{Connection, ConnectionConfig};
 
 #[test]
@@ -11,16 +11,13 @@ fn test_connection_basic() {
 
     {
         let mut txn = session.transaction().unwrap();
-        txn.session_mut()
-            .insert_one("test", json!({"_id": "key1", "value": "value1"}))
-            .unwrap();
+        let txn_id = txn.as_ref().id();
+        insert_kv_in_session(txn.session_mut(), "test", b"key1", b"value1", txn_id).unwrap();
 
-        let value = txn
-            .session_mut()
-            .find_one("test", Some(json!({"_id": "key1"})))
+        let value = get_kv_in_session(txn.session_mut(), "test", b"key1", txn_id)
             .unwrap()
             .unwrap();
-        assert_eq!(value.get("value"), Some(&json!("value1")));
+        assert_eq!(value, b"value1".to_vec());
 
         txn.commit().unwrap();
     }
@@ -37,26 +34,19 @@ fn test_connection_with_config() {
 
     {
         let mut txn = session.transaction().unwrap();
-        txn.session_mut()
-            .insert_one("users", json!({"_id": "user1", "name": "alice"}))
-            .unwrap();
-        txn.session_mut()
-            .insert_one("users", json!({"_id": "user2", "name": "bob"}))
-            .unwrap();
+        let txn_id = txn.as_ref().id();
+        insert_kv_in_session(txn.session_mut(), "users", b"user1", b"alice", txn_id).unwrap();
+        insert_kv_in_session(txn.session_mut(), "users", b"user2", b"bob", txn_id).unwrap();
 
-        let value = txn
-            .session_mut()
-            .find_one("users", Some(json!({"_id": "user1"})))
+        let value = get_kv_in_session(txn.session_mut(), "users", b"user1", txn_id)
             .unwrap()
             .unwrap();
-        assert_eq!(value.get("name"), Some(&json!("alice")));
+        assert_eq!(value, b"alice".to_vec());
 
-        let value = txn
-            .session_mut()
-            .find_one("users", Some(json!({"_id": "user2"})))
+        let value = get_kv_in_session(txn.session_mut(), "users", b"user2", txn_id)
             .unwrap()
             .unwrap();
-        assert_eq!(value.get("name"), Some(&json!("bob")));
+        assert_eq!(value, b"bob".to_vec());
 
         txn.commit().unwrap();
     }
@@ -72,36 +62,27 @@ fn test_session_delete() {
 
     {
         let mut txn = session.transaction().unwrap();
-        txn.session_mut()
-            .insert_one("items", json!({"_id": "item1", "value": "apple"}))
-            .unwrap();
-        txn.session_mut()
-            .insert_one("items", json!({"_id": "item2", "value": "banana"}))
-            .unwrap();
+        let txn_id = txn.as_ref().id();
+        insert_kv_in_session(txn.session_mut(), "items", b"item1", b"apple", txn_id).unwrap();
+        insert_kv_in_session(txn.session_mut(), "items", b"item2", b"banana", txn_id).unwrap();
 
-        let value = txn
-            .session_mut()
-            .find_one("items", Some(json!({"_id": "item1"})))
+        let value = get_kv_in_session(txn.session_mut(), "items", b"item1", txn_id)
             .unwrap()
             .unwrap();
-        assert_eq!(value.get("value"), Some(&json!("apple")));
+        assert_eq!(value, b"apple".to_vec());
 
-        txn.session_mut()
-            .delete_one("items", Some(json!({"_id": "item1"})))
-            .unwrap();
+        delete_kv_in_session(txn.session_mut(), "items", b"item1", txn_id).unwrap();
 
-        assert!(txn
-            .session_mut()
-            .find_one("items", Some(json!({"_id": "item1"})))
-            .unwrap()
-            .is_none());
+        assert!(
+            get_kv_in_session(txn.session_mut(), "items", b"item1", txn_id)
+                .unwrap()
+                .is_none()
+        );
 
-        let value = txn
-            .session_mut()
-            .find_one("items", Some(json!({"_id": "item2"})))
+        let value = get_kv_in_session(txn.session_mut(), "items", b"item2", txn_id)
             .unwrap()
             .unwrap();
-        assert_eq!(value.get("value"), Some(&json!("banana")));
+        assert_eq!(value, b"banana".to_vec());
 
         txn.commit().unwrap();
     }
@@ -115,23 +96,9 @@ fn test_session_autocommit_visibility_with_wal() {
     let mut session = conn.open_session();
     session.create("table:kv").unwrap();
 
-    session
-        .insert_one("kv", json!({"_id": "k1", "value": "v1"}))
-        .unwrap();
-    assert_eq!(
-        session
-            .find_one("kv", Some(json!({"_id": "k1"})))
-            .unwrap()
-            .unwrap()
-            .get("value"),
-        Some(&json!("v1"))
-    );
+    insert_kv_in_session(&mut session, "kv", b"k1", b"v1", 0).unwrap();
+    assert_eq!(get_kv(&conn, "kv", b"k1").unwrap().unwrap(), b"v1".to_vec());
 
-    session
-        .delete_one("kv", Some(json!({"_id": "k1"})))
-        .unwrap();
-    assert!(session
-        .find_one("kv", Some(json!({"_id": "k1"})))
-        .unwrap()
-        .is_none());
+    delete_kv_in_session(&mut session, "kv", b"k1", 0).unwrap();
+    assert!(get_kv(&conn, "kv", b"k1").unwrap().is_none());
 }

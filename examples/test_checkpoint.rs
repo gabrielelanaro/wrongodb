@@ -1,4 +1,3 @@
-use serde_json::json;
 use wrongodb::{Connection, ConnectionConfig};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -6,15 +5,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let conn = Connection::open("test_checkpoint", ConnectionConfig::default())?;
     let mut session = conn.open_session();
+    session.create("table:test")?;
 
     for i in 0..10 {
-        session.insert_one(
-            "test",
-            json!({"_id": format!("doc:{i}"), "value": format!("value:{i}")}),
-        )?;
+        let mut cursor = session.open_cursor("table:test")?;
+        let key = format!("doc:{i}");
+        let value = format!("value:{i}");
+        cursor.insert(key.as_bytes(), value.as_bytes(), 0)?;
     }
 
-    let count = session.find("test", None)?.len();
+    let mut cursor = session.open_cursor("table:test")?;
+    let mut count = 0;
+    while cursor.next(0)?.is_some() {
+        count += 1;
+    }
 
     println!("Inserted and scanned {} records", count);
     Ok(())

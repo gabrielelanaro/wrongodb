@@ -1,6 +1,5 @@
 use std::net::TcpListener;
 
-use serde_json::json;
 use tempfile::tempdir;
 
 use wrongodb::{Connection, ConnectionConfig, RaftMode, RaftPeerConfig, WrongoDBError};
@@ -14,13 +13,9 @@ fn free_local_addr() -> String {
 
 fn insert_kv(conn: &Connection, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
     let mut session = conn.open_session();
-    session.insert_one(
-        "test",
-        json!({
-            "_id": String::from_utf8_lossy(key).to_string(),
-            "value": String::from_utf8_lossy(value).to_string(),
-        }),
-    )?;
+    session.create("table:test")?;
+    let mut cursor = session.open_cursor("table:test")?;
+    cursor.insert(key, value, 0)?;
     Ok(())
 }
 
@@ -36,16 +31,14 @@ fn standalone_mode_commits_writes_with_majority_one() {
 
     insert_kv(&conn, b"alice", b"value").unwrap();
 
-    let mut session = conn.open_session();
-    let doc = session
-        .find_one("test", Some(json!({"_id": "alice"})))
-        .unwrap()
-        .unwrap();
-    assert_eq!(doc.get("value"), Some(&json!("value")));
+    let session = conn.open_session();
+    let mut cursor = session.open_cursor("table:test").unwrap();
+    let value = cursor.get(b"alice", 0).unwrap().unwrap();
+    assert_eq!(value, b"value".to_vec());
 }
 
 #[test]
-fn cluster_mode_rejects_write_when_node_is_not_leader() {
+fn cluster_mode_rejects_public_cursor_writes() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("db");
     let local_raft_addr = free_local_addr();
@@ -64,8 +57,7 @@ fn cluster_mode_rejects_write_when_node_is_not_leader() {
     .unwrap();
 
     let err = insert_kv(&conn, b"alice", b"value").unwrap_err();
-    match err {
-        WrongoDBError::NotLeader { leader_hint } => assert_eq!(leader_hint, None),
-        other => panic!("unexpected error: {other}"),
-    }
+    assert!(err
+        .to_string()
+        .contains("cursor writes are not available when durability defers apply"));
 }

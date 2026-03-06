@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use serde_json::json;
 use wrongodb::{Connection, ConnectionConfig};
 
 fn main() {
@@ -15,8 +14,10 @@ fn main() {
         let mut txn = session.transaction().unwrap();
 
         println!("Inserting key0");
-        txn.session_mut()
-            .insert_one("test", json!({"_id": "key0", "value": "value0"}))
+        txn.session_mut().create("table:test").unwrap();
+        let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
+        cursor
+            .insert(b"key0", b"value0", txn.as_ref().id())
             .unwrap();
         txn.commit().unwrap();
     }
@@ -24,12 +25,11 @@ fn main() {
     println!("\n=== Reopening database (recovery) ===");
     {
         let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
-        let mut session = conn.open_session();
+        let session = conn.open_session();
 
         println!("Trying to get key0");
-        let found = session
-            .find_one("test", Some(json!({"_id": "key0"})))
-            .unwrap();
+        let mut cursor = session.open_cursor("table:test").unwrap();
+        let found = cursor.get(b"key0", 0).unwrap();
         println!("Found: {:?}", found);
     }
 }

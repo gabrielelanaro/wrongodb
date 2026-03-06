@@ -6,7 +6,7 @@ pub mod update;
 
 pub use global_txn::GlobalTxnState;
 #[allow(unused_imports)]
-pub(crate) use manager::TransactionManager;
+pub(crate) use manager::{LocalWriteDurability, TransactionManager};
 #[allow(unused_imports)]
 pub use transaction::{IsolationLevel, Transaction, TxnState};
 pub use update::{Update, UpdateChain, UpdateType};

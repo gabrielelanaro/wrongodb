@@ -3,7 +3,7 @@
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 
-use serde_json::json;
+use crate::common::kv::{get_kv, insert_kv_in_session, update_kv_in_session};
 use tempfile::tempdir;
 
 use wrongodb::{Connection, ConnectionConfig};
@@ -15,55 +15,21 @@ fn global_wal_path(db_dir: &std::path::Path) -> std::path::PathBuf {
 fn insert_kv(conn: &Connection, table: &str, key: &[u8], value: &[u8]) {
     let mut session = conn.open_session();
     let mut txn = session.transaction().unwrap();
-    txn.session_mut()
-        .insert_one(
-            table,
-            json!({
-                "_id": String::from_utf8_lossy(key).to_string(),
-                "value": String::from_utf8_lossy(value).to_string(),
-            }),
-        )
-        .unwrap();
+    let txn_id = txn.as_ref().id();
+    insert_kv_in_session(txn.session_mut(), table, key, value, txn_id).unwrap();
     txn.commit().unwrap();
 }
 
 fn insert_kv_non_transactional(conn: &Connection, table: &str, key: &[u8], value: &[u8]) {
-    let mut session = conn.open_session();
-    session
-        .insert_one(
-            table,
-            json!({
-                "_id": String::from_utf8_lossy(key).to_string(),
-                "value": String::from_utf8_lossy(value).to_string(),
-            }),
-        )
-        .unwrap();
+    insert_kv(conn, table, key, value);
 }
 
 fn exists(conn: &Connection, table: &str, key: &[u8]) -> bool {
-    let mut session = conn.open_session();
-    session
-        .find_one(
-            table,
-            Some(json!({"_id": String::from_utf8_lossy(key).to_string()})),
-        )
-        .unwrap()
-        .is_some()
+    get_kv(conn, table, key).unwrap().is_some()
 }
 
 fn read_value(conn: &Connection, table: &str, key: &[u8]) -> Option<Vec<u8>> {
-    let mut session = conn.open_session();
-    session
-        .find_one(
-            table,
-            Some(json!({"_id": String::from_utf8_lossy(key).to_string()})),
-        )
-        .unwrap()
-        .and_then(|doc| {
-            doc.get("value")
-                .and_then(|value| value.as_str())
-                .map(|value| value.as_bytes().to_vec())
-        })
+    get_kv(conn, table, key).unwrap()
 }
 
 #[test]
@@ -116,12 +82,9 @@ fn recovery_skips_uncommitted_transaction_writes() {
         let mut session = conn.open_session();
 
         let mut txn = session.transaction().unwrap();
-        txn.session_mut()
-            .insert_one("test", json!({"_id": "k1", "value": "a"}))
-            .unwrap();
-        txn.session_mut()
-            .insert_one("test", json!({"_id": "k2", "value": "b"}))
-            .unwrap();
+        let txn_id = txn.as_ref().id();
+        insert_kv_in_session(txn.session_mut(), "test", b"k1", b"a", txn_id).unwrap();
+        insert_kv_in_session(txn.session_mut(), "test", b"k2", b"b", txn_id).unwrap();
 
         std::mem::forget(txn);
     }
@@ -143,9 +106,8 @@ fn recovery_skips_explicitly_aborted_transaction_writes() {
         let mut session = conn.open_session();
 
         let mut txn = session.transaction().unwrap();
-        txn.session_mut()
-            .insert_one("test", json!({"_id": "k1", "value": "a"}))
-            .unwrap();
+        let txn_id = txn.as_ref().id();
+        insert_kv_in_session(txn.session_mut(), "test", b"k1", b"a", txn_id).unwrap();
         txn.abort().unwrap();
     }
 
@@ -167,13 +129,8 @@ fn recovery_replays_transactional_writes_at_commit_time() {
         let mut session = conn.open_session();
 
         let mut txn = session.transaction().unwrap();
-        txn.session_mut()
-            .update_one(
-                "test",
-                Some(json!({"_id": "shared"})),
-                json!({"$set": {"value": "txn"}}),
-            )
-            .unwrap();
+        let txn_id = txn.as_ref().id();
+        update_kv_in_session(txn.session_mut(), "test", b"shared", b"txn", txn_id).unwrap();
         txn.commit().unwrap();
     }
 

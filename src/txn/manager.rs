@@ -11,10 +11,28 @@ use crate::txn::{
     TXN_ABORTED, TXN_NONE,
 };
 
+pub(crate) trait LocalWriteDurability: Send + Sync + std::fmt::Debug {
+    fn record_put(
+        &self,
+        store_name: &str,
+        key: &[u8],
+        value: &[u8],
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError>;
+
+    fn record_delete(
+        &self,
+        store_name: &str,
+        key: &[u8],
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError>;
+}
+
 #[derive(Debug)]
 pub struct TransactionManager {
     global_txn: Arc<GlobalTxnState>,
     stores: RwLock<HashMap<String, MvccState>>,
+    local_write_durability: RwLock<Option<Arc<dyn LocalWriteDurability>>>,
 }
 
 impl TransactionManager {
@@ -22,7 +40,15 @@ impl TransactionManager {
         Self {
             global_txn,
             stores: RwLock::new(HashMap::new()),
+            local_write_durability: RwLock::new(None),
         }
+    }
+
+    pub(crate) fn set_local_write_durability(
+        &self,
+        durability: Option<Arc<dyn LocalWriteDurability>>,
+    ) {
+        *self.local_write_durability.write() = durability;
     }
 
     pub fn has_active_transactions(&self) -> bool {
@@ -49,6 +75,10 @@ impl TransactionManager {
         value: &[u8],
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
+        if let Some(durability) = self.local_write_durability.read().clone() {
+            durability.record_put(store_name, key, value, txn_id)?;
+        }
+
         if txn_id == TXN_NONE {
             btree.put(key, value)?;
             return Ok(());
@@ -76,6 +106,10 @@ impl TransactionManager {
         key: &[u8],
         txn_id: TxnId,
     ) -> Result<bool, WrongoDBError> {
+        if let Some(durability) = self.local_write_durability.read().clone() {
+            durability.record_delete(store_name, key, txn_id)?;
+        }
+
         if txn_id == TXN_NONE {
             return btree.delete(key);
         }

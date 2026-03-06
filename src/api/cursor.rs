@@ -3,11 +3,12 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
+use crate::core::errors::{DocumentValidationError, StorageError};
 use crate::storage::table::Table;
 use crate::txn::{TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
-type CursorEntry = (Vec<u8>, Vec<u8>);
+pub type CursorEntry = (Vec<u8>, Vec<u8>);
 
 #[derive(Debug, Clone)]
 struct TrackedTxn {
@@ -50,10 +51,17 @@ impl StoreWriteTracker {
     }
 }
 
-pub(crate) struct Cursor {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorWriteAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+pub struct Cursor {
     table: Arc<RwLock<Table>>,
     store_name: String,
     write_tracker: StoreWriteTracker,
+    write_access: CursorWriteAccess,
     buffered_entries: Vec<CursorEntry>,
     buffer_pos: usize,
     exhausted: bool,
@@ -66,11 +74,13 @@ impl Cursor {
         table: Arc<RwLock<Table>>,
         store_name: String,
         write_tracker: StoreWriteTracker,
+        write_access: CursorWriteAccess,
     ) -> Self {
         Self {
             table,
             store_name,
             write_tracker,
+            write_access,
             buffered_entries: Vec::new(),
             buffer_pos: 0,
             exhausted: false,
@@ -79,103 +89,73 @@ impl Cursor {
         }
     }
 
-    pub(crate) fn set_range(&mut self, start: Option<Vec<u8>>, end: Option<Vec<u8>>) {
+    pub fn set_range(&mut self, start: Option<Vec<u8>>, end: Option<Vec<u8>>) {
         self.range_start = start;
         self.range_end = end;
         self.reset();
     }
 
-    pub(crate) fn insert(
-        &mut self,
-        key: &[u8],
-        value: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        let exists = {
-            let mut table = self.table.write();
-            table.contains_key(key, txn_id)?
-        };
-        if exists {
-            return Err(
-                crate::core::errors::DocumentValidationError("duplicate key error".into()).into(),
-            );
+    fn ensure_writable(&self) -> Result<(), WrongoDBError> {
+        if self.write_access == CursorWriteAccess::ReadWrite {
+            return Ok(());
         }
+        Err(WrongoDBError::Storage(StorageError(
+            "cursor writes are not available when durability defers apply; use Session::insert/update/delete"
+                .into(),
+        )))
+    }
 
+    pub fn insert(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+        self.ensure_writable()?;
         let mut table = self.table.write();
         if table.contains_key(key, txn_id)? {
-            return Err(
-                crate::core::errors::DocumentValidationError("duplicate key error".into()).into(),
-            );
+            return Err(DocumentValidationError("duplicate key error".into()).into());
         }
         table.local_apply_put_with_txn(key, value, txn_id)?;
+        drop(table);
         self.write_tracker.record(&self.store_name, txn_id);
         Ok(())
     }
 
-    pub(crate) fn update(
-        &mut self,
-        key: &[u8],
-        value: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        let exists = {
-            let mut table = self.table.write();
-            table.contains_key(key, txn_id)?
-        };
-        if !exists {
-            return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
-                "key not found for update".to_string(),
-            )));
-        }
-
+    pub fn update(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+        self.ensure_writable()?;
         let mut table = self.table.write();
         if !table.contains_key(key, txn_id)? {
-            return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
+            return Err(WrongoDBError::Storage(StorageError(
                 "key not found for update".to_string(),
             )));
         }
         table.local_apply_put_with_txn(key, value, txn_id)?;
+        drop(table);
         self.write_tracker.record(&self.store_name, txn_id);
         Ok(())
     }
 
-    pub(crate) fn delete(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
-        let exists = {
-            let mut table = self.table.write();
-            table.contains_key(key, txn_id)?
-        };
-        if !exists {
-            return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
-                "key not found for delete".to_string(),
-            )));
-        }
-
+    pub fn delete(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+        self.ensure_writable()?;
         let mut table = self.table.write();
         if !table.contains_key(key, txn_id)? {
-            return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
+            return Err(WrongoDBError::Storage(StorageError(
                 "key not found for delete".to_string(),
             )));
         }
-        let result = table.local_apply_delete_with_txn(key, txn_id)?;
-        if !result {
-            return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
+        let deleted = table.local_apply_delete_with_txn(key, txn_id)?;
+        if !deleted {
+            return Err(WrongoDBError::Storage(StorageError(
                 "key not found for delete".to_string(),
             )));
         }
+        drop(table);
         self.write_tracker.record(&self.store_name, txn_id);
         Ok(())
     }
 
-    pub(crate) fn get(
-        &mut self,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<Option<Vec<u8>>, WrongoDBError> {
+    pub fn get(&mut self, key: &[u8], txn_id: TxnId) -> Result<Option<Vec<u8>>, WrongoDBError> {
         let mut table = self.table.write();
         table.get_version(key, txn_id)
     }
 
-    pub(crate) fn next(&mut self, txn_id: TxnId) -> Result<Option<CursorEntry>, WrongoDBError> {
+    pub fn next(&mut self, txn_id: TxnId) -> Result<Option<CursorEntry>, WrongoDBError> {
         if self.exhausted {
             return Ok(None);
         }
@@ -241,7 +221,7 @@ impl Cursor {
     }
 
     /// Reset the cursor position to the beginning.
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.buffered_entries.clear();
         self.buffer_pos = 0;
         self.exhausted = false;
@@ -273,7 +253,12 @@ mod tests {
     #[test]
     fn insert_applies_locally() {
         let (_tmp, table, store_name) = open_index_table();
-        let mut cursor = Cursor::new(table.clone(), store_name, StoreWriteTracker::new());
+        let mut cursor = Cursor::new(
+            table.clone(),
+            store_name,
+            StoreWriteTracker::new(),
+            CursorWriteAccess::ReadWrite,
+        );
 
         cursor.insert(b"k1", b"v1", TXN_NONE).unwrap();
 
@@ -290,7 +275,12 @@ mod tests {
             .write()
             .local_apply_put_with_txn(b"k1", b"v1", TXN_NONE)
             .unwrap();
-        let mut cursor = Cursor::new(table.clone(), store_name, StoreWriteTracker::new());
+        let mut cursor = Cursor::new(
+            table.clone(),
+            store_name,
+            StoreWriteTracker::new(),
+            CursorWriteAccess::ReadWrite,
+        );
 
         cursor.delete(b"k1", TXN_NONE).unwrap();
 
@@ -303,10 +293,31 @@ mod tests {
         let touched_stores = Arc::new(Mutex::new(HashSet::new()));
         let write_tracker = StoreWriteTracker::new();
         write_tracker.begin(7, touched_stores.clone());
-        let mut cursor = Cursor::new(table, store_name.clone(), write_tracker);
+        let mut cursor = Cursor::new(
+            table,
+            store_name.clone(),
+            write_tracker,
+            CursorWriteAccess::ReadWrite,
+        );
 
         cursor.insert(b"k1", b"v1", 7).unwrap();
 
         assert!(touched_stores.lock().contains(&store_name));
+    }
+
+    #[test]
+    fn read_only_cursor_rejects_writes() {
+        let (_tmp, table, store_name) = open_index_table();
+        let mut cursor = Cursor::new(
+            table,
+            store_name,
+            StoreWriteTracker::new(),
+            CursorWriteAccess::ReadOnly,
+        );
+
+        let err = cursor.insert(b"k1", b"v1", TXN_NONE).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cursor writes are not available when durability defers apply"));
     }
 }

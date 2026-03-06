@@ -1,5 +1,68 @@
 # Decisions
 
+## 2026-03-06: Split standalone local durability from RAFT replication and keep the public cursor WT-like
+
+**Decision**
+- Split runtime durability into three modes:
+  - `Disabled`
+  - `LocalWal`
+  - `Raft`
+- Treat `wal_enabled=true` with `RaftMode::Standalone` as `LocalWal`, not standalone RAFT.
+- Keep `Cursor` as a WT-style local store cursor:
+  - one-store reads and local writes only
+  - no hidden request-path durability branching
+- In clustered RAFT mode, public cursor writes are intentionally unsupported.
+- Move Mongo-style document write orchestration into `src/collection_write_path.rs` and keep
+  read/query helpers in `src/document_query.rs`.
+
+**Why**
+- The design knot came from asking one public cursor API to serve two different layers:
+  WT-style local storage access and Mongo-style replicated write orchestration.
+- WiredTiger keeps cursor meaning stable, and Mongo keeps replicated write control in an
+  explicit write path above storage primitives.
+- Splitting standalone durability from RAFT removes the last reason to hide apply-policy inside
+  the public cursor path: standalone/default durability can log locally and still let the cursor
+  mean “mutate this one store”.
+
+**Notes**
+- Local WAL `Put`/`Delete` logging now happens below the cursor boundary through the
+  transaction manager, while `TxnCommit`/`TxnAbort`/`Checkpoint` markers remain session-owned.
+- The previous same-day decision about restoring a WT-style public cursor API is superseded here:
+  the public cursor stays, but only with strictly local/store semantics.
+- Old integration tests that used the public cursor as a replicated write API were removed and
+  replaced by coverage on the internal collection write path and server protocol path.
+
+## 2026-03-06: Restore a WT-style public cursor API while keeping request-path policy internal
+
+**Decision**
+- Restore `Cursor` and `Session::open_cursor(uri)` as public low-level API surface.
+- Keep `Cursor` semantics narrow and stable:
+  - one-store access path
+  - explicit `txn_id` on read/write methods
+  - no public durability-policy branching
+- Remove public document CRUD/index helpers from `Session` and keep Mongo-style document
+  orchestration internal in `src/document_ops/`.
+- Keep request-path apply policy behind an internal cursor write executor chosen by
+  `DurabilityBackend::request_apply_mode()`.
+- Extend `Session::create(uri)` to support both:
+  - `table:<collection>`
+  - `index:<collection>:<field>`
+
+**Why**
+- Making `Cursor` internal improved ownership clarity, but it moved the public API farther away
+  from the WiredTiger mental model that the storage layer is already converging toward.
+- Re-exposing the cursor is only correct if its meaning is stable across backends. The earlier
+  hidden “maybe apply now, maybe record for later” behavior was the real problem, not the
+  existence of a public cursor.
+- Keeping document/index orchestration in `document_ops` preserves the cleaned-up responsibility
+  split:
+  public API is storage-engine flavored, while Mongo-style collection semantics stay internal.
+
+**Notes**
+- This supersedes the earlier same-day decision that made `Cursor` internal.
+- The committed replay path is unchanged: `StoreCommandApplier` remains the only deferred local
+  applier.
+
 ## 2026-03-06: Remove hook-owned apply policy and make `Session` the durable write orchestrator
 
 **Decision**

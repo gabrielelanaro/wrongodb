@@ -1,4 +1,3 @@
-use serde_json::json;
 use tempfile::tempdir;
 use wrongodb::{Connection, ConnectionConfig};
 
@@ -15,14 +14,14 @@ fn main() {
         session.create("table:test").unwrap();
 
         let mut txn = session.transaction().unwrap();
+        let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
 
         for i in 0..5 {
             println!("Inserting: key{}", i);
-            txn.session_mut()
-                .insert_one(
-                    "test",
-                    json!({"_id": format!("key{i}"), "value": format!("value{i}")}),
-                )
+            let key = format!("key{i}");
+            let value = format!("value{i}");
+            cursor
+                .insert(key.as_bytes(), value.as_bytes(), txn.as_ref().id())
                 .unwrap();
         }
 
@@ -35,14 +34,14 @@ fn main() {
         let mut session = conn.open_session();
 
         let mut txn = session.transaction().unwrap();
+        let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
 
         for i in 5..10 {
             println!("Inserting: key{}", i);
-            txn.session_mut()
-                .insert_one(
-                    "test",
-                    json!({"_id": format!("key{i}"), "value": format!("value{i}")}),
-                )
+            let key = format!("key{i}");
+            let value = format!("value{i}");
+            cursor
+                .insert(key.as_bytes(), value.as_bytes(), txn.as_ref().id())
                 .unwrap();
         }
 
@@ -56,15 +55,14 @@ fn main() {
     println!("\n=== Phase 3: Reopen and check ===");
     {
         let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
-        let mut session = conn.open_session();
+        let session = conn.open_session();
+        let mut cursor = session.open_cursor("table:test").unwrap();
 
         for i in 0..10 {
             let key = format!("key{}", i);
-            let result = session
-                .find_one("test", Some(json!({"_id": key.clone()})))
-                .unwrap();
+            let result = cursor.get(key.as_bytes(), 0).unwrap();
             match &result {
-                Some(doc) => println!("{} -> {:?}", key, doc.get("value")),
+                Some(value) => println!("{} -> {:?}", key, String::from_utf8_lossy(value)),
                 None => println!("{} -> MISSING", key),
             }
         }

@@ -30,6 +30,9 @@ A learning-oriented MongoDB-compatible database in Rust, inspired by WiredTiger'
 - Transaction-scoped reads/writes via `Session::transaction()`
 - MongoDB wire protocol server (works with `mongosh`)
 
+`Cursor` is intentionally a local/store-level API. In clustered RAFT mode, replicated writes go
+through the server/internal collection write path, not through low-level cursor writes.
+
 ### Future Work
 - Background maintenance: space reuse, compaction, compression
 
@@ -41,7 +44,8 @@ The codebase is organized by domain to keep storage and server concerns separate
 - `src/core/`: shared types/utilities (BSON codec, document helpers, errors).
 - `src/storage/`: on-disk storage (block file, B-tree, WAL, main table).
 - `src/index/`: secondary index implementation and key encoding.
-- `src/document_ops/`: internal document CRUD/index orchestration used by server handlers.
+- `src/collection_write_path.rs`: internal Mongo-style document/index write orchestration.
+- `src/document_query.rs`: internal document/query helpers used by the server path.
 - `src/server/`: MongoDB wire-protocol server and command handlers.
 
 Integration tests are grouped under `tests/` with explicit suite entrypoints:
@@ -68,6 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Open connection (WAL enabled by default)
     let conn = Connection::open("data/db", ConnectionConfig::default())?;
     let mut session = conn.open_session();
+    session.create("table:test")?;
 
     // Execute one transactional write unit
     let mut txn = session.transaction()?;
@@ -84,6 +89,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+Schema objects are URI-based too:
+- `session.create("table:users")?`
+- `session.create("index:users:name")?`
 
 #### As a Server
 For interactive usage with mongosh, see [Server Documentation](docs/server.md).

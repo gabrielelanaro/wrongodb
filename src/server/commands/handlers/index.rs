@@ -1,4 +1,6 @@
+use crate::collection_write_path;
 use crate::commands::Command;
+use crate::document_query;
 use crate::{Connection, WrongoDBError};
 use bson::{doc, Bson, Document};
 
@@ -13,7 +15,7 @@ impl Command for ListIndexesCommand {
     fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("listIndexes").unwrap_or("test");
         let session = conn.open_session();
-        let indexes = session.list_indexes(coll_name)?;
+        let indexes = document_query::list_indexes(&session, coll_name)?;
 
         let indexes_bson: Vec<Bson> = indexes
             .into_iter()
@@ -66,7 +68,8 @@ impl Command for CreateIndexesCommand {
                 if let Bson::Document(spec) = index_spec {
                     if let Ok(key_doc) = spec.get_document("key") {
                         for (field, _) in key_doc {
-                            let _ = session.create_index(coll_name, field);
+                            let _ =
+                                collection_write_path::create_index(&mut session, coll_name, field);
                             created += 1;
                         }
                     }
@@ -74,7 +77,7 @@ impl Command for CreateIndexesCommand {
             }
         }
 
-        let total_indexes = session.list_indexes(coll_name)?.len() as i32 + 1;
+        let total_indexes = document_query::list_indexes(&session, coll_name)?.len() as i32 + 1;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),

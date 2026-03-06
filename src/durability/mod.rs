@@ -4,6 +4,6 @@ pub(crate) mod op;
 
 pub(crate) use applier::StoreCommandApplier;
 #[allow(unused_imports)]
-pub(crate) use backend::{DurabilityBackend, DurabilityGuarantee, RaftStatus, RequestApplyMode};
+pub(crate) use backend::{DurabilityBackend, DurabilityGuarantee, RaftStatus, WritePathMode};
 #[allow(unused_imports)]
 pub(crate) use op::{CommittedDurableOp, DurableOp};

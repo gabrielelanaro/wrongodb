@@ -1,6 +1,7 @@
 mod api;
+mod collection_write_path;
 mod core;
-mod document_ops;
+mod document_query;
 mod durability;
 mod index;
 mod raft;
@@ -14,7 +15,9 @@ pub mod commands {
     pub use crate::server::commands::*;
 }
 
-pub use crate::api::{Connection, ConnectionConfig, RaftMode, RaftPeerConfig, Session};
+pub use crate::api::{
+    Connection, ConnectionConfig, Cursor, CursorEntry, RaftMode, RaftPeerConfig, Session,
+};
 pub use crate::core::errors::{DocumentValidationError, StorageError, WrongoDBError};
 pub use crate::index::{
     decode_index_id, encode_index_key, encode_range_bounds, encode_scalar_prefix,

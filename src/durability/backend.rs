@@ -3,7 +3,6 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-#[cfg(test)]
 use parking_lot::Mutex;
 
 use crate::api::connection::{RaftMode, RaftPeerConfig};
@@ -12,6 +11,8 @@ use crate::durability::{DurableOp, StoreCommandApplier};
 use crate::raft::node::{RaftNodeConfig, RaftNodeCore};
 use crate::raft::service::{RaftServiceConfig, RaftServiceHandle};
 use crate::recovery::manager::warn_legacy_per_table_wal_files;
+use crate::storage::wal::GlobalWal;
+use crate::txn::LocalWriteDurability;
 use crate::WrongoDBError;
 
 #[cfg(test)]
@@ -36,17 +37,23 @@ pub(crate) enum DurabilityGuarantee {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RequestApplyMode {
-    LocalNow,
-    DeferredCommittedApply,
+pub(crate) enum WritePathMode {
+    LocalApply,
+    DeferredReplication,
 }
 
 #[derive(Debug)]
 pub(crate) enum DurabilityBackend {
     Disabled,
+    LocalWal(LocalWalDurabilityBackend),
     Raft(RaftDurabilityBackend),
     #[cfg(test)]
     Test(TestDurabilityBackend),
+}
+
+#[derive(Debug)]
+pub(crate) struct LocalWalDurabilityBackend {
+    wal: Arc<Mutex<GlobalWal>>,
 }
 
 #[derive(Debug)]
@@ -54,10 +61,15 @@ pub(crate) struct RaftDurabilityBackend {
     raft_service: RaftServiceHandle,
 }
 
+#[derive(Debug)]
+struct LocalWalWriteDurability {
+    wal: Arc<Mutex<GlobalWal>>,
+}
+
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct TestDurabilityBackend {
-    request_apply_mode: RequestApplyMode,
+    write_path_mode: WritePathMode,
     recorded_ops: Arc<Mutex<Vec<(DurableOp, DurabilityGuarantee)>>>,
 }
 
@@ -73,9 +85,14 @@ impl DurabilityBackend {
         }
 
         warn_legacy_per_table_wal_files(base_path);
-        Ok(Self::Raft(RaftDurabilityBackend::open(
-            base_path, applier, raft_mode,
-        )?))
+        match raft_mode {
+            RaftMode::Standalone => Ok(Self::LocalWal(LocalWalDurabilityBackend::open(base_path)?)),
+            clustered_mode => Ok(Self::Raft(RaftDurabilityBackend::open(
+                base_path,
+                applier,
+                clustered_mode,
+            )?)),
+        }
     }
 
     pub(crate) fn record(
@@ -85,6 +102,7 @@ impl DurabilityBackend {
     ) -> Result<(), WrongoDBError> {
         match self {
             Self::Disabled => Ok(()),
+            Self::LocalWal(backend) => backend.record(op, guarantee),
             Self::Raft(backend) => backend.record(op, guarantee),
             #[cfg(test)]
             Self::Test(backend) => {
@@ -97,35 +115,44 @@ impl DurabilityBackend {
     pub(crate) fn is_enabled(&self) -> bool {
         match self {
             Self::Disabled => false,
+            Self::LocalWal(_) => true,
             Self::Raft(_) => true,
             #[cfg(test)]
-            Self::Test(backend) => {
-                backend.request_apply_mode == RequestApplyMode::DeferredCommittedApply
-            }
+            Self::Test(backend) => backend.write_path_mode == WritePathMode::DeferredReplication,
         }
     }
 
     pub(crate) fn status(&self) -> Option<RaftStatus> {
         match self {
             Self::Disabled => None,
+            Self::LocalWal(_) => None,
             Self::Raft(backend) => Some(backend.status()),
             #[cfg(test)]
             Self::Test(_) => None,
         }
     }
 
-    pub(crate) fn request_apply_mode(&self) -> RequestApplyMode {
+    pub(crate) fn write_path_mode(&self) -> WritePathMode {
         match self {
-            Self::Disabled => RequestApplyMode::LocalNow,
-            Self::Raft(_) => RequestApplyMode::DeferredCommittedApply,
+            Self::Disabled => WritePathMode::LocalApply,
+            Self::LocalWal(_) => WritePathMode::LocalApply,
+            Self::Raft(_) => WritePathMode::DeferredReplication,
             #[cfg(test)]
-            Self::Test(backend) => backend.request_apply_mode,
+            Self::Test(backend) => backend.write_path_mode,
+        }
+    }
+
+    pub(crate) fn local_write_durability(&self) -> Option<Arc<dyn LocalWriteDurability>> {
+        match self {
+            Self::LocalWal(backend) => Some(backend.local_write_durability()),
+            _ => None,
         }
     }
 
     pub(crate) fn truncate_to_checkpoint(&self) -> Result<(), WrongoDBError> {
         match self {
             Self::Disabled => Ok(()),
+            Self::LocalWal(backend) => backend.truncate_to_checkpoint(),
             Self::Raft(backend) => backend.truncate_to_checkpoint(),
             #[cfg(test)]
             Self::Test(_) => Ok(()),
@@ -136,6 +163,7 @@ impl DurabilityBackend {
     pub(crate) fn raft_tick(&self) -> Result<(), WrongoDBError> {
         match self {
             Self::Disabled => Ok(()),
+            Self::LocalWal(_) => Ok(()),
             Self::Raft(backend) => backend.raft_tick(),
             #[cfg(test)]
             Self::Test(_) => Ok(()),
@@ -149,6 +177,7 @@ impl DurabilityBackend {
     ) -> Result<(), WrongoDBError> {
         match self {
             Self::Disabled => Ok(()),
+            Self::LocalWal(_) => Ok(()),
             Self::Raft(backend) => backend.raft_handle_inbound(msg),
             #[cfg(test)]
             Self::Test(_) => {
@@ -160,16 +189,68 @@ impl DurabilityBackend {
 
     #[cfg(test)]
     pub(crate) fn test_backend(
-        request_apply_mode: RequestApplyMode,
+        write_path_mode: WritePathMode,
     ) -> (Self, Arc<Mutex<Vec<(DurableOp, DurabilityGuarantee)>>>) {
         let recorded_ops = Arc::new(Mutex::new(Vec::new()));
         (
             Self::Test(TestDurabilityBackend {
-                request_apply_mode,
+                write_path_mode,
                 recorded_ops: recorded_ops.clone(),
             }),
             recorded_ops,
         )
+    }
+}
+
+impl LocalWalDurabilityBackend {
+    fn open(base_path: &Path) -> Result<Self, WrongoDBError> {
+        Ok(Self {
+            wal: Arc::new(Mutex::new(GlobalWal::open_or_create(base_path)?)),
+        })
+    }
+
+    fn record(&self, op: DurableOp, guarantee: DurabilityGuarantee) -> Result<(), WrongoDBError> {
+        let mut wal = self.wal.lock();
+        match op {
+            DurableOp::Put {
+                store_name,
+                key,
+                value,
+                txn_id,
+            } => {
+                wal.log_put(&store_name, &key, &value, txn_id, 0)?;
+            }
+            DurableOp::Delete {
+                store_name,
+                key,
+                txn_id,
+            } => {
+                wal.log_delete(&store_name, &key, txn_id, 0)?;
+            }
+            DurableOp::TxnCommit { txn_id, commit_ts } => {
+                wal.log_txn_commit(txn_id, commit_ts, 0)?;
+            }
+            DurableOp::TxnAbort { txn_id } => {
+                wal.log_txn_abort(txn_id, 0)?;
+            }
+            DurableOp::Checkpoint => {
+                wal.log_checkpoint(0)?;
+            }
+        }
+        if guarantee == DurabilityGuarantee::Sync {
+            wal.sync()?;
+        }
+        Ok(())
+    }
+
+    fn truncate_to_checkpoint(&self) -> Result<(), WrongoDBError> {
+        self.wal.lock().truncate_to_checkpoint()
+    }
+
+    fn local_write_durability(&self) -> Arc<dyn LocalWriteDurability> {
+        Arc::new(LocalWalWriteDurability {
+            wal: self.wal.clone(),
+        })
     }
 }
 
@@ -221,6 +302,29 @@ impl RaftDurabilityBackend {
         msg: crate::raft::runtime::RaftInboundMessage,
     ) -> Result<(), WrongoDBError> {
         self.raft_service.inject_inbound(msg)
+    }
+}
+
+impl LocalWriteDurability for LocalWalWriteDurability {
+    fn record_put(
+        &self,
+        store_name: &str,
+        key: &[u8],
+        value: &[u8],
+        txn_id: u64,
+    ) -> Result<(), WrongoDBError> {
+        self.wal.lock().log_put(store_name, key, value, txn_id, 0)?;
+        Ok(())
+    }
+
+    fn record_delete(
+        &self,
+        store_name: &str,
+        key: &[u8],
+        txn_id: u64,
+    ) -> Result<(), WrongoDBError> {
+        self.wal.lock().log_delete(store_name, key, txn_id, 0)?;
+        Ok(())
     }
 }
 
@@ -433,14 +537,14 @@ mod tests {
     }
 
     #[test]
-    fn wal_enabled_startup_creates_raft_hard_state_file() {
+    fn wal_enabled_standalone_startup_creates_global_wal_file() {
         let dir = tempdir().unwrap();
-        let raft_state_path = RaftHardStateStore::path_for_db(dir.path());
-        assert!(!raft_state_path.exists());
+        let wal_path = GlobalWal::path_for_db(dir.path());
+        assert!(!wal_path.exists());
 
         let _backend = new_durability_backend(&dir, true, RaftMode::Standalone);
 
-        assert!(raft_state_path.exists());
+        assert!(wal_path.exists());
     }
 
     #[test]
@@ -455,11 +559,22 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_raft_hard_state_fails_startup() {
+    fn corrupt_cluster_raft_hard_state_fails_startup() {
         let dir = tempdir().unwrap();
         let raft_state_path = RaftHardStateStore::path_for_db(dir.path());
 
-        let _backend = new_durability_backend(&dir, true, RaftMode::Standalone);
+        let _backend = new_durability_backend(
+            &dir,
+            true,
+            RaftMode::Cluster {
+                local_node_id: "n1".to_string(),
+                local_raft_addr: free_local_addr(),
+                peers: vec![RaftPeerConfig {
+                    node_id: "n2".to_string(),
+                    raft_addr: "127.0.0.1:65003".to_string(),
+                }],
+            },
+        );
         assert!(raft_state_path.exists());
 
         let mut file = OpenOptions::new()
@@ -474,19 +589,29 @@ mod tests {
         let txn_manager = new_txn_manager();
         let table_cache = new_table_cache(&dir, txn_manager);
         let applier = Arc::new(StoreCommandApplier::new(table_cache));
-        let err =
-            DurabilityBackend::open(dir.path(), true, applier, RaftMode::Standalone).unwrap_err();
+        let err = DurabilityBackend::open(
+            dir.path(),
+            true,
+            applier,
+            RaftMode::Cluster {
+                local_node_id: "n1".to_string(),
+                local_raft_addr: free_local_addr(),
+                peers: vec![RaftPeerConfig {
+                    node_id: "n2".to_string(),
+                    raft_addr: "127.0.0.1:65004".to_string(),
+                }],
+            },
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("raft hard state"));
     }
 
     #[test]
-    fn standalone_mode_reports_writable_primary() {
+    fn standalone_local_wal_mode_has_no_raft_status() {
         let dir = tempdir().unwrap();
         let backend = new_durability_backend(&dir, true, RaftMode::Standalone);
 
-        let status = backend.status().unwrap();
-        assert!(status.is_writable_primary);
-        assert_eq!(status.leader_hint.as_deref(), Some("local"));
+        assert!(backend.status().is_none());
     }
 
     #[test]
