@@ -1,0 +1,54 @@
+error[E0599]: no method named `as_ref` found for struct `WriteUnitOfWork<'a>` in the current scope
+ --> tests/ui/fail/raw_transaction_access.rs:9:24
+  |
+9 |     let _ = write_unit.as_ref().id();
+  |                        ^^^^^^
+  |
+help: there is a method `pipe_as_ref` with a similar name, but with different arguments
+ --> $CARGO/tap-$VERSION/src/pipe.rs
+  |
+  | /     fn pipe_as_ref<'a, U, R>(&'a self, func: impl FnOnce(&'a U) -> R) -> R
+  | |     where
+  | |         Self: AsRef<U>,
+  | |         U: 'a + ?Sized,
+  | |         R: 'a + Sized,
+  | |______________________^
+
+error[E0599]: no method named `as_mut` found for struct `WriteUnitOfWork<'a>` in the current scope
+  --> tests/ui/fail/raw_transaction_access.rs:10:24
+   |
+10 |     let _ = write_unit.as_mut();
+   |                        ^^^^^^
+   |
+  ::: $RUST/core/src/convert/mod.rs
+   |
+   |     fn as_mut(&mut self) -> &mut T;
+   |        ------
+   |        |
+   |        the method is available for `Box<WriteUnitOfWork<'_>>` here
+   |        the method is available for `Box<&mut WriteUnitOfWork<'_>>` here
+   |        the method is available for `Box<&WriteUnitOfWork<'_>>` here
+   |
+help: there is a method `pipe_as_mut` with a similar name, but with different arguments
+  --> $CARGO/tap-$VERSION/src/pipe.rs
+   |
+   | /     fn pipe_as_mut<'a, U, R>(
+   | |         &'a mut self,
+   | |         func: impl FnOnce(&'a mut U) -> R,
+   | |     ) -> R
+...  |
+   | |         U: 'a + ?Sized,
+   | |         R: 'a + Sized,
+   | |______________________^
+help: consider wrapping the receiver expression with the appropriate type
+   |
+10 |     let _ = Box::new(write_unit).as_mut();
+   |             +++++++++          +
+help: consider wrapping the receiver expression with the appropriate type
+   |
+10 |     let _ = Box::new(&mut write_unit).as_mut();
+   |             +++++++++++++           +
+help: consider wrapping the receiver expression with the appropriate type
+   |
+10 |     let _ = Box::new(&write_unit).as_mut();
+   |             ++++++++++          +

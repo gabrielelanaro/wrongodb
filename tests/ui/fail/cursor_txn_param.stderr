@@ -1,0 +1,16 @@
+error[E0061]: this method takes 2 arguments but 3 arguments were supplied
+  --> tests/ui/fail/cursor_txn_param.rs:10:20
+   |
+10 |     let _ = cursor.insert(b"k", b"v", 0);
+   |                    ^^^^^^             - unexpected argument #3 of type `{integer}`
+   |
+note: method defined here
+  --> src/api/cursor.rs
+   |
+   |     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
+   |            ^^^^^^
+help: remove the extra argument
+   |
+10 -     let _ = cursor.insert(b"k", b"v", 0);
+10 +     let _ = cursor.insert(b"k", b"v");
+   |

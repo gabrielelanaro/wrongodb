@@ -60,6 +60,7 @@ pub(crate) enum CursorWriteAccess {
 pub struct Cursor {
     table: Arc<RwLock<Table>>,
     store_name: String,
+    bound_txn_id: TxnId,
     recovery_unit: Arc<dyn RecoveryUnit>,
     write_tracker: StoreWriteTracker,
     write_access: CursorWriteAccess,
@@ -74,6 +75,7 @@ impl Cursor {
     pub(crate) fn new(
         table: Arc<RwLock<Table>>,
         store_name: String,
+        bound_txn_id: TxnId,
         recovery_unit: Arc<dyn RecoveryUnit>,
         write_tracker: StoreWriteTracker,
         write_access: CursorWriteAccess,
@@ -81,6 +83,7 @@ impl Cursor {
         Self {
             table,
             store_name,
+            bound_txn_id,
             recovery_unit,
             write_tracker,
             write_access,
@@ -103,12 +106,13 @@ impl Cursor {
             return Ok(());
         }
         Err(WrongoDBError::Storage(StorageError(
-            "cursor writes are not available when durability defers apply; use Session::insert/update/delete"
+            "cursor writes are not available when replication defers apply; replicated writes do not go through the low-level cursor API"
                 .into(),
         )))
     }
 
-    pub fn insert(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+    pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
+        let txn_id = self.bound_txn_id;
         self.ensure_writable()?;
         let mut table = self.table.write();
         if table.contains_key(key, txn_id)? {
@@ -122,7 +126,8 @@ impl Cursor {
         Ok(())
     }
 
-    pub fn update(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+    pub fn update(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
+        let txn_id = self.bound_txn_id;
         self.ensure_writable()?;
         let mut table = self.table.write();
         if !table.contains_key(key, txn_id)? {
@@ -138,7 +143,8 @@ impl Cursor {
         Ok(())
     }
 
-    pub fn delete(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+    pub fn delete(&mut self, key: &[u8]) -> Result<(), WrongoDBError> {
+        let txn_id = self.bound_txn_id;
         self.ensure_writable()?;
         let mut table = self.table.write();
         if !table.contains_key(key, txn_id)? {
@@ -159,12 +165,15 @@ impl Cursor {
         Ok(())
     }
 
-    pub fn get(&mut self, key: &[u8], txn_id: TxnId) -> Result<Option<Vec<u8>>, WrongoDBError> {
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, WrongoDBError> {
+        let txn_id = self.bound_txn_id;
         let mut table = self.table.write();
         table.get_version(key, txn_id)
     }
 
-    pub fn next(&mut self, txn_id: TxnId) -> Result<Option<CursorEntry>, WrongoDBError> {
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<CursorEntry>, WrongoDBError> {
+        let txn_id = self.bound_txn_id;
         if self.exhausted {
             return Ok(None);
         }
@@ -265,12 +274,13 @@ mod tests {
         let mut cursor = Cursor::new(
             table.clone(),
             store_name,
+            TXN_NONE,
             Arc::new(NoopRecoveryUnit),
             StoreWriteTracker::new(),
             CursorWriteAccess::ReadWrite,
         );
 
-        cursor.insert(b"k1", b"v1", TXN_NONE).unwrap();
+        cursor.insert(b"k1", b"v1").unwrap();
 
         assert_eq!(
             table.write().get_version(b"k1", TXN_NONE).unwrap(),
@@ -288,12 +298,13 @@ mod tests {
         let mut cursor = Cursor::new(
             table.clone(),
             store_name,
+            TXN_NONE,
             Arc::new(NoopRecoveryUnit),
             StoreWriteTracker::new(),
             CursorWriteAccess::ReadWrite,
         );
 
-        cursor.delete(b"k1", TXN_NONE).unwrap();
+        cursor.delete(b"k1").unwrap();
 
         assert_eq!(table.write().get_version(b"k1", TXN_NONE).unwrap(), None);
     }
@@ -307,12 +318,13 @@ mod tests {
         let mut cursor = Cursor::new(
             table,
             store_name.clone(),
+            7,
             Arc::new(NoopRecoveryUnit),
             write_tracker,
             CursorWriteAccess::ReadWrite,
         );
 
-        cursor.insert(b"k1", b"v1", 7).unwrap();
+        cursor.insert(b"k1", b"v1").unwrap();
 
         assert!(touched_stores.lock().contains(&store_name));
     }
@@ -323,14 +335,15 @@ mod tests {
         let mut cursor = Cursor::new(
             table,
             store_name,
+            TXN_NONE,
             Arc::new(NoopRecoveryUnit),
             StoreWriteTracker::new(),
             CursorWriteAccess::ReadOnly,
         );
 
-        let err = cursor.insert(b"k1", b"v1", TXN_NONE).unwrap_err();
+        let err = cursor.insert(b"k1", b"v1").unwrap_err();
         assert!(err
             .to_string()
-            .contains("cursor writes are not available when durability defers apply"));
+            .contains("replicated writes do not go through the low-level cursor API"));
     }
 }

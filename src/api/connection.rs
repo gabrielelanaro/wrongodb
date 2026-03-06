@@ -4,10 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::api::session::Session;
+use crate::collection_write_path::CollectionWritePath;
+use crate::document_query::DocumentQuery;
 use crate::durability::{DurabilityBackend, StoreCommandApplier};
 use crate::recovery::RecoveryManager;
 use crate::schema::SchemaCatalog;
 use crate::storage::table_cache::TableCache;
+use crate::store_write_path::StoreWritePath;
 use crate::txn::{GlobalTxnState, TransactionManager};
 use crate::WrongoDBError;
 
@@ -60,11 +63,13 @@ impl ConnectionConfig {
 
 pub struct Connection {
     base_path: PathBuf,
+    wal_enabled: bool,
     schema_catalog: Arc<SchemaCatalog>,
     table_cache: Arc<TableCache>,
-    wal_enabled: bool,
     transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
+    pub(crate) document_query: DocumentQuery,
+    pub(crate) collection_write_path: CollectionWritePath,
 }
 
 impl fmt::Debug for Connection {
@@ -103,6 +108,13 @@ impl Connection {
             applier,
             config.raft_mode,
         )?);
+        let document_query = DocumentQuery::new(schema_catalog.clone());
+        let store_write_path = StoreWritePath::new(table_cache.clone(), durability_backend.clone());
+        let collection_write_path = CollectionWritePath::new(
+            schema_catalog.clone(),
+            document_query.clone(),
+            store_write_path,
+        );
 
         Ok(Self {
             base_path,
@@ -111,6 +123,8 @@ impl Connection {
             wal_enabled: config.wal_enabled,
             transaction_manager,
             durability_backend,
+            document_query,
+            collection_write_path,
         })
     }
 
@@ -123,7 +137,7 @@ impl Connection {
         )
     }
 
-    pub fn base_path(&self) -> &Path {
+    pub(crate) fn base_path(&self) -> &Path {
         &self.base_path
     }
 

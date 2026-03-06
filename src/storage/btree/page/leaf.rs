@@ -471,7 +471,7 @@ fn write_u16(buf: &mut [u8], off: usize, v: u16) -> Result<(), LeafPageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::BlockFile;
+    use crate::storage::block::file::BlockFile;
     use tempfile::tempdir;
 
     #[test]

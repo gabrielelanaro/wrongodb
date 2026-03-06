@@ -75,24 +75,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     session.create("table:test")?;
 
     // Execute one transactional write unit
-    let mut txn = session.transaction()?;
-    let txn_id = txn.as_ref().id();
-    let mut cursor = txn.session_mut().open_cursor("table:test")?;
-    cursor.insert(b"alice", b"age=30", txn_id)?;
-    cursor.insert(b"bob", b"age=25", txn_id)?;
-    txn.commit()?;
+    let mut write_unit = session.transaction()?;
+    let mut cursor = write_unit.open_cursor("table:test")?;
+    cursor.insert(b"alice", b"age=30")?;
+    cursor.insert(b"bob", b"age=25")?;
+    write_unit.commit()?;
 
     // Read back values
     let mut cursor = session.open_cursor("table:test")?;
-    println!("{:?}", cursor.get(b"alice", 0)?);
-    println!("{:?}", cursor.get(b"bob", 0)?);
+    println!("{:?}", cursor.get(b"alice")?);
+    println!("{:?}", cursor.get(b"bob")?);
     Ok(())
 }
 ```
 
-Schema objects are URI-based too:
+Schema objects are URI-based at the low-level API too:
 - `session.create("table:users")?`
-- `session.create("index:users:name")?`
+
+Index creation is handled by the Mongo-style internal write/schema path rather than the
+WT-style public `Session` API.
 
 #### As a Server
 For interactive usage with mongosh, see [Server Documentation](docs/server.md).

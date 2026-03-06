@@ -2,14 +2,13 @@ use bson::Document;
 
 use crate::{Connection, WrongoDBError};
 
-pub mod handlers;
+pub(crate) mod handlers;
 mod registry;
 
-pub use handlers::*;
-pub use registry::CommandRegistry;
+pub(crate) use registry::CommandRegistry;
 
 /// Trait for implementing MongoDB commands.
-pub trait Command: Send + Sync {
+pub(crate) trait Command: Send + Sync {
     /// Returns the command names this handler responds to
     fn names(&self) -> &[&str];
 

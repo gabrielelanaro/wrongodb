@@ -287,6 +287,7 @@ impl CheckpointStore for PageStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn sync_all(&mut self) -> Result<(), WrongoDBError> {
         self.bf.sync_all()
     }

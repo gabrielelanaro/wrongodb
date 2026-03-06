@@ -11,12 +11,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut cursor = session.open_cursor("table:test")?;
         let key = format!("doc:{i}");
         let value = format!("value:{i}");
-        cursor.insert(key.as_bytes(), value.as_bytes(), 0)?;
+        cursor.insert(key.as_bytes(), value.as_bytes())?;
     }
 
     let mut cursor = session.open_cursor("table:test")?;
     let mut count = 0;
-    while cursor.next(0)?.is_some() {
+    while cursor.next()?.is_some() {
         count += 1;
     }
 

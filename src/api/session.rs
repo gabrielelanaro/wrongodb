@@ -3,9 +3,9 @@ use std::sync::Arc;
 use crate::api::cursor::{Cursor, CursorWriteAccess, StoreWriteTracker};
 use crate::core::errors::StorageError;
 use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp, WritePathMode};
-use crate::schema::{CollectionSchema, SchemaCatalog};
+use crate::schema::SchemaCatalog;
 use crate::storage::table_cache::TableCache;
-use crate::txn::{ActiveWriteUnit, RecoveryUnit, Transaction, TransactionManager, TxnId};
+use crate::txn::{ActiveWriteUnit, RecoveryUnit, TransactionManager, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
 /// A request-scoped execution context over shared connection infrastructure.
@@ -13,8 +13,7 @@ use crate::WrongoDBError;
 /// `Connection` owns long-lived shared components (storage handles, schema
 /// metadata, global transaction state, and durability machinery). `Session`
 /// exists to own mutable per-request state that must not be global, especially
-/// the active transaction and document-level orchestration across primary and
-/// index stores.
+/// the active transaction, cursor creation, and checkpoint entrypoint.
 pub struct Session {
     table_cache: Arc<TableCache>,
     schema_catalog: Arc<SchemaCatalog>,
@@ -51,30 +50,14 @@ impl Session {
             return Ok(());
         }
 
-        if let Some(rest) = uri.strip_prefix("index:") {
-            let mut parts = rest.splitn(2, ':');
-            let collection = parts.next().unwrap_or("");
-            let field = parts.next().unwrap_or("");
-            if collection.is_empty() || field.is_empty() {
-                return Err(WrongoDBError::Storage(StorageError(format!(
-                    "invalid index URI: {uri}"
-                ))));
-            }
-            return self.create_index_uri(collection, field);
-        }
-
         Err(WrongoDBError::Storage(StorageError(format!(
-            "unsupported URI: {uri}"
+            "unsupported URI for Session::create: {uri}; only table:... is supported"
         ))))
     }
 
     pub fn open_cursor(&self, uri: &str) -> Result<Cursor, WrongoDBError> {
         let store_name = self.schema_catalog.resolve_uri(uri)?;
-        let write_access = match self.write_path_mode() {
-            WritePathMode::LocalApply => CursorWriteAccess::ReadWrite,
-            WritePathMode::DeferredReplication => CursorWriteAccess::ReadOnly,
-        };
-        self.open_store_cursor_with_access(&store_name, write_access)
+        self.open_store_cursor_with_access(&store_name, TXN_NONE, self.cursor_write_access())
     }
 
     pub fn transaction(&mut self) -> Result<WriteUnitOfWork<'_>, WrongoDBError> {
@@ -91,14 +74,6 @@ impl Session {
         );
         self.active_txn = Some(active_write_unit);
         Ok(WriteUnitOfWork::new(self))
-    }
-
-    pub fn current_txn(&self) -> Option<&Transaction> {
-        self.active_txn.as_ref().map(ActiveWriteUnit::txn)
-    }
-
-    pub fn current_txn_mut(&mut self) -> Option<&mut Transaction> {
-        self.active_txn.as_mut().map(ActiveWriteUnit::txn_mut)
     }
 
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
@@ -118,87 +93,15 @@ impl Session {
         self.durability_backend.truncate_to_checkpoint()
     }
 
-    fn create_index_uri(&mut self, collection: &str, field: &str) -> Result<(), WrongoDBError> {
-        let primary_store = self.schema_catalog.primary_store_name(collection);
-        let _ = self.table_cache.get_or_open_store(&primary_store)?;
-
-        self.with_txn(|session| {
-            let txn_id = session.require_txn_id()?;
-            let mut primary_cursor = session.open_cursor(&format!("table:{collection}"))?;
-            let Some(store_name) =
-                session
-                    .schema_catalog
-                    .add_index(collection, field, vec![field.to_string()])?
-            else {
-                return Ok(());
-            };
-
-            let _ = session.table_cache.get_or_open_store(&store_name)?;
-            while let Some((_, bytes)) = primary_cursor.next(txn_id)? {
-                let doc = crate::core::bson::decode_document(&bytes)?;
-                let Some(id) = doc.get("_id") else {
-                    continue;
-                };
-                let Some(value) = doc.get(field) else {
-                    continue;
-                };
-                let Some(key) = crate::index::encode_index_key(value, id)? else {
-                    continue;
-                };
-                session.insert_store_value(&store_name, &key, &[], txn_id)?;
-            }
-
-            Ok(())
-        })
-    }
-
-    pub(crate) fn schema_catalog(&self) -> &SchemaCatalog {
-        self.schema_catalog.as_ref()
-    }
-
-    pub(crate) fn collection_schema(
-        &self,
-        collection: &str,
-    ) -> Result<CollectionSchema, WrongoDBError> {
-        self.schema_catalog.collection_schema(collection)
-    }
-
-    pub(crate) fn write_path_mode(&self) -> WritePathMode {
+    fn write_path_mode(&self) -> WritePathMode {
         self.durability_backend.write_path_mode()
     }
 
-    fn record_put(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        value: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        self.durability_backend.record(
-            DurableOp::Put {
-                store_name: store_name.to_string(),
-                key: key.to_vec(),
-                value: value.to_vec(),
-                txn_id,
-            },
-            DurabilityGuarantee::Buffered,
-        )
-    }
-
-    fn record_delete(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        self.durability_backend.record(
-            DurableOp::Delete {
-                store_name: store_name.to_string(),
-                key: key.to_vec(),
-                txn_id,
-            },
-            DurabilityGuarantee::Buffered,
-        )
+    fn cursor_write_access(&self) -> CursorWriteAccess {
+        match self.write_path_mode() {
+            WritePathMode::LocalApply => CursorWriteAccess::ReadWrite,
+            WritePathMode::DeferredReplication => CursorWriteAccess::ReadOnly,
+        }
     }
 
     fn record_commit(&self, txn_id: TxnId) -> Result<(), WrongoDBError> {
@@ -218,121 +121,17 @@ impl Session {
         )
     }
 
-    pub(crate) fn store_contains_key(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<bool, WrongoDBError> {
-        let table = self.table_cache.get_or_open_store(store_name)?;
-        let mut table = table.write();
-        table.contains_key(key, txn_id)
-    }
-
-    pub(crate) fn insert_store_value(
-        &mut self,
-        store_name: &str,
-        key: &[u8],
-        value: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        match self.write_path_mode() {
-            WritePathMode::LocalApply => {
-                let mut cursor = self.open_local_store_cursor(store_name)?;
-                cursor.insert(key, value, txn_id)
-            }
-            WritePathMode::DeferredReplication => {
-                if self.store_contains_key(store_name, key, txn_id)? {
-                    return Err(crate::core::errors::DocumentValidationError(
-                        "duplicate key error".into(),
-                    )
-                    .into());
-                }
-                self.record_put(store_name, key, value, txn_id)
-            }
-        }
-    }
-
-    pub(crate) fn update_store_value(
-        &mut self,
-        store_name: &str,
-        key: &[u8],
-        value: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        match self.write_path_mode() {
-            WritePathMode::LocalApply => {
-                let mut cursor = self.open_local_store_cursor(store_name)?;
-                cursor.update(key, value, txn_id)
-            }
-            WritePathMode::DeferredReplication => {
-                if !self.store_contains_key(store_name, key, txn_id)? {
-                    return Err(WrongoDBError::Storage(StorageError(
-                        "key not found for update".to_string(),
-                    )));
-                }
-                self.record_put(store_name, key, value, txn_id)
-            }
-        }
-    }
-
-    pub(crate) fn delete_store_value(
-        &mut self,
-        store_name: &str,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        match self.write_path_mode() {
-            WritePathMode::LocalApply => {
-                let mut cursor = self.open_local_store_cursor(store_name)?;
-                cursor.delete(key, txn_id)
-            }
-            WritePathMode::DeferredReplication => {
-                if !self.store_contains_key(store_name, key, txn_id)? {
-                    return Err(WrongoDBError::Storage(StorageError(
-                        "key not found for delete".to_string(),
-                    )));
-                }
-                self.record_delete(store_name, key, txn_id)
-            }
-        }
-    }
-
-    pub(crate) fn with_txn<R, F>(&mut self, f: F) -> Result<R, WrongoDBError>
-    where
-        F: FnOnce(&mut Session) -> Result<R, WrongoDBError>,
-    {
-        if self.current_txn().is_some() {
-            return f(self);
-        }
-
-        let mut txn = self.transaction()?;
-        let result = f(txn.session_mut());
-        match result {
-            Ok(value) => {
-                txn.commit()?;
-                Ok(value)
-            }
-            Err(err) => {
-                let _ = txn.abort();
-                Err(err)
-            }
-        }
-    }
-
-    fn open_local_store_cursor(&self, store_name: &str) -> Result<Cursor, WrongoDBError> {
-        self.open_store_cursor_with_access(store_name, CursorWriteAccess::ReadWrite)
-    }
-
     fn open_store_cursor_with_access(
         &self,
         store_name: &str,
+        bound_txn_id: TxnId,
         write_access: CursorWriteAccess,
     ) -> Result<Cursor, WrongoDBError> {
         let table = self.table_cache.get_or_open_store(store_name)?;
         Ok(Cursor::new(
             table,
             store_name.to_string(),
+            bound_txn_id,
             self.recovery_unit.clone(),
             self.write_tracker.clone(),
             write_access,
@@ -355,12 +154,6 @@ impl Session {
         }
         Ok(())
     }
-
-    pub(crate) fn require_txn_id(&self) -> Result<TxnId, WrongoDBError> {
-        self.current_txn()
-            .map(Transaction::id)
-            .ok_or(WrongoDBError::NoActiveTransaction)
-    }
 }
 
 /// RAII write unit of work for Session.
@@ -370,6 +163,15 @@ pub struct WriteUnitOfWork<'a> {
 }
 
 impl<'a> WriteUnitOfWork<'a> {
+    pub fn open_cursor(&mut self, uri: &str) -> Result<Cursor, WrongoDBError> {
+        let store_name = self.session.schema_catalog.resolve_uri(uri)?;
+        self.session.open_store_cursor_with_access(
+            &store_name,
+            self.txn_id(),
+            self.session.cursor_write_access(),
+        )
+    }
+
     pub fn commit(mut self) -> Result<(), WrongoDBError> {
         let Some(active) = self.session.active_txn.as_ref() else {
             self.session.write_tracker.clear();
@@ -439,15 +241,31 @@ impl<'a> WriteUnitOfWork<'a> {
         Ok(())
     }
 
-    pub fn session_mut(&mut self) -> &mut Session {
-        self.session
-    }
-
     fn new(session: &'a mut Session) -> Self {
         Self {
             session,
             committed: false,
         }
+    }
+
+    pub(crate) fn txn_id(&self) -> TxnId {
+        self.session
+            .active_txn
+            .as_ref()
+            .expect("transaction should exist")
+            .txn()
+            .id()
+    }
+
+    pub(crate) fn open_store_cursor_by_name(
+        &mut self,
+        store_name: &str,
+    ) -> Result<Cursor, WrongoDBError> {
+        self.session.open_store_cursor_with_access(
+            store_name,
+            self.txn_id(),
+            self.session.cursor_write_access(),
+        )
     }
 }
 
@@ -485,45 +303,28 @@ impl<'a> Drop for WriteUnitOfWork<'a> {
     }
 }
 
-impl<'a> AsRef<Transaction> for WriteUnitOfWork<'a> {
-    fn as_ref(&self) -> &Transaction {
-        let active = self
-            .session
-            .active_txn
-            .as_ref()
-            .expect("transaction should exist");
-        active.txn()
-    }
-}
-
-impl<'a> AsMut<Transaction> for WriteUnitOfWork<'a> {
-    fn as_mut(&mut self) -> &mut Transaction {
-        let active = self
-            .session
-            .active_txn
-            .as_mut()
-            .expect("transaction should exist");
-        active.txn_mut()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
     use std::sync::Arc;
+
+    use serde_json::json;
     use tempfile::tempdir;
 
     use super::*;
     use crate::api::connection::{Connection, ConnectionConfig};
-    use crate::collection_write_path;
-    use crate::collection_write_path::UpdateResult;
+    use crate::collection_write_path::{CollectionWritePath, UpdateResult};
     use crate::core::bson::{encode_document, encode_id_value};
-    use crate::document_query;
+    use crate::document_query::DocumentQuery;
     use crate::durability::DurabilityBackend;
+    use crate::schema::SchemaCatalog;
+    use crate::storage::table_cache::TableCache;
     use crate::storage::wal::{WalReader, WalRecord};
+    use crate::store_write_path::StoreWritePath;
     use crate::txn::GlobalTxnState;
 
-    fn new_session_with_backend(backend: DurabilityBackend) -> Session {
+    fn new_session_with_backend(
+        backend: DurabilityBackend,
+    ) -> (Session, CollectionWritePath, DocumentQuery) {
         let dir = tempdir().unwrap();
         let base_path = dir.path().to_path_buf();
         std::mem::forget(dir);
@@ -534,12 +335,15 @@ mod tests {
             transaction_manager.clone(),
         ));
         let schema_catalog = Arc::new(SchemaCatalog::new(base_path));
-        Session::new(
-            table_cache,
-            schema_catalog,
-            transaction_manager,
-            Arc::new(backend),
-        )
+        let backend = Arc::new(backend);
+        let query = DocumentQuery::new(schema_catalog.clone());
+        let write_path = CollectionWritePath::new(
+            schema_catalog.clone(),
+            query.clone(),
+            StoreWritePath::new(table_cache.clone(), backend.clone()),
+        );
+        let session = Session::new(table_cache, schema_catalog, transaction_manager, backend);
+        (session, write_path, query)
     }
 
     fn read_wal_records(db_dir: &std::path::Path) -> Vec<WalRecord> {
@@ -553,43 +357,61 @@ mod tests {
     }
 
     fn insert_one(
+        write_path: &CollectionWritePath,
         session: &mut Session,
         collection: &str,
         doc: serde_json::Value,
     ) -> crate::Document {
-        collection_write_path::insert_one(session, collection, doc).unwrap()
+        write_path.insert_one(session, collection, doc).unwrap()
     }
 
     fn find_one(
+        query: &DocumentQuery,
         session: &mut Session,
         collection: &str,
         filter: serde_json::Value,
     ) -> Option<crate::Document> {
-        document_query::find(session, collection, Some(filter))
+        query
+            .find(session, collection, Some(filter))
             .unwrap()
             .into_iter()
             .next()
     }
 
-    fn create_index(session: &mut Session, collection: &str, field: &str) {
-        collection_write_path::create_index(session, collection, field).unwrap();
+    fn create_index(
+        write_path: &CollectionWritePath,
+        session: &mut Session,
+        collection: &str,
+        field: &str,
+    ) {
+        write_path.create_index(session, collection, field).unwrap();
     }
 
-    fn list_indexes(session: &Session, collection: &str) -> Vec<String> {
-        document_query::list_indexes(session, collection).unwrap()
+    fn list_indexes(query: &DocumentQuery, collection: &str) -> Vec<String> {
+        query.list_indexes(collection).unwrap()
     }
 
     fn update_one(
+        write_path: &CollectionWritePath,
         session: &mut Session,
         collection: &str,
         filter: serde_json::Value,
         update: serde_json::Value,
     ) -> UpdateResult {
-        collection_write_path::update_one(session, collection, Some(filter), update).unwrap()
+        write_path
+            .update_one(session, collection, Some(filter), update)
+            .unwrap()
     }
 
-    fn delete_one(session: &mut Session, collection: &str, filter: serde_json::Value) -> usize {
-        collection_write_path::delete_one(session, collection, Some(filter)).unwrap()
+    fn delete_one(
+        write_path: &CollectionWritePath,
+        session: &mut Session,
+        collection: &str,
+        filter: serde_json::Value,
+    ) -> usize {
+        write_path
+            .delete_one(session, collection, Some(filter))
+            .unwrap()
     }
 
     #[test]
@@ -601,11 +423,9 @@ mod tests {
 
         {
             let mut txn = session.transaction().unwrap();
-            insert_one(
-                txn.session_mut(),
-                "items",
-                json!({"_id": "k1", "value": "v1"}),
-            );
+            conn.collection_write_path
+                .insert_one_in_write_unit(&mut txn, "items", json!({"_id": "k1", "value": "v1"}))
+                .unwrap();
         }
 
         let wal_path = dir.path().join("global.wal");
@@ -629,11 +449,9 @@ mod tests {
 
         {
             let mut txn = session.transaction().unwrap();
-            insert_one(
-                txn.session_mut(),
-                "items",
-                json!({"_id": "k1", "value": "v1"}),
-            );
+            conn.collection_write_path
+                .insert_one_in_write_unit(&mut txn, "items", json!({"_id": "k1", "value": "v1"}))
+                .unwrap();
             txn.commit().unwrap();
         }
 
@@ -648,33 +466,31 @@ mod tests {
 
     #[test]
     fn local_mode_commit_finalizes_touched_stores() {
-        let mut session = new_session_with_backend(DurabilityBackend::Disabled);
+        let (mut session, write_path, query) =
+            new_session_with_backend(DurabilityBackend::Disabled);
         let mut txn = session.transaction().unwrap();
-        insert_one(
-            txn.session_mut(),
-            "items",
-            json!({"_id": "k1", "value": "v1"}),
-        );
+        write_path
+            .insert_one_in_write_unit(&mut txn, "items", json!({"_id": "k1", "value": "v1"}))
+            .unwrap();
 
         txn.commit().unwrap();
 
-        let doc = find_one(&mut session, "items", json!({"_id": "k1"})).unwrap();
+        let doc = find_one(&query, &mut session, "items", json!({"_id": "k1"})).unwrap();
         assert_eq!(doc.get("value"), Some(&json!("v1")));
     }
 
     #[test]
     fn local_mode_abort_discards_touched_stores() {
-        let mut session = new_session_with_backend(DurabilityBackend::Disabled);
+        let (mut session, write_path, query) =
+            new_session_with_backend(DurabilityBackend::Disabled);
         let mut txn = session.transaction().unwrap();
-        insert_one(
-            txn.session_mut(),
-            "items",
-            json!({"_id": "k1", "value": "v1"}),
-        );
+        write_path
+            .insert_one_in_write_unit(&mut txn, "items", json!({"_id": "k1", "value": "v1"}))
+            .unwrap();
 
         txn.abort().unwrap();
 
-        assert!(find_one(&mut session, "items", json!({"_id": "k1"})).is_none());
+        assert!(find_one(&query, &mut session, "items", json!({"_id": "k1"})).is_none());
     }
 
     #[test]
@@ -688,12 +504,10 @@ mod tests {
             encode_document(json!({"_id": "k1", "value": "v1"}).as_object().unwrap()).unwrap();
 
         let mut txn = session.transaction().unwrap();
-        let txn_id = txn.as_ref().id();
-        insert_one(
-            txn.session_mut(),
-            "items",
-            json!({"_id": "k1", "value": "v1"}),
-        );
+        let txn_id = txn.txn_id();
+        conn.collection_write_path
+            .insert_one_in_write_unit(&mut txn, "items", json!({"_id": "k1", "value": "v1"}))
+            .unwrap();
         txn.commit().unwrap();
 
         let records = read_wal_records(dir.path());
@@ -727,31 +541,41 @@ mod tests {
             session.create("table:items").unwrap();
 
             let mut txn = session.transaction().unwrap();
-            insert_one(
-                txn.session_mut(),
-                "items",
-                json!({"_id": "abort-me", "value": "v1"}),
-            );
+            conn.collection_write_path
+                .insert_one_in_write_unit(
+                    &mut txn,
+                    "items",
+                    json!({"_id": "abort-me", "value": "v1"}),
+                )
+                .unwrap();
             txn.abort().unwrap();
         }
 
         let reopened = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
         let mut session = reopened.open_session();
-        assert!(find_one(&mut session, "items", json!({"_id": "abort-me"})).is_none());
+        assert!(find_one(
+            &reopened.document_query,
+            &mut session,
+            "items",
+            json!({"_id": "abort-me"})
+        )
+        .is_none());
     }
 
     #[test]
     fn deferred_mode_records_commit_after_write_ops() {
         let (backend, recorded_ops) =
             DurabilityBackend::test_backend(WritePathMode::DeferredReplication);
-        let mut session = new_session_with_backend(backend);
+        let (mut session, write_path, _query) = new_session_with_backend(backend);
         let mut txn = session.transaction().unwrap();
-        let txn_id = txn.as_ref().id();
+        let txn_id = txn.txn_id();
         let doc = json!({"_id": "k1", "value": "v1"});
         let encoded_key = encode_id_value(&json!("k1")).unwrap();
         let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
 
-        insert_one(txn.session_mut(), "items", doc);
+        write_path
+            .insert_one_in_write_unit(&mut txn, "items", doc)
+            .unwrap();
         txn.commit().unwrap();
 
         assert_eq!(
@@ -781,15 +605,17 @@ mod tests {
     fn deferred_mode_records_abort_for_explicit_and_drop_abort() {
         let (backend, recorded_ops) =
             DurabilityBackend::test_backend(WritePathMode::DeferredReplication);
-        let mut session = new_session_with_backend(backend);
+        let (mut session, write_path, _query) = new_session_with_backend(backend);
 
         {
             let mut txn = session.transaction().unwrap();
-            let txn_id = txn.as_ref().id();
+            let txn_id = txn.txn_id();
             let doc = json!({"_id": "abort-me", "value": "v1"});
             let encoded_key = encode_id_value(&json!("abort-me")).unwrap();
             let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
-            insert_one(txn.session_mut(), "items", doc);
+            write_path
+                .insert_one_in_write_unit(&mut txn, "items", doc)
+                .unwrap();
             txn.abort().unwrap();
 
             assert_eq!(
@@ -816,11 +642,13 @@ mod tests {
 
         {
             let mut dropped = session.transaction().unwrap();
-            let txn_id = dropped.as_ref().id();
+            let txn_id = dropped.txn_id();
             let doc = json!({"_id": "drop-me", "value": "v2"});
             let encoded_key = encode_id_value(&json!("drop-me")).unwrap();
             let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
-            insert_one(dropped.session_mut(), "items", doc);
+            write_path
+                .insert_one_in_write_unit(&mut dropped, "items", doc)
+                .unwrap();
             drop(dropped);
 
             assert_eq!(
@@ -850,13 +678,25 @@ mod tests {
         let conn = Connection::open(tmp.path().join("db"), ConnectionConfig::default()).unwrap();
         let mut session = conn.open_session();
 
-        let inserted = insert_one(&mut session, "test", json!({"name": "alice", "age": 30}));
+        let inserted = insert_one(
+            &conn.collection_write_path,
+            &mut session,
+            "test",
+            json!({"name": "alice", "age": 30}),
+        );
         let id = inserted.get("_id").unwrap().clone();
 
-        let fetched = find_one(&mut session, "test", json!({"_id": id.clone()})).unwrap();
+        let fetched = find_one(
+            &conn.document_query,
+            &mut session,
+            "test",
+            json!({"_id": id.clone()}),
+        )
+        .unwrap();
         assert_eq!(fetched.get("name").unwrap().as_str().unwrap(), "alice");
 
         let updated = update_one(
+            &conn.collection_write_path,
             &mut session,
             "test",
             json!({"_id": id.clone()}),
@@ -865,12 +705,29 @@ mod tests {
         assert_eq!(updated.matched, 1);
         assert_eq!(updated.modified, 1);
 
-        let fetched = find_one(&mut session, "test", json!({"_id": id.clone()})).unwrap();
+        let fetched = find_one(
+            &conn.document_query,
+            &mut session,
+            "test",
+            json!({"_id": id.clone()}),
+        )
+        .unwrap();
         assert_eq!(fetched.get("age").unwrap().as_i64().unwrap(), 31);
 
-        let deleted = delete_one(&mut session, "test", json!({"_id": id}));
+        let deleted = delete_one(
+            &conn.collection_write_path,
+            &mut session,
+            "test",
+            json!({"_id": id}),
+        );
         assert_eq!(deleted, 1);
-        assert!(find_one(&mut session, "test", json!({"name": "alice"})).is_none());
+        assert!(find_one(
+            &conn.document_query,
+            &mut session,
+            "test",
+            json!({"name": "alice"})
+        )
+        .is_none());
     }
 
     #[test]
@@ -879,11 +736,26 @@ mod tests {
         let conn = Connection::open(tmp.path().join("db"), ConnectionConfig::default()).unwrap();
         let mut session = conn.open_session();
 
-        insert_one(&mut session, "test", json!({"name": "alice"}));
-        create_index(&mut session, "test", "name");
+        insert_one(
+            &conn.collection_write_path,
+            &mut session,
+            "test",
+            json!({"name": "alice"}),
+        );
+        create_index(&conn.collection_write_path, &mut session, "test", "name");
 
-        let indexes = list_indexes(&session, "test");
+        let indexes = list_indexes(&conn.document_query, "test");
         assert!(indexes.iter().any(|idx| idx == "name"));
+    }
+
+    #[test]
+    fn session_create_rejects_index_uris() {
+        let tmp = tempdir().unwrap();
+        let conn = Connection::open(tmp.path().join("db"), ConnectionConfig::default()).unwrap();
+        let mut session = conn.open_session();
+
+        let err = session.create("index:test:name").unwrap_err();
+        assert!(err.to_string().contains("only table:... is supported"));
     }
 
     #[test]
@@ -892,12 +764,23 @@ mod tests {
         let conn = Connection::open(tmp.path().join("db"), ConnectionConfig::default()).unwrap();
         let mut session = conn.open_session();
 
-        create_index(&mut session, "test", "name");
-        insert_one(&mut session, "test", json!({"_id": 1, "name": "alice"}));
+        create_index(&conn.collection_write_path, &mut session, "test", "name");
+        insert_one(
+            &conn.collection_write_path,
+            &mut session,
+            "test",
+            json!({"_id": 1, "name": "alice"}),
+        );
 
         session.checkpoint().unwrap();
 
-        let doc = find_one(&mut session, "test", json!({"name": "alice"})).unwrap();
+        let doc = find_one(
+            &conn.document_query,
+            &mut session,
+            "test",
+            json!({"name": "alice"}),
+        )
+        .unwrap();
         assert_eq!(doc.get("name"), Some(&json!("alice")));
     }
 }

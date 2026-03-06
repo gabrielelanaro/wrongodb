@@ -1,6 +1,4 @@
-use crate::collection_write_path;
-use crate::commands::Command;
-use crate::document_query;
+use crate::server::commands::Command;
 use crate::{Connection, WrongoDBError};
 use bson::{doc, oid::ObjectId, Bson, Document};
 use serde_json::{Map, Value};
@@ -90,7 +88,7 @@ impl Command for InsertCommand {
                         _ => ObjectId::new(),
                     };
                     let json_doc = bson_to_json_document(&doc_with_id);
-                    collection_write_path::insert_one(
+                    conn.collection_write_path.insert_one(
                         &mut session,
                         coll_name,
                         Value::Object(json_doc),
@@ -130,7 +128,9 @@ impl Command for FindCommand {
         let filter = doc.get("filter").and_then(|f| f.as_document()).cloned();
         let filter_json = filter.map(|d| bson_to_value(&d));
 
-        let mut results = document_query::find(&mut session, coll_name, filter_json)?;
+        let mut results = conn
+            .document_query
+            .find(&mut session, coll_name, filter_json)?;
 
         let skip = doc.get("skip").and_then(|v| v.as_i64()).unwrap_or(0);
         if skip > 0 {
@@ -198,14 +198,14 @@ impl Command for UpdateCommand {
                     let multi = update_doc.get_bool("multi").unwrap_or(false);
 
                     let result = if multi {
-                        collection_write_path::update_many(
+                        conn.collection_write_path.update_many(
                             &mut session,
                             coll_name,
                             filter_json,
                             update_json,
                         )?
                     } else {
-                        collection_write_path::update_one(
+                        conn.collection_write_path.update_one(
                             &mut session,
                             coll_name,
                             filter_json,
@@ -248,13 +248,13 @@ impl Command for DeleteCommand {
                     let limit = delete_doc.get_i32("limit").unwrap_or(0);
 
                     if limit == 1 {
-                        n_deleted += collection_write_path::delete_one(
+                        n_deleted += conn.collection_write_path.delete_one(
                             &mut session,
                             coll_name,
                             filter_json,
                         )? as i32;
                     } else {
-                        n_deleted += collection_write_path::delete_many(
+                        n_deleted += conn.collection_write_path.delete_many(
                             &mut session,
                             coll_name,
                             filter_json,

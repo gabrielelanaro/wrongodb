@@ -1,5 +1,44 @@
 # Decisions
 
+## 2026-03-06: Freeze the public API around `Connection`, `Session`, `WriteUnitOfWork`, and `Cursor`
+
+**Decision**
+- Expose only the small DB-facing surface from the crate root:
+  - `Connection`, `ConnectionConfig`, `RaftMode`, `RaftPeerConfig`
+  - `Session`
+  - `WriteUnitOfWork`
+  - `Cursor`, `CursorEntry`
+  - `WrongoDBError`, `DocumentValidationError`, `StorageError`
+  - `start_server`
+- Make `WriteUnitOfWork` the only public transactional facade:
+  - add `WriteUnitOfWork::open_cursor(...)`
+  - remove `session_mut()` and raw transaction escape hatches
+- Make public cursor semantics WT-like:
+  - cursor methods no longer take explicit `txn_id`
+  - `Session::open_cursor(...)` binds a non-transactional cursor
+  - `WriteUnitOfWork::open_cursor(...)` binds a transactional cursor
+- Keep document/index orchestration internal via explicit services:
+  - `CollectionWritePath`
+  - `DocumentQuery`
+  - `StoreWritePath`
+- Stop compiling storage-engine white-box integration tests as part of the public API suite.
+
+**Why**
+- The crate root had drifted into a mixed DB API plus storage-engine export surface, which made
+  the supported interface impossible to reason about.
+- `Session` was also leaking collaborators to internal callers through helper accessors, which
+  recreated the same ownership knot one level down.
+- The clean Mongo/WT-inspired split is:
+  - public `Session`/`Cursor` for storage-facing usage
+  - public `WriteUnitOfWork` for transaction scope
+  - internal write/query services for document/index orchestration
+
+**Notes**
+- The API surface is now mechanically checked with:
+  - trybuild UI tests for allowed and forbidden usage
+  - a source-level audit of `lib.rs`, `api/mod.rs`, and `server/mod.rs`
+- Public low-level cursor writes remain unsupported in clustered RAFT mode by design.
+
 ## 2026-03-06: Make the public transaction guard the actual `WriteUnitOfWork`
 
 **Decision**
@@ -1545,3 +1584,21 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - **Leaf-only pinning** minimizes pin count but may re-read parent pages during iteration if they're evicted.
 - **Full-path pinning** would keep the entire path from root to leaf pinned, preventing any re-reads but consuming more cache capacity.
 - Current implementation uses leaf-only pinning for simplicity; full-path pinning can be added later if needed for performance.
+
+## 2026-03-06: `Session` stays WT-like; write orchestration moves above it
+
+**Decision**
+- Keep the public `Session` API focused on WT-style context duties:
+  - `create("table:...")`
+  - `open_cursor(uri)`
+  - `transaction()`
+  - `checkpoint()`
+- Remove one-store write branching and index creation/backfill behavior from `Session`.
+- Introduce an internal `store_write_path` layer for one-store write semantics and local-vs-deferred durability branching.
+- Keep `collection_write_path` as the Mongo-style controller for document and index writes.
+- `Session::create("index:...")` is no longer supported; index creation stays internal to the collection write/schema path.
+
+**Why**
+- This keeps `Session` closer to `WT_SESSION` and Mongo's `OperationContext`.
+- It prevents low-level session APIs from accumulating collection/index behavior.
+- It keeps write-path policy out of `Cursor` while also keeping it out of `Session`.

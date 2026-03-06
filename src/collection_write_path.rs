@@ -1,11 +1,15 @@
+use std::sync::Arc;
+
 use serde_json::Value;
 
-use crate::api::Session;
-use crate::core::bson::{encode_document, encode_id_value};
+use crate::api::{Session, WriteUnitOfWork};
+use crate::core::bson::{decode_document, encode_document, encode_id_value};
 use crate::core::document::{normalize_document_in_place, validate_is_object};
 use crate::core::errors::DocumentValidationError;
-use crate::document_query::find_with_txn;
+use crate::document_query::DocumentQuery;
 use crate::index::encode_index_key;
+use crate::schema::SchemaCatalog;
+use crate::store_write_path::StoreWritePath;
 use crate::{Document, WrongoDBError};
 
 #[derive(Debug, Clone, Copy)]
@@ -14,23 +18,132 @@ pub(crate) struct UpdateResult {
     pub(crate) modified: usize,
 }
 
-pub(crate) fn insert_one(
-    session: &mut Session,
-    collection: &str,
-    doc: Value,
-) -> Result<Document, WrongoDBError> {
-    session.with_txn(|session| insert_one_in_txn(session, collection, doc))
+#[derive(Clone)]
+pub(crate) struct CollectionWritePath {
+    schema_catalog: Arc<SchemaCatalog>,
+    document_query: DocumentQuery,
+    store_write_path: StoreWritePath,
 }
 
-pub(crate) fn update_one(
-    session: &mut Session,
-    collection: &str,
-    filter: Option<Value>,
-    update: Value,
-) -> Result<UpdateResult, WrongoDBError> {
-    session.with_txn(|session| {
-        let txn_id = session.require_txn_id()?;
-        let docs = find_with_txn(session, collection, filter, txn_id)?;
+impl CollectionWritePath {
+    pub(crate) fn new(
+        schema_catalog: Arc<SchemaCatalog>,
+        document_query: DocumentQuery,
+        store_write_path: StoreWritePath,
+    ) -> Self {
+        Self {
+            schema_catalog,
+            document_query,
+            store_write_path,
+        }
+    }
+
+    pub(crate) fn insert_one(
+        &self,
+        session: &mut Session,
+        collection: &str,
+        doc: Value,
+    ) -> Result<Document, WrongoDBError> {
+        self.run_in_write_unit(session, |this, write_unit| {
+            this.insert_one_in_write_unit(write_unit, collection, doc)
+        })
+    }
+
+    pub(crate) fn update_one(
+        &self,
+        session: &mut Session,
+        collection: &str,
+        filter: Option<Value>,
+        update: Value,
+    ) -> Result<UpdateResult, WrongoDBError> {
+        self.run_in_write_unit(session, |this, write_unit| {
+            this.update_one_in_write_unit(write_unit, collection, filter, update)
+        })
+    }
+
+    pub(crate) fn update_many(
+        &self,
+        session: &mut Session,
+        collection: &str,
+        filter: Option<Value>,
+        update: Value,
+    ) -> Result<UpdateResult, WrongoDBError> {
+        self.run_in_write_unit(session, |this, write_unit| {
+            this.update_many_in_write_unit(write_unit, collection, filter, update)
+        })
+    }
+
+    pub(crate) fn delete_one(
+        &self,
+        session: &mut Session,
+        collection: &str,
+        filter: Option<Value>,
+    ) -> Result<usize, WrongoDBError> {
+        self.run_in_write_unit(session, |this, write_unit| {
+            this.delete_one_in_write_unit(write_unit, collection, filter)
+        })
+    }
+
+    pub(crate) fn delete_many(
+        &self,
+        session: &mut Session,
+        collection: &str,
+        filter: Option<Value>,
+    ) -> Result<usize, WrongoDBError> {
+        self.run_in_write_unit(session, |this, write_unit| {
+            this.delete_many_in_write_unit(write_unit, collection, filter)
+        })
+    }
+
+    pub(crate) fn create_index(
+        &self,
+        session: &mut Session,
+        collection: &str,
+        field: &str,
+    ) -> Result<(), WrongoDBError> {
+        session.create(&format!("table:{collection}"))?;
+        self.run_in_write_unit(session, |this, write_unit| {
+            this.create_index_in_write_unit(write_unit, collection, field)
+        })
+    }
+
+    pub(crate) fn insert_one_in_write_unit(
+        &self,
+        write_unit: &mut WriteUnitOfWork<'_>,
+        collection: &str,
+        doc: Value,
+    ) -> Result<Document, WrongoDBError> {
+        validate_is_object(&doc)?;
+        let mut obj = doc.as_object().expect("validated object").clone();
+        normalize_document_in_place(&mut obj)?;
+
+        let id = obj
+            .get("_id")
+            .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
+        let key = encode_id_value(id)?;
+        let value = encode_document(&obj)?;
+
+        let primary_store = self
+            .schema_catalog
+            .collection_schema(collection)?
+            .primary_store()
+            .to_string();
+        self.store_write_path
+            .insert(write_unit, &primary_store, &key, &value)?;
+        self.apply_index_add(write_unit, collection, &obj)?;
+        Ok(obj)
+    }
+
+    pub(crate) fn update_one_in_write_unit(
+        &self,
+        write_unit: &mut WriteUnitOfWork<'_>,
+        collection: &str,
+        filter: Option<Value>,
+        update: Value,
+    ) -> Result<UpdateResult, WrongoDBError> {
+        let docs = self
+            .document_query
+            .find_in_write_unit(write_unit, collection, filter)?;
         if docs.is_empty() {
             return Ok(UpdateResult {
                 matched: 0,
@@ -45,31 +158,33 @@ pub(crate) fn update_one(
             .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
         let key = encode_id_value(id)?;
         let value = encode_document(&updated_doc)?;
-        let primary_store = session
+        let primary_store = self
+            .schema_catalog
             .collection_schema(collection)?
             .primary_store()
             .to_string();
-        session.update_store_value(&primary_store, &key, &value, txn_id)?;
+        self.store_write_path
+            .update(write_unit, &primary_store, &key, &value)?;
 
-        apply_index_remove(session, collection, doc, txn_id)?;
-        apply_index_add(session, collection, &updated_doc, txn_id)?;
+        self.apply_index_remove(write_unit, collection, doc)?;
+        self.apply_index_add(write_unit, collection, &updated_doc)?;
 
         Ok(UpdateResult {
             matched: 1,
             modified: 1,
         })
-    })
-}
+    }
 
-pub(crate) fn update_many(
-    session: &mut Session,
-    collection: &str,
-    filter: Option<Value>,
-    update: Value,
-) -> Result<UpdateResult, WrongoDBError> {
-    session.with_txn(|session| {
-        let txn_id = session.require_txn_id()?;
-        let docs = find_with_txn(session, collection, filter, txn_id)?;
+    pub(crate) fn update_many_in_write_unit(
+        &self,
+        write_unit: &mut WriteUnitOfWork<'_>,
+        collection: &str,
+        filter: Option<Value>,
+        update: Value,
+    ) -> Result<UpdateResult, WrongoDBError> {
+        let docs = self
+            .document_query
+            .find_in_write_unit(write_unit, collection, filter)?;
         if docs.is_empty() {
             return Ok(UpdateResult {
                 matched: 0,
@@ -77,6 +192,11 @@ pub(crate) fn update_many(
             });
         }
 
+        let primary_store = self
+            .schema_catalog
+            .collection_schema(collection)?
+            .primary_store()
+            .to_string();
         let mut modified = 0;
         for doc in docs {
             let updated_doc = apply_update(&doc, &update)?;
@@ -85,14 +205,11 @@ pub(crate) fn update_many(
                 .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
             let key = encode_id_value(id)?;
             let value = encode_document(&updated_doc)?;
-            let primary_store = session
-                .collection_schema(collection)?
-                .primary_store()
-                .to_string();
-            session.update_store_value(&primary_store, &key, &value, txn_id)?;
+            self.store_write_path
+                .update(write_unit, &primary_store, &key, &value)?;
 
-            apply_index_remove(session, collection, &doc, txn_id)?;
-            apply_index_add(session, collection, &updated_doc, txn_id)?;
+            self.apply_index_remove(write_unit, collection, &doc)?;
+            self.apply_index_add(write_unit, collection, &updated_doc)?;
             modified += 1;
         }
 
@@ -100,17 +217,17 @@ pub(crate) fn update_many(
             matched: modified,
             modified,
         })
-    })
-}
+    }
 
-pub(crate) fn delete_one(
-    session: &mut Session,
-    collection: &str,
-    filter: Option<Value>,
-) -> Result<usize, WrongoDBError> {
-    session.with_txn(|session| {
-        let txn_id = session.require_txn_id()?;
-        let docs = find_with_txn(session, collection, filter, txn_id)?;
+    pub(crate) fn delete_one_in_write_unit(
+        &self,
+        write_unit: &mut WriteUnitOfWork<'_>,
+        collection: &str,
+        filter: Option<Value>,
+    ) -> Result<usize, WrongoDBError> {
+        let docs = self
+            .document_query
+            .find_in_write_unit(write_unit, collection, filter)?;
         if docs.is_empty() {
             return Ok(0);
         }
@@ -120,78 +237,151 @@ pub(crate) fn delete_one(
             return Ok(0);
         };
         let key = encode_id_value(id)?;
-        let primary_store = session
+        let primary_store = self
+            .schema_catalog
             .collection_schema(collection)?
             .primary_store()
             .to_string();
-        session.delete_store_value(&primary_store, &key, txn_id)?;
-        apply_index_remove(session, collection, doc, txn_id)?;
+        self.store_write_path
+            .delete(write_unit, &primary_store, &key)?;
+        self.apply_index_remove(write_unit, collection, doc)?;
         Ok(1)
-    })
-}
+    }
 
-pub(crate) fn delete_many(
-    session: &mut Session,
-    collection: &str,
-    filter: Option<Value>,
-) -> Result<usize, WrongoDBError> {
-    session.with_txn(|session| {
-        let txn_id = session.require_txn_id()?;
-        let docs = find_with_txn(session, collection, filter, txn_id)?;
+    pub(crate) fn delete_many_in_write_unit(
+        &self,
+        write_unit: &mut WriteUnitOfWork<'_>,
+        collection: &str,
+        filter: Option<Value>,
+    ) -> Result<usize, WrongoDBError> {
+        let docs = self
+            .document_query
+            .find_in_write_unit(write_unit, collection, filter)?;
         if docs.is_empty() {
             return Ok(0);
         }
 
+        let primary_store = self
+            .schema_catalog
+            .collection_schema(collection)?
+            .primary_store()
+            .to_string();
         let mut deleted = 0;
         for doc in docs {
             let Some(id) = doc.get("_id") else {
                 continue;
             };
             let key = encode_id_value(id)?;
-            let primary_store = session
-                .collection_schema(collection)?
-                .primary_store()
-                .to_string();
-            session.delete_store_value(&primary_store, &key, txn_id)?;
-            apply_index_remove(session, collection, &doc, txn_id)?;
+            self.store_write_path
+                .delete(write_unit, &primary_store, &key)?;
+            self.apply_index_remove(write_unit, collection, &doc)?;
             deleted += 1;
         }
 
         Ok(deleted)
-    })
-}
+    }
 
-pub(crate) fn create_index(
-    session: &mut Session,
-    collection: &str,
-    field: &str,
-) -> Result<(), WrongoDBError> {
-    session.create(&format!("index:{collection}:{field}"))
-}
+    pub(crate) fn create_index_in_write_unit(
+        &self,
+        write_unit: &mut WriteUnitOfWork<'_>,
+        collection: &str,
+        field: &str,
+    ) -> Result<(), WrongoDBError> {
+        let Some(store_name) =
+            self.schema_catalog
+                .add_index(collection, field, vec![field.to_string()])?
+        else {
+            return Ok(());
+        };
 
-fn insert_one_in_txn(
-    session: &mut Session,
-    collection: &str,
-    doc: Value,
-) -> Result<Document, WrongoDBError> {
-    validate_is_object(&doc)?;
-    let mut obj = doc.as_object().expect("validated object").clone();
-    normalize_document_in_place(&mut obj)?;
+        self.store_write_path.ensure_store(&store_name)?;
+        let mut primary_cursor = write_unit.open_cursor(&format!("table:{collection}"))?;
 
-    let id = obj
-        .get("_id")
-        .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
-    let key = encode_id_value(id)?;
-    let value = encode_document(&obj)?;
-    let txn_id = session.require_txn_id()?;
+        while let Some((_, bytes)) = primary_cursor.next()? {
+            let doc = decode_document(&bytes)?;
+            let Some(id) = doc.get("_id") else {
+                continue;
+            };
+            let Some(value) = doc.get(field) else {
+                continue;
+            };
+            let Some(key) = encode_index_key(value, id)? else {
+                continue;
+            };
+            self.store_write_path
+                .insert(write_unit, &store_name, &key, &[])?;
+        }
 
-    let primary_store = session
-        .collection_schema(collection)?
-        .primary_store()
-        .to_string();
-    session.insert_store_value(&primary_store, &key, &value, txn_id)?;
-    apply_index_add(session, collection, &obj, txn_id)?;
-    Ok(obj)
+        Ok(())
+    }
+
+    fn apply_index_add(
+        &self,
+        write_unit: &mut WriteUnitOfWork<'_>,
+        collection: &str,
+        doc: &Document,
+    ) -> Result<(), WrongoDBError> {
+        self.apply_index_doc(write_unit, collection, doc, true)
+    }
+
+    fn apply_index_remove(
+        &self,
+        write_unit: &mut WriteUnitOfWork<'_>,
+        collection: &str,
+        doc: &Document,
+    ) -> Result<(), WrongoDBError> {
+        self.apply_index_doc(write_unit, collection, doc, false)
+    }
+
+    fn apply_index_doc(
+        &self,
+        write_unit: &mut WriteUnitOfWork<'_>,
+        collection: &str,
+        doc: &Document,
+        is_add: bool,
+    ) -> Result<(), WrongoDBError> {
+        let Some(id) = doc.get("_id") else {
+            return Ok(());
+        };
+        let schema = self.schema_catalog.collection_schema(collection)?;
+        for def in schema.index_definitions() {
+            let Some(field) = def.columns.first() else {
+                continue;
+            };
+            let Some(value) = doc.get(field) else {
+                continue;
+            };
+            let Some(key) = encode_index_key(value, id)? else {
+                continue;
+            };
+            if is_add {
+                self.store_write_path
+                    .insert(write_unit, &def.source, &key, &[])?;
+            } else {
+                self.store_write_path
+                    .delete(write_unit, &def.source, &key)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn run_in_write_unit<R, F>(&self, session: &mut Session, f: F) -> Result<R, WrongoDBError>
+    where
+        F: FnOnce(&Self, &mut WriteUnitOfWork<'_>) -> Result<R, WrongoDBError>,
+    {
+        let mut write_unit = session.transaction()?;
+        let result = f(self, &mut write_unit);
+        match result {
+            Ok(value) => {
+                write_unit.commit()?;
+                Ok(value)
+            }
+            Err(err) => {
+                let _ = write_unit.abort();
+                Err(err)
+            }
+        }
+    }
 }
 
 fn apply_update(doc: &Document, update: &Value) -> Result<Document, WrongoDBError> {
@@ -264,64 +454,23 @@ fn apply_update(doc: &Document, update: &Value) -> Result<Document, WrongoDBErro
     Ok(new_doc)
 }
 
-fn apply_index_add(
-    session: &mut Session,
-    collection: &str,
-    doc: &Document,
-    txn_id: crate::txn::TxnId,
-) -> Result<(), WrongoDBError> {
-    apply_index_doc(session, collection, doc, txn_id, true)
-}
-
-fn apply_index_remove(
-    session: &mut Session,
-    collection: &str,
-    doc: &Document,
-    txn_id: crate::txn::TxnId,
-) -> Result<(), WrongoDBError> {
-    apply_index_doc(session, collection, doc, txn_id, false)
-}
-
-fn apply_index_doc(
-    session: &mut Session,
-    collection: &str,
-    doc: &Document,
-    txn_id: crate::txn::TxnId,
-    is_add: bool,
-) -> Result<(), WrongoDBError> {
-    let Some(id) = doc.get("_id") else {
-        return Ok(());
-    };
-    let schema = session.collection_schema(collection)?;
-    for def in schema.index_definitions() {
-        let Some(field) = def.columns.first() else {
-            continue;
-        };
-        let Some(value) = doc.get(field) else {
-            continue;
-        };
-        let Some(key) = encode_index_key(value, id)? else {
-            continue;
-        };
-        if is_add {
-            session.insert_store_value(&def.source, &key, &[], txn_id)?;
-        } else {
-            session.delete_store_value(&def.source, &key, txn_id)?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
+    use std::sync::Arc;
 
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::apply_update;
-    use super::insert_one;
     use crate::api::connection::{Connection, ConnectionConfig, RaftMode, RaftPeerConfig};
+    use crate::collection_write_path::CollectionWritePath;
+    use crate::document_query::DocumentQuery;
+    use crate::durability::DurabilityBackend;
+    use crate::schema::SchemaCatalog;
+    use crate::storage::table_cache::TableCache;
+    use crate::store_write_path::StoreWritePath;
+    use crate::txn::{GlobalTxnState, TransactionManager};
     use crate::WrongoDBError;
 
     fn free_local_addr() -> String {
@@ -329,6 +478,27 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         drop(listener);
         addr.to_string()
+    }
+
+    fn test_services(
+        base_path: std::path::PathBuf,
+        backend: DurabilityBackend,
+    ) -> (CollectionWritePath, crate::api::Session) {
+        let transaction_manager =
+            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+        let table_cache = Arc::new(TableCache::new(
+            base_path.clone(),
+            transaction_manager.clone(),
+        ));
+        let schema_catalog = Arc::new(SchemaCatalog::new(base_path));
+        let backend = Arc::new(backend);
+        let document_query = DocumentQuery::new(schema_catalog.clone());
+        let store_write_path = StoreWritePath::new(table_cache.clone(), backend.clone());
+        let service =
+            CollectionWritePath::new(schema_catalog.clone(), document_query, store_write_path);
+        let session =
+            crate::api::Session::new(table_cache, schema_catalog, transaction_manager, backend);
+        (service, session)
     }
 
     #[test]
@@ -405,11 +575,30 @@ mod tests {
         .unwrap();
         let mut session = conn.open_session();
 
-        let err =
-            insert_one(&mut session, "items", json!({"_id": "k1", "value": "v1"})).unwrap_err();
+        let err = conn
+            .collection_write_path
+            .insert_one(&mut session, "items", json!({"_id": "k1", "value": "v1"}))
+            .unwrap_err();
         match err {
             WrongoDBError::NotLeader { leader_hint } => assert_eq!(leader_hint, None),
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn create_index_backfills_existing_documents() {
+        let tmp = tempdir().unwrap();
+        let (service, mut session) =
+            test_services(tmp.path().to_path_buf(), DurabilityBackend::Disabled);
+
+        service
+            .insert_one(&mut session, "users", json!({"_id": 1, "name": "alice"}))
+            .unwrap();
+        service.create_index(&mut session, "users", "name").unwrap();
+
+        let mut wuow = session.transaction().unwrap();
+        let mut cursor = wuow.open_cursor("index:users:name").unwrap();
+        assert!(cursor.next().unwrap().is_some());
+        wuow.commit().unwrap();
     }
 }

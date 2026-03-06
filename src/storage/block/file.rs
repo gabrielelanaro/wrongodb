@@ -219,7 +219,7 @@ impl FileHeader {
 
 #[derive(Debug)]
 pub struct BlockFile {
-    pub path: PathBuf,
+    _path: PathBuf,
     file: File,
     pub header: FileHeader,
     pub page_size: usize,
@@ -289,7 +289,7 @@ impl BlockFile {
         let block_manager = BlockManager::new(stable_generation, extents);
 
         Ok(Self {
-            path,
+            _path: path,
             file,
             header,
             page_size,
@@ -344,7 +344,7 @@ impl BlockFile {
         let stable_generation = header.checkpoint_slots[active_checkpoint_slot].generation;
         let block_manager = BlockManager::new(stable_generation, extents);
         Ok(Self {
-            path,
+            _path: path,
             file,
             header,
             page_size,
@@ -439,7 +439,9 @@ impl BlockFile {
         Ok(extent)
     }
 
-    pub fn write_new_block(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError> {
+    #[allow(dead_code)]
+    #[cfg(test)]
+    pub(crate) fn write_new_block(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError> {
         let block_id = self.allocate_block()?;
         self.write_block(block_id, payload)?;
         Ok(block_id)
@@ -468,18 +470,15 @@ impl BlockFile {
         Ok(())
     }
 
-    pub fn close(self) -> Result<(), WrongoDBError> {
+    #[allow(dead_code)]
+    #[cfg(test)]
+    pub(crate) fn close(self) -> Result<(), WrongoDBError> {
         self.file.sync_all()?;
         Ok(())
     }
 
     pub fn sync_all(&mut self) -> Result<(), WrongoDBError> {
         self.file.sync_all()?;
-        Ok(())
-    }
-
-    pub fn sync_data(&mut self) -> Result<(), WrongoDBError> {
-        self.file.sync_data()?;
         Ok(())
     }
 

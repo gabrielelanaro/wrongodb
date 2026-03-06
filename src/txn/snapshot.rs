@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use super::TxnId;
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub(crate) snap_max: TxnId,
@@ -12,6 +13,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_visible(&self, txn_id: TxnId) -> bool {
         if txn_id == self.my_txn_id {
             return true;

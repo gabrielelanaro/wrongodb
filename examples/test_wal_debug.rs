@@ -18,7 +18,7 @@ fn main() {
             let mut cursor = session.open_cursor("table:test").unwrap();
             let key = format!("k{i}");
             let value = format!("v{i}");
-            cursor.insert(key.as_bytes(), value.as_bytes(), 0).unwrap();
+            cursor.insert(key.as_bytes(), value.as_bytes()).unwrap();
         }
     }
 

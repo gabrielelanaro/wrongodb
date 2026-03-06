@@ -130,7 +130,13 @@ impl BTree {
         Ok(())
     }
 
-    pub fn insert_unique(&mut self, key: &[u8], value: &[u8]) -> Result<bool, WrongoDBError> {
+    #[allow(dead_code)]
+    #[cfg(test)]
+    pub(crate) fn insert_unique(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<bool, WrongoDBError> {
         let root = self.pager.root_page_id();
         if root == NONE_PAGE_ID {
             return Err(StorageError("btree missing root".into()).into());
@@ -173,7 +179,9 @@ impl BTree {
         Ok(result.deleted)
     }
 
-    pub fn sync_all(&mut self) -> Result<(), WrongoDBError> {
+    #[allow(dead_code)]
+    #[cfg(test)]
+    pub(crate) fn sync_all(&mut self) -> Result<(), WrongoDBError> {
         self.pager.sync_all()
     }
 

@@ -4,6 +4,7 @@ use crate::txn::snapshot::Snapshot;
 use crate::txn::update::Update;
 use crate::txn::{Timestamp, TxnId, TS_NONE, TXN_NONE};
 
+#[allow(dead_code)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum IsolationLevel {
     Snapshot,
@@ -19,7 +20,9 @@ pub enum TxnState {
 #[derive(Debug)]
 pub struct Transaction {
     id: TxnId,
+    #[cfg_attr(not(test), allow(dead_code))]
     snapshot: Option<Snapshot>,
+    #[cfg_attr(not(test), allow(dead_code))]
     read_ts: Option<Timestamp>,
     state: TxnState,
 }
@@ -38,10 +41,12 @@ impl Transaction {
         self.id
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn snapshot(&self) -> Option<&Snapshot> {
         self.snapshot.as_ref()
     }
 
+    #[allow(dead_code)]
     pub fn state(&self) -> TxnState {
         self.state
     }
@@ -98,15 +103,18 @@ impl Transaction {
     }
 
     /// Check if this transaction is committed.
+    #[allow(dead_code)]
     pub fn is_committed(&self) -> bool {
         matches!(self.state, TxnState::Committed { .. })
     }
 
     /// Check if this transaction is aborted.
+    #[allow(dead_code)]
     pub fn is_aborted(&self) -> bool {
         matches!(self.state, TxnState::Aborted)
     }
 
+    #[allow(dead_code)]
     pub fn set_read_ts(&mut self, ts: Timestamp) {
         if ts == TS_NONE {
             self.read_ts = None;
@@ -115,12 +123,14 @@ impl Transaction {
         }
     }
 
+    #[allow(dead_code)]
     pub fn end(&mut self, global: &GlobalTxnState) {
         if self.id != TXN_NONE {
             global.unregister_active(self.id);
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn can_see(&self, update: &Update) -> bool {
         let visible_txn = match &self.snapshot {
             Some(snapshot) => snapshot.is_visible(update.txn_id),

@@ -1,4 +1,4 @@
-use crate::commands::Command;
+use crate::server::commands::Command;
 use crate::{Connection, WrongoDBError};
 use bson::{doc, Bson, Document};
 

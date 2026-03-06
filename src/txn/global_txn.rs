@@ -101,7 +101,9 @@ impl GlobalTxnState {
     }
 
     /// Check if a transaction is aborted
-    pub fn is_aborted(&self, txn_id: TxnId) -> bool {
+    #[allow(dead_code)]
+    #[cfg(test)]
+    pub(crate) fn is_aborted(&self, txn_id: TxnId) -> bool {
         let guard = self
             .aborted_txns
             .read()

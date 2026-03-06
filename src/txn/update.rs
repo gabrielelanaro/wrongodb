@@ -1,5 +1,6 @@
 use super::{Timestamp, TxnId, TS_MAX, TS_NONE, TXN_ABORTED};
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum UpdateType {
     Standard,
@@ -7,6 +8,7 @@ pub enum UpdateType {
     Reserve,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TimeWindow {
     pub start_ts: Timestamp,

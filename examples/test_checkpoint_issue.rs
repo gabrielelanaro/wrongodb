@@ -14,15 +14,13 @@ fn main() {
         session.create("table:test").unwrap();
 
         let mut txn = session.transaction().unwrap();
-        let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
+        let mut cursor = txn.open_cursor("table:test").unwrap();
 
         for i in 0..5 {
             println!("Inserting: key{}", i);
             let key = format!("key{i}");
             let value = format!("value{i}");
-            cursor
-                .insert(key.as_bytes(), value.as_bytes(), txn.as_ref().id())
-                .unwrap();
+            cursor.insert(key.as_bytes(), value.as_bytes()).unwrap();
         }
 
         txn.commit().unwrap();
@@ -34,15 +32,13 @@ fn main() {
         let mut session = conn.open_session();
 
         let mut txn = session.transaction().unwrap();
-        let mut cursor = txn.session_mut().open_cursor("table:test").unwrap();
+        let mut cursor = txn.open_cursor("table:test").unwrap();
 
         for i in 5..10 {
             println!("Inserting: key{}", i);
             let key = format!("key{i}");
             let value = format!("value{i}");
-            cursor
-                .insert(key.as_bytes(), value.as_bytes(), txn.as_ref().id())
-                .unwrap();
+            cursor.insert(key.as_bytes(), value.as_bytes()).unwrap();
         }
 
         txn.commit().unwrap();
@@ -60,7 +56,7 @@ fn main() {
 
         for i in 0..10 {
             let key = format!("key{}", i);
-            let result = cursor.get(key.as_bytes(), 0).unwrap();
+            let result = cursor.get(key.as_bytes()).unwrap();
             match &result {
                 Some(value) => println!("{} -> {:?}", key, String::from_utf8_lossy(value)),
                 None => println!("{} -> MISSING", key),
