@@ -1,18 +1,25 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use crate::txn::{GlobalTxnState, UpdateChain, UpdateType, TS_NONE, TXN_ABORTED};
+use crate::txn::{TxnId, UpdateChain, UpdateType};
+
+pub(crate) type MaterializedEntry = (Vec<u8>, UpdateType, Vec<u8>);
+pub(crate) type MaterializedEntries = Vec<MaterializedEntry>;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReconcileStats {
+    pub(crate) materialized_entries: usize,
+    pub(crate) obsolete_updates_removed: usize,
+    pub(crate) chains_dropped: usize,
+}
 
 #[derive(Debug)]
 pub struct MvccState {
-    global: Arc<GlobalTxnState>,
     chains: HashMap<Vec<u8>, UpdateChain>,
 }
 
 impl MvccState {
-    pub fn new(global: Arc<GlobalTxnState>) -> Self {
+    pub fn new() -> Self {
         Self {
-            global,
             chains: HashMap::new(),
         }
     }
@@ -25,32 +32,33 @@ impl MvccState {
         self.chains.entry(key.to_vec()).or_default()
     }
 
-    /// Run garbage collection on all update chains.
-    /// Returns (chains_cleaned, updates_removed, chains_dropped).
-    #[allow(dead_code)]
-    pub fn run_gc(&mut self) -> (usize, usize, usize) {
-        let threshold = self.global.oldest_active_txn_id();
-        let mut chains_cleaned = 0;
-        let mut updates_removed = 0;
+    pub fn reconcile_for_checkpoint(
+        &mut self,
+        oldest_active_txn_id: TxnId,
+        no_active_txns: bool,
+    ) -> (MaterializedEntries, ReconcileStats) {
+        let mut entries_to_materialize = Vec::new();
+        let mut stats = ReconcileStats::default();
         let mut keys_to_remove = Vec::new();
 
         for (key, chain) in self.chains.iter_mut() {
-            let removed = chain.truncate_obsolete(threshold);
-            if removed > 0 {
-                chains_cleaned += 1;
-                updates_removed += removed;
+            if let Some((update_type, data)) = chain.latest_committed_entry() {
+                entries_to_materialize.push((key.clone(), update_type, data));
+                stats.materialized_entries += 1;
             }
-            if chain.is_empty() {
+
+            stats.obsolete_updates_removed += chain.truncate_obsolete(oldest_active_txn_id);
+            if chain.clear_if_materialized_current(no_active_txns) || chain.is_empty() {
                 keys_to_remove.push(key.clone());
             }
         }
 
-        let chains_dropped = keys_to_remove.len();
+        stats.chains_dropped = keys_to_remove.len();
         for key in keys_to_remove {
             self.chains.remove(&key);
         }
 
-        (chains_cleaned, updates_removed, chains_dropped)
+        (entries_to_materialize, stats)
     }
 
     pub fn keys_in_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Vec<Vec<u8>> {
@@ -64,33 +72,6 @@ impl MvccState {
         }
         keys.sort();
         keys
-    }
-
-    pub fn latest_committed_entries(&self) -> Vec<(Vec<u8>, UpdateType, Vec<u8>)> {
-        let mut out = Vec::new();
-        for (key, chain) in self.chains.iter() {
-            for update in chain.iter() {
-                let is_aborted = update.time_window.stop_txn == TXN_ABORTED
-                    && update.time_window.stop_ts == TS_NONE;
-                if is_aborted {
-                    continue;
-                }
-                if update.time_window.start_ts == TS_NONE {
-                    continue;
-                }
-                match update.type_ {
-                    UpdateType::Standard => {
-                        out.push((key.clone(), UpdateType::Standard, update.data.clone()))
-                    }
-                    UpdateType::Tombstone => {
-                        out.push((key.clone(), UpdateType::Tombstone, Vec::new()))
-                    }
-                    UpdateType::Reserve => {}
-                }
-                break;
-            }
-        }
-        out
     }
 
     pub fn chains_mut(&mut self) -> impl Iterator<Item = &mut UpdateChain> {

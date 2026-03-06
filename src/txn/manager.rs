@@ -5,7 +5,7 @@ use parking_lot::RwLock;
 
 use crate::core::errors::WrongoDBError;
 use crate::storage::btree::BTree;
-use crate::storage::mvcc::MvccState;
+use crate::storage::mvcc::{MvccState, ReconcileStats};
 use crate::txn::{
     GlobalTxnState, Timestamp, Transaction, TxnId, Update, UpdateType, TS_MAX, TS_NONE,
     TXN_ABORTED, TXN_NONE,
@@ -57,7 +57,7 @@ impl TransactionManager {
         let mut stores = self.stores.write();
         let state = stores
             .entry(store_name.to_string())
-            .or_insert_with(|| MvccState::new(self.global_txn.clone()));
+            .or_insert_with(MvccState::new);
 
         let chain = state.chain_mut_or_create(key);
         if let Some(head) = chain.head_mut() {
@@ -83,7 +83,7 @@ impl TransactionManager {
         let mut stores = self.stores.write();
         let state = stores
             .entry(store_name.to_string())
-            .or_insert_with(|| MvccState::new(self.global_txn.clone()));
+            .or_insert_with(MvccState::new);
 
         let chain = state.chain_mut_or_create(key);
         if let Some(head) = chain.head_mut() {
@@ -179,17 +179,19 @@ impl TransactionManager {
             .unwrap_or_default()
     }
 
-    pub fn materialize_committed_updates(
+    pub(crate) fn reconcile_store_for_checkpoint(
         &self,
         store_name: &str,
         btree: &mut BTree,
-    ) -> Result<(), WrongoDBError> {
-        let entries = {
-            let stores = self.stores.read();
-            stores
-                .get(store_name)
-                .map(|state| state.latest_committed_entries())
-                .unwrap_or_default()
+    ) -> Result<ReconcileStats, WrongoDBError> {
+        let oldest_active_txn_id = self.global_txn.oldest_active_txn_id();
+        let no_active_txns = !self.global_txn.has_active_transactions();
+        let (entries, stats) = {
+            let mut stores = self.stores.write();
+            let Some(state) = stores.get_mut(store_name) else {
+                return Ok(ReconcileStats::default());
+            };
+            state.reconcile_for_checkpoint(oldest_active_txn_id, no_active_txns)
         };
 
         for (key, update_type, data) in entries {
@@ -202,15 +204,6 @@ impl TransactionManager {
             }
         }
 
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn run_gc_for_store(&self, store_name: &str) -> (usize, usize, usize) {
-        let mut stores = self.stores.write();
-        stores
-            .get_mut(store_name)
-            .map(MvccState::run_gc)
-            .unwrap_or((0, 0, 0))
+        Ok(stats)
     }
 }

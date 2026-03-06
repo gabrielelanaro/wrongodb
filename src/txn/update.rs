@@ -52,26 +52,32 @@ impl Update {
         }
     }
 
+    pub fn is_aborted(&self) -> bool {
+        self.time_window.stop_txn == TXN_ABORTED && self.time_window.stop_ts == TS_NONE
+    }
+
+    pub fn is_committed(&self) -> bool {
+        !self.is_aborted() && self.time_window.start_ts != TS_NONE
+    }
+
+    pub fn is_current(&self) -> bool {
+        self.time_window.stop_ts == TS_MAX
+    }
+
     /// Check if this update is obsolete - no active transaction can see it.
-    /// An update is obsolete if:
-    /// 1. It was aborted (stop_txn == TXN_ABORTED AND stop_ts == TS_NONE), OR
-    /// 2. It has a stop_ts (was overwritten), AND
-    /// 3. All active transactions have a snap_max > start_txn (started after this update)
+    /// An aborted update is obsolete once every active transaction started after it.
+    /// An overwritten update is obsolete once every active transaction can also see
+    /// the update that stopped it.
     pub fn is_obsolete(&self, oldest_active_txn_id: TxnId) -> bool {
-        // Aborted updates are obsolete if no active transaction can see them.
-        // Aborted updates have stop_txn == TXN_ABORTED AND stop_ts == TS_NONE.
-        if self.time_window.stop_txn == TXN_ABORTED && self.time_window.stop_ts == TS_NONE {
+        if self.is_aborted() {
             return self.time_window.start_txn < oldest_active_txn_id;
         }
 
-        // If stop_ts is MAX, the update is still the current version
-        if self.time_window.stop_ts == TS_MAX {
+        if self.is_current() {
             return false;
         }
 
-        // If the oldest active transaction started after this update's start_txn,
-        // then no active transaction can see this update
-        self.time_window.start_txn < oldest_active_txn_id
+        self.time_window.stop_txn <= oldest_active_txn_id
     }
 
     /// Mark this update as stopped (overwritten by a newer update).
@@ -109,7 +115,6 @@ impl UpdateChain {
 
     /// Remove obsolete updates from the chain, keeping only visible ones.
     /// Returns the number of updates removed.
-    #[allow(dead_code)]
     pub fn truncate_obsolete(&mut self, oldest_active_txn_id: TxnId) -> usize {
         let mut removed = 0;
 
@@ -145,9 +150,38 @@ impl UpdateChain {
     }
 
     /// Check if the chain is empty.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.head.is_none()
+    }
+
+    pub fn latest_committed_entry(&self) -> Option<(UpdateType, Vec<u8>)> {
+        for update in self.iter() {
+            if !update.is_committed() {
+                continue;
+            }
+            return match update.type_ {
+                UpdateType::Standard => Some((UpdateType::Standard, update.data.clone())),
+                UpdateType::Tombstone => Some((UpdateType::Tombstone, Vec::new())),
+                UpdateType::Reserve => continue,
+            };
+        }
+        None
+    }
+
+    pub fn clear_if_materialized_current(&mut self, no_active_txns: bool) -> bool {
+        if !no_active_txns {
+            return false;
+        }
+
+        let Some(head) = self.head.as_ref() else {
+            return false;
+        };
+        if !head.is_committed() || !head.is_current() {
+            return false;
+        }
+
+        self.head = None;
+        true
     }
 
     /// Iterate over all updates in the chain (from head to tail).
@@ -197,6 +231,15 @@ mod tests {
 
         // If oldest active is 2, txn 1's update is obsolete
         assert!(update.is_obsolete(2));
+    }
+
+    #[test]
+    fn test_obsolete_detection_uses_stop_txn_for_overwritten_updates() {
+        let mut update = Update::new(9, UpdateType::Standard, vec![1, 2, 3]);
+        update.mark_stopped(15);
+
+        assert!(!update.is_obsolete(10));
+        assert!(update.is_obsolete(15));
     }
 
     #[test]

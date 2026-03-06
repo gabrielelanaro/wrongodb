@@ -340,23 +340,6 @@ impl Session {
         self.durability_backend.truncate_to_checkpoint()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn run_gc(&mut self) -> Result<(usize, usize, usize), WrongoDBError> {
-        let mut chains = 0;
-        let mut updates = 0;
-        let mut dropped = 0;
-
-        for store_name in self.schema_catalog.all_store_names()? {
-            let table = self.table_cache.get_or_open_store(&store_name)?;
-            let (store_chains, store_updates, store_dropped) = table.write().run_store_gc();
-            chains += store_chains;
-            updates += store_updates;
-            dropped += store_dropped;
-        }
-
-        Ok((chains, updates, dropped))
-    }
-
     fn with_txn<R, F>(&mut self, f: F) -> Result<R, WrongoDBError>
     where
         F: FnOnce(&mut Session) -> Result<R, WrongoDBError>,
@@ -927,5 +910,25 @@ mod tests {
 
         let indexes = session.list_indexes("test").unwrap();
         assert!(indexes.iter().any(|idx| idx == "name"));
+    }
+
+    #[test]
+    fn checkpoint_preserves_indexed_lookup_after_reconciliation() {
+        let tmp = tempdir().unwrap();
+        let conn = Connection::open(tmp.path().join("db"), ConnectionConfig::default()).unwrap();
+        let mut session = conn.open_session();
+
+        session.create_index("test", "name").unwrap();
+        session
+            .insert_one("test", json!({"_id": 1, "name": "alice"}))
+            .unwrap();
+
+        session.checkpoint().unwrap();
+
+        let doc = session
+            .find_one("test", Some(json!({"name": "alice"})))
+            .unwrap()
+            .unwrap();
+        assert_eq!(doc.get("name"), Some(&json!("alice")));
     }
 }

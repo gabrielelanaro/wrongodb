@@ -1,5 +1,32 @@
 # Decisions
 
+## 2026-03-06: Make MVCC cleanup checkpoint-owned reconciliation
+
+**Decision**
+- Remove the dormant runtime GC surface and make checkpoint the only owner of MVCC cleanup.
+- Add `TransactionManager::reconcile_store_for_checkpoint(...)` as the internal maintenance step
+  before `BTree::checkpoint()`.
+- Reconciliation performs three steps per store:
+  - materialize the latest committed entry from each update chain into the base store
+  - prune obsolete updates that are no longer needed by any active transaction
+  - when there are no active transactions, drop fully materialized current committed heads
+- Keep `Session::checkpoint()` as the only runtime maintenance entrypoint; do not add a separate
+  public `compact` or `run_gc` API in this pass.
+
+**Why**
+- The previous refactor left a dead GC path in place without a real runtime caller.
+- The actual missing feature was not “a GC API”, but a complete checkpoint-owned reconciliation
+  pass that closes the loop between in-memory MVCC chains and the on-disk base store.
+- This matches the intended split:
+  `Session` owns maintenance entrypoints, storage internals perform reconciliation, and callers do
+  not need to choose between multiple cleanup mechanisms.
+
+**Notes**
+- This is an internal correctness/readability change only; public API stays the same.
+- The reconciliation logic uses the stopping transaction of overwritten versions to decide when
+  they are obsolete, so older snapshots are preserved until their replacement is visible to all
+  active transactions.
+
 ## 2026-03-06: Make `Session` the document/index controller and `Table` a pure store handle
 
 **Decision**

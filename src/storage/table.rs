@@ -73,8 +73,9 @@ impl Table {
     }
 
     pub fn checkpoint_store(&mut self) -> Result<(), WrongoDBError> {
-        self.transaction_manager
-            .materialize_committed_updates(&self.store_name, &mut self.btree)?;
+        let _ = self
+            .transaction_manager
+            .reconcile_store_for_checkpoint(&self.store_name, &mut self.btree)?;
         self.btree.checkpoint()
     }
 
@@ -95,17 +96,6 @@ impl Table {
     ) -> Result<bool, WrongoDBError> {
         self.transaction_manager
             .delete(&self.store_name, &mut self.btree, key, txn_id)
-    }
-
-    #[allow(dead_code)]
-    pub fn put_recovery(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
-        self.btree.put(key, value)
-    }
-
-    #[allow(dead_code)]
-    pub fn delete_recovery(&mut self, key: &[u8]) -> Result<(), WrongoDBError> {
-        let _ = self.btree.delete(key)?;
-        Ok(())
     }
 
     pub fn local_mark_updates_committed(
@@ -135,11 +125,6 @@ impl Table {
 
     pub fn contains_key(&mut self, key: &[u8], txn_id: TxnId) -> Result<bool, WrongoDBError> {
         Ok(self.get_version(key, txn_id)?.is_some())
-    }
-
-    #[allow(dead_code)]
-    pub fn run_store_gc(&mut self) -> (usize, usize, usize) {
-        self.transaction_manager.run_gc_for_store(&self.store_name)
     }
 
     fn open_or_create_btree(path: &Path) -> Result<BTree, WrongoDBError> {
@@ -188,15 +173,21 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::storage::mvcc::ReconcileStats;
     use crate::txn::{GlobalTxnState, TXN_NONE};
 
-    #[test]
-    fn local_apply_and_recovery_writes_do_not_depend_on_hooks() {
+    fn open_table(store_name: &str) -> (tempfile::TempDir, Arc<TransactionManager>, Table) {
         let tmp = tempdir().unwrap();
-        let path = tmp.path().join("table.idx.wt");
+        let path = tmp.path().join(store_name);
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let mut table = Table::open_or_create_store(&path, transaction_manager).unwrap();
+        let table = Table::open_or_create_store(&path, transaction_manager.clone()).unwrap();
+        (tmp, transaction_manager, table)
+    }
+
+    #[test]
+    fn local_apply_writes_do_not_depend_on_hooks() {
+        let (_tmp, _transaction_manager, mut table) = open_table("table.idx.wt");
 
         table
             .local_apply_put_with_txn(b"k1", b"v1", TXN_NONE)
@@ -208,10 +199,138 @@ mod tests {
         let deleted = table.local_apply_delete_with_txn(b"k1", TXN_NONE).unwrap();
         assert!(deleted);
         assert_eq!(table.get_version(b"k1", TXN_NONE).unwrap(), None);
+    }
 
-        table.put_recovery(b"k1", b"v1").unwrap();
-        assert_eq!(table.btree.get(b"k1").unwrap(), Some(b"v1".to_vec()));
-        table.delete_recovery(b"k1").unwrap();
-        assert_eq!(table.btree.get(b"k1").unwrap(), None);
+    #[test]
+    fn reconcile_materializes_and_drops_current_committed_chain_without_active_transactions() {
+        let (_tmp, transaction_manager, mut table) = open_table("table.idx.wt");
+
+        let mut txn = transaction_manager.begin_snapshot_txn();
+        let txn_id = txn.id();
+        table
+            .local_apply_put_with_txn(b"k1", b"v1", txn_id)
+            .unwrap();
+        table.local_mark_updates_committed(txn_id).unwrap();
+        transaction_manager.commit_txn_state(&mut txn).unwrap();
+
+        assert_eq!(table.get_version(b"k1", TXN_NONE).unwrap(), None);
+
+        let stats = transaction_manager
+            .reconcile_store_for_checkpoint(&table.store_name, &mut table.btree)
+            .unwrap();
+        assert_eq!(
+            stats,
+            ReconcileStats {
+                materialized_entries: 1,
+                obsolete_updates_removed: 0,
+                chains_dropped: 1,
+            }
+        );
+        assert_eq!(
+            table.get_version(b"k1", TXN_NONE).unwrap(),
+            Some(b"v1".to_vec())
+        );
+
+        let second_pass = transaction_manager
+            .reconcile_store_for_checkpoint(&table.store_name, &mut table.btree)
+            .unwrap();
+        assert_eq!(second_pass, ReconcileStats::default());
+    }
+
+    #[test]
+    fn reconcile_keeps_old_versions_needed_by_active_transactions() {
+        let (_tmp, transaction_manager, mut table) = open_table("table.idx.wt");
+
+        let mut first_writer = transaction_manager.begin_snapshot_txn();
+        let first_writer_id = first_writer.id();
+        table
+            .local_apply_put_with_txn(b"k1", b"v1", first_writer_id)
+            .unwrap();
+        table.local_mark_updates_committed(first_writer_id).unwrap();
+        transaction_manager
+            .commit_txn_state(&mut first_writer)
+            .unwrap();
+
+        let mut reader = transaction_manager.begin_snapshot_txn();
+        let reader_id = reader.id();
+
+        let mut second_writer = transaction_manager.begin_snapshot_txn();
+        let second_writer_id = second_writer.id();
+        table
+            .local_apply_put_with_txn(b"k1", b"v2", second_writer_id)
+            .unwrap();
+        table
+            .local_mark_updates_committed(second_writer_id)
+            .unwrap();
+        transaction_manager
+            .commit_txn_state(&mut second_writer)
+            .unwrap();
+
+        let stats = transaction_manager
+            .reconcile_store_for_checkpoint(&table.store_name, &mut table.btree)
+            .unwrap();
+        assert_eq!(
+            stats,
+            ReconcileStats {
+                materialized_entries: 1,
+                obsolete_updates_removed: 0,
+                chains_dropped: 0,
+            }
+        );
+        assert_eq!(
+            table.get_version(b"k1", reader_id).unwrap(),
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            table.get_version(b"k1", TXN_NONE).unwrap(),
+            Some(b"v2".to_vec())
+        );
+
+        transaction_manager.commit_txn_state(&mut reader).unwrap();
+
+        let second_pass = transaction_manager
+            .reconcile_store_for_checkpoint(&table.store_name, &mut table.btree)
+            .unwrap();
+        assert_eq!(
+            second_pass,
+            ReconcileStats {
+                materialized_entries: 1,
+                obsolete_updates_removed: 1,
+                chains_dropped: 1,
+            }
+        );
+        assert_eq!(
+            table.get_version(b"k1", TXN_NONE).unwrap(),
+            Some(b"v2".to_vec())
+        );
+    }
+
+    #[test]
+    fn reconcile_materializes_deletes_and_drops_tombstone_chains() {
+        let (_tmp, transaction_manager, mut table) = open_table("table.idx.wt");
+
+        table
+            .local_apply_put_with_txn(b"k1", b"v1", TXN_NONE)
+            .unwrap();
+
+        let mut txn = transaction_manager.begin_snapshot_txn();
+        let txn_id = txn.id();
+        let deleted = table.local_apply_delete_with_txn(b"k1", txn_id).unwrap();
+        assert!(deleted);
+        table.local_mark_updates_committed(txn_id).unwrap();
+        transaction_manager.commit_txn_state(&mut txn).unwrap();
+
+        let stats = transaction_manager
+            .reconcile_store_for_checkpoint(&table.store_name, &mut table.btree)
+            .unwrap();
+        assert_eq!(
+            stats,
+            ReconcileStats {
+                materialized_entries: 1,
+                obsolete_updates_removed: 0,
+                chains_dropped: 1,
+            }
+        );
+        assert_eq!(table.get_version(b"k1", TXN_NONE).unwrap(), None);
     }
 }
