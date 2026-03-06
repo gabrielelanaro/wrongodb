@@ -133,6 +133,10 @@ impl Table {
             .get(&self.store_name, &mut self.btree, key, txn_id)
     }
 
+    pub fn contains_key(&mut self, key: &[u8], txn_id: TxnId) -> Result<bool, WrongoDBError> {
+        Ok(self.get_version(key, txn_id)?.is_some())
+    }
+
     #[allow(dead_code)]
     pub fn run_store_gc(&mut self) -> (usize, usize, usize) {
         self.transaction_manager.run_gc_for_store(&self.store_name)

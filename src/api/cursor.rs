@@ -92,7 +92,7 @@ impl Cursor {
     pub fn insert(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         let exists = {
             let mut table = self.table.write();
-            table.get_version(key, txn_id)?.is_some()
+            table.contains_key(key, txn_id)?
         };
         if exists {
             return Err(
@@ -108,7 +108,7 @@ impl Cursor {
         }
 
         let mut table = self.table.write();
-        if table.get_version(key, txn_id)?.is_some() {
+        if table.contains_key(key, txn_id)? {
             return Err(
                 crate::core::errors::DocumentValidationError("duplicate key error".into()).into(),
             );
@@ -121,7 +121,7 @@ impl Cursor {
     pub fn update(&mut self, key: &[u8], value: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         let exists = {
             let mut table = self.table.write();
-            table.get_version(key, txn_id)?.is_some()
+            table.contains_key(key, txn_id)?
         };
         if !exists {
             return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
@@ -137,7 +137,7 @@ impl Cursor {
         }
 
         let mut table = self.table.write();
-        if table.get_version(key, txn_id)?.is_none() {
+        if !table.contains_key(key, txn_id)? {
             return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
                 "key not found for update".to_string(),
             )));
@@ -150,7 +150,7 @@ impl Cursor {
     pub fn delete(&mut self, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
         let exists = {
             let mut table = self.table.write();
-            table.get_version(key, txn_id)?.is_some()
+            table.contains_key(key, txn_id)?
         };
         if !exists {
             return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
@@ -166,7 +166,7 @@ impl Cursor {
         }
 
         let mut table = self.table.write();
-        if table.get_version(key, txn_id)?.is_none() {
+        if !table.contains_key(key, txn_id)? {
             return Err(WrongoDBError::Storage(crate::core::errors::StorageError(
                 "key not found for delete".to_string(),
             )));
