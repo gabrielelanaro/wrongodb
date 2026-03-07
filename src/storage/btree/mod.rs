@@ -130,43 +130,6 @@ impl BTree {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    #[cfg(test)]
-    pub(crate) fn insert_unique(
-        &mut self,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<bool, WrongoDBError> {
-        let root = self.pager.root_page_id();
-        if root == NONE_PAGE_ID {
-            return Err(StorageError("btree missing root".into()).into());
-        }
-
-        let result = self.insert_recursive(root, key, value, InsertMode::Unique)?;
-        if !result.inserted {
-            return Ok(false);
-        }
-
-        if let Some(split) = result.split {
-            let payload_len = self.pager.page_payload_len();
-            let mut root_internal_bytes = vec![0u8; payload_len];
-            {
-                let mut internal = InternalPage::init(&mut root_internal_bytes, result.new_node_id)
-                    .map_err(|e| StorageError(format!("init new root internal failed: {e}")))?;
-                internal
-                    .put_separator(&split.sep_key, split.right_child)
-                    .map_err(map_internal_err)?;
-            }
-
-            let new_root_id = self.pager.write_new_page(&root_internal_bytes)?;
-            self.pager.set_root_page_id(new_root_id)?;
-        } else {
-            self.pager.set_root_page_id(result.new_node_id)?;
-        }
-
-        Ok(true)
-    }
-
     pub fn delete(&mut self, key: &[u8]) -> Result<bool, WrongoDBError> {
         let root = self.pager.root_page_id();
         if root == NONE_PAGE_ID {
