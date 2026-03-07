@@ -5,7 +5,6 @@ fn main() {
     let tmp = tempdir().unwrap();
     let conn = Connection::open(tmp.path().join("db"), ConnectionConfig::default()).unwrap();
     let mut session = conn.open_session();
-    let mut write_unit = session.transaction().unwrap();
-    let _ = write_unit.as_ref().id();
-    let _ = write_unit.as_mut();
+    let write_unit = session.transaction().unwrap();
+    let _ = write_unit.txn_id();
 }
