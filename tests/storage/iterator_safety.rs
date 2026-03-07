@@ -4,23 +4,23 @@ use std::path::Path;
 
 use tempfile::tempdir;
 use wrongodb::{
-    BTree, LeafPage, PageStore, PageStoreTrait, StorageError, WrongoDBError, NONE_BLOCK_ID,
+    BTree, BlockFilePageStore, LeafPage, PageStore, StorageError, WrongoDBError, NONE_BLOCK_ID,
 };
 
 fn create_tree(path: &Path, page_size: usize) -> Result<BTree, WrongoDBError> {
-    let mut page_store = PageStore::create(path, page_size)?;
+    let mut page_store = BlockFilePageStore::create(path, page_size)?;
     init_root_if_missing(&mut page_store)?;
     page_store.checkpoint()?;
     Ok(BTree::new(Box::new(page_store)))
 }
 
 fn open_tree(path: &Path) -> Result<BTree, WrongoDBError> {
-    let mut page_store = PageStore::open(path)?;
+    let mut page_store = BlockFilePageStore::open(path)?;
     init_root_if_missing(&mut page_store)?;
     Ok(BTree::new(Box::new(page_store)))
 }
 
-fn init_root_if_missing(page_store: &mut dyn PageStoreTrait) -> Result<(), WrongoDBError> {
+fn init_root_if_missing(page_store: &mut dyn PageStore) -> Result<(), WrongoDBError> {
     if page_store.root_page_id() != NONE_BLOCK_ID {
         return Ok(());
     }

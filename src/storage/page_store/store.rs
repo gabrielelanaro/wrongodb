@@ -10,14 +10,14 @@ use super::types::{PinnedPage, PinnedPageMut};
 
 /// File-backed page store implementation.
 #[derive(Debug)]
-pub struct PageStore {
+pub struct BlockFilePageStore {
     bf: BlockFile,
     working_root: u64,
     working_pages: HashSet<u64>,
     cache: PageCache,
 }
 
-impl PageStore {
+impl BlockFilePageStore {
     pub fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
         let mut bf = BlockFile::create(&path, page_size)?;
         if let Ok(raw) = std::env::var("WRONGO_PREALLOC_PAGES") {
@@ -227,49 +227,49 @@ impl PageStore {
     }
 }
 
-impl PageRead for PageStore {
+impl PageRead for BlockFilePageStore {
     fn page_payload_len(&self) -> usize {
-        PageStore::page_payload_len(self)
+        BlockFilePageStore::page_payload_len(self)
     }
 
     fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError> {
-        PageStore::pin_page(self, page_id)
+        BlockFilePageStore::pin_page(self, page_id)
     }
 
     fn unpin_page(&mut self, page_id: u64) {
-        PageStore::unpin_page(self, page_id);
+        BlockFilePageStore::unpin_page(self, page_id);
     }
 }
 
-impl PageWrite for PageStore {
+impl PageWrite for BlockFilePageStore {
     fn pin_page_mut(&mut self, page_id: u64) -> Result<PinnedPageMut, WrongoDBError> {
-        PageStore::pin_page_mut(self, page_id)
+        BlockFilePageStore::pin_page_mut(self, page_id)
     }
 
     fn unpin_page_mut_commit(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError> {
-        PageStore::unpin_page_mut_commit(self, page)
+        BlockFilePageStore::unpin_page_mut_commit(self, page)
     }
 
     fn unpin_page_mut_abort(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError> {
-        PageStore::unpin_page_mut_abort(self, page)
+        BlockFilePageStore::unpin_page_mut_abort(self, page)
     }
 
     fn write_new_page(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError> {
-        PageStore::write_new_page(self, payload)
+        BlockFilePageStore::write_new_page(self, payload)
     }
 }
 
-impl RootStore for PageStore {
+impl RootStore for BlockFilePageStore {
     fn root_page_id(&self) -> u64 {
-        PageStore::root_page_id(self)
+        BlockFilePageStore::root_page_id(self)
     }
 
     fn set_root_page_id(&mut self, root_page_id: u64) -> Result<(), WrongoDBError> {
-        PageStore::set_root_page_id(self, root_page_id)
+        BlockFilePageStore::set_root_page_id(self, root_page_id)
     }
 }
 
-impl CheckpointStore for PageStore {
+impl CheckpointStore for BlockFilePageStore {
     fn checkpoint_prepare(&self) -> u64 {
         self.working_root
     }
@@ -328,7 +328,7 @@ mod tests {
     fn eviction_writes_back_dirty_page() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("page-store-cache.db");
-        let mut page_store = PageStore::create(&path, 256).unwrap();
+        let mut page_store = BlockFilePageStore::create(&path, 256).unwrap();
         let payload_len = page_store.page_payload_len();
         let page_id = page_store.write_new_page(&vec![0u8; payload_len]).unwrap();
 
@@ -349,7 +349,7 @@ mod tests {
     fn flush_rejects_dirty_pinned_page() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("page-store-cache-flush.db");
-        let mut page_store = PageStore::create(&path, 256).unwrap();
+        let mut page_store = BlockFilePageStore::create(&path, 256).unwrap();
         let payload_len = page_store.page_payload_len();
         let page_id = page_store.write_new_page(&vec![0u8; payload_len]).unwrap();
 
@@ -365,7 +365,7 @@ mod tests {
     fn pin_blocks_eviction_until_unpinned() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("page-store-cache-pin.db");
-        let mut page_store = PageStore::create(&path, 256).unwrap();
+        let mut page_store = BlockFilePageStore::create(&path, 256).unwrap();
         let payload_len = page_store.page_payload_len();
 
         let page1 = page_store.write_new_page(&vec![1u8; payload_len]).unwrap();

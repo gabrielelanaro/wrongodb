@@ -5,7 +5,7 @@ use crate::core::errors::StorageError;
 use crate::storage::block::file::NONE_BLOCK_ID;
 use crate::storage::btree::page::LeafPage;
 use crate::storage::btree::BTree;
-use crate::storage::page_store::{PageStore, PageStoreTrait};
+use crate::storage::page_store::{BlockFilePageStore, PageStore};
 use crate::txn::{TransactionManager, TxnId};
 use crate::WrongoDBError;
 
@@ -129,11 +129,11 @@ impl Table {
 
     fn open_or_create_btree(path: &Path) -> Result<BTree, WrongoDBError> {
         if path.exists() {
-            let mut page_store = PageStore::open(path)?;
+            let mut page_store = BlockFilePageStore::open(path)?;
             init_root_if_missing(&mut page_store)?;
             Ok(BTree::new(Box::new(page_store)))
         } else {
-            let mut page_store = PageStore::create(path, 4096)?;
+            let mut page_store = BlockFilePageStore::create(path, 4096)?;
             init_root_if_missing(&mut page_store)?;
             page_store.checkpoint()?;
             Ok(BTree::new(Box::new(page_store)))
@@ -141,7 +141,7 @@ impl Table {
     }
 }
 
-fn init_root_if_missing(page_store: &mut dyn PageStoreTrait) -> Result<(), WrongoDBError> {
+fn init_root_if_missing(page_store: &mut dyn PageStore) -> Result<(), WrongoDBError> {
     if page_store.root_page_id() != NONE_BLOCK_ID {
         return Ok(());
     }
