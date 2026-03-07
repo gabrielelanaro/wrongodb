@@ -1,4 +1,4 @@
-error[E0599]: no method named `as_ref` found for struct `WriteUnitOfWork<'a>` in the current scope
+error[E0599]: no method named `as_ref` found for struct `WriteUnitOfWork` in the current scope
  --> tests/ui/fail/raw_transaction_access.rs:9:24
   |
 9 |     let _ = write_unit.as_ref().id();
@@ -14,7 +14,7 @@ help: there is a method `pipe_as_ref` with a similar name, but with different ar
   | |         R: 'a + Sized,
   | |______________________^
 
-error[E0599]: no method named `as_mut` found for struct `WriteUnitOfWork<'a>` in the current scope
+error[E0599]: no method named `as_mut` found for struct `WriteUnitOfWork` in the current scope
   --> tests/ui/fail/raw_transaction_access.rs:10:24
    |
 10 |     let _ = write_unit.as_mut();

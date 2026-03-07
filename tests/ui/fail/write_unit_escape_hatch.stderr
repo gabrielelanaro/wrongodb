@@ -1,4 +1,4 @@
-error[E0599]: no method named `session_mut` found for struct `WriteUnitOfWork<'a>` in the current scope
+error[E0599]: no method named `session_mut` found for struct `WriteUnitOfWork` in the current scope
  --> tests/ui/fail/write_unit_escape_hatch.rs:9:24
   |
 9 |     let _ = write_unit.session_mut();
