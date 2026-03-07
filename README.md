@@ -25,6 +25,9 @@ A learning-oriented MongoDB-compatible database in Rust, inspired by WiredTiger'
 - **WAL (Write-Ahead Logging)**: Global WAL with LSNs, CRC32 checksums, change-vector logging, recovery replay
 - **MVCC/Transactions**: Global transaction state, snapshot isolation, version chains, commit/abort
 
+### Replication
+- **RAFT**: Multi-node distributed consensus for replicated writes
+
 ### API
 - `Connection`/`Session`/`Cursor` low-level storage API
 - Transaction-scoped reads/writes via `Session::transaction()`
@@ -35,22 +38,43 @@ through the server/internal collection write path, not through low-level cursor 
 
 ### Future Work
 - Background maintenance: space reuse, compaction, compression
+- Additional query operators and aggregation
 
 ## Source Layout
 
-The codebase is organized by domain to keep storage and server concerns separate:
+The codebase is organized by domain to keep storage, server, and replication concerns separate:
 
-- `src/api/`: connection/session/cursor APIs and handle cache.
-- `src/core/`: shared types/utilities (BSON codec, document helpers, errors).
-- `src/storage/`: on-disk storage (block file, B-tree, WAL, main table).
-- `src/index/`: secondary index implementation and key encoding.
-- `src/collection_write_path.rs`: internal Mongo-style document/index write orchestration.
-- `src/document_query.rs`: internal document/query helpers used by the server path.
-- `src/server/`: MongoDB wire-protocol server and command handlers.
+- `src/api/`: connection/session/cursor APIs and handle cache
+- `src/core/`: shared types/utilities (BSON codec, document helpers, errors)
+- `src/storage/`: on-disk storage (block file, B-tree, WAL, main table)
+- `src/index/`: secondary index implementation and key encoding
+- `src/durability/`: WAL and durability backend
+- `src/txn/`: global transaction state, MVCC, recovery units
+- `src/raft/`: RAFT replication implementation
+- `src/recovery/`: recovery manager for crash recovery
+- `src/schema/`: schema catalog and metadata
+- `src/document_ops/`: document-level operations
+- `src/collection_write_path.rs`: internal Mongo-style document/index write orchestration
+- `src/document_query.rs`: internal document/query helpers used by the server path
+- `src/store_write_path.rs`: store-level write path
+- `src/server/`: MongoDB wire-protocol server and command handlers
+- `src/bin/`: server binary entry point
 
-Integration tests are grouped under `tests/` with explicit suite entrypoints:
-`tests/storage_suite.rs`, `tests/server_suite.rs`, and `tests/connection_suite.rs`.
-Each suite loads domain folders such as `tests/storage/`.
+Integration tests are grouped under `tests/`:
+- `tests/storage_suite.rs`: storage layer tests (`tests/storage/`)
+- `tests/connection_suite.rs`: connection API tests (`tests/connection/`)
+- `tests/public_api_*.rs`: public API surface tests and trybuild UI tests (`tests/ui/`)
+- `tests/bench_wire_ab_smoke.rs`: wire protocol benchmark smoke tests
+
+See the `examples/` directory for additional standalone programs demonstrating recovery, checkpointing, and WAL behavior.
+
+## Documentation
+
+See the [docs/](docs/) directory for detailed architecture documentation:
+- [Server Usage](docs/server.md): running the MongoDB-compatible server
+- [Design Decisions](docs/decisions.md): recorded architectural decisions
+- [MVCC Proposal](docs/mvcc_proposal.md): multi-version concurrency design
+- [Global WAL Architecture](docs/global_wal_architecture.md): write-ahead logging design
 
 ## Install
 
@@ -89,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Schema objects are URI-based at the low-level API too:
+Schema objects are URI-based at the low-level API:
 - `session.create("table:users")?`
 
 Index creation is handled by the Mongo-style internal write/schema path rather than the
@@ -109,6 +133,33 @@ For benchmark isolation, you can set data path with `--db-path` or `WRONGO_DB_PA
 
 Run tests with `cargo test`.
 
+## Development
+
+```bash
+# Build
+cargo build
+just build
+
+# Run tests
+cargo test
+just test
+
+# Check compilation (faster than full build)
+cargo check
+just check
+
+# Lint (clippy with warnings as errors)
+cargo clippy -- -D warnings
+just clippy
+
+# Format code
+cargo fmt
+just fmt
+
+# Run all checks (check, test, clippy, fmt)
+just all
+```
+
 ## Benchmarking
 
 Run wire-protocol A/B benchmarks (WrongoDB vs MongoDB via Docker):
@@ -122,8 +173,6 @@ This runs `bench_wire_ab` with defaults:
 - warmup: `15s`
 - measure: `60s`
 - concurrency: `1,4,8,16,32,64`
-- scenario: `all` (`insert_unique` and `update_hotspot`)
-- repetitions: `3`
 - mongo image: `mongo:7.0`
 
 Artifacts are written to:
@@ -134,14 +183,14 @@ Artifacts are written to:
 
 ## Release
 
-Create a version tag and push it to trigger the GitHub Actions release workflow:
+Create a version tag and push it to trigger the GitHub Actions release workflow (uses `cargo-dist`):
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The workflow builds artifacts and publishes them to GitHub Releases.
+The workflow builds artifacts (archives, installers) and publishes them to GitHub Releases.
 
 ## License
 
