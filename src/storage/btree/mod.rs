@@ -142,12 +142,6 @@ impl BTree {
         Ok(result.deleted)
     }
 
-    #[allow(dead_code)]
-    #[cfg(test)]
-    pub(crate) fn sync_all(&mut self) -> Result<(), WrongoDBError> {
-        self.pager.sync_all()
-    }
-
     /// Explicitly checkpoint the B+tree.
     ///
     /// This flushes all dirty pages to disk and atomically swaps the root.
