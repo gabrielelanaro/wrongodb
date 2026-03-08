@@ -78,20 +78,20 @@ struct DeleteResult {
 }
 
 // ============================================================================
-// BTree (Public API)
+// BTreeCursor (Public API)
 // ============================================================================
 
 #[derive(Debug)]
-pub struct BTree {
+pub struct BTreeCursor {
     page_store: Box<dyn PageStore>,
 }
 
-impl BTree {
+impl BTreeCursor {
     // ------------------------------------------------------------------------
     // Constructors
     // ------------------------------------------------------------------------
 
-    /// Create a BTree with the given page-store implementation.
+    /// Create a BTreeCursor with the given page-store implementation.
     pub fn new(store: Box<dyn PageStore>) -> Self {
         Self { page_store: store }
     }

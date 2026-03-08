@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::core::errors::StorageError;
 use crate::storage::block::file::NONE_BLOCK_ID;
 use crate::storage::btree::page::LeafPage;
-use crate::storage::btree::BTree;
+use crate::storage::btree::BTreeCursor;
 use crate::storage::page_store::{BlockFilePageStore, PageStore};
 use crate::txn::{TransactionManager, TxnId};
 use crate::WrongoDBError;
@@ -12,13 +12,13 @@ use crate::WrongoDBError;
 type TableEntry = (Vec<u8>, Vec<u8>);
 type ScanEntries = Vec<TableEntry>;
 
-/// A low-level storage table, wrapping a BTree.
+/// A low-level storage table, wrapping a BTreeCursor.
 ///
 /// This provides a byte-oriented interface for storage operations.
 /// It does not know about BSON or Documents.
 #[derive(Debug)]
 pub struct Table {
-    btree: BTree,
+    btree: BTreeCursor,
     store_name: String,
     transaction_manager: Arc<TransactionManager>,
 }
@@ -151,16 +151,16 @@ impl Table {
     // Private Helpers
     // ------------------------------------------------------------------------
 
-    fn open_or_create_btree(path: &Path) -> Result<BTree, WrongoDBError> {
+    fn open_or_create_btree(path: &Path) -> Result<BTreeCursor, WrongoDBError> {
         if path.exists() {
             let mut page_store = BlockFilePageStore::open(path)?;
             init_root_if_missing(&mut page_store)?;
-            Ok(BTree::new(Box::new(page_store)))
+            Ok(BTreeCursor::new(Box::new(page_store)))
         } else {
             let mut page_store = BlockFilePageStore::create(path, 4096)?;
             init_root_if_missing(&mut page_store)?;
             page_store.checkpoint()?;
-            Ok(BTree::new(Box::new(page_store)))
+            Ok(BTreeCursor::new(Box::new(page_store)))
         }
     }
 }

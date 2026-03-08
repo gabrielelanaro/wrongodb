@@ -4,7 +4,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::core::errors::WrongoDBError;
-use crate::storage::btree::BTree;
+use crate::storage::btree::BTreeCursor;
 use crate::storage::mvcc::{MvccState, ReconcileStats};
 use crate::txn::{
     GlobalTxnState, Timestamp, Transaction, TxnId, Update, UpdateType, TS_MAX, TS_NONE,
@@ -44,7 +44,7 @@ impl TransactionManager {
     pub fn put(
         &self,
         store_name: &str,
-        btree: &mut BTree,
+        btree: &mut BTreeCursor,
         key: &[u8],
         value: &[u8],
         txn_id: TxnId,
@@ -72,7 +72,7 @@ impl TransactionManager {
     pub fn delete(
         &self,
         store_name: &str,
-        btree: &mut BTree,
+        btree: &mut BTreeCursor,
         key: &[u8],
         txn_id: TxnId,
     ) -> Result<bool, WrongoDBError> {
@@ -98,7 +98,7 @@ impl TransactionManager {
     pub fn get(
         &self,
         store_name: &str,
-        btree: &mut BTree,
+        btree: &mut BTreeCursor,
         key: &[u8],
         txn_id: TxnId,
     ) -> Result<Option<Vec<u8>>, WrongoDBError> {
@@ -182,7 +182,7 @@ impl TransactionManager {
     pub(crate) fn reconcile_store_for_checkpoint(
         &self,
         store_name: &str,
-        btree: &mut BTree,
+        btree: &mut BTreeCursor,
     ) -> Result<ReconcileStats, WrongoDBError> {
         let oldest_active_txn_id = self.global_txn.oldest_active_txn_id();
         let no_active_txns = !self.global_txn.has_active_transactions();
