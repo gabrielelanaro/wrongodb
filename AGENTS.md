@@ -82,6 +82,107 @@ Order: std imports first, then third-party crates, then local crate imports (gro
 - `src/txn/`: transaction management, recovery, MVCC
 - `src/index/`: secondary index implementation
 
+### Clean Code: Step-Down Rule
+
+**CRITICAL**: All code must follow the **Step-Down Rule** from Robert C. Martin's *Clean Code*. Code should read like a top-down narrative:
+
+1. **High-level abstractions at the top** - Public APIs, "what" the code does
+2. **Implementation details below** - Private methods, "how" it works
+3. **Lowest-level utilities at the bottom** - Helper functions, primitives
+
+#### File Structure Pattern
+
+```rust
+// Imports (std, then external crates, then local)
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const MAGIC: [u8; 8] = *b"MMWT0001";
+const VERSION: u16 = 3;
+
+// ============================================================================
+// High-level types (public abstractions)
+// ============================================================================
+
+pub struct MyType { ... }
+
+impl MyType {
+    // ------------------------------------------------------------------------
+    // Constructors (highest level)
+    // ------------------------------------------------------------------------
+    pub fn new(...) -> Result<Self> { ... }
+
+    // ------------------------------------------------------------------------
+    // Public API
+    // ------------------------------------------------------------------------
+    pub fn process(&mut self) -> Result<()> { ... }
+
+    // ------------------------------------------------------------------------
+    // Private helpers (lowest level)
+    // ------------------------------------------------------------------------
+    fn validate(&self) -> bool { ... }
+}
+
+// ============================================================================
+// Helper functions (utilities)
+// ============================================================================
+
+fn utility(...) -> Result<()> { ... }
+```
+
+#### impl Block Organization
+
+Within each `impl` block, group methods by purpose and abstraction level:
+
+1. **Constructors** - `new()`, `create()`, `open()`
+2. **Lifecycle methods** - `close()`, `sync()`, `flush()`
+3. **Public API methods** - grouped by functionality (e.g., all allocation methods together)
+4. **Private helpers** - internal implementation details
+
+**Example**:
+```rust
+impl BlockFile {
+    // ------------------------------------------------------------------------
+    // Constructors
+    // ------------------------------------------------------------------------
+    pub fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self> { ... }
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> { ... }
+
+    // ------------------------------------------------------------------------
+    // Lifecycle
+    // ------------------------------------------------------------------------
+    pub fn close(self) -> Result<(), WrongoDBError> { ... }
+    pub fn sync_all(&mut self) -> Result<(), WrongoDBError> { ... }
+
+    // ------------------------------------------------------------------------
+    // Block allocation
+    // ------------------------------------------------------------------------
+    pub fn allocate_block(&mut self) -> Result<u64, WrongoDBError> { ... }
+    pub fn free_block(&mut self, block_id: u64) -> Result<(), WrongoDBError> { ... }
+
+    // ------------------------------------------------------------------------
+    // Block I/O
+    // ------------------------------------------------------------------------
+    pub fn read_block(&mut self, block_id: u64, verify: bool) -> Result<Vec<u8>> { ... }
+    pub fn write_block(&mut self, block_id: u64, payload: &[u8]) -> Result<()> { ... }
+
+    // ------------------------------------------------------------------------
+    // Private helpers
+    // ------------------------------------------------------------------------
+    fn write_header(&mut self) -> Result<(), WrongoDBError> { ... }
+    fn num_blocks(&mut self) -> Result<u64, WrongoDBError> { ... }
+}
+```
+
+#### Section Comment Style
+
+Use consistent comment formatting:
+- Major sections: `// ============================================================================`
+- Subsections within impl: `// --------`
+- Purpose labels: `// Constructors`, `// Public API`, `// Private helpers`
+
 ## Decisions log
 - When making a non-trivial design/behavior decision (API semantics, file formats, invariants), record it in `docs/decisions.md`.
 - Add an entry even if the change is "small" but affects persistence, crash-safety, or public APIs.

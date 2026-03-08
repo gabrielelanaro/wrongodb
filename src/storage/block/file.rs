@@ -8,6 +8,12 @@ use crc32fast::Hasher;
 use super::manager::{BlockManager, Extent, ExtentLists};
 use crate::core::errors::{StorageError, WrongoDBError};
 
+// ============================================================================
+// Constants
+// ============================================================================
+
+pub const NONE_BLOCK_ID: u64 = 0;
+
 const CHECKSUM_SIZE: usize = 4;
 const DEFAULT_PAGE_SIZE: usize = 4096;
 const MAGIC: [u8; 8] = *b"MMWT0001";
@@ -18,7 +24,10 @@ const HEADER_FIXED_SIZE: usize =
     8 + 2 + 4 + 4 + 4 + 4 + (CHECKPOINT_SLOT_COUNT * CHECKPOINT_SLOT_SIZE);
 const HEADER_MIN_SIZE: usize = HEADER_FIXED_SIZE;
 const EXTENT_ENCODED_SIZE: usize = 8 + 8 + 8;
-pub const NONE_BLOCK_ID: u64 = 0;
+
+// ============================================================================
+// CheckpointSlot - Checkpoint metadata with CRC validation
+// ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckpointSlot {
@@ -48,6 +57,10 @@ impl CheckpointSlot {
     }
 }
 
+// ============================================================================
+// FileHeader - On-disk header with checkpoint slots and extent lists
+// ============================================================================
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
     pub magic: [u8; 8],
@@ -76,6 +89,10 @@ impl Default for FileHeader {
 }
 
 impl FileHeader {
+    // ------------------------------------------------------------------------
+    // Serialization (pack/unpack)
+    // ------------------------------------------------------------------------
+
     pub(crate) fn unpack_fixed(buf: &[u8]) -> Result<Self, WrongoDBError> {
         if buf.len() < HEADER_MIN_SIZE {
             return Err(StorageError("header buffer too small".into()).into());
@@ -114,41 +131,6 @@ impl FileHeader {
             discard_count,
             checkpoint_slots,
         })
-    }
-
-    pub(crate) fn pack(
-        &self,
-        extents: &ExtentLists,
-        max_payload: usize,
-    ) -> Result<Vec<u8>, WrongoDBError> {
-        let mut buf = Vec::with_capacity(max_payload);
-        buf.extend_from_slice(&self.magic);
-        buf.write_u16::<LittleEndian>(self.version)?;
-        buf.write_u32::<LittleEndian>(self.page_size)?;
-        buf.write_u32::<LittleEndian>(extents.alloc.len() as u32)?;
-        buf.write_u32::<LittleEndian>(extents.avail.len() as u32)?;
-        buf.write_u32::<LittleEndian>(extents.discard.len() as u32)?;
-        for slot in &self.checkpoint_slots {
-            buf.write_u64::<LittleEndian>(slot.root_block_id)?;
-            buf.write_u64::<LittleEndian>(slot.generation)?;
-            buf.write_u32::<LittleEndian>(slot.crc32)?;
-        }
-
-        for extent in &extents.alloc {
-            write_extent(&mut buf, extent)?;
-        }
-        for extent in &extents.avail {
-            write_extent(&mut buf, extent)?;
-        }
-        for extent in &extents.discard {
-            write_extent(&mut buf, extent)?;
-        }
-
-        if buf.len() > max_payload {
-            return Err(StorageError("extent metadata exceeds header payload".into()).into());
-        }
-        buf.resize(max_payload, 0);
-        Ok(buf)
     }
 
     pub(crate) fn unpack(buf: &[u8]) -> Result<(Self, ExtentLists), WrongoDBError> {
@@ -215,7 +197,46 @@ impl FileHeader {
             lists,
         ))
     }
+
+    pub(crate) fn pack(
+        &self,
+        extents: &ExtentLists,
+        max_payload: usize,
+    ) -> Result<Vec<u8>, WrongoDBError> {
+        let mut buf = Vec::with_capacity(max_payload);
+        buf.extend_from_slice(&self.magic);
+        buf.write_u16::<LittleEndian>(self.version)?;
+        buf.write_u32::<LittleEndian>(self.page_size)?;
+        buf.write_u32::<LittleEndian>(extents.alloc.len() as u32)?;
+        buf.write_u32::<LittleEndian>(extents.avail.len() as u32)?;
+        buf.write_u32::<LittleEndian>(extents.discard.len() as u32)?;
+        for slot in &self.checkpoint_slots {
+            buf.write_u64::<LittleEndian>(slot.root_block_id)?;
+            buf.write_u64::<LittleEndian>(slot.generation)?;
+            buf.write_u32::<LittleEndian>(slot.crc32)?;
+        }
+
+        for extent in &extents.alloc {
+            write_extent(&mut buf, extent)?;
+        }
+        for extent in &extents.avail {
+            write_extent(&mut buf, extent)?;
+        }
+        for extent in &extents.discard {
+            write_extent(&mut buf, extent)?;
+        }
+
+        if buf.len() > max_payload {
+            return Err(StorageError("extent metadata exceeds header payload".into()).into());
+        }
+        buf.resize(max_payload, 0);
+        Ok(buf)
+    }
 }
+
+// ============================================================================
+// BlockFile - Fixed-size block storage with extent allocation
+// ============================================================================
 
 #[derive(Debug)]
 pub struct BlockFile {
@@ -228,32 +249,9 @@ pub struct BlockFile {
 }
 
 impl BlockFile {
-    fn select_checkpoint_slot(header: &FileHeader) -> Result<usize, WrongoDBError> {
-        let mut best_idx: Option<usize> = None;
-        let mut best_gen = 0u64;
-        for (idx, slot) in header.checkpoint_slots.iter().enumerate() {
-            if !slot.is_valid() {
-                continue;
-            }
-            match best_idx {
-                None => {
-                    best_idx = Some(idx);
-                    best_gen = slot.generation;
-                }
-                Some(_) if slot.generation > best_gen => {
-                    best_idx = Some(idx);
-                    best_gen = slot.generation;
-                }
-                _ => {}
-            }
-        }
-
-        best_idx.ok_or_else(|| StorageError("no valid checkpoint slots found".into()).into())
-    }
-
-    pub(crate) fn page_payload_len(&self) -> usize {
-        self.page_size - CHECKSUM_SIZE
-    }
+    // ------------------------------------------------------------------------
+    // Constructors (highest level of abstraction)
+    // ------------------------------------------------------------------------
 
     pub fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
         let path = path.as_ref().to_path_buf();
@@ -353,15 +351,25 @@ impl BlockFile {
         })
     }
 
-    fn write_header(&mut self) -> Result<(), WrongoDBError> {
-        let extents = self.block_manager.extent_lists();
-        self.header.alloc_count = extents.alloc.len() as u32;
-        self.header.avail_count = extents.avail.len() as u32;
-        self.header.discard_count = extents.discard.len() as u32;
-        let payload = self.header.pack(&extents, self.page_size - CHECKSUM_SIZE)?;
-        write_header_page(&mut self.file, &payload)?;
+    // ------------------------------------------------------------------------
+    // Lifecycle methods (resource management)
+    // ------------------------------------------------------------------------
+
+    #[allow(dead_code)]
+    #[cfg(test)]
+    pub(crate) fn close(self) -> Result<(), WrongoDBError> {
+        self.file.sync_all()?;
         Ok(())
     }
+
+    pub fn sync_all(&mut self) -> Result<(), WrongoDBError> {
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------------
+    // Checkpoint management
+    // ------------------------------------------------------------------------
 
     pub fn root_block_id(&self) -> u64 {
         self.header.checkpoint_slots[self.active_checkpoint_slot].root_block_id
@@ -382,32 +390,12 @@ impl BlockFile {
         Ok(())
     }
 
+    // ------------------------------------------------------------------------
+    // Block allocation
+    // ------------------------------------------------------------------------
+
     pub fn allocate_block(&mut self) -> Result<u64, WrongoDBError> {
         Ok(self.allocate_extent(1)?.offset)
-    }
-
-    pub fn preallocate_blocks(&mut self, blocks: u64) -> Result<(), WrongoDBError> {
-        if blocks == 0 {
-            return Ok(());
-        }
-
-        let current_blocks = self.num_blocks()?;
-        let new_len_blocks = current_blocks
-            .checked_add(blocks)
-            .ok_or_else(|| StorageError("block count overflow".into()))?;
-        let new_len = new_len_blocks
-            .checked_mul(self.page_size as u64)
-            .ok_or_else(|| StorageError("file length overflow".into()))?;
-        self.file.set_len(new_len)?;
-
-        let extent = Extent {
-            offset: current_blocks,
-            size: blocks,
-            generation: self.block_manager.stable_generation(),
-        };
-        self.block_manager.add_avail_extent(extent);
-        self.write_header()?;
-        Ok(())
     }
 
     pub fn allocate_extent(&mut self, blocks: u64) -> Result<Extent, WrongoDBError> {
@@ -439,12 +427,28 @@ impl BlockFile {
         Ok(extent)
     }
 
-    #[allow(dead_code)]
-    #[cfg(test)]
-    pub(crate) fn write_new_block(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError> {
-        let block_id = self.allocate_block()?;
-        self.write_block(block_id, payload)?;
-        Ok(block_id)
+    pub fn preallocate_blocks(&mut self, blocks: u64) -> Result<(), WrongoDBError> {
+        if blocks == 0 {
+            return Ok(());
+        }
+
+        let current_blocks = self.num_blocks()?;
+        let new_len_blocks = current_blocks
+            .checked_add(blocks)
+            .ok_or_else(|| StorageError("block count overflow".into()))?;
+        let new_len = new_len_blocks
+            .checked_mul(self.page_size as u64)
+            .ok_or_else(|| StorageError("file length overflow".into()))?;
+        self.file.set_len(new_len)?;
+
+        let extent = Extent {
+            offset: current_blocks,
+            size: blocks,
+            generation: self.block_manager.stable_generation(),
+        };
+        self.block_manager.add_avail_extent(extent);
+        self.write_header()?;
+        Ok(())
     }
 
     pub fn free_block(&mut self, block_id: u64) -> Result<(), WrongoDBError> {
@@ -470,17 +474,9 @@ impl BlockFile {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    #[cfg(test)]
-    pub(crate) fn close(self) -> Result<(), WrongoDBError> {
-        self.file.sync_all()?;
-        Ok(())
-    }
-
-    pub fn sync_all(&mut self) -> Result<(), WrongoDBError> {
-        self.file.sync_all()?;
-        Ok(())
-    }
+    // ------------------------------------------------------------------------
+    // Block I/O
+    // ------------------------------------------------------------------------
 
     pub fn read_block(&mut self, block_id: u64, verify: bool) -> Result<Vec<u8>, WrongoDBError> {
         let offset = block_id
@@ -540,11 +536,56 @@ impl BlockFile {
         Ok(())
     }
 
-    pub fn num_blocks(&mut self) -> Result<u64, WrongoDBError> {
+    // ------------------------------------------------------------------------
+    // Private helpers (lowest level of abstraction)
+    // ------------------------------------------------------------------------
+
+    fn write_header(&mut self) -> Result<(), WrongoDBError> {
+        let extents = self.block_manager.extent_lists();
+        self.header.alloc_count = extents.alloc.len() as u32;
+        self.header.avail_count = extents.avail.len() as u32;
+        self.header.discard_count = extents.discard.len() as u32;
+        let payload = self.header.pack(&extents, self.page_size - CHECKSUM_SIZE)?;
+        write_header_page(&mut self.file, &payload)?;
+        Ok(())
+    }
+
+    fn num_blocks(&mut self) -> Result<u64, WrongoDBError> {
         let size = self.file.metadata()?.len();
         Ok(size / (self.page_size as u64))
     }
+
+    pub(crate) fn page_payload_len(&self) -> usize {
+        self.page_size - CHECKSUM_SIZE
+    }
+
+    fn select_checkpoint_slot(header: &FileHeader) -> Result<usize, WrongoDBError> {
+        let mut best_idx: Option<usize> = None;
+        let mut best_gen = 0u64;
+        for (idx, slot) in header.checkpoint_slots.iter().enumerate() {
+            if !slot.is_valid() {
+                continue;
+            }
+            match best_idx {
+                None => {
+                    best_idx = Some(idx);
+                    best_gen = slot.generation;
+                }
+                Some(_) if slot.generation > best_gen => {
+                    best_idx = Some(idx);
+                    best_gen = slot.generation;
+                }
+                _ => {}
+            }
+        }
+
+        best_idx.ok_or_else(|| StorageError("no valid checkpoint slots found".into()).into())
+    }
 }
+
+// ============================================================================
+// Helper functions (serialization and checksums)
+// ============================================================================
 
 fn crc32(data: &[u8]) -> u32 {
     let mut hasher = Hasher::new();

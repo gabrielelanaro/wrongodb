@@ -207,6 +207,93 @@ Collection files use the naming convention `{base}.{collection}.main.wt` for the
 
 The append-only log legacy format (`{base}.{collection}.log`) is deprecated in favor of BTree-based storage.
 
+## Code Organization Standards
+
+### Clean Code: Step-Down Rule
+
+This project follows the **Step-Down Rule** from Robert C. Martin's *Clean Code*. Code should read like a top-down narrative, where:
+
+1. **High-level abstractions come first** - Public APIs and "what" the code does
+2. **Implementation details follow** - Private methods and "how" it works
+3. **Lowest-level utilities at the bottom** - Helper functions and primitives
+
+#### File Structure Template
+
+```rust
+// Imports
+use std::...;
+
+// ============================================================================
+// Constants (highest-level, most stable)
+// ============================================================================
+
+const MAGIC: [u8; 8] = *b"MMWT0001";
+const VERSION: u16 = 3;
+
+// ============================================================================
+// High-level types (public abstractions)
+// ============================================================================
+
+pub struct MyType { ... }
+
+impl MyType {
+    // ------------------------------------------------------------------------
+    // Public API (highest level of abstraction)
+    // ------------------------------------------------------------------------
+    pub fn new(...) -> Result<Self> { ... }
+    pub fn do_something(&mut self) -> Result<()> { ... }
+
+    // ------------------------------------------------------------------------
+    // Implementation helpers
+    // ------------------------------------------------------------------------
+    fn internal_helper(&self) -> usize { ... }
+}
+
+// ============================================================================
+// Helper functions (lowest-level utilities)
+// ============================================================================
+
+fn utility_function(...) -> Result<()> { ... }
+```
+
+#### impl Block Organization
+
+Within `impl` blocks, group methods by abstraction level:
+
+1. **Constructors** - `new()`, `create()`, `open()`
+2. **Public API methods** - What users can do with the type
+3. **Internal helpers** - Private methods used by public API
+4. **Getters/Setters** - Simple property access
+
+Each section should be marked with a comment header:
+```rust
+impl MyType {
+    // ------------------------------------------------------------------------
+    // Constructors
+    // ------------------------------------------------------------------------
+    pub fn new(...) -> Self { ... }
+
+    // ------------------------------------------------------------------------
+    // Public API
+    // ------------------------------------------------------------------------
+    pub fn process(&mut self) -> Result<()> { ... }
+
+    // ------------------------------------------------------------------------
+    // Private helpers
+    // ------------------------------------------------------------------------
+    fn validate(&self) -> bool { ... }
+}
+```
+
+#### Related Grouping
+
+Keep related functionality together:
+- All allocation methods in one section
+- All I/O methods in another section
+- All lifecycle methods (open/close/sync) together
+
+This organization makes the file **skimmable** - readers can quickly find what they need by looking at the section headers.
+
 
 # Reference implementation
 
