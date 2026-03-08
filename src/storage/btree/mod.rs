@@ -163,7 +163,12 @@ impl BTree {
         if root == NONE_PAGE_ID {
             return Ok(BTreeRangeIter::empty());
         }
-        BTreeRangeIter::new(self.page_store.as_mut() as &mut dyn PageRead, root, start, end)
+        BTreeRangeIter::new(
+            self.page_store.as_mut() as &mut dyn PageRead,
+            root,
+            start,
+            end,
+        )
     }
 
     /// Delete a key from the subtree rooted at `node_id`.

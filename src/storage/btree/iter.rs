@@ -4,11 +4,19 @@ use crate::storage::page_store::{PageRead, PinnedPage};
 use super::layout::{map_internal_err, map_leaf_err, page_type, PageType};
 use super::page::{InternalPage, InternalPageError, LeafPage, LeafPageError};
 
+// ============================================================================
+// Helper Types
+// ============================================================================
+
 #[derive(Debug, Clone, Copy)]
 struct CursorFrame {
     internal_id: u64,
     child_idx: usize,
 }
+
+// ============================================================================
+// BTreeRangeIter (Public API)
+// ============================================================================
 
 /// Ordered range iterator over the B+tree (start inclusive, end exclusive).
 ///
@@ -46,11 +54,11 @@ pub struct BTreeRangeIter<'a> {
     done: bool,
 }
 
-fn missing_pager() -> WrongoDBError {
-    StorageError("range iterator has no backing page store".into()).into()
-}
-
 impl<'a> BTreeRangeIter<'a> {
+    // ------------------------------------------------------------------------
+    // Constructors
+    // ------------------------------------------------------------------------
+
     pub(super) fn empty() -> Self {
         Self {
             pager: None,
@@ -79,6 +87,10 @@ impl<'a> BTreeRangeIter<'a> {
         it.seek(root, start)?;
         Ok(it)
     }
+
+    // ------------------------------------------------------------------------
+    // Private Helpers: Navigation
+    // ------------------------------------------------------------------------
 
     fn clear_leaf(&mut self) -> Result<(), WrongoDBError> {
         if let Some(leaf) = self.leaf.take() {
@@ -258,6 +270,10 @@ impl<'a> BTreeRangeIter<'a> {
     }
 }
 
+// ============================================================================
+// Iterator Implementation
+// ============================================================================
+
 impl<'a> Iterator for BTreeRangeIter<'a> {
     type Item = Result<(Vec<u8>, Vec<u8>), WrongoDBError>;
 
@@ -351,6 +367,14 @@ impl<'a> Drop for BTreeRangeIter<'a> {
     fn drop(&mut self) {
         let _ = self.clear_leaf();
     }
+}
+
+// ============================================================================
+// Helper Functions (lowest-level utilities)
+// ============================================================================
+
+fn missing_pager() -> WrongoDBError {
+    StorageError("range iterator has no backing page store".into()).into()
 }
 
 fn leaf_lower_bound(leaf: &LeafPage<'_>, key: &[u8]) -> Result<usize, LeafPageError> {
