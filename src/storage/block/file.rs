@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
@@ -240,7 +240,6 @@ impl FileHeader {
 
 #[derive(Debug)]
 pub struct BlockFile {
-    _path: PathBuf,
     file: File,
     pub header: FileHeader,
     pub page_size: usize,
@@ -287,7 +286,6 @@ impl BlockFile {
         let block_manager = BlockManager::new(stable_generation, extents);
 
         Ok(Self {
-            _path: path,
             file,
             header,
             page_size,
@@ -297,12 +295,12 @@ impl BlockFile {
     }
 
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, WrongoDBError> {
-        let path = path.as_ref().to_path_buf();
+        let path = path.as_ref();
         if !path.exists() {
             return Err(StorageError(format!("file not found: {path:?}")).into());
         }
 
-        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
 
         let mut prefix = vec![0u8; CHECKSUM_SIZE + HEADER_FIXED_SIZE];
         file.read_exact(&mut prefix)
@@ -342,7 +340,6 @@ impl BlockFile {
         let stable_generation = header.checkpoint_slots[active_checkpoint_slot].generation;
         let block_manager = BlockManager::new(stable_generation, extents);
         Ok(Self {
-            _path: path,
             file,
             header,
             page_size,
