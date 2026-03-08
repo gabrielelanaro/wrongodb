@@ -1,7 +1,7 @@
 use crate::core::errors::{StorageError, WrongoDBError};
-use crate::storage::page_store::{PageRead, PinnedPage};
+use crate::storage::page_store::{PageRead, PageType, ReadPin};
 
-use super::layout::{map_internal_err, map_leaf_err, page_type, PageType};
+use super::layout::{map_internal_err, map_leaf_err};
 use super::page::{InternalPage, InternalPageError, LeafPage, LeafPageError};
 
 // ============================================================================
@@ -14,42 +14,31 @@ struct CursorFrame {
     child_idx: usize,
 }
 
+enum SeekStep {
+    Leaf { slot_idx: usize },
+    Descend { child_idx: usize, child_id: u64 },
+}
+
+enum AdvanceStep {
+    Descend(u64),
+    KeepClimbing,
+}
+
+enum NextStep {
+    Yield(Vec<u8>, Vec<u8>),
+    Advance,
+    End,
+}
+
 // ============================================================================
 // BTreeRangeIter (Public API)
 // ============================================================================
 
-/// Ordered range iterator over the B+tree (start inclusive, end exclusive).
-///
-/// Notes:
-/// - Leaves are not linked (no sibling pointers), so advancing to the next leaf uses a parent stack.
-///
-/// ## Iterator Pinning Strategy
-///
-/// This iterator uses **leaf-only pinning** for memory efficiency:
-/// - Only the current leaf page is pinned during iteration.
-/// - Parent internal pages are unpinned after routing down to the leaf.
-/// - When advancing to the next leaf, the current leaf is unpinned before climbing the stack.
-///
-/// This is safe because:
-/// - Internal pages are immutable from the stable root perspective (COW semantics).
-/// - If a parent page is evicted and re-read, it returns the same stable content.
-/// - The iterator only needs stable access to the current leaf; mutations create new working pages.
-///
-/// Tradeoff: Parent pages may be re-read if evicted during iteration, but this is acceptable
-/// for the current single-threaded design. Full-path pinning could be added later if needed.
-///
-/// Graphically:
-/// ```text
-/// current leaf exhausted
-///   -> climb stack until a parent has a "next child"
-///   -> go to that next child subtree
-///   -> descend leftmost to the next leaf
-/// ```
 pub struct BTreeRangeIter<'a> {
     pager: Option<&'a mut (dyn PageRead + 'a)>,
     end: Option<Vec<u8>>,
     stack: Vec<CursorFrame>,
-    leaf: Option<PinnedPage>,
+    leaf: Option<ReadPin>,
     slot_idx: usize,
     done: bool,
 }
@@ -76,16 +65,16 @@ impl<'a> BTreeRangeIter<'a> {
         start: Option<&[u8]>,
         end: Option<&[u8]>,
     ) -> Result<Self, WrongoDBError> {
-        let mut it = Self {
+        let mut iter = Self {
             pager: Some(pager),
-            end: end.map(|b| b.to_vec()),
+            end: end.map(|value| value.to_vec()),
             stack: Vec::new(),
             leaf: None,
             slot_idx: 0,
             done: false,
         };
-        it.seek(root, start)?;
-        Ok(it)
+        iter.seek(root, start)?;
+        Ok(iter)
     }
 
     // ------------------------------------------------------------------------
@@ -93,9 +82,9 @@ impl<'a> BTreeRangeIter<'a> {
     // ------------------------------------------------------------------------
 
     fn clear_leaf(&mut self) -> Result<(), WrongoDBError> {
-        if let Some(leaf) = self.leaf.take() {
+        if let Some(leaf_pin) = self.leaf.take() {
             let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
-            pager.unpin_page(leaf.page_id());
+            pager.unpin_page(leaf_pin);
         }
         Ok(())
     }
@@ -103,78 +92,64 @@ impl<'a> BTreeRangeIter<'a> {
     fn seek(&mut self, root: u64, start: Option<&[u8]>) -> Result<(), WrongoDBError> {
         self.clear_leaf()?;
         self.stack.clear();
+
         let mut node_id = root;
         loop {
-            let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
-            let mut page = pager.pin_page(node_id)?;
-            let page_id = page.page_id();
-            let page_type = match page_type(page.payload()) {
-                Ok(t) => t,
-                Err(e) => {
-                    pager.unpin_page(page_id);
-                    return Err(e);
+            let pin = {
+                let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
+                pager.pin_page(node_id)?
+            };
+
+            let step = {
+                let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
+                let page = pager.get_page(&pin);
+                match page.header().page_type {
+                    PageType::Leaf => {
+                        let leaf = LeafPage::open(page)
+                            .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
+                        let slot_idx = if let Some(start_key) = start {
+                            leaf_lower_bound(&leaf, start_key).map_err(map_leaf_err)?
+                        } else {
+                            0
+                        };
+                        SeekStep::Leaf { slot_idx }
+                    }
+                    PageType::Internal => {
+                        let internal = InternalPage::open(page).map_err(|e| {
+                            StorageError(format!("corrupt internal {node_id}: {e}"))
+                        })?;
+                        let child_idx = if let Some(start_key) = start {
+                            internal_child_index_for_key(&internal, start_key)
+                                .map_err(map_internal_err)?
+                        } else {
+                            0
+                        };
+                        let child_id =
+                            internal_child_at(&internal, child_idx).map_err(map_internal_err)?;
+                        SeekStep::Descend {
+                            child_idx,
+                            child_id,
+                        }
+                    }
                 }
             };
-            match page_type {
-                PageType::Leaf => {
-                    let leaf = match LeafPage::open(page.payload_mut()) {
-                        Ok(leaf) => leaf,
-                        Err(e) => {
-                            pager.unpin_page(page_id);
-                            return Err(StorageError(format!("corrupt leaf {node_id}: {e}")).into());
-                        }
-                    };
-                    let slot_idx = if let Some(start_key) = start {
-                        match leaf_lower_bound(&leaf, start_key).map_err(map_leaf_err) {
-                            Ok(idx) => idx,
-                            Err(e) => {
-                                pager.unpin_page(page_id);
-                                return Err(e);
-                            }
-                        }
-                    } else {
-                        0
-                    };
-                    self.leaf = Some(page);
+
+            match step {
+                SeekStep::Leaf { slot_idx } => {
+                    self.leaf = Some(pin);
                     self.slot_idx = slot_idx;
                     return Ok(());
                 }
-                PageType::Internal => {
-                    let internal = match InternalPage::open(page.payload_mut()) {
-                        Ok(internal) => internal,
-                        Err(e) => {
-                            pager.unpin_page(page_id);
-                            return Err(
-                                StorageError(format!("corrupt internal {node_id}: {e}")).into()
-                            );
-                        }
-                    };
-                    let child_idx = if let Some(start_key) = start {
-                        match internal_child_index_for_key(&internal, start_key)
-                            .map_err(map_internal_err)
-                        {
-                            Ok(idx) => idx,
-                            Err(e) => {
-                                pager.unpin_page(page_id);
-                                return Err(e);
-                            }
-                        }
-                    } else {
-                        0
-                    };
-                    let child_id =
-                        match internal_child_at(&internal, child_idx).map_err(map_internal_err) {
-                            Ok(id) => id,
-                            Err(e) => {
-                                pager.unpin_page(page_id);
-                                return Err(e);
-                            }
-                        };
+                SeekStep::Descend {
+                    child_idx,
+                    child_id,
+                } => {
                     self.stack.push(CursorFrame {
                         internal_id: node_id,
                         child_idx,
                     });
-                    pager.unpin_page(page_id);
+                    let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
+                    pager.unpin_page(pin);
                     node_id = child_id;
                 }
             }
@@ -183,19 +158,22 @@ impl<'a> BTreeRangeIter<'a> {
 
     fn advance_to_next_leaf(&mut self) -> Result<bool, WrongoDBError> {
         self.clear_leaf()?;
+
         while let Some(frame) = self.stack.pop() {
-            let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
-            let mut page = pager.pin_page(frame.internal_id)?;
-            let page_id = page.page_id();
-            let next_child_id = match (|| {
-                let internal = InternalPage::open(page.payload_mut()).map_err(|e| {
+            let pin = {
+                let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
+                pager.pin_page(frame.internal_id)?
+            };
+
+            let step = {
+                let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
+                let page = pager.get_page(&pin);
+                let internal = InternalPage::open(page).map_err(|e| {
                     StorageError(format!("corrupt internal {}: {e}", frame.internal_id))
                 })?;
-
-                let slots = internal.slot_count().map_err(map_internal_err)?;
-                let children_count = slots + 1;
+                let children_count = internal.slot_count() + 1;
                 if frame.child_idx + 1 >= children_count {
-                    Ok(None)
+                    AdvanceStep::KeepClimbing
                 } else {
                     let next_child_idx = frame.child_idx + 1;
                     let next_child_id =
@@ -204,67 +182,64 @@ impl<'a> BTreeRangeIter<'a> {
                         internal_id: frame.internal_id,
                         child_idx: next_child_idx,
                     });
-                    Ok(Some(next_child_id))
-                }
-            })() {
-                Ok(next) => next,
-                Err(e) => {
-                    pager.unpin_page(page_id);
-                    return Err(e);
+                    AdvanceStep::Descend(next_child_id)
                 }
             };
-            pager.unpin_page(page_id);
-            if let Some(next_child_id) = next_child_id {
-                self.descend_leftmost(next_child_id)?;
-                return Ok(true);
+
+            let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
+            pager.unpin_page(pin);
+
+            match step {
+                AdvanceStep::Descend(next_child_id) => {
+                    self.descend_leftmost(next_child_id)?;
+                    return Ok(true);
+                }
+                AdvanceStep::KeepClimbing => {}
             }
         }
+
         Ok(false)
     }
 
     fn descend_leftmost(&mut self, start_id: u64) -> Result<(), WrongoDBError> {
         let mut node_id = start_id;
         loop {
-            let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
-            let mut page = pager.pin_page(node_id)?;
-            let page_id = page.page_id();
-            let page_type = match page_type(page.payload()) {
-                Ok(t) => t,
-                Err(e) => {
-                    pager.unpin_page(page_id);
-                    return Err(e);
+            let pin = {
+                let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
+                pager.pin_page(node_id)?
+            };
+
+            let step = {
+                let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
+                let page = pager.get_page(&pin);
+                match page.header().page_type {
+                    PageType::Leaf => AdvanceStep::Descend(node_id),
+                    PageType::Internal => {
+                        let internal = InternalPage::open(page).map_err(|e| {
+                            StorageError(format!("corrupt internal {node_id}: {e}"))
+                        })?;
+                        let child_id = internal.first_child();
+                        self.stack.push(CursorFrame {
+                            internal_id: node_id,
+                            child_idx: 0,
+                        });
+                        AdvanceStep::Descend(child_id)
+                    }
                 }
             };
-            match page_type {
-                PageType::Leaf => {
-                    self.leaf = Some(page);
+
+            match step {
+                AdvanceStep::Descend(next_id) if next_id == node_id => {
+                    self.leaf = Some(pin);
                     self.slot_idx = 0;
                     return Ok(());
                 }
-                PageType::Internal => {
-                    let internal = match InternalPage::open(page.payload_mut()) {
-                        Ok(internal) => internal,
-                        Err(e) => {
-                            pager.unpin_page(page_id);
-                            return Err(
-                                StorageError(format!("corrupt internal {node_id}: {e}")).into()
-                            );
-                        }
-                    };
-                    let child_id = match internal.first_child().map_err(map_internal_err) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            pager.unpin_page(page_id);
-                            return Err(e);
-                        }
-                    };
-                    self.stack.push(CursorFrame {
-                        internal_id: node_id,
-                        child_idx: 0,
-                    });
-                    pager.unpin_page(page_id);
-                    node_id = child_id;
+                AdvanceStep::Descend(next_id) => {
+                    let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
+                    pager.unpin_page(pin);
+                    node_id = next_id;
                 }
+                AdvanceStep::KeepClimbing => unreachable!(),
             }
         }
     }
@@ -283,80 +258,84 @@ impl<'a> Iterator for BTreeRangeIter<'a> {
         }
 
         loop {
-            let Some(mut leaf_page) = self.leaf.take() else {
+            let Some(leaf_pin) = self.leaf.take() else {
                 self.done = true;
                 return None;
             };
-            let leaf_id = leaf_page.page_id();
-            let leaf = match LeafPage::open(leaf_page.payload_mut()) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.done = true;
-                    if let Some(pager) = self.pager.as_deref_mut() {
-                        pager.unpin_page(leaf_id);
+
+            let step = {
+                let pager = match self.pager.as_deref_mut() {
+                    Some(pager) => pager,
+                    None => {
+                        self.done = true;
+                        return Some(Err(missing_pager()));
                     }
-                    return Some(Err(
-                        StorageError(format!("corrupt leaf {}: {e}", leaf_id)).into()
-                    ));
+                };
+                let page = pager.get_page(&leaf_pin);
+                let leaf = match LeafPage::open(page) {
+                    Ok(leaf) => leaf,
+                    Err(err) => {
+                        return Some(Err(StorageError(format!(
+                            "corrupt leaf {}: {err}",
+                            leaf_pin.page_id()
+                        ))
+                        .into()));
+                    }
+                };
+
+                if self.slot_idx < leaf.slot_count() {
+                    let key = match leaf.key_at(self.slot_idx) {
+                        Ok(value) => value.to_vec(),
+                        Err(err) => return Some(Err(map_leaf_err(err))),
+                    };
+                    if let Some(end) = &self.end {
+                        if key.as_slice() >= end.as_slice() {
+                            NextStep::End
+                        } else {
+                            let value = match leaf.value_at(self.slot_idx) {
+                                Ok(value) => value.to_vec(),
+                                Err(err) => return Some(Err(map_leaf_err(err))),
+                            };
+                            NextStep::Yield(key, value)
+                        }
+                    } else {
+                        let value = match leaf.value_at(self.slot_idx) {
+                            Ok(value) => value.to_vec(),
+                            Err(err) => return Some(Err(map_leaf_err(err))),
+                        };
+                        NextStep::Yield(key, value)
+                    }
+                } else {
+                    NextStep::Advance
                 }
             };
 
-            let slot_count = match leaf.slot_count() {
-                Ok(v) => v,
-                Err(e) => {
+            match step {
+                NextStep::Yield(key, value) => {
+                    self.slot_idx += 1;
+                    self.leaf = Some(leaf_pin);
+                    return Some(Ok((key, value)));
+                }
+                NextStep::End => {
                     self.done = true;
                     if let Some(pager) = self.pager.as_deref_mut() {
-                        pager.unpin_page(leaf_id);
+                        pager.unpin_page(leaf_pin);
                     }
-                    return Some(Err(map_leaf_err(e)));
-                }
-            };
-
-            if self.slot_idx < slot_count {
-                let k = match leaf.key_at(self.slot_idx) {
-                    Ok(v) => v.to_vec(),
-                    Err(e) => {
-                        self.done = true;
-                        if let Some(pager) = self.pager.as_deref_mut() {
-                            pager.unpin_page(leaf_id);
-                        }
-                        return Some(Err(map_leaf_err(e)));
-                    }
-                };
-                if let Some(end) = &self.end {
-                    if k.as_slice() >= end.as_slice() {
-                        self.done = true;
-                        if let Some(pager) = self.pager.as_deref_mut() {
-                            pager.unpin_page(leaf_id);
-                        }
-                        return None;
-                    }
-                }
-                let v = match leaf.value_at(self.slot_idx) {
-                    Ok(v) => v.to_vec(),
-                    Err(e) => {
-                        self.done = true;
-                        if let Some(pager) = self.pager.as_deref_mut() {
-                            pager.unpin_page(leaf_id);
-                        }
-                        return Some(Err(map_leaf_err(e)));
-                    }
-                };
-                self.slot_idx += 1;
-                self.leaf = Some(leaf_page);
-                return Some(Ok((k, v)));
-            }
-
-            self.leaf = Some(leaf_page);
-            match self.advance_to_next_leaf() {
-                Ok(true) => continue,
-                Ok(false) => {
-                    self.done = true;
                     return None;
                 }
-                Err(e) => {
-                    self.done = true;
-                    return Some(Err(e));
+                NextStep::Advance => {
+                    self.leaf = Some(leaf_pin);
+                    match self.advance_to_next_leaf() {
+                        Ok(true) => continue,
+                        Ok(false) => {
+                            self.done = true;
+                            return None;
+                        }
+                        Err(err) => {
+                            self.done = true;
+                            return Some(Err(err));
+                        }
+                    }
                 }
             }
         }
@@ -370,7 +349,7 @@ impl<'a> Drop for BTreeRangeIter<'a> {
 }
 
 // ============================================================================
-// Helper Functions (lowest-level utilities)
+// Helper Functions
 // ============================================================================
 
 fn missing_pager() -> WrongoDBError {
@@ -378,7 +357,7 @@ fn missing_pager() -> WrongoDBError {
 }
 
 fn leaf_lower_bound(leaf: &LeafPage<'_>, key: &[u8]) -> Result<usize, LeafPageError> {
-    let n = leaf.slot_count()?;
+    let n = leaf.slot_count();
     let mut lo = 0usize;
     let mut hi = n;
     while lo < hi {
@@ -397,7 +376,7 @@ fn internal_child_index_for_key(
     internal: &InternalPage<'_>,
     key: &[u8],
 ) -> Result<usize, InternalPageError> {
-    let n = internal.slot_count()?;
+    let n = internal.slot_count();
     if n == 0 {
         return Ok(0);
     }
@@ -420,7 +399,7 @@ fn internal_child_at(
     child_idx: usize,
 ) -> Result<u64, InternalPageError> {
     if child_idx == 0 {
-        internal.first_child()
+        Ok(internal.first_child())
     } else {
         internal.child_at(child_idx - 1)
     }
