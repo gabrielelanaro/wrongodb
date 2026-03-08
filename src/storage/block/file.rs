@@ -29,6 +29,11 @@ const EXTENT_ENCODED_SIZE: usize = 8 + 8 + 8;
 // CheckpointSlot - Checkpoint metadata with CRC validation
 // ============================================================================
 
+/// Checkpoint metadata record with CRC32 validation.
+///
+/// Stores the root block ID and generation number for a checkpoint,
+/// with a checksum to detect corruption. Used for crash recovery
+/// and checkpoint consistency verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckpointSlot {
     pub root_block_id: u64,
@@ -61,6 +66,16 @@ impl CheckpointSlot {
 // FileHeader - On-disk header with checkpoint slots and extent lists
 // ============================================================================
 
+/// On-disk file header containing checkpoint metadata and extent allocation lists.
+///
+/// The header is stored in page 0 and includes:
+/// - Magic number and version for file identification
+/// - Page size for the file
+/// - Count fields for alloc/avail/discard extent lists
+/// - Two checkpoint slots for atomic checkpoint updates
+///
+/// Extent lists track which blocks are allocated (reachable from checkpoint),
+/// available for reuse, or discarded (awaiting safe reclaim after checkpoint).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
     pub magic: [u8; 8],
@@ -238,6 +253,16 @@ impl FileHeader {
 // BlockFile - Fixed-size block storage with extent allocation
 // ============================================================================
 
+/// Fixed-size block storage file with checksummed I/O and extent-based allocation.
+///
+/// `BlockFile` provides the foundation for on-disk storage with:
+/// - **Checksummed I/O**: Each block includes a CRC32 checksum for corruption detection
+/// - **Extent allocation**: Three-list allocation scheme (alloc/avail/discard) for COW semantics
+/// - **Checkpoint slots**: Dual-slot design for atomic checkpoint updates
+/// - **Crash recovery**: Header checksum and checkpoint slot validation on open
+///
+/// Block 0 is reserved for the file header. All other blocks are available
+/// for data storage and managed through the extent allocation system.
 #[derive(Debug)]
 pub struct BlockFile {
     file: File,
@@ -252,6 +277,10 @@ impl BlockFile {
     // Constructors (highest level of abstraction)
     // ------------------------------------------------------------------------
 
+    /// Create a new block file with the specified page size.
+    ///
+    /// Creates a new file on disk with a valid header and empty extent lists.
+    /// Fails if a non-empty file already exists at the path.
     pub fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -294,6 +323,11 @@ impl BlockFile {
         })
     }
 
+    /// Open an existing block file, validating header and checksums.
+    ///
+    /// Reads the file header, validates the magic number, version, and checksum,
+    /// then selects the valid checkpoint slot with the highest generation number.
+    /// Fails if the file is corrupted, has an unsupported version, or has no valid checkpoints.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, WrongoDBError> {
         let path = path.as_ref();
         let mut file = OpenOptions::new()
@@ -366,10 +400,16 @@ impl BlockFile {
     // Checkpoint management
     // ------------------------------------------------------------------------
 
+    /// Return the root block ID from the active checkpoint slot.
     pub fn root_block_id(&self) -> u64 {
         self.header.checkpoint_slots[self.active_checkpoint_slot].root_block_id
     }
 
+    /// Update the root block ID in the next checkpoint slot.
+    ///
+    /// Advances to the next checkpoint slot with an incremented generation number,
+    /// writes the updated header to disk, and updates the block manager's stable
+    /// generation to enable reclaim of discarded extents.
     pub fn set_root_block_id(&mut self, root_block_id: u64) -> Result<(), WrongoDBError> {
         let current_slot = self.active_checkpoint_slot;
         let next_slot = (current_slot + 1) % CHECKPOINT_SLOT_COUNT;
@@ -389,10 +429,15 @@ impl BlockFile {
     // Block allocation
     // ------------------------------------------------------------------------
 
+    /// Allocate a single block from the avail list or grow the file.
     pub fn allocate_block(&mut self) -> Result<u64, WrongoDBError> {
         Ok(self.allocate_extent(1)?.offset)
     }
 
+    /// Allocate a contiguous extent of the specified size.
+    ///
+    /// First tries to satisfy the request from the avail list. If no suitable
+    /// extent is available, grows the file to allocate new blocks.
     pub fn allocate_extent(&mut self, blocks: u64) -> Result<Extent, WrongoDBError> {
         if blocks == 0 {
             return Err(StorageError("cannot allocate zero-length extent".into()).into());
@@ -422,6 +467,10 @@ impl BlockFile {
         Ok(extent)
     }
 
+    /// Preallocate blocks to the file, adding them to the avail list.
+    ///
+    /// Grows the file and adds the new blocks as a single extent to the avail
+    /// list, avoiding fallocate/ftruncate in the allocation hot path.
     pub fn preallocate_blocks(&mut self, blocks: u64) -> Result<(), WrongoDBError> {
         if blocks == 0 {
             return Ok(());
@@ -446,6 +495,7 @@ impl BlockFile {
         Ok(())
     }
 
+    /// Free a single block, moving it to the discard list.
     pub fn free_block(&mut self, block_id: u64) -> Result<(), WrongoDBError> {
         if block_id == 0 {
             return Err(StorageError("block 0 is reserved for the header".into()).into());
@@ -463,6 +513,7 @@ impl BlockFile {
         Ok(())
     }
 
+    /// Reclaim discarded extents by moving them to the avail list.
     pub fn reclaim_discarded(&mut self) -> Result<(), WrongoDBError> {
         self.block_manager.reclaim_discarded();
         self.write_header()?;
@@ -473,6 +524,7 @@ impl BlockFile {
     // Block I/O
     // ------------------------------------------------------------------------
 
+    /// Read a block from disk, optionally verifying the checksum.
     pub fn read_block(&mut self, block_id: u64, verify: bool) -> Result<Vec<u8>, WrongoDBError> {
         let offset = block_id
             .checked_mul(self.page_size as u64)
@@ -495,6 +547,7 @@ impl BlockFile {
         Ok(payload.to_vec())
     }
 
+    /// Write a payload to a block, computing and storing the checksum.
     pub fn write_block(&mut self, block_id: u64, payload: &[u8]) -> Result<(), WrongoDBError> {
         if block_id == 0 {
             return Err(StorageError("block 0 is reserved for the header".into()).into());

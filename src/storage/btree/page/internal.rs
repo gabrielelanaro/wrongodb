@@ -18,6 +18,11 @@ const RECORD_VLEN_OFF: usize = 2;
 // Error Types
 // ============================================================================
 
+/// Errors that can occur when working with internal B+tree pages.
+///
+/// Internal pages store separator keys and child page pointers, forming the
+/// upper levels of the B+tree. This error type covers both space constraints
+/// and data corruption scenarios.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum InternalPageError {
     #[error("page full")]
@@ -31,6 +36,14 @@ pub enum InternalPageError {
 // InternalPage (Read API)
 // ============================================================================
 
+/// Read-only view of an internal B+tree page.
+///
+/// Internal pages form the upper levels of a B+tree, storing separator keys
+/// and child page pointers. Each internal page has a "first child" pointer
+/// and a series of slots containing (separator key, child page) pairs.
+///
+/// Navigation uses binary search: for a given key, the page finds the child
+/// whose subtree should contain that key.
 #[derive(Debug)]
 pub struct InternalPage<'a> {
     page: &'a Page,
@@ -41,6 +54,10 @@ impl<'a> InternalPage<'a> {
     // Constructors
     // ------------------------------------------------------------------------
 
+    /// Opens a read-only view of an internal page.
+    ///
+    /// Validates that the page is correctly formatted as an internal page
+    /// before returning the view.
     pub fn open(page: &'a Page) -> Result<Self, InternalPageError> {
         validate_internal(page)?;
         Ok(Self { page })
@@ -83,6 +100,11 @@ impl<'a> InternalPage<'a> {
         read_u64(self.page.data(), child_off)
     }
 
+    /// Finds the child page that should contain the given key.
+    ///
+    /// Uses binary search on the separator keys to determine which subtree
+    /// should contain the key. If all separators are less than the key,
+    /// returns the last child. If no slots exist, returns the first child.
     pub fn child_for_key(&self, key: &[u8]) -> Result<u64, InternalPageError> {
         let n = self.slot_count();
         if n == 0 {
@@ -160,6 +182,11 @@ impl<'a> InternalPage<'a> {
 // InternalPageMut (Write API)
 // ============================================================================
 
+/// Mutable view of an internal B+tree page.
+///
+/// Provides write operations for internal pages, including inserting
+/// separator-key/child pairs and compaction to reclaim space from deleted
+/// entries.
 #[derive(Debug)]
 pub struct InternalPageMut<'a> {
     page: &'a mut Page,
@@ -170,6 +197,10 @@ impl<'a> InternalPageMut<'a> {
     // Constructors
     // ------------------------------------------------------------------------
 
+    /// Opens a mutable view of an internal page.
+    ///
+    /// Validates that the page is correctly formatted as an internal page
+    /// before returning the mutable view.
     pub fn open(page: &'a mut Page) -> Result<Self, InternalPageError> {
         validate_internal(page)?;
         Ok(Self { page })
@@ -191,6 +222,13 @@ impl<'a> InternalPageMut<'a> {
     // Public API: Write Operations
     // ------------------------------------------------------------------------
 
+    /// Inserts or updates a separator key and child page pair.
+    ///
+    /// If the key already exists, the existing entry is deleted and replaced.
+    /// Attempts compaction if space is insufficient. Returns [`PageFull`]
+    /// if the page cannot accommodate the entry even after compaction.
+    ///
+    /// [`PageFull`]: InternalPageError::PageFull
     pub fn put_separator(&mut self, key: &[u8], child: u64) -> Result<(), InternalPageError> {
         let (idx, found) = self.find_slot(key)?;
         if found {
@@ -240,6 +278,11 @@ impl<'a> InternalPageMut<'a> {
     // Public API: Maintenance Operations
     // ------------------------------------------------------------------------
 
+    /// Compacts the page by rewriting all records contiguously.
+    ///
+    /// Reclaims space left by deleted or modified records. Creates a new page
+    /// with the same content but with records packed from the end, then swaps
+    /// it in place.
     pub fn compact(&mut self) -> Result<(), InternalPageError> {
         validate_internal(self.page)?;
 

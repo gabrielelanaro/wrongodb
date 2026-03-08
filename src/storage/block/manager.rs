@@ -4,6 +4,10 @@ use crate::core::errors::{StorageError, WrongoDBError};
 // Public types - Extent and ExtentLists (highest level)
 // ============================================================================
 
+/// Contiguous range of blocks with generation tracking for copy-on-write.
+///
+/// Extents represent allocated or free regions in the block file. The generation
+/// field enables COW semantics by tracking which checkpoint allocated the extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Extent {
     pub offset: u64,
@@ -11,6 +15,12 @@ pub struct Extent {
     pub generation: u64,
 }
 
+/// Collection of extent lists tracking allocation state.
+///
+/// Three lists implement the extent-based allocation scheme:
+/// - **alloc**: Extents reachable from the stable checkpoint (in use)
+/// - **avail**: Free extents available for immediate allocation
+/// - **discard**: Extents freed after the checkpoint, awaiting safe reclaim
 #[derive(Debug, Clone, Default)]
 pub struct ExtentLists {
     pub alloc: Vec<Extent>,
@@ -22,6 +32,15 @@ pub struct ExtentLists {
 // BlockManager - Public API for extent allocation
 // ============================================================================
 
+/// Extent allocator with generation tracking for copy-on-write semantics.
+///
+/// `BlockManager` manages three extent lists (alloc/avail/discard) to support
+/// crash recovery and checkpointing. Freed extents go to the discard list and
+/// are only moved to avail after the stable checkpoint advances beyond their
+/// generation, ensuring they're not referenced by any recoverable state.
+///
+/// Uses skip lists for efficient offset-based and size-based lookups during
+/// allocation and coalescing operations.
 #[derive(Debug, Clone)]
 pub struct BlockManager {
     alloc: ExtentIndex,
@@ -35,6 +54,7 @@ impl BlockManager {
     // Constructors
     // ------------------------------------------------------------------------
 
+    /// Create a new block manager with the given stable generation and initial extent lists.
     pub fn new(stable_generation: u64, lists: ExtentLists) -> Self {
         let seed = stable_generation ^ 0xC0FFEE;
         let alloc = ExtentIndex::from_extents(seed ^ 0x11, lists.alloc);
@@ -72,6 +92,11 @@ impl BlockManager {
     // Allocation API
     // ------------------------------------------------------------------------
 
+    /// Allocate an extent of the requested size from the avail list using best-fit.
+    ///
+    /// Returns the smallest extent that satisfies the request. If a larger extent
+    /// is used, any remainder is returned to the avail list. Returns None if no
+    /// suitable extent is available.
     pub fn allocate_from_avail(&mut self, size: u64) -> Option<Extent> {
         let candidate = self.avail.best_fit(size)?;
         let extent = self.avail.remove_by_offset(candidate.offset)?;
@@ -115,6 +140,11 @@ impl BlockManager {
     // Free and reclaim API
     // ------------------------------------------------------------------------
 
+    /// Free an allocated extent, moving it to the discard list.
+    ///
+    /// The extent is not immediately available for reuse; it must wait for
+    /// the stable checkpoint to advance beyond its generation before reclaim.
+    /// Fails if the specified range is not currently allocated.
     pub fn free_extent(&mut self, offset: u64, size: u64) -> Result<(), WrongoDBError> {
         if size == 0 {
             return Ok(());
@@ -138,6 +168,10 @@ impl BlockManager {
         Ok(())
     }
 
+    /// Reclaim discarded extents whose generation is <= stable generation.
+    ///
+    /// Moves discard-list extents that are no longer needed for recovery
+    /// into the avail list, coalescing adjacent extents to minimize fragmentation.
     pub fn reclaim_discarded(&mut self) {
         let mut avail_extents = self.avail.values_by_offset();
         let mut remaining_discard = Vec::new();

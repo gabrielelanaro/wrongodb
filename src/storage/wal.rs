@@ -1,7 +1,16 @@
-//! Connection-level Write-Ahead Logging (WAL) for crash recovery.
-//!
-//! A single WAL file (`global.wal`) is shared across all B-trees in the database.
-//! Records include the target store name so replay can route operations correctly.
+// ============================================================================
+// Constants
+// ============================================================================
+
+const GLOBAL_WAL_FILE_NAME: &str = "global.wal";
+const WAL_MAGIC: &[u8; 8] = b"WALG001\0";
+const WAL_VERSION: u16 = 2;
+const WAL_HEADER_SIZE: usize = 512;
+const RECORD_HEADER_SIZE: usize = 42;
+
+// ============================================================================
+// Public Types
+// ============================================================================
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -11,25 +20,6 @@ use crc32fast::Hasher;
 
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::txn::{Timestamp, TxnId};
-
-// ============================================================================
-// Constants
-// ============================================================================
-
-/// Global WAL file name.
-const GLOBAL_WAL_FILE_NAME: &str = "global.wal";
-/// WAL file magic bytes (8 bytes)
-const WAL_MAGIC: &[u8; 8] = b"WALG001\0";
-/// WAL file format version
-const WAL_VERSION: u16 = 2;
-/// WAL file header size (512 bytes)
-const WAL_HEADER_SIZE: usize = 512;
-/// WAL record header size (42 bytes)
-const RECORD_HEADER_SIZE: usize = 42;
-
-// ============================================================================
-// Public Types
-// ============================================================================
 
 /// Log Sequence Number - uniquely identifies a position in the WAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

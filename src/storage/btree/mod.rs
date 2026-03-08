@@ -68,6 +68,17 @@ enum ReadStep {
 // BTreeCursor (Public API)
 // ============================================================================
 
+/// B+tree cursor providing read, write, and checkpoint operations.
+///
+/// `BTreeCursor` is the main interface for B+tree operations, managing:
+///
+/// - **Point queries**: `get` retrieves a single key-value pair
+/// - **Range scans**: `range` returns an iterator over key ranges
+/// - **Mutations**: `put` and `delete` modify tree structure with automatic splitting
+/// - **Checkpointing**: `checkpoint` flushes dirty pages and creates a consistent recovery point
+///
+/// The cursor owns a [`PageStore`] which handles page caching, copy-on-write,
+/// and coordination with the underlying block file.
 #[derive(Debug)]
 pub struct BTreeCursor {
     page_store: Box<dyn PageStore>,
@@ -78,6 +89,10 @@ impl BTreeCursor {
     // Constructors
     // ------------------------------------------------------------------------
 
+    /// Creates a new B+tree cursor backed by the given page store.
+    ///
+    /// The cursor takes ownership of the page store, which manages
+    /// page caching, copy-on-write, and checkpoint coordination.
     pub fn new(store: Box<dyn PageStore>) -> Self {
         Self { page_store: store }
     }

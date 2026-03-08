@@ -18,6 +18,10 @@ const RECORD_HEADER_SIZE: usize = 4;
 // Error Types
 // ============================================================================
 
+/// Errors that can occur when working with leaf B+tree pages.
+///
+/// Leaf pages store the actual key-value pairs at the bottom of the B+tree.
+/// This error type covers both space constraints and data corruption scenarios.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LeafPageError {
     #[error("page full")]
@@ -31,6 +35,12 @@ pub enum LeafPageError {
 // LeafPage (Read API)
 // ============================================================================
 
+/// Read-only view of a leaf B+tree page.
+///
+/// Leaf pages store the actual key-value data at the bottom level of the
+/// B+tree. Each entry contains a key, value, and their lengths. Pages use
+/// a slot-based layout with records growing from the end and slots from
+/// the beginning.
 #[derive(Debug)]
 pub struct LeafPage<'a> {
     page: &'a Page,
@@ -41,6 +51,10 @@ impl<'a> LeafPage<'a> {
     // Constructors
     // ------------------------------------------------------------------------
 
+    /// Opens a read-only view of a leaf page.
+    ///
+    /// Validates that the page is correctly formatted as a leaf page
+    /// before returning the view.
     pub fn open(page: &'a Page) -> Result<Self, LeafPageError> {
         validate_leaf(page)?;
         Ok(Self { page })
@@ -50,6 +64,10 @@ impl<'a> LeafPage<'a> {
     // Public API: Read Operations
     // ------------------------------------------------------------------------
 
+    /// Looks up a key in the leaf page.
+    ///
+    /// Uses binary search to find the key. Returns `Some(value)` if found,
+    /// `None` if the key is not present.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, LeafPageError> {
         let (idx, found) = self.find_slot(key)?;
         if !found {
@@ -156,6 +174,10 @@ impl<'a> LeafPage<'a> {
 // LeafPageMut (Write API)
 // ============================================================================
 
+/// Mutable view of a leaf B+tree page.
+///
+/// Provides write operations for leaf pages, including inserting, updating,
+/// deleting key-value pairs, and compaction to reclaim space.
 #[derive(Debug)]
 pub struct LeafPageMut<'a> {
     page: &'a mut Page,
@@ -166,6 +188,10 @@ impl<'a> LeafPageMut<'a> {
     // Constructors
     // ------------------------------------------------------------------------
 
+    /// Opens a mutable view of a leaf page.
+    ///
+    /// Validates that the page is correctly formatted as a leaf page
+    /// before returning the mutable view.
     pub fn open(page: &'a mut Page) -> Result<Self, LeafPageError> {
         validate_leaf(page)?;
         Ok(Self { page })
@@ -191,6 +217,13 @@ impl<'a> LeafPageMut<'a> {
     // Public API: Write Operations
     // ------------------------------------------------------------------------
 
+    /// Inserts or updates a key-value pair.
+    ///
+    /// If the key already exists, the existing entry is deleted and replaced.
+    /// Attempts compaction if space is insufficient. Returns [`PageFull`]
+    /// if the page cannot accommodate the entry even after compaction.
+    ///
+    /// [`PageFull`]: LeafPageError::PageFull
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), LeafPageError> {
         let (idx, found) = self.find_slot(key)?;
         if found {
@@ -236,6 +269,10 @@ impl<'a> LeafPageMut<'a> {
         Ok(())
     }
 
+    /// Deletes a key from the leaf page.
+    ///
+    /// Returns `true` if the key was found and deleted, `false` if the key
+    /// was not present.
     pub fn delete(&mut self, key: &[u8]) -> Result<bool, LeafPageError> {
         let (idx, found) = self.find_slot(key)?;
         if !found {
@@ -249,6 +286,11 @@ impl<'a> LeafPageMut<'a> {
     // Public API: Maintenance Operations
     // ------------------------------------------------------------------------
 
+    /// Compacts the page by rewriting all records contiguously.
+    ///
+    /// Reclaims space left by deleted or modified records. Creates a new page
+    /// with the same content but with records packed from the end, then swaps
+    /// it in place.
     pub fn compact(&mut self) -> Result<(), LeafPageError> {
         self.validate()?;
 

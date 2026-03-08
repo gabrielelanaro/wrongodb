@@ -5,35 +5,18 @@ use super::layout::{map_internal_err, map_leaf_err};
 use super::page::{InternalPage, InternalPageError, LeafPage, LeafPageError};
 
 // ============================================================================
-// Helper Types
-// ============================================================================
-
-#[derive(Debug, Clone, Copy)]
-struct CursorFrame {
-    internal_id: u64,
-    child_idx: usize,
-}
-
-enum SeekStep {
-    Leaf { slot_idx: usize },
-    Descend { child_idx: usize, child_id: u64 },
-}
-
-enum AdvanceStep {
-    Descend(u64),
-    KeepClimbing,
-}
-
-enum NextStep {
-    Yield(Vec<u8>, Vec<u8>),
-    Advance,
-    End,
-}
-
-// ============================================================================
 // BTreeRangeIter (Public API)
 // ============================================================================
 
+/// Range iterator over B+tree key-value pairs.
+///
+/// Yields entries in sorted order from `start` (inclusive) to `end` (exclusive).
+/// Manages page pinning to prevent eviction during iteration.
+///
+/// Key design decisions:
+/// - **Pager ownership**: Takes `&mut dyn PageRead` to allow unpinning pages during traversal
+/// - **Lazy navigation**: Only pins pages as needed, releases internal nodes after descending
+/// - **Stack-based cursor**: Tracks position through internal nodes for efficient advance
 pub struct BTreeRangeIter<'a> {
     pager: Option<&'a mut (dyn PageRead + 'a)>,
     end: Option<Vec<u8>>,
@@ -48,6 +31,9 @@ impl<'a> BTreeRangeIter<'a> {
     // Constructors
     // ------------------------------------------------------------------------
 
+    /// Creates an empty iterator that yields nothing.
+    ///
+    /// Used when a B+tree is empty or when no matching range exists.
     pub(super) fn empty() -> Self {
         Self {
             pager: None,
@@ -59,6 +45,13 @@ impl<'a> BTreeRangeIter<'a> {
         }
     }
 
+    /// Creates a range iterator over the B+tree rooted at `root`.
+    ///
+    /// - `start`: Inclusive lower bound, or `None` to start from the first key
+    /// - `end`: Exclusive upper bound, or `None` to iterate to the end
+    ///
+    /// The iterator seeks to the starting position during construction,
+    /// pinning the initial leaf page.
     pub(super) fn new(
         pager: &'a mut (dyn PageRead + 'a),
         root: u64,
@@ -346,6 +339,36 @@ impl<'a> Drop for BTreeRangeIter<'a> {
     fn drop(&mut self) {
         let _ = self.clear_leaf();
     }
+}
+
+// ============================================================================
+// Helper Types (Internal)
+// ============================================================================
+
+/// Tracks position within an internal node during traversal.
+#[derive(Debug, Clone, Copy)]
+struct CursorFrame {
+    internal_id: u64,
+    child_idx: usize,
+}
+
+/// Result of seeking to a position in the tree.
+enum SeekStep {
+    Leaf { slot_idx: usize },
+    Descend { child_idx: usize, child_id: u64 },
+}
+
+/// Result of advancing through internal nodes.
+enum AdvanceStep {
+    Descend(u64),
+    KeepClimbing,
+}
+
+/// Result of processing a leaf during iteration.
+enum NextStep {
+    Yield(Vec<u8>, Vec<u8>),
+    Advance,
+    End,
 }
 
 // ============================================================================

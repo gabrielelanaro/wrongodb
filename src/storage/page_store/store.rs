@@ -370,31 +370,6 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::storage::page_store::page_cache::{PageCache, PageCacheConfig};
-
-    #[test]
-    fn lru_skips_pinned_pages() {
-        let mut cache = PageCache::new(PageCacheConfig { capacity_pages: 3 });
-        cache.insert(1, Page::new_leaf(64).unwrap());
-        cache.insert(2, Page::new_leaf(64).unwrap());
-        cache.insert(3, Page::new_leaf(64).unwrap());
-
-        cache.get_mut(2).unwrap().pin_count = 1;
-        cache.get_mut(1);
-
-        let candidate = cache.lru_unpinned();
-        assert_eq!(candidate, Some(3));
-    }
-
-    #[test]
-    fn evict_lru_errors_when_all_pinned() {
-        let mut cache = PageCache::new(PageCacheConfig { capacity_pages: 2 });
-        cache.insert(1, Page::new_leaf(64).unwrap()).pin_count = 1;
-        cache.insert(2, Page::new_leaf(64).unwrap()).pin_count = 1;
-
-        let err = cache.evict_lru().unwrap_err();
-        assert!(matches!(err, WrongoDBError::Storage(_)));
-    }
 
     #[test]
     fn eviction_writes_back_dirty_page() {
