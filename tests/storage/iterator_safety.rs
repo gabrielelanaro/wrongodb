@@ -4,7 +4,8 @@ use std::path::Path;
 
 use tempfile::tempdir;
 use wrongodb::{
-    BTree, BlockFilePageStore, LeafPage, PageStore, StorageError, WrongoDBError, NONE_BLOCK_ID,
+    BTree, BlockFilePageStore, LeafPage, PageStore, ReadVisibility, StorageError, WrongoDBError,
+    NONE_BLOCK_ID, TXN_NONE,
 };
 
 fn create_tree(path: &Path, page_size: usize) -> Result<BTree, WrongoDBError> {
@@ -93,7 +94,10 @@ fn checkpoint_fails_with_dirty_pinned_page() {
     // Verify the key is still there after reopen
     drop(btree);
     let mut btree2 = open_tree(&path).unwrap();
-    assert_eq!(btree2.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+    assert_eq!(
+        btree2.get(b"key1", &ReadVisibility::from_txn_id(TXN_NONE)).unwrap(),
+        Some(b"value1".to_vec())
+    );
 }
 
 /// Test that all-pinned-at-capacity returns an error for new page loads.
@@ -118,7 +122,7 @@ fn loading_page_with_full_pinned_cache_fails() {
     // will work as expected)
 
     // Get the key back
-    let value = btree.get(b"key1").unwrap();
+    let value = btree.get(b"key1", &ReadVisibility::from_txn_id(TXN_NONE)).unwrap();
     assert_eq!(value, Some(b"value1".to_vec()));
 }
 
@@ -159,7 +163,10 @@ fn checkpoint_stages_basic() {
     // Verify after reopen
     drop(btree);
     let mut btree2 = open_tree(&path).unwrap();
-    assert_eq!(btree2.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+    assert_eq!(
+        btree2.get(b"key1", &ReadVisibility::from_txn_id(TXN_NONE)).unwrap(),
+        Some(b"value1".to_vec())
+    );
 }
 
 /// Test checkpoint scheduling with update count.
@@ -187,6 +194,11 @@ fn checkpoint_scheduling_with_updates() {
     let mut btree2 = open_tree(&path).unwrap();
     for i in 0..10 {
         let key = format!("key{}", i);
-        assert_eq!(btree2.get(key.as_bytes()).unwrap(), Some(b"value".to_vec()));
+        assert_eq!(
+            btree2
+                .get(key.as_bytes(), &ReadVisibility::from_txn_id(TXN_NONE))
+                .unwrap(),
+            Some(b"value".to_vec())
+        );
     }
 }

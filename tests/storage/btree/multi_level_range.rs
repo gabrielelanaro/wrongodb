@@ -1,6 +1,6 @@
 use tempfile::tempdir;
 
-use wrongodb::{BlockFile, InternalPage, NONE_BLOCK_ID};
+use wrongodb::{BlockFile, InternalPage, ReadVisibility, NONE_BLOCK_ID, TXN_NONE};
 
 use super::{create_tree, open_tree};
 
@@ -40,7 +40,7 @@ fn grows_tree_height_past_two_levels_and_survives_reopen() {
 
     for i in 0..800u32 {
         let k = format!("k{i:04}").into_bytes();
-        let got = tree.get(&k).unwrap().unwrap();
+        let got = tree.get(&k, &ReadVisibility::from_txn_id(TXN_NONE)).unwrap().unwrap();
         assert_eq!(got, vec![b'v'; 24]);
     }
 
@@ -54,7 +54,7 @@ fn grows_tree_height_past_two_levels_and_survives_reopen() {
     let mut tree2 = open_tree(&path).unwrap();
     for i in 0..800u32 {
         let k = format!("k{i:04}").into_bytes();
-        assert!(tree2.get(&k).unwrap().is_some());
+        assert!(tree2.get(&k, &ReadVisibility::from_txn_id(TXN_NONE)).unwrap().is_some());
     }
     assert!(internal_levels(&path) >= 2);
 }

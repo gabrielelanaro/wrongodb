@@ -7,8 +7,8 @@ use crate::core::errors::WrongoDBError;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::mvcc::{MvccState, ReconcileStats};
 use crate::txn::{
-    GlobalTxnState, Timestamp, Transaction, TxnId, Update, UpdateType, TS_MAX, TS_NONE,
-    TXN_ABORTED, TXN_NONE,
+    GlobalTxnState, ReadVisibility, Timestamp, Transaction, TxnId, Update, UpdateType, TS_MAX,
+    TXN_NONE,
 };
 
 #[derive(Debug)]
@@ -100,33 +100,29 @@ impl TransactionManager {
         store_name: &str,
         btree: &mut BTreeCursor,
         key: &[u8],
-        txn_id: TxnId,
+        visibility: &ReadVisibility,
     ) -> Result<Option<Vec<u8>>, WrongoDBError> {
         {
             let stores = self.stores.read();
             if let Some(state) = stores.get(store_name) {
                 if let Some(chain) = state.chain(key) {
                     for update in chain.iter() {
-                        let is_aborted = update.time_window.stop_txn == TXN_ABORTED
-                            && update.time_window.stop_ts == TS_NONE;
-                        if is_aborted {
+                        if !visibility.can_see(update) {
                             continue;
                         }
 
-                        if update.txn_id <= txn_id {
-                            if update.type_ == UpdateType::Standard {
-                                return Ok(Some(update.data.clone()));
-                            }
-                            if update.type_ == UpdateType::Tombstone {
-                                return Ok(None);
-                            }
+                        if update.type_ == UpdateType::Standard {
+                            return Ok(Some(update.data.clone()));
+                        }
+                        if update.type_ == UpdateType::Tombstone {
+                            return Ok(None);
                         }
                     }
                 }
             }
         }
 
-        btree.get(key)
+        btree.get(key, visibility)
     }
 
     pub fn mark_updates_committed(

@@ -1,6 +1,6 @@
 use tempfile::tempdir;
 
-use wrongodb::BlockFile;
+use wrongodb::{BlockFile, ReadVisibility, TXN_NONE};
 
 use super::{create_tree, open_tree};
 
@@ -26,7 +26,10 @@ fn checkpoint_commit_selects_new_root_on_reopen() {
     assert_ne!(new_root, old_root);
 
     let mut tree2 = open_tree(&path).unwrap();
-    assert_eq!(tree2.get(b"alpha").unwrap(), Some(b"value".to_vec()));
+    assert_eq!(
+        tree2.get(b"alpha", &ReadVisibility::from_txn_id(TXN_NONE)).unwrap(),
+        Some(b"value".to_vec())
+    );
 }
 
 #[test]
@@ -50,7 +53,7 @@ fn crash_before_checkpoint_uses_old_root() {
     assert_eq!(reopened_root, stable_root);
 
     let mut tree2 = open_tree(&path).unwrap();
-    assert_eq!(tree2.get(b"beta").unwrap(), None);
+    assert_eq!(tree2.get(b"beta", &ReadVisibility::from_txn_id(TXN_NONE)).unwrap(), None);
 }
 
 #[test]
@@ -147,14 +150,21 @@ fn checkpoint_then_crash_recovers_new_root() {
         let key = format!("key{}", i);
         let value = format!("value{}", i);
         assert_eq!(
-            tree2.get(key.as_bytes()).unwrap(),
+            tree2
+                .get(key.as_bytes(), &ReadVisibility::from_txn_id(TXN_NONE))
+                .unwrap(),
             Some(value.as_bytes().to_vec())
         );
     }
     // Records 10-19 should be lost
     for i in 10..20 {
         let key = format!("key{}", i);
-        assert_eq!(tree2.get(key.as_bytes()).unwrap(), None);
+        assert_eq!(
+            tree2
+                .get(key.as_bytes(), &ReadVisibility::from_txn_id(TXN_NONE))
+                .unwrap(),
+            None
+        );
     }
 }
 
@@ -201,7 +211,16 @@ fn dirty_pages_flushed_on_checkpoint() {
 
     // Reopen and verify all data is durable
     let mut tree2 = open_tree(&path).unwrap();
-    assert_eq!(tree2.get(b"key1").unwrap(), Some(b"value1".to_vec()));
-    assert_eq!(tree2.get(b"key2").unwrap(), Some(b"value2".to_vec()));
-    assert_eq!(tree2.get(b"key3").unwrap(), Some(b"value3".to_vec()));
+    assert_eq!(
+        tree2.get(b"key1", &ReadVisibility::from_txn_id(TXN_NONE)).unwrap(),
+        Some(b"value1".to_vec())
+    );
+    assert_eq!(
+        tree2.get(b"key2", &ReadVisibility::from_txn_id(TXN_NONE)).unwrap(),
+        Some(b"value2".to_vec())
+    );
+    assert_eq!(
+        tree2.get(b"key3", &ReadVisibility::from_txn_id(TXN_NONE)).unwrap(),
+        Some(b"value3".to_vec())
+    );
 }

@@ -7,6 +7,7 @@ use super::search::search_leaf;
 // Public Functions
 // ============================================================================
 
+#[cfg(test)]
 pub(super) fn get(page: &Page, key: &[u8]) -> Result<Option<Vec<u8>>, LeafPageError> {
     let leaf = LeafPage::open(page)?;
     let position = search_leaf(&leaf, key)?;

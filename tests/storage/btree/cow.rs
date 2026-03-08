@@ -1,6 +1,6 @@
 use tempfile::tempdir;
 
-use wrongodb::{BlockFile, LeafPage};
+use wrongodb::{BlockFile, LeafPage, ReadVisibility, TXN_NONE};
 
 use super::create_tree;
 
@@ -18,7 +18,10 @@ fn cow_put_preserves_old_root_leaf() {
     let key = b"alpha";
     let value = b"value";
     tree.put(key, value).unwrap();
-    assert_eq!(tree.get(key).unwrap().unwrap(), value);
+    assert_eq!(
+        tree.get(key, &ReadVisibility::from_txn_id(TXN_NONE)).unwrap().unwrap(),
+        value
+    );
 
     let mut bf_before = BlockFile::open(&path).unwrap();
     let mut old_payload = bf_before.read_block(old_root, true).unwrap();

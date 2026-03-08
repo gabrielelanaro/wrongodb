@@ -1,6 +1,6 @@
 use tempfile::tempdir;
 
-use wrongodb::{BlockFile, InternalPage};
+use wrongodb::{BlockFile, InternalPage, ReadVisibility, TXN_NONE};
 
 use super::{create_tree, open_tree};
 
@@ -19,7 +19,7 @@ fn splits_root_leaf_into_internal_root() {
 
     for i in 0..20u32 {
         let k = format!("k{i:04}").into_bytes();
-        let got = tree.get(&k).unwrap().unwrap();
+        let got = tree.get(&k, &ReadVisibility::from_txn_id(TXN_NONE)).unwrap().unwrap();
         assert_eq!(got, vec![b'v'; 24]);
     }
 
@@ -37,7 +37,7 @@ fn splits_root_leaf_into_internal_root() {
     let mut tree2 = open_tree(&path).unwrap();
     for i in 0..20u32 {
         let k = format!("k{i:04}").into_bytes();
-        assert!(tree2.get(&k).unwrap().is_some());
+        assert!(tree2.get(&k, &ReadVisibility::from_txn_id(TXN_NONE)).unwrap().is_some());
     }
 }
 
@@ -56,7 +56,7 @@ fn multiple_leaf_splits_update_root_separators() {
 
     for i in 0..60u32 {
         let k = format!("k{i:04}").into_bytes();
-        let got = tree.get(&k).unwrap().unwrap();
+        let got = tree.get(&k, &ReadVisibility::from_txn_id(TXN_NONE)).unwrap().unwrap();
         assert_eq!(got, vec![b'x'; 16]);
     }
 

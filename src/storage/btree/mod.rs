@@ -1,5 +1,5 @@
-mod iter;
 mod internal_ops;
+mod iter;
 mod layout;
 mod leaf_ops;
 pub mod page;
@@ -9,17 +9,17 @@ pub use iter::BTreeRangeIter;
 
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::page_store::{Page, PageEdit, PageRead, PageStore, PageType};
+use crate::txn::{ReadVisibility, UpdateChain, UpdateType};
+use internal_ops::put_separator as put_internal_separator;
 use layout::{
     build_internal_page, internal_entries, leaf_entries, map_leaf_err, split_internal_entries,
     split_leaf_entries,
 };
-use internal_ops::put_separator as put_internal_separator;
 use leaf_ops::{
-    contains_key as leaf_contains_key, delete as delete_from_leaf_page, get as leaf_get,
-    put as put_in_leaf_page,
+    contains_key as leaf_contains_key, delete as delete_from_leaf_page, put as put_in_leaf_page,
 };
-use page::{InternalPage, LeafPageError};
-use search::child_for_key;
+use page::{InternalPage, LeafPage, LeafPageError};
+use search::{child_for_key, search_leaf};
 
 // ============================================================================
 // Type Aliases
@@ -110,7 +110,11 @@ impl BTreeCursor {
     // Public API: Read Operations
     // ------------------------------------------------------------------------
 
-    pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, WrongoDBError> {
+    pub fn get(
+        &mut self,
+        key: &[u8],
+        visibility: &ReadVisibility,
+    ) -> Result<Option<Vec<u8>>, WrongoDBError> {
         let mut node_id = self.page_store.root_page_id();
         if node_id == NONE_PAGE_ID {
             return Ok(None);
@@ -121,7 +125,10 @@ impl BTreeCursor {
             let step = {
                 let page = self.page_store.get_page(&pin);
                 match page.header().page_type {
-                    PageType::Leaf => ReadStep::Found(leaf_get(page, key).map_err(map_leaf_err)?),
+                    PageType::Leaf => ReadStep::Found(
+                        self.resolve_visible_leaf_value(page, key, visibility)
+                            .map_err(map_leaf_err)?,
+                    ),
                     PageType::Internal => {
                         let internal = InternalPage::open(page).map_err(|e| {
                             StorageError(format!("corrupt internal {node_id}: {e}"))
@@ -211,6 +218,41 @@ impl BTreeCursor {
     // ------------------------------------------------------------------------
     // Private Helpers: Delete Operations
     // ------------------------------------------------------------------------
+
+    fn resolve_visible_leaf_value(
+        &self,
+        page: &Page,
+        key: &[u8],
+        visibility: &ReadVisibility,
+    ) -> Result<Option<Vec<u8>>, LeafPageError> {
+        let leaf = LeafPage::open(page)?;
+        let position = search_leaf(&leaf, key)?;
+
+        if let Some(modify) = page.row_modify() {
+            if position.found {
+                if let Some(chain) = modify.row_updates()[position.index].as_ref() {
+                    if let Some(value) = visible_chain_value(chain, visibility) {
+                        return Ok(value);
+                    }
+                }
+            } else {
+                for insert in &modify.row_inserts()[position.index] {
+                    if insert.key() != key {
+                        continue;
+                    }
+                    if let Some(value) = visible_chain_value(insert.updates(), visibility) {
+                        return Ok(value);
+                    }
+                }
+            }
+        }
+
+        if !position.found {
+            return Ok(None);
+        }
+
+        Ok(Some(leaf.value_at(position.index)?.to_vec()))
+    }
 
     fn delete_recursive(
         &mut self,
@@ -436,6 +478,25 @@ impl BTreeCursor {
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+fn visible_chain_value(
+    chain: &UpdateChain,
+    visibility: &ReadVisibility,
+) -> Option<Option<Vec<u8>>> {
+    for update in chain.iter() {
+        if !visibility.can_see(update) {
+            continue;
+        }
+
+        return match update.type_ {
+            UpdateType::Standard => Some(Some(update.data.clone())),
+            UpdateType::Tombstone => Some(None),
+            UpdateType::Reserve => continue,
+        };
+    }
+
+    None
+}
 
 fn upsert_entry(entries: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &[u8], value: &[u8]) {
     match entries.binary_search_by(|(existing_key, _)| existing_key.as_slice().cmp(key)) {

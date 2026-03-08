@@ -1679,3 +1679,18 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
   the cursor/tree code can work with slot and insertion positions directly.
 - Reusable helper modules avoid duplicating binary-search and leaf mutation logic across the cursor,
   range iterator, and page-layout builders.
+
+## 2026-03-08: B-tree point reads consume a visibility object instead of transaction-manager state
+
+**Decision**
+- Introduce `txn::ReadVisibility` as the read-time visibility context passed into `BTreeCursor::get`.
+- Keep `TransactionManager` responsible for transaction lifecycle and update-chain bookkeeping, but
+  move point-read visibility checks into the B-tree layer.
+- Have `Table::get_version` build a `ReadVisibility` from the bound transaction id and pass it down.
+
+**Why**
+- The B-tree should resolve visibility from page-local update chains without depending directly on
+  `TransactionManager`.
+- A small visibility object preserves a clean boundary: transaction code produces read context, and
+  storage code consumes it.
+- This is the right API shape for the later move from global MVCC maps to page-owned update chains.

@@ -5,7 +5,7 @@ use crate::core::errors::StorageError;
 use crate::storage::block::file::NONE_BLOCK_ID;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::page_store::{BlockFilePageStore, Page, PageStore};
-use crate::txn::{TransactionManager, TxnId};
+use crate::txn::{ReadVisibility, TransactionManager, TxnId};
 use crate::WrongoDBError;
 
 type TableEntry = (Vec<u8>, Vec<u8>);
@@ -50,8 +50,9 @@ impl Table {
         key: &[u8],
         txn_id: TxnId,
     ) -> Result<Option<Vec<u8>>, WrongoDBError> {
+        let visibility = ReadVisibility::from_txn_id(txn_id);
         self.transaction_manager
-            .get(&self.store_name, &mut self.btree, key, txn_id)
+            .get(&self.store_name, &mut self.btree, key, &visibility)
     }
 
     pub fn contains_key(&mut self, key: &[u8], txn_id: TxnId) -> Result<bool, WrongoDBError> {
@@ -64,6 +65,7 @@ impl Table {
         end_key: Option<&[u8]>,
         txn_id: TxnId,
     ) -> Result<ScanEntries, WrongoDBError> {
+        let visibility = ReadVisibility::from_txn_id(txn_id);
         let entries = self
             .btree
             .range(start_key, end_key)
@@ -81,10 +83,12 @@ impl Table {
 
         let mut out = Vec::new();
         for key in keys {
-            if let Some(bytes) =
-                self.transaction_manager
-                    .get(&self.store_name, &mut self.btree, &key, txn_id)?
-            {
+            if let Some(bytes) = self.transaction_manager.get(
+                &self.store_name,
+                &mut self.btree,
+                &key,
+                &visibility,
+            )? {
                 out.push((key, bytes));
             }
         }
