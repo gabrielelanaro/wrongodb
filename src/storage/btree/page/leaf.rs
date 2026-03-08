@@ -355,10 +355,6 @@ impl<'a> LeafPage<'a> {
         Ok((klen, vlen))
     }
 
-    fn record_key_at(&self, index: usize) -> Result<&[u8], LeafPageError> {
-        self.key_at(index)
-    }
-
     fn find_slot(&self, key: &[u8]) -> Result<(usize, bool), LeafPageError> {
         self.validate()?;
         let slot_count = self.slot_count()?;
@@ -369,7 +365,7 @@ impl<'a> LeafPage<'a> {
         let mut hi = slot_count;
         while lo < hi {
             let mid = (lo + hi) / 2;
-            let mid_key = self.record_key_at(mid)?;
+            let mid_key = self.key_at(mid)?;
             match mid_key.cmp(key) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Equal => return Ok((mid, true)),
