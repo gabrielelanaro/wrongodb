@@ -1,14 +1,15 @@
+use super::page::Page;
+
 // ============================================================================
-// PinnedPage - Read-only pinned page handle
+// ReadPin - Read-only pin token
 // ============================================================================
 
-#[derive(Debug)]
-pub struct PinnedPage {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadPin {
     pub(crate) page_id: u64,
-    pub(crate) payload: Vec<u8>,
 }
 
-impl PinnedPage {
+impl ReadPin {
     // ------------------------------------------------------------------------
     // Public API
     // ------------------------------------------------------------------------
@@ -16,28 +17,20 @@ impl PinnedPage {
     pub fn page_id(&self) -> u64 {
         self.page_id
     }
-
-    pub fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-
-    pub fn payload_mut(&mut self) -> &mut [u8] {
-        &mut self.payload
-    }
 }
 
 // ============================================================================
-// PinnedPageMut - Mutable pinned page handle (copy-on-write)
+// PageEdit - Owned mutable page edit (copy-on-write)
 // ============================================================================
 
 #[derive(Debug)]
-pub struct PinnedPageMut {
+pub struct PageEdit {
     pub(crate) page_id: u64,
-    pub(crate) payload: Vec<u8>,
     pub(crate) original_page_id: Option<u64>,
+    pub(crate) page: Page,
 }
 
-impl PinnedPageMut {
+impl PageEdit {
     // ------------------------------------------------------------------------
     // Public API
     // ------------------------------------------------------------------------
@@ -46,11 +39,16 @@ impl PinnedPageMut {
         self.page_id
     }
 
-    pub fn payload(&self) -> &[u8] {
-        &self.payload
+    #[allow(dead_code)]
+    pub fn original_page_id(&self) -> Option<u64> {
+        self.original_page_id
     }
 
-    pub fn payload_mut(&mut self) -> &mut [u8] {
-        &mut self.payload
+    pub fn page(&self) -> &Page {
+        &self.page
+    }
+
+    pub fn page_mut(&mut self) -> &mut Page {
+        &mut self.page
     }
 }

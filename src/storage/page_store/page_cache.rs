@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use crate::core::errors::{StorageError, WrongoDBError};
 
+use super::page::Page;
+use super::types::ReadPin;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -32,7 +35,7 @@ impl Default for PageCacheConfig {
 #[derive(Debug)]
 pub(crate) struct PageCacheEntry {
     pub page_id: u64,
-    pub payload: Vec<u8>,
+    pub page: Page,
     pub dirty: bool,
     pub pin_count: u32,
     pub last_access: u64,
@@ -43,10 +46,10 @@ impl PageCacheEntry {
     // Constructors
     // ------------------------------------------------------------------------
 
-    pub fn new(page_id: u64, payload: Vec<u8>) -> Self {
+    pub fn new(page_id: u64, page: Page) -> Self {
         Self {
             page_id,
-            payload,
+            page,
             dirty: false,
             pin_count: 0,
             last_access: 0,
@@ -98,10 +101,6 @@ impl PageCache {
         self.entries.contains_key(&page_id)
     }
 
-    pub fn get(&self, page_id: u64) -> Option<&PageCacheEntry> {
-        self.entries.get(&page_id)
-    }
-
     pub fn get_mut(&mut self, page_id: u64) -> Option<&mut PageCacheEntry> {
         let access = self.next_access();
         let entry = self.entries.get_mut(&page_id)?;
@@ -109,12 +108,21 @@ impl PageCache {
         Some(entry)
     }
 
+    pub fn get_page(&self, page_id: u64) -> &Page {
+        let entry = self
+            .entries
+            .get(&page_id)
+            .expect("pinned page must exist in cache");
+        debug_assert!(entry.pin_count > 0, "page {} must be pinned", page_id);
+        &entry.page
+    }
+
     // ------------------------------------------------------------------------
     // Public API - Modification Operations
     // ------------------------------------------------------------------------
 
-    pub fn insert(&mut self, page_id: u64, payload: Vec<u8>) -> &mut PageCacheEntry {
-        let mut entry = PageCacheEntry::new(page_id, payload);
+    pub fn insert(&mut self, page_id: u64, page: Page) -> &mut PageCacheEntry {
+        let mut entry = PageCacheEntry::new(page_id, page);
         entry.last_access = self.next_access();
         self.entries.insert(page_id, entry);
         self.entries
@@ -189,45 +197,41 @@ impl PageCache {
         &mut self,
         page_id: u64,
         mut read_fn: F,
-    ) -> Result<Vec<u8>, WrongoDBError>
+    ) -> Result<ReadPin, WrongoDBError>
     where
         F: FnMut(u64) -> Result<Vec<u8>, WrongoDBError>,
     {
         if self.contains(page_id) {
             self.pin(page_id)?;
-            let payload = self
-                .get(page_id)
-                .expect("page cache entry just pinned")
-                .payload
-                .clone();
-            return Ok(payload);
+            return Ok(ReadPin { page_id });
         }
 
         let payload = read_fn(page_id)?;
-        let entry = self.insert(page_id, payload.clone());
+        let page = Page::from_bytes(payload)
+            .map_err(|e| StorageError(format!("corrupt page {page_id}: {e}")))?;
+        let entry = self.insert(page_id, page);
         entry.pin_count = 1;
-        Ok(payload)
+        Ok(ReadPin { page_id })
     }
 
-    /// Load payload for CoW without pinning.
-    pub fn load_cow_payload<F>(
-        &mut self,
-        page_id: u64,
-        mut read_fn: F,
-    ) -> Result<Vec<u8>, WrongoDBError>
+    /// Load page for CoW without pinning.
+    pub fn load_cow_page<F>(&mut self, page_id: u64, mut read_fn: F) -> Result<Page, WrongoDBError>
     where
         F: FnMut(u64) -> Result<Vec<u8>, WrongoDBError>,
     {
         if let Some(entry) = self.get_mut(page_id) {
-            return Ok(entry.payload.clone());
+            return Ok(entry.page.clone());
         }
-        read_fn(page_id)
+
+        let payload = read_fn(page_id)?;
+        Page::from_bytes(payload)
+            .map_err(|e| StorageError(format!("corrupt page {page_id}: {e}")).into())
     }
 
     /// Evict LRU entry if cache is at capacity.
     pub fn evict_if_full<F>(&mut self, mut write_fn: F) -> Result<(), WrongoDBError>
     where
-        F: FnMut(u64, &[u8]) -> Result<(), WrongoDBError>,
+        F: FnMut(u64, &Page) -> Result<(), WrongoDBError>,
     {
         if !self.is_full() {
             return Ok(());
@@ -237,7 +241,7 @@ impl PageCache {
             None => return Ok(()),
         };
         if entry.dirty {
-            if let Err(err) = write_fn(entry.page_id, &entry.payload) {
+            if let Err(err) = write_fn(entry.page_id, &entry.page) {
                 self.entries.insert(entry.page_id, entry);
                 return Err(err);
             }
@@ -248,7 +252,7 @@ impl PageCache {
     /// Flush all dirty pages to storage.
     pub fn flush<F>(&mut self, mut write_fn: F) -> Result<(), WrongoDBError>
     where
-        F: FnMut(u64, &[u8]) -> Result<(), WrongoDBError>,
+        F: FnMut(u64, &Page) -> Result<(), WrongoDBError>,
     {
         for entry in self.entries.values_mut() {
             if !entry.dirty {
@@ -261,7 +265,7 @@ impl PageCache {
                 ))
                 .into());
             }
-            write_fn(entry.page_id, &entry.payload)?;
+            write_fn(entry.page_id, &entry.page)?;
             entry.dirty = false;
         }
         Ok(())
@@ -284,9 +288,9 @@ mod tests {
     #[test]
     fn lru_skips_pinned_pages() {
         let mut cache = PageCache::new(PageCacheConfig { capacity_pages: 3 });
-        cache.insert(1, vec![1]);
-        cache.insert(2, vec![2]);
-        cache.insert(3, vec![3]);
+        cache.insert(1, Page::new_leaf(64).unwrap());
+        cache.insert(2, Page::new_leaf(64).unwrap());
+        cache.insert(3, Page::new_leaf(64).unwrap());
 
         cache.get_mut(2).unwrap().pin_count = 1;
         cache.get_mut(1);
@@ -298,8 +302,8 @@ mod tests {
     #[test]
     fn evict_lru_errors_when_all_pinned() {
         let mut cache = PageCache::new(PageCacheConfig { capacity_pages: 2 });
-        cache.insert(1, vec![1]).pin_count = 1;
-        cache.insert(2, vec![2]).pin_count = 1;
+        cache.insert(1, Page::new_leaf(64).unwrap()).pin_count = 1;
+        cache.insert(2, Page::new_leaf(64).unwrap()).pin_count = 1;
 
         let err = cache.evict_lru().unwrap_err();
         assert!(matches!(err, WrongoDBError::Storage(_)));

@@ -1,18 +1,20 @@
 use crate::core::errors::WrongoDBError;
 
-use super::types::{PinnedPage, PinnedPageMut};
+use super::page::Page;
+use super::types::{PageEdit, ReadPin};
 
 pub trait PageRead: std::fmt::Debug + Send + Sync {
     fn page_payload_len(&self) -> usize;
-    fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError>;
-    fn unpin_page(&mut self, page_id: u64);
+    fn pin_page(&mut self, page_id: u64) -> Result<ReadPin, WrongoDBError>;
+    fn get_page(&self, pin: &ReadPin) -> &Page;
+    fn unpin_page(&mut self, pin: ReadPin);
 }
 
 pub trait PageWrite: std::fmt::Debug + Send + Sync {
-    fn pin_page_mut(&mut self, page_id: u64) -> Result<PinnedPageMut, WrongoDBError>;
-    fn unpin_page_mut_commit(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError>;
-    fn unpin_page_mut_abort(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError>;
-    fn write_new_page(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError>;
+    fn pin_page_mut(&mut self, page_id: u64) -> Result<PageEdit, WrongoDBError>;
+    fn commit_page_edit(&mut self, edit: PageEdit) -> Result<u64, WrongoDBError>;
+    fn abort_page_edit(&mut self, edit: PageEdit) -> Result<(), WrongoDBError>;
+    fn write_new_page(&mut self, page: Page) -> Result<u64, WrongoDBError>;
 }
 
 pub trait RootStore: std::fmt::Debug + Send + Sync {
