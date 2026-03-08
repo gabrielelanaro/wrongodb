@@ -6,9 +6,7 @@ use crate::storage::block::file::NONE_BLOCK_ID;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::mvcc::ReconcileStats;
 use crate::storage::page_store::{BlockFilePageStore, Page, PageStore};
-use crate::txn::{
-    ReadVisibility, Transaction, TransactionManager, TxnId, TxnOp, WriteContext, TXN_NONE,
-};
+use crate::txn::{ReadVisibility, Transaction, TransactionManager, TxnId, TxnOp, WriteContext};
 use crate::WrongoDBError;
 
 type TableEntry = (Vec<u8>, Vec<u8>);
@@ -75,36 +73,31 @@ impl Table {
     // Write Operations
     // ------------------------------------------------------------------------
 
-    pub fn local_apply_put_with_txn(
+    pub fn local_apply_put_autocommit(
         &mut self,
         key: &[u8],
         value: &[u8],
-        txn_id: crate::txn::TxnId,
     ) -> Result<(), WrongoDBError> {
-        if txn_id != TXN_NONE {
-            return Err(StorageError(
-                "transactional local_apply_put_with_txn requires a live Transaction".into(),
-            )
-            .into());
+        let mut txn = self.transaction_manager.begin_snapshot_txn();
+        if let Err(err) = self.local_apply_put_in_txn(key, value, &mut txn) {
+            let _ = self.transaction_manager.abort_txn_state(&mut txn);
+            return Err(err);
         }
-
-        self.btree
-            .put(key, value, &WriteContext::from_txn_id(txn_id))
+        self.transaction_manager.commit_txn_state(&mut txn)?;
+        Ok(())
     }
 
-    pub fn local_apply_delete_with_txn(
-        &mut self,
-        key: &[u8],
-        txn_id: crate::txn::TxnId,
-    ) -> Result<bool, WrongoDBError> {
-        if txn_id != TXN_NONE {
-            return Err(StorageError(
-                "transactional local_apply_delete_with_txn requires a live Transaction".into(),
-            )
-            .into());
-        }
-
-        self.btree.delete(key, &WriteContext::from_txn_id(txn_id))
+    pub fn local_apply_delete_autocommit(&mut self, key: &[u8]) -> Result<bool, WrongoDBError> {
+        let mut txn = self.transaction_manager.begin_snapshot_txn();
+        let deleted = match self.local_apply_delete_in_txn(key, &mut txn) {
+            Ok(deleted) => deleted,
+            Err(err) => {
+                let _ = self.transaction_manager.abort_txn_state(&mut txn);
+                return Err(err);
+            }
+        };
+        self.transaction_manager.commit_txn_state(&mut txn)?;
+        Ok(deleted)
     }
 
     pub fn local_apply_put_in_txn(
@@ -204,14 +197,12 @@ mod tests {
     fn local_apply_writes_do_not_depend_on_hooks() {
         let (_tmp, _transaction_manager, mut table) = open_table("table.idx.wt");
 
-        table
-            .local_apply_put_with_txn(b"k1", b"v1", TXN_NONE)
-            .unwrap();
+        table.local_apply_put_autocommit(b"k1", b"v1").unwrap();
         assert_eq!(
             table.get_version(b"k1", TXN_NONE).unwrap(),
             Some(b"v1".to_vec())
         );
-        let deleted = table.local_apply_delete_with_txn(b"k1", TXN_NONE).unwrap();
+        let deleted = table.local_apply_delete_autocommit(b"k1").unwrap();
         assert!(deleted);
         assert_eq!(table.get_version(b"k1", TXN_NONE).unwrap(), None);
     }
@@ -226,7 +217,10 @@ mod tests {
             .unwrap();
         transaction_manager.commit_txn_state(&mut txn).unwrap();
 
-        assert_eq!(table.get_version(b"k1", TXN_NONE).unwrap(), None);
+        assert_eq!(
+            table.get_version(b"k1", TXN_NONE).unwrap(),
+            Some(b"v1".to_vec())
+        );
 
         let stats = table.reconcile_for_checkpoint().unwrap();
         assert_eq!(
@@ -308,9 +302,7 @@ mod tests {
     fn reconcile_materializes_deletes_and_drops_tombstone_chains() {
         let (_tmp, transaction_manager, mut table) = open_table("table.idx.wt");
 
-        table
-            .local_apply_put_with_txn(b"k1", b"v1", TXN_NONE)
-            .unwrap();
+        table.local_apply_put_autocommit(b"k1", b"v1").unwrap();
 
         let mut txn = transaction_manager.begin_snapshot_txn();
         let deleted = table.local_apply_delete_in_txn(b"k1", &mut txn).unwrap();
@@ -322,7 +314,7 @@ mod tests {
             stats,
             ReconcileStats {
                 materialized_entries: 1,
-                obsolete_updates_removed: 0,
+                obsolete_updates_removed: 1,
                 chains_dropped: 1,
             }
         );
@@ -333,12 +325,8 @@ mod tests {
     fn scan_range_merges_page_local_inserts_and_slot_updates() {
         let (_tmp, transaction_manager, mut table) = open_table("table.idx.wt");
 
-        table
-            .local_apply_put_with_txn(b"k1", b"v1", TXN_NONE)
-            .unwrap();
-        table
-            .local_apply_put_with_txn(b"k3", b"v3", TXN_NONE)
-            .unwrap();
+        table.local_apply_put_autocommit(b"k1", b"v1").unwrap();
+        table.local_apply_put_autocommit(b"k3", b"v3").unwrap();
 
         let mut txn = transaction_manager.begin_snapshot_txn();
         table
@@ -363,12 +351,8 @@ mod tests {
     fn scan_range_skips_page_local_tombstones() {
         let (_tmp, transaction_manager, mut table) = open_table("table.idx.wt");
 
-        table
-            .local_apply_put_with_txn(b"k1", b"v1", TXN_NONE)
-            .unwrap();
-        table
-            .local_apply_put_with_txn(b"k2", b"v2", TXN_NONE)
-            .unwrap();
+        table.local_apply_put_autocommit(b"k1", b"v1").unwrap();
+        table.local_apply_put_autocommit(b"k2", b"v2").unwrap();
 
         let mut txn = transaction_manager.begin_snapshot_txn();
         let deleted = table.local_apply_delete_in_txn(b"k1", &mut txn).unwrap();

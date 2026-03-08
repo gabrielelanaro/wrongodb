@@ -4,7 +4,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::core::errors::{DocumentValidationError, StorageError};
 use crate::storage::table::Table;
-use crate::txn::{RecoveryUnit, Transaction, TxnId, TXN_NONE};
+use crate::txn::{RecoveryUnit, Transaction, TxnId};
 use crate::WrongoDBError;
 
 /// A single key/value entry returned by [`Cursor::next`].
@@ -114,7 +114,7 @@ impl Cursor {
                 let mut txn = txn_handle.lock();
                 table.local_apply_put_in_txn(key, value, &mut txn)
             }
-            None => table.local_apply_put_with_txn(key, value, TXN_NONE),
+            None => table.local_apply_put_autocommit(key, value),
         }
     }
 
@@ -134,7 +134,7 @@ impl Cursor {
                 let mut txn = txn_handle.lock();
                 table.local_apply_delete_in_txn(key, &mut txn)
             }
-            None => table.local_apply_delete_with_txn(key, TXN_NONE),
+            None => table.local_apply_delete_autocommit(key),
         }
     }
 
@@ -358,7 +358,7 @@ mod tests {
         let (_tmp, table, store_name) = open_index_table();
         table
             .write()
-            .local_apply_put_with_txn(b"k1", b"v1", TXN_NONE)
+            .local_apply_put_autocommit(b"k1", b"v1")
             .unwrap();
         let mut cursor = Cursor::new(
             table.clone(),

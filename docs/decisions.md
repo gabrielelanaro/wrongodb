@@ -1800,3 +1800,22 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - Replay transactions need the same page-local op resolution logic as live transactions, but they
   should not distort snapshot bookkeeping such as active transaction registration or oldest-active
   calculations.
+
+## 2026-03-08: Non-transactional writes now use implicit transactions
+
+**Decision**
+- Remove the remaining `Table::local_apply_put_with_txn` / `local_apply_delete_with_txn` runtime
+  API.
+- Make non-transactional cursor writes run through short-lived implicit transactions using the same
+  page-local `TxnOp` path as explicit transactions.
+- Make durability replay apply `TXN_NONE` write operations through the same autocommit helpers
+  instead of keeping a separate txn-id-shaped fast path.
+
+**Why**
+- WT-style autocommit is still MVCC: it is an implicit one-operation transaction, not a direct
+  base-page rewrite path.
+- Removing the `*_with_txn(TXN_NONE)` shape eliminates the last public write API that suggested
+  `TXN_NONE` was a distinct MVCC/storage mode.
+- With this change, explicit transactions, implicit autocommit writes, and replayed autocommit
+  writes all converge on the same page-local update-chain model; only checkpoint/reconcile keeps
+  the internal materialization path.

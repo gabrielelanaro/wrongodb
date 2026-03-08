@@ -29,7 +29,15 @@ impl ReadVisibility {
     // ------------------------------------------------------------------------
 
     pub fn can_see(&self, update: &Update) -> bool {
-        !is_aborted(update) && update.txn_id <= self.txn_id
+        if is_aborted(update) {
+            return false;
+        }
+
+        if self.txn_id == crate::txn::TXN_NONE {
+            return update.is_committed();
+        }
+
+        update.txn_id <= self.txn_id
     }
 }
 

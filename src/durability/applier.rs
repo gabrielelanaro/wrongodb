@@ -50,9 +50,7 @@ impl StoreCommandApplier {
             } => {
                 let table = self.table_cache.get_or_open_store(&store_name)?;
                 if txn_id == TXN_NONE {
-                    table
-                        .write()
-                        .local_apply_put_with_txn(&key, &value, TXN_NONE)?;
+                    table.write().local_apply_put_autocommit(&key, &value)?;
                 } else {
                     let mut txns = self.in_flight_txns.lock();
                     let txn = txns
@@ -68,7 +66,7 @@ impl StoreCommandApplier {
             } => {
                 let table = self.table_cache.get_or_open_store(&store_name)?;
                 if txn_id == TXN_NONE {
-                    let _ = table.write().local_apply_delete_with_txn(&key, TXN_NONE)?;
+                    let _ = table.write().local_apply_delete_autocommit(&key)?;
                 } else {
                     let mut txns = self.in_flight_txns.lock();
                     let txn = txns
