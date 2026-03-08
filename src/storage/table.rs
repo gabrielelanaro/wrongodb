@@ -3,9 +3,8 @@ use std::sync::Arc;
 
 use crate::core::errors::StorageError;
 use crate::storage::block::file::NONE_BLOCK_ID;
-use crate::storage::btree::page::LeafPage;
 use crate::storage::btree::BTreeCursor;
-use crate::storage::page_store::{BlockFilePageStore, PageStore};
+use crate::storage::page_store::{BlockFilePageStore, Page, PageStore};
 use crate::txn::{TransactionManager, TxnId};
 use crate::WrongoDBError;
 
@@ -175,10 +174,9 @@ fn init_root_if_missing(page_store: &mut dyn PageStore) -> Result<(), WrongoDBEr
     }
 
     let payload_len = page_store.page_payload_len();
-    let mut leaf_bytes = vec![0u8; payload_len];
-    LeafPage::init(&mut leaf_bytes)
+    let leaf = Page::new_leaf(payload_len)
         .map_err(|e| StorageError(format!("init root leaf failed: {e}")))?;
-    let leaf_id = page_store.write_new_page(&leaf_bytes)?;
+    let leaf_id = page_store.write_new_page(leaf)?;
     page_store.set_root_page_id(leaf_id)?;
     Ok(())
 }
