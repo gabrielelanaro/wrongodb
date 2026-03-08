@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -7,20 +7,25 @@ use crate::durability::{CommittedDurableOp, DurableOp};
 use crate::raft::command::CommittedCommand;
 use crate::raft::service::CommittedCommandExecutor;
 use crate::storage::table_cache::TableCache;
-use crate::txn::{TxnId, TXN_NONE};
+use crate::txn::{Transaction, TransactionManager, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
 #[derive(Debug)]
 pub(crate) struct StoreCommandApplier {
     table_cache: Arc<TableCache>,
-    touched_stores: Mutex<HashMap<TxnId, HashSet<String>>>,
+    transaction_manager: Arc<TransactionManager>,
+    in_flight_txns: Mutex<HashMap<TxnId, Transaction>>,
 }
 
 impl StoreCommandApplier {
-    pub(crate) fn new(table_cache: Arc<TableCache>) -> Self {
+    pub(crate) fn new(
+        table_cache: Arc<TableCache>,
+        transaction_manager: Arc<TransactionManager>,
+    ) -> Self {
         Self {
             table_cache,
-            touched_stores: Mutex::new(HashMap::new()),
+            transaction_manager,
+            in_flight_txns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -44,12 +49,16 @@ impl StoreCommandApplier {
                 txn_id,
             } => {
                 let table = self.table_cache.get_or_open_store(&store_name)?;
-                table
-                    .write()
-                    .local_apply_put_with_txn(&key, &value, txn_id)?;
-                if txn_id != TXN_NONE {
-                    let mut touched = self.touched_stores.lock();
-                    touched.entry(txn_id).or_default().insert(store_name);
+                if txn_id == TXN_NONE {
+                    table
+                        .write()
+                        .local_apply_put_with_txn(&key, &value, TXN_NONE)?;
+                } else {
+                    let mut txns = self.in_flight_txns.lock();
+                    let txn = txns
+                        .entry(txn_id)
+                        .or_insert_with(|| self.transaction_manager.begin_replay_txn(txn_id));
+                    table.write().local_apply_put_in_txn(&key, &value, txn)?;
                 }
             }
             DurableOp::Delete {
@@ -58,38 +67,30 @@ impl StoreCommandApplier {
                 txn_id,
             } => {
                 let table = self.table_cache.get_or_open_store(&store_name)?;
-                let _ = table.write().local_apply_delete_with_txn(&key, txn_id)?;
-                if txn_id != TXN_NONE {
-                    let mut touched = self.touched_stores.lock();
-                    touched.entry(txn_id).or_default().insert(store_name);
+                if txn_id == TXN_NONE {
+                    let _ = table.write().local_apply_delete_with_txn(&key, TXN_NONE)?;
+                } else {
+                    let mut txns = self.in_flight_txns.lock();
+                    let txn = txns
+                        .entry(txn_id)
+                        .or_insert_with(|| self.transaction_manager.begin_replay_txn(txn_id));
+                    let _ = table.write().local_apply_delete_in_txn(&key, txn)?;
                 }
             }
             DurableOp::TxnCommit { txn_id, .. } => {
                 if txn_id == TXN_NONE {
                     return Ok(());
                 }
-                let touched = self
-                    .touched_stores
-                    .lock()
-                    .remove(&txn_id)
-                    .unwrap_or_default();
-                for store_name in touched {
-                    let table = self.table_cache.get_or_open_store(&store_name)?;
-                    table.write().local_mark_updates_committed(txn_id)?;
+                if let Some(mut txn) = self.in_flight_txns.lock().remove(&txn_id) {
+                    self.transaction_manager.commit_txn_state(&mut txn)?;
                 }
             }
             DurableOp::TxnAbort { txn_id } => {
                 if txn_id == TXN_NONE {
                     return Ok(());
                 }
-                let touched = self
-                    .touched_stores
-                    .lock()
-                    .remove(&txn_id)
-                    .unwrap_or_default();
-                for store_name in touched {
-                    let table = self.table_cache.get_or_open_store(&store_name)?;
-                    table.write().local_mark_updates_aborted(txn_id)?;
+                if let Some(mut txn) = self.in_flight_txns.lock().remove(&txn_id) {
+                    self.transaction_manager.abort_txn_state(&mut txn)?;
                 }
             }
             DurableOp::Checkpoint => {}

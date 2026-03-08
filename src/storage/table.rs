@@ -6,7 +6,9 @@ use crate::storage::block::file::NONE_BLOCK_ID;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::mvcc::ReconcileStats;
 use crate::storage::page_store::{BlockFilePageStore, Page, PageStore};
-use crate::txn::{ReadVisibility, Transaction, TransactionManager, TxnId, TxnOp, WriteContext};
+use crate::txn::{
+    ReadVisibility, Transaction, TransactionManager, TxnId, TxnOp, WriteContext, TXN_NONE,
+};
 use crate::WrongoDBError;
 
 type TableEntry = (Vec<u8>, Vec<u8>);
@@ -79,6 +81,13 @@ impl Table {
         value: &[u8],
         txn_id: crate::txn::TxnId,
     ) -> Result<(), WrongoDBError> {
+        if txn_id != TXN_NONE {
+            return Err(StorageError(
+                "transactional local_apply_put_with_txn requires a live Transaction".into(),
+            )
+            .into());
+        }
+
         self.btree
             .put(key, value, &WriteContext::from_txn_id(txn_id))
     }
@@ -88,6 +97,13 @@ impl Table {
         key: &[u8],
         txn_id: crate::txn::TxnId,
     ) -> Result<bool, WrongoDBError> {
+        if txn_id != TXN_NONE {
+            return Err(StorageError(
+                "transactional local_apply_delete_with_txn requires a live Transaction".into(),
+            )
+            .into());
+        }
+
         self.btree.delete(key, &WriteContext::from_txn_id(txn_id))
     }
 
@@ -112,24 +128,6 @@ impl Table {
         let update_ref = self.btree.delete_with_update_ref(key, &write_context)?;
         txn.record_op(TxnOp::PageUpdate(update_ref));
         Ok(true)
-    }
-
-    // ------------------------------------------------------------------------
-    // Transaction Lifecycle
-    // ------------------------------------------------------------------------
-
-    pub fn local_mark_updates_committed(
-        &mut self,
-        txn_id: crate::txn::TxnId,
-    ) -> Result<(), WrongoDBError> {
-        self.btree.mark_updates_committed(txn_id)
-    }
-
-    pub fn local_mark_updates_aborted(
-        &mut self,
-        txn_id: crate::txn::TxnId,
-    ) -> Result<(), WrongoDBError> {
-        self.btree.mark_updates_aborted(txn_id)
     }
 
     // ------------------------------------------------------------------------
@@ -223,11 +221,9 @@ mod tests {
         let (_tmp, transaction_manager, mut table) = open_table("table.idx.wt");
 
         let mut txn = transaction_manager.begin_snapshot_txn();
-        let txn_id = txn.id();
         table
-            .local_apply_put_with_txn(b"k1", b"v1", txn_id)
+            .local_apply_put_in_txn(b"k1", b"v1", &mut txn)
             .unwrap();
-        table.local_mark_updates_committed(txn_id).unwrap();
         transaction_manager.commit_txn_state(&mut txn).unwrap();
 
         assert_eq!(table.get_version(b"k1", TXN_NONE).unwrap(), None);
@@ -255,11 +251,9 @@ mod tests {
         let (_tmp, transaction_manager, mut table) = open_table("table.idx.wt");
 
         let mut first_writer = transaction_manager.begin_snapshot_txn();
-        let first_writer_id = first_writer.id();
         table
-            .local_apply_put_with_txn(b"k1", b"v1", first_writer_id)
+            .local_apply_put_in_txn(b"k1", b"v1", &mut first_writer)
             .unwrap();
-        table.local_mark_updates_committed(first_writer_id).unwrap();
         transaction_manager
             .commit_txn_state(&mut first_writer)
             .unwrap();
@@ -268,12 +262,8 @@ mod tests {
         let reader_id = reader.id();
 
         let mut second_writer = transaction_manager.begin_snapshot_txn();
-        let second_writer_id = second_writer.id();
         table
-            .local_apply_put_with_txn(b"k1", b"v2", second_writer_id)
-            .unwrap();
-        table
-            .local_mark_updates_committed(second_writer_id)
+            .local_apply_put_in_txn(b"k1", b"v2", &mut second_writer)
             .unwrap();
         transaction_manager
             .commit_txn_state(&mut second_writer)
@@ -323,10 +313,8 @@ mod tests {
             .unwrap();
 
         let mut txn = transaction_manager.begin_snapshot_txn();
-        let txn_id = txn.id();
-        let deleted = table.local_apply_delete_with_txn(b"k1", txn_id).unwrap();
+        let deleted = table.local_apply_delete_in_txn(b"k1", &mut txn).unwrap();
         assert!(deleted);
-        table.local_mark_updates_committed(txn_id).unwrap();
         transaction_manager.commit_txn_state(&mut txn).unwrap();
 
         let stats = table.reconcile_for_checkpoint().unwrap();

@@ -5,6 +5,12 @@ use crate::txn::update::{Update, UpdateRef};
 use crate::txn::{Timestamp, TxnId, TXN_NONE};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum TransactionKind {
+    Snapshot,
+    Replay,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum TxnState {
     Active,
     Committed { commit_ts: Timestamp },
@@ -24,6 +30,7 @@ pub struct Transaction {
     snapshot: Option<Snapshot>,
     #[cfg_attr(not(test), allow(dead_code))]
     read_ts: Option<Timestamp>,
+    kind: TransactionKind,
     state: TxnState,
     ops: Vec<TxnOp>,
 }
@@ -34,6 +41,18 @@ impl Transaction {
             id,
             snapshot: Some(snapshot),
             read_ts: None,
+            kind: TransactionKind::Snapshot,
+            state: TxnState::Active,
+            ops: Vec::new(),
+        }
+    }
+
+    pub(crate) fn replay(id: TxnId) -> Self {
+        Self {
+            id,
+            snapshot: None,
+            read_ts: None,
+            kind: TransactionKind::Replay,
             state: TxnState::Active,
             ops: Vec::new(),
         }
@@ -49,14 +68,11 @@ impl Transaction {
     pub fn commit(&mut self, global: &GlobalTxnState) -> Result<Timestamp, WrongoDBError> {
         match self.state {
             TxnState::Active => {
-                // For Phase 2, we use a simple timestamp based on the current txn_id
-                // In a full implementation, this would use a global timestamp oracle
                 let commit_ts = self.id;
 
                 self.state = TxnState::Committed { commit_ts };
 
-                // Unregister from active transactions
-                if self.id != TXN_NONE {
+                if self.kind == TransactionKind::Snapshot && self.id != TXN_NONE {
                     global.unregister_active(self.id);
                 }
 
@@ -79,8 +95,7 @@ impl Transaction {
             TxnState::Active => {
                 self.state = TxnState::Aborted;
 
-                // Mark as aborted and unregister from active transactions
-                if self.id != TXN_NONE {
+                if self.kind == TransactionKind::Snapshot && self.id != TXN_NONE {
                     global.mark_aborted(self.id);
                     global.unregister_active(self.id);
                 }
@@ -133,10 +148,27 @@ impl Transaction {
     }
 
     fn mark_ops_aborted(&mut self) {
-        for op in self.ops.drain(..) {
+        for op in self.ops.drain(..).rev() {
             match op {
-                TxnOp::PageUpdate(update_ref) => update_ref.write().mark_aborted(),
+                TxnOp::PageUpdate(update_ref) => abort_update_ref(&update_ref),
             }
         }
+    }
+}
+
+fn abort_update_ref(update_ref: &UpdateRef) {
+    let (txn_id, next) = {
+        let mut update = update_ref.write();
+        update.mark_aborted();
+        (update.txn_id, update.next.clone())
+    };
+
+    let Some(next_ref) = next else {
+        return;
+    };
+
+    let mut next = next_ref.write();
+    if next.time_window.stop_txn == txn_id && next.time_window.stop_ts == txn_id {
+        next.restore_current();
     }
 }

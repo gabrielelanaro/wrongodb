@@ -1777,3 +1777,26 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
   is to teach the B-tree how to commit/abort/reconcile page-local chains by transaction id.
 - This keeps the runtime data model coherent: page-local chains are the source of truth, and the
   transaction layer only manages transaction state.
+
+## 2026-03-08: Transactional page-local update tracking now uses live `Transaction` ops only
+
+**Decision**
+- Treat `TxnOp::PageUpdate(UpdateRef)` on the live [`Transaction`] as the only transactional
+  commit/abort bookkeeping for page-local MVCC updates.
+- Remove the temporary B-tree and table helpers that walked page-local chains by `txn_id` to mark
+  updates committed or aborted.
+- Restrict `Table::local_apply_put_with_txn` / `local_apply_delete_with_txn` to the non-transaction
+  `TXN_NONE` path; transactional callers must pass a live `Transaction` and record ops there.
+- Distinguish replay transactions from snapshot transactions so replay apply can resolve recorded
+  page-local ops without pretending those transactions were ever registered in global active-txn
+  state.
+
+**Why**
+- Once page-local updates are recorded directly on the live transaction, the old `txn_id` finalizer
+  path is redundant and semantically weaker: it reintroduces store-wide scans and bypasses the
+  transaction object that already owns commit/abort lifecycle.
+- Rejecting txn-id-only transactional table writes keeps the API honest: transactional mutation now
+  requires a real transaction boundary everywhere, including durability replay.
+- Replay transactions need the same page-local op resolution logic as live transactions, but they
+  should not distort snapshot bookkeeping such as active transaction registration or oldest-active
+  calculations.

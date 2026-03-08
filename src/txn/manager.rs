@@ -25,6 +25,10 @@ impl TransactionManager {
         self.global_txn.begin_snapshot_txn()
     }
 
+    pub(crate) fn begin_replay_txn(&self, txn_id: TxnId) -> Transaction {
+        Transaction::replay(txn_id)
+    }
+
     pub fn commit_txn_state(&self, txn: &mut Transaction) -> Result<Timestamp, WrongoDBError> {
         txn.commit(&self.global_txn)
     }

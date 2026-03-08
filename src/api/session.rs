@@ -1,6 +1,6 @@
 use std::sync::{Arc, Weak};
 
-use crate::api::cursor::{Cursor, CursorWriteAccess, StoreWriteTracker};
+use crate::api::cursor::{Cursor, CursorWriteAccess};
 use crate::core::errors::StorageError;
 use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp, WritePathMode};
 use crate::schema::SchemaCatalog;
@@ -30,7 +30,6 @@ pub struct Session {
     transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
     recovery_unit: Arc<dyn RecoveryUnit>,
-    write_tracker: StoreWriteTracker,
     active_txn: Option<ActiveWriteUnit>,
 }
 
@@ -48,7 +47,6 @@ impl Session {
             transaction_manager,
             recovery_unit,
             durability_backend,
-            write_tracker: StoreWriteTracker::new(),
             active_txn: None,
         }
     }
@@ -109,12 +107,7 @@ impl Session {
 
         let txn = self.transaction_manager.begin_snapshot_txn();
         self.recovery_unit.begin_unit_of_work()?;
-        let active_write_unit = ActiveWriteUnit::new(txn);
-        self.write_tracker.begin(
-            active_write_unit.txn_id(),
-            active_write_unit.touched_stores(),
-        );
-        self.active_txn = Some(active_write_unit);
+        self.active_txn = Some(ActiveWriteUnit::new(txn));
         Ok(WriteUnitOfWork::new(self))
     }
 
@@ -185,26 +178,8 @@ impl Session {
             bound_txn_id,
             active_txn,
             self.recovery_unit.clone(),
-            self.write_tracker.clone(),
             write_access,
         ))
-    }
-
-    fn finalize_touched_stores_locally(
-        &self,
-        touched_stores: &[String],
-        txn_id: TxnId,
-        committed: bool,
-    ) -> Result<(), WrongoDBError> {
-        for store_name in touched_stores {
-            let table = self.table_cache.get_or_open_store(store_name)?;
-            if committed {
-                table.write().local_mark_updates_committed(txn_id)?;
-            } else {
-                table.write().local_mark_updates_aborted(txn_id)?;
-            }
-        }
-        Ok(())
     }
 
     fn bound_transaction_handle(
@@ -272,11 +247,9 @@ impl<'a> WriteUnitOfWork<'a> {
     /// transaction boundary's responsibility.
     pub fn commit(mut self) -> Result<(), WrongoDBError> {
         let Some(active) = self.session.active_txn.as_ref() else {
-            self.session.write_tracker.clear();
             self.committed = true;
             return Ok(());
         };
-        let touched_stores: Vec<String> = active.touched_stores().lock().iter().cloned().collect();
         let txn_id = active.txn_id();
         let txn_handle = active.txn_handle();
 
@@ -296,13 +269,7 @@ impl<'a> WriteUnitOfWork<'a> {
         }
 
         self.session.active_txn = None;
-        self.session.write_tracker.clear();
         self.committed = true;
-
-        if self.write_path_mode == WritePathMode::LocalApply {
-            self.session
-                .finalize_touched_stores_locally(&touched_stores, txn_id, true)?;
-        }
         Ok(())
     }
 
@@ -317,11 +284,9 @@ impl<'a> WriteUnitOfWork<'a> {
     /// to the transaction boundary, not to the general session object.
     pub fn abort(mut self) -> Result<(), WrongoDBError> {
         let Some(active) = self.session.active_txn.as_ref() else {
-            self.session.write_tracker.clear();
             self.committed = true;
             return Ok(());
         };
-        let touched_stores: Vec<String> = active.touched_stores().lock().iter().cloned().collect();
         let txn_id = active.txn_id();
         let txn_handle = active.txn_handle();
 
@@ -336,13 +301,7 @@ impl<'a> WriteUnitOfWork<'a> {
         }
 
         self.session.active_txn = None;
-        self.session.write_tracker.clear();
         self.committed = true;
-
-        if self.write_path_mode == WritePathMode::LocalApply {
-            self.session
-                .finalize_touched_stores_locally(&touched_stores, txn_id, false)?;
-        }
         Ok(())
     }
 
@@ -382,8 +341,6 @@ impl<'a> Drop for WriteUnitOfWork<'a> {
         }
 
         if let Some(active) = self.session.active_txn.take() {
-            let touched_stores: Vec<String> =
-                active.touched_stores().lock().iter().cloned().collect();
             let txn_id = active.txn_id();
             let txn_handle = active.txn_handle();
             match self.write_path_mode {
@@ -396,14 +353,6 @@ impl<'a> Drop for WriteUnitOfWork<'a> {
             }
             let mut txn = txn_handle.lock();
             let _ = self.session.transaction_manager.abort_txn_state(&mut txn);
-            self.session.write_tracker.clear();
-            if self.write_path_mode == WritePathMode::LocalApply {
-                let _ =
-                    self.session
-                        .finalize_touched_stores_locally(&touched_stores, txn_id, false);
-            }
-        } else {
-            self.session.write_tracker.clear();
         }
     }
 }
@@ -570,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn local_mode_commit_finalizes_touched_stores() {
+    fn local_mode_commit_applies_page_local_updates() {
         let (mut session, write_path, query) =
             new_session_with_backend(DurabilityBackend::Disabled);
         let mut txn = session.transaction().unwrap();
@@ -585,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn local_mode_abort_discards_touched_stores() {
+    fn local_mode_abort_discards_page_local_updates() {
         let (mut session, write_path, query) =
             new_session_with_backend(DurabilityBackend::Disabled);
         let mut txn = session.transaction().unwrap();

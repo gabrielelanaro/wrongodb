@@ -338,28 +338,6 @@ impl BTreeCursor {
         Ok(update_ref)
     }
 
-    pub(crate) fn mark_updates_committed(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        let root = self.page_store.root_page_id();
-        if root == NONE_PAGE_ID {
-            return Ok(());
-        }
-
-        self.visit_leaf_updates_mut(root, &mut |page| {
-            mark_leaf_updates_committed(page, txn_id);
-        })
-    }
-
-    pub(crate) fn mark_updates_aborted(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        let root = self.page_store.root_page_id();
-        if root == NONE_PAGE_ID {
-            return Ok(());
-        }
-
-        self.visit_leaf_updates_mut(root, &mut |page| {
-            mark_leaf_updates_aborted(page, txn_id);
-        })
-    }
-
     pub(crate) fn reconcile_page_local_updates(
         &mut self,
         oldest_active_txn_id: TxnId,
@@ -485,44 +463,6 @@ impl BTreeCursor {
                 entries,
                 stats,
             )?;
-        }
-
-        Ok(())
-    }
-
-    fn visit_leaf_updates_mut(
-        &mut self,
-        node_id: u64,
-        visit: &mut dyn FnMut(&mut Page),
-    ) -> Result<(), WrongoDBError> {
-        let pin = self.page_store.pin_page(node_id)?;
-        let children = {
-            let page_type = self.page_store.get_page(&pin).header().page_type;
-            match page_type {
-                PageType::Leaf => {
-                    let page = self.page_store.get_page_mut(&pin);
-                    visit(page);
-                    Vec::new()
-                }
-                PageType::Internal => {
-                    let page = self.page_store.get_page(&pin);
-                    let internal = InternalPage::open(page)
-                        .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
-                    let mut children = Vec::with_capacity(internal.slot_count() + 1);
-                    children.push(internal.first_child());
-                    for index in 0..internal.slot_count() {
-                        children.push(internal.child_at(index).map_err(|e| {
-                            StorageError(format!("corrupt internal {node_id}: {e}"))
-                        })?);
-                    }
-                    children
-                }
-            }
-        };
-        self.page_store.unpin_page(pin);
-
-        for child_id in children {
-            self.visit_leaf_updates_mut(child_id, visit)?;
         }
 
         Ok(())
@@ -824,47 +764,6 @@ fn prepend_update(chain: &mut UpdateChain, update: Update) -> UpdateRef {
         head.write().mark_stopped(update.txn_id);
     }
     chain.prepend(update)
-}
-
-fn mark_leaf_updates_committed(page: &mut Page, txn_id: TxnId) {
-    let Some(modify) = page.row_modify_mut() else {
-        return;
-    };
-
-    for chain in modify.row_updates_mut().iter_mut().flatten() {
-        mark_chain_committed(chain, txn_id);
-    }
-
-    for bucket in modify.row_inserts_mut() {
-        for insert in bucket {
-            mark_chain_committed(insert.updates_mut(), txn_id);
-        }
-    }
-}
-
-fn mark_leaf_updates_aborted(page: &mut Page, txn_id: TxnId) {
-    let Some(modify) = page.row_modify_mut() else {
-        return;
-    };
-
-    for chain in modify.row_updates_mut().iter_mut().flatten() {
-        chain.mark_aborted(txn_id);
-    }
-
-    for bucket in modify.row_inserts_mut() {
-        for insert in bucket {
-            insert.updates_mut().mark_aborted(txn_id);
-        }
-    }
-}
-
-fn mark_chain_committed(chain: &mut UpdateChain, txn_id: TxnId) {
-    for update_ref in chain.iter() {
-        let mut update = update_ref.write();
-        if update.txn_id == txn_id {
-            update.mark_committed(txn_id);
-        }
-    }
 }
 
 fn collect_leaf_page_local_entries(

@@ -157,7 +157,10 @@ impl Connection {
             base_path.clone(),
             transaction_manager.clone(),
         ));
-        let applier = Arc::new(StoreCommandApplier::new(table_cache.clone()));
+        let applier = Arc::new(StoreCommandApplier::new(
+            table_cache.clone(),
+            transaction_manager.clone(),
+        ));
 
         if config.wal_enabled {
             RecoveryManager::new(applier.clone()).recover(&base_path)?;

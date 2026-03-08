@@ -67,7 +67,6 @@ impl Update {
 
     pub fn mark_committed(&mut self, commit_ts: Timestamp) {
         self.time_window.start_ts = commit_ts;
-        self.time_window.stop_ts = TS_MAX;
     }
 
     pub fn mark_aborted(&mut self) {
@@ -96,6 +95,11 @@ impl Update {
         self.time_window.stop_ts = stop_txn;
         self.time_window.stop_txn = stop_txn;
     }
+
+    pub fn restore_current(&mut self) {
+        self.time_window.stop_ts = TS_MAX;
+        self.time_window.stop_txn = TXN_ABORTED;
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -113,17 +117,6 @@ impl UpdateChain {
 
     pub fn head(&self) -> Option<UpdateRef> {
         self.head.clone()
-    }
-
-    pub fn mark_aborted(&mut self, txn_id: TxnId) {
-        let mut current = self.head.clone();
-        while let Some(update_ref) = current {
-            let mut update = update_ref.write();
-            if update.txn_id == txn_id {
-                update.mark_aborted();
-            }
-            current = update.next.clone();
-        }
     }
 
     /// Remove obsolete updates from the chain, keeping only visible ones.

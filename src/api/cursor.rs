@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::{Arc, Weak};
 
 use parking_lot::{Mutex, RwLock};
@@ -16,47 +15,6 @@ use crate::WrongoDBError;
 /// This type alias exists to keep that low-level API readable without
 /// introducing a heavier public wrapper type.
 pub type CursorEntry = (Vec<u8>, Vec<u8>);
-
-#[derive(Debug, Clone)]
-struct TrackedTxn {
-    txn_id: TxnId,
-    touched_stores: Arc<Mutex<HashSet<String>>>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct StoreWriteTracker {
-    active_txn: Arc<Mutex<Option<TrackedTxn>>>,
-}
-
-impl StoreWriteTracker {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn begin(&self, txn_id: TxnId, touched_stores: Arc<Mutex<HashSet<String>>>) {
-        *self.active_txn.lock() = Some(TrackedTxn {
-            txn_id,
-            touched_stores,
-        });
-    }
-
-    pub(crate) fn clear(&self) {
-        *self.active_txn.lock() = None;
-    }
-
-    fn record(&self, store_name: &str, txn_id: TxnId) {
-        if txn_id == TXN_NONE {
-            return;
-        }
-        let active = self.active_txn.lock().clone();
-        let Some(active) = active else {
-            return;
-        };
-        if active.txn_id == txn_id {
-            active.touched_stores.lock().insert(store_name.to_string());
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CursorWriteAccess {
@@ -84,7 +42,6 @@ pub struct Cursor {
     bound_txn_id: TxnId,
     active_txn: Option<Weak<Mutex<Transaction>>>,
     recovery_unit: Arc<dyn RecoveryUnit>,
-    write_tracker: StoreWriteTracker,
     write_access: CursorWriteAccess,
     buffered_entries: Vec<CursorEntry>,
     buffer_pos: usize,
@@ -100,7 +57,6 @@ impl Cursor {
         bound_txn_id: TxnId,
         active_txn: Option<Weak<Mutex<Transaction>>>,
         recovery_unit: Arc<dyn RecoveryUnit>,
-        write_tracker: StoreWriteTracker,
         write_access: CursorWriteAccess,
     ) -> Self {
         Self {
@@ -109,7 +65,6 @@ impl Cursor {
             bound_txn_id,
             active_txn,
             recovery_unit,
-            write_tracker,
             write_access,
             buffered_entries: Vec::new(),
             buffer_pos: 0,
@@ -142,7 +97,7 @@ impl Cursor {
         )))
     }
 
-    fn with_table_put(
+    fn apply_put(
         &self,
         table: &mut Table,
         key: &[u8],
@@ -159,11 +114,11 @@ impl Cursor {
                 let mut txn = txn_handle.lock();
                 table.local_apply_put_in_txn(key, value, &mut txn)
             }
-            None => table.local_apply_put_with_txn(key, value, txn_id),
+            None => table.local_apply_put_with_txn(key, value, TXN_NONE),
         }
     }
 
-    fn with_table_delete(
+    fn apply_delete(
         &self,
         table: &mut Table,
         key: &[u8],
@@ -179,7 +134,7 @@ impl Cursor {
                 let mut txn = txn_handle.lock();
                 table.local_apply_delete_in_txn(key, &mut txn)
             }
-            None => table.local_apply_delete_with_txn(key, txn_id),
+            None => table.local_apply_delete_with_txn(key, TXN_NONE),
         }
     }
 
@@ -201,9 +156,7 @@ impl Cursor {
         }
         self.recovery_unit
             .record_put(&self.store_name, key, value, txn_id)?;
-        self.with_table_put(&mut table, key, value, txn_id)?;
-        drop(table);
-        self.write_tracker.record(&self.store_name, txn_id);
+        self.apply_put(&mut table, key, value, txn_id)?;
         Ok(())
     }
 
@@ -225,9 +178,7 @@ impl Cursor {
         }
         self.recovery_unit
             .record_put(&self.store_name, key, value, txn_id)?;
-        self.with_table_put(&mut table, key, value, txn_id)?;
-        drop(table);
-        self.write_tracker.record(&self.store_name, txn_id);
+        self.apply_put(&mut table, key, value, txn_id)?;
         Ok(())
     }
 
@@ -250,14 +201,12 @@ impl Cursor {
         }
         self.recovery_unit
             .record_delete(&self.store_name, key, txn_id)?;
-        let deleted = self.with_table_delete(&mut table, key, txn_id)?;
+        let deleted = self.apply_delete(&mut table, key, txn_id)?;
         if !deleted {
             return Err(WrongoDBError::Storage(StorageError(
                 "key not found for delete".to_string(),
             )));
         }
-        drop(table);
-        self.write_tracker.record(&self.store_name, txn_id);
         Ok(())
     }
 
@@ -393,7 +342,6 @@ mod tests {
             TXN_NONE,
             None,
             Arc::new(NoopRecoveryUnit),
-            StoreWriteTracker::new(),
             CursorWriteAccess::ReadWrite,
         );
 
@@ -418,34 +366,12 @@ mod tests {
             TXN_NONE,
             None,
             Arc::new(NoopRecoveryUnit),
-            StoreWriteTracker::new(),
             CursorWriteAccess::ReadWrite,
         );
 
         cursor.delete(b"k1").unwrap();
 
         assert_eq!(table.write().get_version(b"k1", TXN_NONE).unwrap(), None);
-    }
-
-    #[test]
-    fn write_tracker_records_touched_store_for_transactional_writes() {
-        let (_tmp, table, store_name) = open_index_table();
-        let touched_stores = Arc::new(Mutex::new(HashSet::new()));
-        let write_tracker = StoreWriteTracker::new();
-        write_tracker.begin(7, touched_stores.clone());
-        let mut cursor = Cursor::new(
-            table,
-            store_name.clone(),
-            7,
-            None,
-            Arc::new(NoopRecoveryUnit),
-            write_tracker,
-            CursorWriteAccess::ReadWrite,
-        );
-
-        cursor.insert(b"k1", b"v1").unwrap();
-
-        assert!(touched_stores.lock().contains(&store_name));
     }
 
     #[test]
@@ -457,7 +383,6 @@ mod tests {
             TXN_NONE,
             None,
             Arc::new(NoopRecoveryUnit),
-            StoreWriteTracker::new(),
             CursorWriteAccess::ReadOnly,
         );
 
@@ -479,7 +404,6 @@ mod tests {
             txn_id,
             Some(Arc::downgrade(&txn_handle)),
             Arc::new(NoopRecoveryUnit),
-            StoreWriteTracker::new(),
             CursorWriteAccess::ReadWrite,
         );
 

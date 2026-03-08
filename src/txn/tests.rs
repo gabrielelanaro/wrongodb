@@ -92,3 +92,46 @@ fn transaction_abort_marks_recorded_ops_aborted() {
     let update = update_ref.read();
     assert!(update.is_aborted());
 }
+
+#[test]
+fn transaction_abort_restores_previous_current_update() {
+    let global = GlobalTxnState::new();
+    let mut txn = global.begin_snapshot_txn();
+
+    let mut chain = UpdateChain::default();
+    let base_ref = chain.prepend(Update::new(TXN_NONE, UpdateType::Standard, b"v1".to_vec()));
+    base_ref.write().mark_committed(1);
+
+    let update_ref = chain.prepend(Update::new(txn.id(), UpdateType::Standard, b"v2".to_vec()));
+    base_ref.write().mark_stopped(txn.id());
+    txn.record_op(TxnOp::PageUpdate(update_ref.clone()));
+
+    txn.abort(&global).unwrap();
+
+    assert!(update_ref.read().is_aborted());
+    assert!(base_ref.read().is_current());
+}
+
+#[test]
+fn transaction_commit_preserves_stop_metadata_on_overwritten_updates() {
+    let global = GlobalTxnState::new();
+    let mut txn = global.begin_snapshot_txn();
+
+    let mut chain = UpdateChain::default();
+    let base_ref = chain.prepend(Update::new(TXN_NONE, UpdateType::Standard, b"v1".to_vec()));
+    base_ref.write().mark_committed(1);
+
+    let update_ref = chain.prepend(Update::new(txn.id(), UpdateType::Standard, b"v2".to_vec()));
+    base_ref.write().mark_stopped(txn.id());
+    txn.record_op(TxnOp::PageUpdate(update_ref.clone()));
+
+    txn.commit(&global).unwrap();
+
+    let update = update_ref.read();
+    assert!(update.is_committed());
+    assert!(update.is_current());
+
+    let base = base_ref.read();
+    assert_eq!(base.time_window.stop_txn, txn.id());
+    assert_eq!(base.time_window.stop_ts, txn.id());
+}

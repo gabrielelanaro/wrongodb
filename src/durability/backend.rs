@@ -417,8 +417,8 @@ mod tests {
         raft_mode: RaftMode,
     ) -> DurabilityBackend {
         let txn_manager = new_txn_manager();
-        let table_cache = new_table_cache(dir, txn_manager);
-        let applier = Arc::new(StoreCommandApplier::new(table_cache));
+        let table_cache = new_table_cache(dir, txn_manager.clone());
+        let applier = Arc::new(StoreCommandApplier::new(table_cache, txn_manager));
         DurabilityBackend::open(dir.path(), wal_enabled, applier, raft_mode).unwrap()
     }
 
@@ -560,8 +560,8 @@ mod tests {
         file.sync_all().unwrap();
 
         let txn_manager = new_txn_manager();
-        let table_cache = new_table_cache(&dir, txn_manager);
-        let applier = Arc::new(StoreCommandApplier::new(table_cache));
+        let table_cache = new_table_cache(&dir, txn_manager.clone());
+        let applier = Arc::new(StoreCommandApplier::new(table_cache, txn_manager));
         let err = DurabilityBackend::open(
             dir.path(),
             true,
