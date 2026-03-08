@@ -12,17 +12,29 @@ pub(crate) struct ReconcileStats {
     pub(crate) chains_dropped: usize,
 }
 
+/// MVCC state manager for a single store.
+///
+/// Maintains update chains for each key, supporting snapshot isolation
+/// and reconciliation for checkpointing.
 #[derive(Debug)]
 pub struct MvccState {
     chains: HashMap<Vec<u8>, UpdateChain>,
 }
 
 impl MvccState {
+    // ------------------------------------------------------------------------
+    // Constructors
+    // ------------------------------------------------------------------------
+
     pub fn new() -> Self {
         Self {
             chains: HashMap::new(),
         }
     }
+
+    // ------------------------------------------------------------------------
+    // Chain Access
+    // ------------------------------------------------------------------------
 
     pub fn chain(&self, key: &[u8]) -> Option<&UpdateChain> {
         self.chains.get(key)
@@ -31,6 +43,14 @@ impl MvccState {
     pub fn chain_mut_or_create(&mut self, key: &[u8]) -> &mut UpdateChain {
         self.chains.entry(key.to_vec()).or_default()
     }
+
+    pub fn chains_mut(&mut self) -> impl Iterator<Item = &mut UpdateChain> {
+        self.chains.values_mut()
+    }
+
+    // ------------------------------------------------------------------------
+    // Checkpoint Reconciliation
+    // ------------------------------------------------------------------------
 
     pub fn reconcile_for_checkpoint(
         &mut self,
@@ -61,6 +81,10 @@ impl MvccState {
         (entries_to_materialize, stats)
     }
 
+    // ------------------------------------------------------------------------
+    // Key Range Queries
+    // ------------------------------------------------------------------------
+
     pub fn keys_in_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Vec<Vec<u8>> {
         let mut keys: Vec<Vec<u8>> = self.chains.keys().cloned().collect();
         if start.is_some() || end.is_some() {
@@ -72,9 +96,5 @@ impl MvccState {
         }
         keys.sort();
         keys
-    }
-
-    pub fn chains_mut(&mut self) -> impl Iterator<Item = &mut UpdateChain> {
-        self.chains.values_mut()
     }
 }
