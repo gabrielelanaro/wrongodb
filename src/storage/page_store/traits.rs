@@ -24,6 +24,7 @@ pub trait CheckpointStore: std::fmt::Debug + Send + Sync {
     fn checkpoint_prepare(&self) -> u64;
     fn checkpoint_flush_data(&mut self) -> Result<(), WrongoDBError>;
     fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError>;
+    /// Sync all data to disk. Only available in tests for forcing durability.
     #[allow(dead_code)]
     #[cfg(test)]
     fn sync_all(&mut self) -> Result<(), WrongoDBError>;
