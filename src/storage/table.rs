@@ -5,7 +5,7 @@ use crate::core::errors::StorageError;
 use crate::storage::block::file::NONE_BLOCK_ID;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::page_store::{BlockFilePageStore, Page, PageStore};
-use crate::txn::{ReadVisibility, TransactionManager, TxnId};
+use crate::txn::{ReadVisibility, Transaction, TransactionManager, TxnId, TxnOp, WriteContext};
 use crate::WrongoDBError;
 
 type TableEntry = (Vec<u8>, Vec<u8>);
@@ -119,6 +119,29 @@ impl Table {
             .delete(&self.store_name, &mut self.btree, key, txn_id)
     }
 
+    pub fn local_apply_put_in_txn(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        txn: &mut Transaction,
+    ) -> Result<(), WrongoDBError> {
+        let write_context = WriteContext::from_txn_id(txn.id());
+        let update_ref = self.btree.put_with_update_ref(key, value, &write_context)?;
+        txn.record_op(TxnOp::PageUpdate(update_ref));
+        Ok(())
+    }
+
+    pub fn local_apply_delete_in_txn(
+        &mut self,
+        key: &[u8],
+        txn: &mut Transaction,
+    ) -> Result<bool, WrongoDBError> {
+        let write_context = WriteContext::from_txn_id(txn.id());
+        let update_ref = self.btree.delete_with_update_ref(key, &write_context)?;
+        txn.record_op(TxnOp::PageUpdate(update_ref));
+        Ok(true)
+    }
+
     // ------------------------------------------------------------------------
     // Transaction Lifecycle
     // ------------------------------------------------------------------------
@@ -144,6 +167,8 @@ impl Table {
     // ------------------------------------------------------------------------
 
     pub fn checkpoint_store(&mut self) -> Result<(), WrongoDBError> {
+        self.btree
+            .reconcile_page_local_updates(!self.transaction_manager.has_active_transactions())?;
         let _ = self
             .transaction_manager
             .reconcile_store_for_checkpoint(&self.store_name, &mut self.btree)?;

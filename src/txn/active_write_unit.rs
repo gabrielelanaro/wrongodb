@@ -7,24 +7,24 @@ use crate::txn::Transaction;
 
 #[derive(Debug)]
 pub(crate) struct ActiveWriteUnit {
-    txn: Transaction,
+    txn: Arc<Mutex<Transaction>>,
     touched_stores: Arc<Mutex<HashSet<String>>>,
 }
 
 impl ActiveWriteUnit {
     pub(crate) fn new(txn: Transaction) -> Self {
         Self {
-            txn,
+            txn: Arc::new(Mutex::new(txn)),
             touched_stores: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
-    pub(crate) fn txn(&self) -> &Transaction {
-        &self.txn
+    pub(crate) fn txn_handle(&self) -> Arc<Mutex<Transaction>> {
+        self.txn.clone()
     }
 
-    pub(crate) fn txn_mut(&mut self) -> &mut Transaction {
-        &mut self.txn
+    pub(crate) fn txn_id(&self) -> crate::txn::TxnId {
+        self.txn.lock().id()
     }
 
     pub(crate) fn touched_stores(&self) -> Arc<Mutex<HashSet<String>>> {

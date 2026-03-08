@@ -416,6 +416,10 @@ impl Page {
         self.row_modify.as_ref()
     }
 
+    pub(crate) fn clear_row_modify(&mut self) {
+        self.row_modify = None;
+    }
+
     #[allow(dead_code)]
     pub(crate) fn ensure_row_modify(&mut self) -> Result<&mut RowModify, PageError> {
         if self.header().page_type != PageType::Leaf {

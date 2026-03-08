@@ -1,11 +1,11 @@
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use parking_lot::{Mutex, RwLock};
 
 use crate::core::errors::{DocumentValidationError, StorageError};
 use crate::storage::table::Table;
-use crate::txn::{RecoveryUnit, TxnId, TXN_NONE};
+use crate::txn::{RecoveryUnit, Transaction, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
 /// A single key/value entry returned by [`Cursor::next`].
@@ -82,6 +82,7 @@ pub struct Cursor {
     table: Arc<RwLock<Table>>,
     store_name: String,
     bound_txn_id: TxnId,
+    active_txn: Option<Weak<Mutex<Transaction>>>,
     recovery_unit: Arc<dyn RecoveryUnit>,
     write_tracker: StoreWriteTracker,
     write_access: CursorWriteAccess,
@@ -97,6 +98,7 @@ impl Cursor {
         table: Arc<RwLock<Table>>,
         store_name: String,
         bound_txn_id: TxnId,
+        active_txn: Option<Weak<Mutex<Transaction>>>,
         recovery_unit: Arc<dyn RecoveryUnit>,
         write_tracker: StoreWriteTracker,
         write_access: CursorWriteAccess,
@@ -105,6 +107,7 @@ impl Cursor {
             table,
             store_name,
             bound_txn_id,
+            active_txn,
             recovery_unit,
             write_tracker,
             write_access,
@@ -139,6 +142,47 @@ impl Cursor {
         )))
     }
 
+    fn with_table_put(
+        &self,
+        table: &mut Table,
+        key: &[u8],
+        value: &[u8],
+        txn_id: TxnId,
+    ) -> Result<(), WrongoDBError> {
+        match &self.active_txn {
+            Some(active_txn) => {
+                let txn_handle = active_txn.upgrade().ok_or_else(|| {
+                    StorageError(format!(
+                        "transaction cursor for txn {txn_id} is no longer active"
+                    ))
+                })?;
+                let mut txn = txn_handle.lock();
+                table.local_apply_put_in_txn(key, value, &mut txn)
+            }
+            None => table.local_apply_put_with_txn(key, value, txn_id),
+        }
+    }
+
+    fn with_table_delete(
+        &self,
+        table: &mut Table,
+        key: &[u8],
+        txn_id: TxnId,
+    ) -> Result<bool, WrongoDBError> {
+        match &self.active_txn {
+            Some(active_txn) => {
+                let txn_handle = active_txn.upgrade().ok_or_else(|| {
+                    StorageError(format!(
+                        "transaction cursor for txn {txn_id} is no longer active"
+                    ))
+                })?;
+                let mut txn = txn_handle.lock();
+                table.local_apply_delete_in_txn(key, &mut txn)
+            }
+            None => table.local_apply_delete_with_txn(key, txn_id),
+        }
+    }
+
     /// Insert a new key/value pair into the bound store.
     ///
     /// The cursor performs only store-local semantics here: duplicate-key
@@ -157,7 +201,7 @@ impl Cursor {
         }
         self.recovery_unit
             .record_put(&self.store_name, key, value, txn_id)?;
-        table.local_apply_put_with_txn(key, value, txn_id)?;
+        self.with_table_put(&mut table, key, value, txn_id)?;
         drop(table);
         self.write_tracker.record(&self.store_name, txn_id);
         Ok(())
@@ -181,7 +225,7 @@ impl Cursor {
         }
         self.recovery_unit
             .record_put(&self.store_name, key, value, txn_id)?;
-        table.local_apply_put_with_txn(key, value, txn_id)?;
+        self.with_table_put(&mut table, key, value, txn_id)?;
         drop(table);
         self.write_tracker.record(&self.store_name, txn_id);
         Ok(())
@@ -206,7 +250,7 @@ impl Cursor {
         }
         self.recovery_unit
             .record_delete(&self.store_name, key, txn_id)?;
-        let deleted = table.local_apply_delete_with_txn(key, txn_id)?;
+        let deleted = self.with_table_delete(&mut table, key, txn_id)?;
         if !deleted {
             return Err(WrongoDBError::Storage(StorageError(
                 "key not found for delete".to_string(),
@@ -347,6 +391,7 @@ mod tests {
             table.clone(),
             store_name,
             TXN_NONE,
+            None,
             Arc::new(NoopRecoveryUnit),
             StoreWriteTracker::new(),
             CursorWriteAccess::ReadWrite,
@@ -371,6 +416,7 @@ mod tests {
             table.clone(),
             store_name,
             TXN_NONE,
+            None,
             Arc::new(NoopRecoveryUnit),
             StoreWriteTracker::new(),
             CursorWriteAccess::ReadWrite,
@@ -391,6 +437,7 @@ mod tests {
             table,
             store_name.clone(),
             7,
+            None,
             Arc::new(NoopRecoveryUnit),
             write_tracker,
             CursorWriteAccess::ReadWrite,
@@ -408,6 +455,7 @@ mod tests {
             table,
             store_name,
             TXN_NONE,
+            None,
             Arc::new(NoopRecoveryUnit),
             StoreWriteTracker::new(),
             CursorWriteAccess::ReadOnly,
@@ -417,5 +465,27 @@ mod tests {
         assert!(err
             .to_string()
             .contains("replicated writes do not go through the low-level cursor API"));
+    }
+
+    #[test]
+    fn transaction_bound_cursor_rejects_writes_after_transaction_handle_drops() {
+        let (_tmp, table, store_name) = open_index_table();
+        let txn_manager = Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+        let txn_handle = Arc::new(Mutex::new(txn_manager.begin_snapshot_txn()));
+        let txn_id = txn_handle.lock().id();
+        let mut cursor = Cursor::new(
+            table,
+            store_name,
+            txn_id,
+            Some(Arc::downgrade(&txn_handle)),
+            Arc::new(NoopRecoveryUnit),
+            StoreWriteTracker::new(),
+            CursorWriteAccess::ReadWrite,
+        );
+
+        drop(txn_handle);
+
+        let err = cursor.insert(b"k1", b"v1").unwrap_err();
+        assert!(err.to_string().contains("transaction cursor for txn"));
     }
 }

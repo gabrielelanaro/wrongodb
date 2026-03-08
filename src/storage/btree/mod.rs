@@ -32,6 +32,7 @@ type KeyChildId = (Key, u64);
 type LeafEntries = Vec<KeyValuePair>;
 type InternalEntries = (u64, Vec<KeyChildId>);
 type KeyValueIter<'a> = BTreeRangeIter<'a>;
+type ReconcileEntries = Vec<(Vec<u8>, UpdateType, Vec<u8>)>;
 
 // ============================================================================
 // Constants
@@ -335,6 +336,40 @@ impl BTreeCursor {
         Ok(update_ref)
     }
 
+    pub(crate) fn reconcile_page_local_updates(
+        &mut self,
+        no_active_txns: bool,
+    ) -> Result<(), WrongoDBError> {
+        if !no_active_txns {
+            return Ok(());
+        }
+
+        let root = self.page_store.root_page_id();
+        if root == NONE_PAGE_ID {
+            return Ok(());
+        }
+
+        let mut entries = Vec::new();
+        self.collect_page_local_entries(root, &mut entries)?;
+
+        for (key, update_type, data) in entries {
+            match update_type {
+                UpdateType::Standard => self.materialize_put(&key, &data)?,
+                UpdateType::Tombstone => {
+                    let _ = self.materialize_delete(&key)?;
+                }
+                UpdateType::Reserve => {}
+            }
+        }
+
+        let root = self.page_store.root_page_id();
+        if root != NONE_PAGE_ID {
+            self.clear_page_local_state(root)?;
+        }
+
+        Ok(())
+    }
+
     #[allow(dead_code)]
     fn find_leaf_position(&mut self, key: &[u8]) -> Result<LeafPosition, WrongoDBError> {
         let mut node_id = self.page_store.root_page_id();
@@ -377,6 +412,113 @@ impl BTreeCursor {
                 return Ok(position);
             }
         }
+    }
+
+    fn collect_page_local_entries(
+        &mut self,
+        node_id: u64,
+        entries: &mut ReconcileEntries,
+    ) -> Result<(), WrongoDBError> {
+        let pin = self.page_store.pin_page(node_id)?;
+        let children = {
+            let page = self.page_store.get_page(&pin);
+            match page.header().page_type {
+                PageType::Leaf => {
+                    self.collect_leaf_page_local_entries(page, entries)?;
+                    Vec::new()
+                }
+                PageType::Internal => {
+                    let internal = InternalPage::open(page)
+                        .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
+                    let mut children = Vec::with_capacity(internal.slot_count() + 1);
+                    children.push(internal.first_child());
+                    for index in 0..internal.slot_count() {
+                        children.push(internal.child_at(index).map_err(|e| {
+                            StorageError(format!("corrupt internal {node_id}: {e}"))
+                        })?);
+                    }
+                    children
+                }
+            }
+        };
+        self.page_store.unpin_page(pin);
+
+        for child_id in children {
+            self.collect_page_local_entries(child_id, entries)?;
+        }
+
+        Ok(())
+    }
+
+    fn collect_leaf_page_local_entries(
+        &self,
+        page: &Page,
+        entries: &mut ReconcileEntries,
+    ) -> Result<(), WrongoDBError> {
+        let Some(modify) = page.row_modify() else {
+            return Ok(());
+        };
+
+        let leaf =
+            LeafPage::open(page).map_err(|e| StorageError(format!("corrupt leaf page: {e}")))?;
+
+        for index in 0..leaf.slot_count() {
+            let Some(chain) = modify.row_updates()[index].as_ref() else {
+                continue;
+            };
+            let Some((update_type, data)) = chain.latest_committed_entry() else {
+                continue;
+            };
+            entries.push((
+                leaf.key_at(index).map_err(map_leaf_err)?.to_vec(),
+                update_type,
+                data,
+            ));
+        }
+
+        for bucket in modify.row_inserts() {
+            for insert in bucket {
+                let Some((update_type, data)) = insert.updates().latest_committed_entry() else {
+                    continue;
+                };
+                entries.push((insert.key().to_vec(), update_type, data));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn clear_page_local_state(&mut self, node_id: u64) -> Result<(), WrongoDBError> {
+        let pin = self.page_store.pin_page(node_id)?;
+        let children = {
+            let page = self.page_store.get_page(&pin);
+            match page.header().page_type {
+                PageType::Leaf => Vec::new(),
+                PageType::Internal => {
+                    let internal = InternalPage::open(page)
+                        .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
+                    let mut children = Vec::with_capacity(internal.slot_count() + 1);
+                    children.push(internal.first_child());
+                    for index in 0..internal.slot_count() {
+                        children.push(internal.child_at(index).map_err(|e| {
+                            StorageError(format!("corrupt internal {node_id}: {e}"))
+                        })?);
+                    }
+                    children
+                }
+            }
+        };
+
+        if self.page_store.get_page(&pin).header().page_type == PageType::Leaf {
+            self.page_store.get_page_mut(&pin).clear_row_modify();
+        }
+        self.page_store.unpin_page(pin);
+
+        for child_id in children {
+            self.clear_page_local_state(child_id)?;
+        }
+
+        Ok(())
     }
 
     fn materialize_delete_recursive(

@@ -1715,3 +1715,25 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - Keeping materialization private makes the boundary clearer: `BTreeCursor` owns write policy,
   while the page store still provides the lower-level mechanisms needed by reconciliation and
   structural page rewrites.
+
+## 2026-03-08: Transaction-bound cursors carry a live transaction handle for page-local MVCC writes
+
+**Decision**
+- Make `ActiveWriteUnit` own the transaction behind `Arc<Mutex<Transaction>>`.
+- Bind transaction-scoped cursors to a `Weak<Mutex<Transaction>>` instead of only a raw `txn_id`.
+- Route session/write-unit cursor writes through `Table::local_apply_put_in_txn` /
+  `local_apply_delete_in_txn`, so the B-tree returns `UpdateRef`s and the live `Transaction`
+  records `TxnOp::PageUpdate(...)`.
+- Keep non-transactional cursors, durability appliers, and the remaining legacy paths on the old
+  transaction-manager APIs for now.
+- During checkpoint with no active transactions, sweep page-local committed updates into the base
+  tree before flushing and then clear runtime page-local modify state from the reachable tree.
+
+**Why**
+- Transaction-owned operation bookkeeping is cleaner than a manager-side `txn_id -> updates` map:
+  commit/abort already operate on the `Transaction`, so the write path should record ops there.
+- A weak transaction handle makes stale transaction-bound cursors fail cleanly after commit/abort
+  instead of continuing to write with a dead transaction id.
+- The checkpoint sweep is the minimal bridge needed to keep the new session-bound MVCC write path
+  compatible with the existing persisted base-page/checkpoint model while scans and full
+  reconciliation are still being migrated.

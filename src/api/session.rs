@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::api::cursor::{Cursor, CursorWriteAccess, StoreWriteTracker};
 use crate::core::errors::StorageError;
@@ -111,7 +111,7 @@ impl Session {
         self.recovery_unit.begin_unit_of_work()?;
         let active_write_unit = ActiveWriteUnit::new(txn);
         self.write_tracker.begin(
-            active_write_unit.txn().id(),
+            active_write_unit.txn_id(),
             active_write_unit.touched_stores(),
         );
         self.active_txn = Some(active_write_unit);
@@ -178,10 +178,12 @@ impl Session {
         write_access: CursorWriteAccess,
     ) -> Result<Cursor, WrongoDBError> {
         let table = self.table_cache.get_or_open_store(store_name)?;
+        let active_txn = self.bound_transaction_handle(bound_txn_id)?;
         Ok(Cursor::new(
             table,
             store_name.to_string(),
             bound_txn_id,
+            active_txn,
             self.recovery_unit.clone(),
             self.write_tracker.clone(),
             write_access,
@@ -203,6 +205,22 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    fn bound_transaction_handle(
+        &self,
+        bound_txn_id: TxnId,
+    ) -> Result<Option<Weak<parking_lot::Mutex<crate::txn::Transaction>>>, WrongoDBError> {
+        if bound_txn_id == TXN_NONE {
+            return Ok(None);
+        }
+
+        let active = self.active_txn.as_ref().ok_or_else(|| {
+            StorageError(format!(
+                "transaction cursor requested for txn {bound_txn_id}, but no transaction is active"
+            ))
+        })?;
+        Ok(Some(Arc::downgrade(&active.txn_handle())))
     }
 }
 
@@ -259,7 +277,8 @@ impl<'a> WriteUnitOfWork<'a> {
             return Ok(());
         };
         let touched_stores: Vec<String> = active.touched_stores().lock().iter().cloned().collect();
-        let txn_id = active.txn().id();
+        let txn_id = active.txn_id();
+        let txn_handle = active.txn_handle();
 
         match self.write_path_mode {
             WritePathMode::LocalApply => self
@@ -269,13 +288,12 @@ impl<'a> WriteUnitOfWork<'a> {
             WritePathMode::DeferredReplication => self.session.record_commit(txn_id)?,
         }
 
-        let active =
-            self.session.active_txn.as_mut().ok_or_else(|| {
-                StorageError("transaction context disappeared during commit".into())
-            })?;
-        self.session
-            .transaction_manager
-            .commit_txn_state(active.txn_mut())?;
+        {
+            let mut txn = txn_handle.lock();
+            self.session
+                .transaction_manager
+                .commit_txn_state(&mut txn)?;
+        }
 
         self.session.active_txn = None;
         self.session.write_tracker.clear();
@@ -304,20 +322,18 @@ impl<'a> WriteUnitOfWork<'a> {
             return Ok(());
         };
         let touched_stores: Vec<String> = active.touched_stores().lock().iter().cloned().collect();
-        let txn_id = active.txn().id();
+        let txn_id = active.txn_id();
+        let txn_handle = active.txn_handle();
 
         match self.write_path_mode {
             WritePathMode::LocalApply => self.session.recovery_unit.abort_unit_of_work(txn_id)?,
             WritePathMode::DeferredReplication => self.session.record_abort(txn_id)?,
         }
 
-        let active =
-            self.session.active_txn.as_mut().ok_or_else(|| {
-                StorageError("transaction context disappeared during abort".into())
-            })?;
-        self.session
-            .transaction_manager
-            .abort_txn_state(active.txn_mut())?;
+        {
+            let mut txn = txn_handle.lock();
+            self.session.transaction_manager.abort_txn_state(&mut txn)?;
+        }
 
         self.session.active_txn = None;
         self.session.write_tracker.clear();
@@ -344,8 +360,7 @@ impl<'a> WriteUnitOfWork<'a> {
             .active_txn
             .as_ref()
             .expect("transaction should exist")
-            .txn()
-            .id()
+            .txn_id()
     }
 
     pub(crate) fn open_store_cursor_by_name(
@@ -366,10 +381,11 @@ impl<'a> Drop for WriteUnitOfWork<'a> {
             return;
         }
 
-        if let Some(mut active) = self.session.active_txn.take() {
+        if let Some(active) = self.session.active_txn.take() {
             let touched_stores: Vec<String> =
                 active.touched_stores().lock().iter().cloned().collect();
-            let txn_id = active.txn().id();
+            let txn_id = active.txn_id();
+            let txn_handle = active.txn_handle();
             match self.write_path_mode {
                 WritePathMode::LocalApply => {
                     let _ = self.session.recovery_unit.abort_unit_of_work(txn_id);
@@ -378,10 +394,8 @@ impl<'a> Drop for WriteUnitOfWork<'a> {
                     let _ = self.session.record_abort(txn_id);
                 }
             }
-            let _ = self
-                .session
-                .transaction_manager
-                .abort_txn_state(active.txn_mut());
+            let mut txn = txn_handle.lock();
+            let _ = self.session.transaction_manager.abort_txn_state(&mut txn);
             self.session.write_tracker.clear();
             if self.write_path_mode == WritePathMode::LocalApply {
                 let _ =
