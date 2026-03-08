@@ -119,7 +119,7 @@ impl PageHeader {
     // Public API
     // ------------------------------------------------------------------------
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn header_size(&self) -> usize {
         match self.page_type {
             PageType::Leaf => LEAF_HEADER_SIZE,
@@ -224,7 +224,7 @@ impl Page {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn set_first_child(&mut self, first_child: u64) -> Result<(), PageError> {
         if self.header.page_type != PageType::Internal {
             return Err(PageError::Corrupt(

@@ -8,28 +8,21 @@ pub enum UpdateType {
     Reserve,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TimeWindow {
     pub start_ts: Timestamp,
-    pub durable_start_ts: Timestamp,
     pub start_txn: TxnId,
     pub stop_ts: Timestamp,
-    pub durable_stop_ts: Timestamp,
     pub stop_txn: TxnId,
-    pub prepared: bool,
 }
 
 impl TimeWindow {
     pub fn new(start_txn: TxnId) -> Self {
         Self {
             start_ts: TS_NONE,
-            durable_start_ts: TS_NONE,
             start_txn,
             stop_ts: TS_MAX,
-            durable_stop_ts: TS_MAX,
             stop_txn: TXN_ABORTED,
-            prepared: false,
         }
     }
 }

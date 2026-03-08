@@ -13,7 +13,7 @@ pub(crate) use manager::TransactionManager;
 #[allow(unused_imports)]
 pub(crate) use recovery_unit::{NoopRecoveryUnit, RecoveryUnit, WalRecoveryUnit};
 #[allow(unused_imports)]
-pub use transaction::{IsolationLevel, Transaction, TxnState};
+pub use transaction::{Transaction, TxnState};
 pub use update::{Update, UpdateChain, UpdateType};
 
 pub type TxnId = u64;

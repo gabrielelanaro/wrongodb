@@ -2,13 +2,7 @@ use crate::core::errors::WrongoDBError;
 use crate::txn::global_txn::GlobalTxnState;
 use crate::txn::snapshot::Snapshot;
 use crate::txn::update::Update;
-use crate::txn::{Timestamp, TxnId, TS_NONE, TXN_NONE};
-
-#[allow(dead_code)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum IsolationLevel {
-    Snapshot,
-}
+use crate::txn::{Timestamp, TxnId, TXN_NONE};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum TxnState {
@@ -39,16 +33,6 @@ impl Transaction {
 
     pub fn id(&self) -> TxnId {
         self.id
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn snapshot(&self) -> Option<&Snapshot> {
-        self.snapshot.as_ref()
-    }
-
-    #[allow(dead_code)]
-    pub fn state(&self) -> TxnState {
-        self.state
     }
 
     /// Commit the transaction.
@@ -102,32 +86,9 @@ impl Transaction {
         }
     }
 
-    /// Check if this transaction is committed.
-    #[allow(dead_code)]
-    pub fn is_committed(&self) -> bool {
-        matches!(self.state, TxnState::Committed { .. })
-    }
-
-    /// Check if this transaction is aborted.
-    #[allow(dead_code)]
-    pub fn is_aborted(&self) -> bool {
-        matches!(self.state, TxnState::Aborted)
-    }
-
-    #[allow(dead_code)]
-    pub fn set_read_ts(&mut self, ts: Timestamp) {
-        if ts == TS_NONE {
-            self.read_ts = None;
-        } else {
-            self.read_ts = Some(ts);
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn end(&mut self, global: &GlobalTxnState) {
-        if self.id != TXN_NONE {
-            global.unregister_active(self.id);
-        }
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn snapshot(&self) -> Option<&Snapshot> {
+        self.snapshot.as_ref()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

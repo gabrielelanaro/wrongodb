@@ -39,11 +39,6 @@ impl PageEdit {
         self.page_id
     }
 
-    #[allow(dead_code)]
-    pub fn original_page_id(&self) -> Option<u64> {
-        self.original_page_id
-    }
-
     pub fn page(&self) -> &Page {
         &self.page
     }

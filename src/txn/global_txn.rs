@@ -100,17 +100,6 @@ impl GlobalTxnState {
         guard.insert(txn_id);
     }
 
-    /// Check if a transaction is aborted
-    #[allow(dead_code)]
-    #[cfg(test)]
-    pub(crate) fn is_aborted(&self, txn_id: TxnId) -> bool {
-        let guard = self
-            .aborted_txns
-            .read()
-            .expect("aborted_txns lock poisoned");
-        guard.contains(&txn_id)
-    }
-
     pub fn take_snapshot(&self, my_txn_id: TxnId) -> Snapshot {
         let current = self.current_txn_id.load(Ordering::Acquire);
         let active_guard = self.active_txns.read().expect("active_txns lock poisoned");

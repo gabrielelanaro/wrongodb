@@ -64,9 +64,7 @@ impl Default for RaftNodeConfig {
 
 #[derive(Debug)]
 pub(crate) struct RaftNodeCore {
-    #[allow(dead_code)]
     local_node_id: String,
-    #[allow(dead_code)]
     hard_state_store: RaftHardStateStore,
     hard_state: RaftHardState,
     progress: RaftProgress,
@@ -205,7 +203,6 @@ impl RaftNodeCore {
         &self.protocol_state
     }
 
-    #[allow(dead_code)]
     pub(crate) fn role(&self) -> RaftRole {
         self.role_engine.role()
     }
@@ -301,7 +298,6 @@ impl RaftNodeCore {
         Ok(self.last_applied_protocol_index)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn applied_index(&self) -> u64 {
         self.last_applied_protocol_index
     }
@@ -318,7 +314,6 @@ impl RaftNodeCore {
         self.applied_commands.drain(..).collect()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn tick(&mut self) -> Result<Vec<RaftEffect>, WrongoDBError> {
         let previous_term = self.protocol_state.current_term;
         let previous_vote = self.protocol_state.voted_for.clone();
@@ -331,7 +326,6 @@ impl RaftNodeCore {
         Ok(effects)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn handle_request_vote_rpc(
         &mut self,
         req: RequestVoteRequest,
@@ -352,7 +346,6 @@ impl RaftNodeCore {
         Ok(response)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn handle_append_entries_rpc(
         &mut self,
         req: AppendEntriesRequest,
@@ -375,7 +368,6 @@ impl RaftNodeCore {
         Ok(response)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn handle_request_vote_response_rpc(
         &mut self,
         from: &str,
@@ -395,7 +387,6 @@ impl RaftNodeCore {
         Ok(effects)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn handle_append_entries_response_rpc(
         &mut self,
         from: &str,
