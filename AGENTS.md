@@ -43,8 +43,54 @@ Order: std imports first, then third-party crates, then local crate imports (gro
 - Custom error types for domain-specific validation: `StorageError`, `DocumentValidationError`
 
 ### Documentation
-- Use `///` for public API documentation
-- Keep docs concise; let code be self-documenting where possible
+
+#### What Gets Documented
+
+**Always document:**
+- Public structs, enums, and type aliases - explain what they represent and why
+- Public functions/methods - especially constructors and key API methods
+- Trait definitions and their purpose
+- Error types and their variants
+
+**Do NOT document:**
+- Private helper functions - let code be self-documenting
+- Simple getters/setters - `fn page_id(&self) -> u64` is obvious
+- Obvious implementation details
+- Module-level (`//!`) comments - not used in this codebase
+
+#### Docstring Format
+
+Use `///` comments with this structure:
+
+```rust
+/// [Single-line summary - what the thing is]
+///
+/// [Explanation of what it does, architectural context, design decisions]
+///
+/// [Optional: Bulleted list of key behaviors]
+/// - **Feature 1**: Description
+/// - **Feature 2**: Description
+```
+
+**Example:**
+```rust
+/// File-backed page store with copy-on-write semantics and page caching.
+///
+/// `BlockFilePageStore` sits between the B+tree layer and the block file,
+/// providing:
+///
+/// - **Page caching**: LRU cache with pin/unpin semantics
+/// - **Copy-on-write (COW)**: Modifications create new pages
+/// - **Checkpoint coordination**: Tracks working pages for flush operations
+pub struct BlockFilePageStore { ... }
+```
+
+#### Documentation Principles
+
+1. **Explain "Why", not just "What"** - Design decisions and rationale matter
+2. **Use intra-doc links** - Reference related types with [`TypeName`]
+3. **No code examples in docs** - Put examples in `tests/` directory
+4. **No boilerplate** - Don't document obvious things
 
 ### Types and structs
 - Prefer explicit field types over generics when clarity is needed

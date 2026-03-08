@@ -1,5 +1,41 @@
 # Decisions
 
+## 2026-03-08: Cache parsed page headers in the page-store and pin pages by token
+
+**Decision**
+- Store parsed in-memory `Page` objects in the page cache instead of raw `Vec<u8>` payloads.
+- Cache the fixed page header in `PageHeader`:
+  - `page_type`
+  - `flags`
+  - `slot_count`
+  - `lower`
+  - `upper`
+  - `first_child`
+- Replace read-path `PinnedPage` copies with lightweight `ReadPin` tokens plus
+  `PageRead::get_page(&ReadPin) -> &Page`.
+- Keep copy-on-write semantics on the write path, but make the owned mutable value explicit as
+  `PageEdit { page_id, original_page_id, page }`.
+- Split B-tree page wrappers into read and write forms:
+  - `LeafPage` / `LeafPageMut`
+  - `InternalPage` / `InternalPageMut`
+- Keep the on-disk page format unchanged; this refactor is purely in-memory.
+
+**Why**
+- The previous read path cloned page bytes on every pin and reparsed header fields on every page
+  access, which made the hot B-tree traversal path do avoidable work.
+- Returning direct page references from `pin_page()` would have forced the store to stay borrowed
+  across traversal and iteration, which does not fit the current trait-object based B-tree API.
+- Token-based pinning keeps eviction control explicit without fighting Rust's borrowing rules,
+  while still removing the read-path payload copy.
+- Making header mutations go through `Page` setters keeps cached header fields synchronized with
+  the backing byte image.
+
+**Notes**
+- Structural page validation still lives in the leaf/internal page wrappers; `Page::from_bytes`
+  only parses the fixed header.
+- Read paths now inspect `page.header()` directly; write paths still clone page contents only when
+  entering the copy-on-write edit flow.
+
 ## 2026-03-06: Freeze the public API around `Connection`, `Session`, `WriteUnitOfWork`, and `Cursor`
 
 **Decision**

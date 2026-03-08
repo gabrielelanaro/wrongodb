@@ -295,6 +295,62 @@ Keep related functionality together:
 
 This organization makes the file **skimmable** - readers can quickly find what they need by looking at the section headers.
 
+### Documentation Style
+
+#### What Gets Documented
+
+**Always document:**
+- Public structs, enums, and type aliases - explain what they represent and why they exist
+- Public functions/methods - especially constructors and key API methods
+- Trait definitions and their purpose
+- Error types and their variants
+
+**Do NOT document:**
+- Private helper functions - let code be self-documenting
+- Simple getters/setters - `fn page_id(&self) -> u64` is obvious
+- Obvious implementation details - trust the code
+- Module-level (`//!`) comments - not used in this codebase
+
+#### Docstring Format
+
+Use `///` comments with this structure:
+
+```rust
+/// [Single-line summary - what the thing is]
+///
+/// [One or more paragraphs explaining what it does, how it fits
+/// into the architecture, and important design decisions]
+///
+/// [Optional: Bulleted list of key behaviors or features]
+/// - **Feature 1**: Description
+/// - **Feature 2**: Description
+```
+
+**Example:**
+```rust
+/// File-backed page store with copy-on-write semantics and page caching.
+///
+/// `BlockFilePageStore` sits between the B+tree layer and the block file,
+/// providing:
+///
+/// - **Page caching**: LRU cache with pin/unpin semantics to prevent eviction
+///   of in-use pages
+/// - **Copy-on-write (COW)**: Modifications create new pages, leaving originals
+///   intact for crash recovery and checkpointing
+/// - **Checkpoint coordination**: Tracks working pages and coordinates flush
+///   operations with the block file's extent allocation
+pub struct BlockFilePageStore { ... }
+```
+
+#### Documentation Philosophy
+
+1. **Explain "Why", not just "What"** - Design decisions and rationale matter more than mechanics
+2. **Tell a story** - Docs should read like a narrative explaining how pieces fit together
+3. **Educational focus** - This is a learning-oriented codebase; explain storage engine concepts
+4. **Use intra-doc links** - Reference related types with [`TypeName`] for navigation
+5. **No code examples in docs** - Put examples in `tests/` directory instead
+6. **No boilerplate** - Don't document obvious things; respect the reader's time
+
 
 # Reference implementation
 
