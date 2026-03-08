@@ -416,6 +416,10 @@ impl Page {
         self.row_modify.as_ref()
     }
 
+    pub(crate) fn row_modify_mut(&mut self) -> Option<&mut RowModify> {
+        self.row_modify.as_mut()
+    }
+
     pub(crate) fn clear_row_modify(&mut self) {
         self.row_modify = None;
     }

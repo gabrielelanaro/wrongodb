@@ -8,8 +8,9 @@ mod search;
 pub use iter::BTreeRangeIter;
 
 use crate::core::errors::{StorageError, WrongoDBError};
+use crate::storage::mvcc::ReconcileStats;
 use crate::storage::page_store::{Page, PageEdit, PageRead, PageStore, PageType, RowInsert};
-use crate::txn::{ReadVisibility, Update, UpdateChain, UpdateRef, UpdateType, WriteContext};
+use crate::txn::{ReadVisibility, TxnId, Update, UpdateChain, UpdateRef, UpdateType, WriteContext};
 use internal_ops::put_separator as put_internal_separator;
 use layout::{
     build_internal_page, internal_entries, leaf_entries, map_leaf_err, split_internal_entries,
@@ -274,20 +275,19 @@ impl BTreeCursor {
 
         if let Some(modify) = page.row_modify() {
             if position.found {
-                if let Some(chain) = modify.row_updates()[position.index].as_ref() {
+                if let Some(chain) = modify
+                    .row_updates()
+                    .get(position.index)
+                    .and_then(|chain| chain.as_ref())
+                {
                     if let Some(value) = visible_chain_value(chain, visibility) {
                         return Ok(value);
                     }
                 }
-            } else {
-                for insert in &modify.row_inserts()[position.index] {
-                    if insert.key() != key {
-                        continue;
-                    }
-                    if let Some(value) = visible_chain_value(insert.updates(), visibility) {
-                        return Ok(value);
-                    }
-                }
+            }
+
+            if let Some(value) = find_visible_insert_value(modify.row_inserts(), key, visibility) {
+                return Ok(value);
             }
         }
 
@@ -338,21 +338,47 @@ impl BTreeCursor {
         Ok(update_ref)
     }
 
-    pub(crate) fn reconcile_page_local_updates(
-        &mut self,
-        no_active_txns: bool,
-    ) -> Result<(), WrongoDBError> {
-        if !no_active_txns {
-            return Ok(());
-        }
-
+    pub(crate) fn mark_updates_committed(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
         let root = self.page_store.root_page_id();
         if root == NONE_PAGE_ID {
             return Ok(());
         }
 
+        self.visit_leaf_updates_mut(root, &mut |page| {
+            mark_leaf_updates_committed(page, txn_id);
+        })
+    }
+
+    pub(crate) fn mark_updates_aborted(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
+        let root = self.page_store.root_page_id();
+        if root == NONE_PAGE_ID {
+            return Ok(());
+        }
+
+        self.visit_leaf_updates_mut(root, &mut |page| {
+            mark_leaf_updates_aborted(page, txn_id);
+        })
+    }
+
+    pub(crate) fn reconcile_page_local_updates(
+        &mut self,
+        oldest_active_txn_id: TxnId,
+        no_active_txns: bool,
+    ) -> Result<ReconcileStats, WrongoDBError> {
+        let root = self.page_store.root_page_id();
+        if root == NONE_PAGE_ID {
+            return Ok(ReconcileStats::default());
+        }
+
         let mut entries = Vec::new();
-        self.collect_page_local_entries(root, &mut entries)?;
+        let mut stats = ReconcileStats::default();
+        self.collect_page_local_entries(
+            root,
+            oldest_active_txn_id,
+            no_active_txns,
+            &mut entries,
+            &mut stats,
+        )?;
 
         for (key, update_type, data) in entries {
             match update_type {
@@ -364,12 +390,7 @@ impl BTreeCursor {
             }
         }
 
-        let root = self.page_store.root_page_id();
-        if root != NONE_PAGE_ID {
-            self.clear_page_local_state(root)?;
-        }
-
-        Ok(())
+        Ok(stats)
     }
 
     #[allow(dead_code)]
@@ -419,17 +440,28 @@ impl BTreeCursor {
     fn collect_page_local_entries(
         &mut self,
         node_id: u64,
+        oldest_active_txn_id: TxnId,
+        no_active_txns: bool,
         entries: &mut ReconcileEntries,
+        stats: &mut ReconcileStats,
     ) -> Result<(), WrongoDBError> {
         let pin = self.page_store.pin_page(node_id)?;
         let children = {
-            let page = self.page_store.get_page(&pin);
-            match page.header().page_type {
+            let page_type = self.page_store.get_page(&pin).header().page_type;
+            match page_type {
                 PageType::Leaf => {
-                    self.collect_leaf_page_local_entries(page, entries)?;
+                    let page = self.page_store.get_page_mut(&pin);
+                    collect_leaf_page_local_entries(
+                        page,
+                        oldest_active_txn_id,
+                        no_active_txns,
+                        entries,
+                        stats,
+                    )?;
                     Vec::new()
                 }
                 PageType::Internal => {
+                    let page = self.page_store.get_page(&pin);
                     let internal = InternalPage::open(page)
                         .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
                     let mut children = Vec::with_capacity(internal.slot_count() + 1);
@@ -446,57 +478,34 @@ impl BTreeCursor {
         self.page_store.unpin_page(pin);
 
         for child_id in children {
-            self.collect_page_local_entries(child_id, entries)?;
+            self.collect_page_local_entries(
+                child_id,
+                oldest_active_txn_id,
+                no_active_txns,
+                entries,
+                stats,
+            )?;
         }
 
         Ok(())
     }
 
-    fn collect_leaf_page_local_entries(
-        &self,
-        page: &Page,
-        entries: &mut ReconcileEntries,
+    fn visit_leaf_updates_mut(
+        &mut self,
+        node_id: u64,
+        visit: &mut dyn FnMut(&mut Page),
     ) -> Result<(), WrongoDBError> {
-        let Some(modify) = page.row_modify() else {
-            return Ok(());
-        };
-
-        let leaf =
-            LeafPage::open(page).map_err(|e| StorageError(format!("corrupt leaf page: {e}")))?;
-
-        for index in 0..leaf.slot_count() {
-            let Some(chain) = modify.row_updates()[index].as_ref() else {
-                continue;
-            };
-            let Some((update_type, data)) = chain.latest_committed_entry() else {
-                continue;
-            };
-            entries.push((
-                leaf.key_at(index).map_err(map_leaf_err)?.to_vec(),
-                update_type,
-                data,
-            ));
-        }
-
-        for bucket in modify.row_inserts() {
-            for insert in bucket {
-                let Some((update_type, data)) = insert.updates().latest_committed_entry() else {
-                    continue;
-                };
-                entries.push((insert.key().to_vec(), update_type, data));
-            }
-        }
-
-        Ok(())
-    }
-
-    fn clear_page_local_state(&mut self, node_id: u64) -> Result<(), WrongoDBError> {
         let pin = self.page_store.pin_page(node_id)?;
         let children = {
-            let page = self.page_store.get_page(&pin);
-            match page.header().page_type {
-                PageType::Leaf => Vec::new(),
+            let page_type = self.page_store.get_page(&pin).header().page_type;
+            match page_type {
+                PageType::Leaf => {
+                    let page = self.page_store.get_page_mut(&pin);
+                    visit(page);
+                    Vec::new()
+                }
                 PageType::Internal => {
+                    let page = self.page_store.get_page(&pin);
                     let internal = InternalPage::open(page)
                         .map_err(|e| StorageError(format!("corrupt internal {node_id}: {e}")))?;
                     let mut children = Vec::with_capacity(internal.slot_count() + 1);
@@ -510,14 +519,10 @@ impl BTreeCursor {
                 }
             }
         };
-
-        if self.page_store.get_page(&pin).header().page_type == PageType::Leaf {
-            self.page_store.get_page_mut(&pin).clear_row_modify();
-        }
         self.page_store.unpin_page(pin);
 
         for child_id in children {
-            self.clear_page_local_state(child_id)?;
+            self.visit_leaf_updates_mut(child_id, visit)?;
         }
 
         Ok(())
@@ -768,6 +773,25 @@ pub(super) fn visible_chain_value(
     None
 }
 
+fn find_visible_insert_value(
+    buckets: &[Vec<RowInsert>],
+    key: &[u8],
+    visibility: &ReadVisibility,
+) -> Option<Option<Vec<u8>>> {
+    for bucket in buckets {
+        for insert in bucket {
+            if insert.key() != key {
+                continue;
+            }
+            if let Some(value) = visible_chain_value(insert.updates(), visibility) {
+                return Some(value);
+            }
+        }
+    }
+
+    None
+}
+
 #[allow(dead_code)]
 fn apply_leaf_update(
     page: &mut Page,
@@ -800,6 +824,133 @@ fn prepend_update(chain: &mut UpdateChain, update: Update) -> UpdateRef {
         head.write().mark_stopped(update.txn_id);
     }
     chain.prepend(update)
+}
+
+fn mark_leaf_updates_committed(page: &mut Page, txn_id: TxnId) {
+    let Some(modify) = page.row_modify_mut() else {
+        return;
+    };
+
+    for chain in modify.row_updates_mut().iter_mut().flatten() {
+        mark_chain_committed(chain, txn_id);
+    }
+
+    for bucket in modify.row_inserts_mut() {
+        for insert in bucket {
+            mark_chain_committed(insert.updates_mut(), txn_id);
+        }
+    }
+}
+
+fn mark_leaf_updates_aborted(page: &mut Page, txn_id: TxnId) {
+    let Some(modify) = page.row_modify_mut() else {
+        return;
+    };
+
+    for chain in modify.row_updates_mut().iter_mut().flatten() {
+        chain.mark_aborted(txn_id);
+    }
+
+    for bucket in modify.row_inserts_mut() {
+        for insert in bucket {
+            insert.updates_mut().mark_aborted(txn_id);
+        }
+    }
+}
+
+fn mark_chain_committed(chain: &mut UpdateChain, txn_id: TxnId) {
+    for update_ref in chain.iter() {
+        let mut update = update_ref.write();
+        if update.txn_id == txn_id {
+            update.mark_committed(txn_id);
+        }
+    }
+}
+
+fn collect_leaf_page_local_entries(
+    page: &mut Page,
+    oldest_active_txn_id: TxnId,
+    no_active_txns: bool,
+    entries: &mut ReconcileEntries,
+    stats: &mut ReconcileStats,
+) -> Result<(), WrongoDBError> {
+    let leaf = LeafPage::open(page).map_err(|e| StorageError(format!("corrupt leaf page: {e}")))?;
+    let slot_keys = (0..leaf.slot_count())
+        .map(|index| {
+            leaf.key_at(index)
+                .map(|key| key.to_vec())
+                .map_err(map_leaf_err)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let Some(modify) = page.row_modify_mut() else {
+        return Ok(());
+    };
+
+    for (index, slot) in modify.row_updates_mut().iter_mut().enumerate() {
+        let Some(chain) = slot.as_mut() else {
+            continue;
+        };
+        record_chain_reconcile(
+            slot_keys[index].clone(),
+            chain,
+            oldest_active_txn_id,
+            no_active_txns,
+            entries,
+            stats,
+        );
+        if chain.is_empty() {
+            *slot = None;
+            stats.chains_dropped += 1;
+        }
+    }
+
+    for bucket in modify.row_inserts_mut() {
+        let mut index = 0;
+        while index < bucket.len() {
+            let key = bucket[index].key().to_vec();
+            let chain = bucket[index].updates_mut();
+            record_chain_reconcile(
+                key,
+                chain,
+                oldest_active_txn_id,
+                no_active_txns,
+                entries,
+                stats,
+            );
+            if chain.is_empty() {
+                bucket.remove(index);
+                stats.chains_dropped += 1;
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    let empty_updates = modify.row_updates().iter().all(Option::is_none);
+    let empty_inserts = modify.row_inserts().iter().all(Vec::is_empty);
+    if empty_updates && empty_inserts {
+        page.clear_row_modify();
+    }
+
+    Ok(())
+}
+
+fn record_chain_reconcile(
+    key: Vec<u8>,
+    chain: &mut UpdateChain,
+    oldest_active_txn_id: TxnId,
+    no_active_txns: bool,
+    entries: &mut ReconcileEntries,
+    stats: &mut ReconcileStats,
+) {
+    if let Some((update_type, data)) = chain.latest_committed_entry() {
+        entries.push((key, update_type, data));
+        stats.materialized_entries += 1;
+    }
+
+    stats.obsolete_updates_removed += chain.truncate_obsolete(oldest_active_txn_id);
+    let _ = chain.clear_if_materialized_current(no_active_txns);
 }
 
 fn upsert_entry(entries: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &[u8], value: &[u8]) {

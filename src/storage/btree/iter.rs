@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::page_store::{Page, PageRead, PageType, ReadPin, RowInsert};
 use crate::txn::{ReadVisibility, TXN_NONE};
@@ -360,9 +362,10 @@ fn collect_visible_leaf_entries(
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
     let leaf =
         LeafPage::open(page).map_err(|err| StorageError(format!("corrupt leaf page: {err}")))?;
-    let mut out = Vec::new();
+    let mut by_key = BTreeMap::new();
 
     let Some(modify) = page.row_modify() else {
+        let mut out = Vec::new();
         for slot_idx in 0..leaf.slot_count() {
             out.push((
                 leaf.key_at(slot_idx).map_err(map_leaf_err)?.to_vec(),
@@ -372,37 +375,46 @@ fn collect_visible_leaf_entries(
         return Ok(out);
     };
 
-    for slot_idx in 0..leaf.slot_count() {
-        append_visible_bucket(&mut out, &modify.row_inserts()[slot_idx], visibility);
+    for bucket in modify.row_inserts() {
+        append_visible_bucket(&mut by_key, bucket, visibility);
+    }
 
+    for slot_idx in 0..leaf.slot_count() {
         let key = leaf.key_at(slot_idx).map_err(map_leaf_err)?.to_vec();
-        match modify.row_updates()[slot_idx]
+        let base_value = leaf.value_at(slot_idx).map_err(map_leaf_err)?.to_vec();
+        match modify
+            .row_updates()
+            .get(slot_idx)
             .as_ref()
+            .and_then(|chain| chain.as_ref())
             .and_then(|chain| visible_chain_value(chain, visibility))
         {
-            Some(Some(value)) => out.push((key, value)),
-            Some(None) => {}
-            None => out.push((key, leaf.value_at(slot_idx).map_err(map_leaf_err)?.to_vec())),
+            Some(Some(value)) => {
+                by_key.insert(key, Some(value));
+            }
+            Some(None) => {
+                by_key.insert(key, None);
+            }
+            None => {
+                by_key.entry(key).or_insert(Some(base_value));
+            }
         }
     }
 
-    append_visible_bucket(
-        &mut out,
-        &modify.row_inserts()[leaf.slot_count()],
-        visibility,
-    );
-
-    Ok(out)
+    Ok(by_key
+        .into_iter()
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+        .collect())
 }
 
 fn append_visible_bucket(
-    out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    out: &mut BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     bucket: &[RowInsert],
     visibility: &ReadVisibility,
 ) {
     for insert in bucket {
-        if let Some(Some(value)) = visible_chain_value(insert.updates(), visibility) {
-            out.push((insert.key().to_vec(), value));
+        if let Some(value) = visible_chain_value(insert.updates(), visibility) {
+            out.insert(insert.key().to_vec(), value);
         }
     }
 }

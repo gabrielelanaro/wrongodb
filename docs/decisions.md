@@ -1756,3 +1756,24 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
   key through TransactionManager" path is both redundant and structurally wrong.
 - Materializing one visible leaf view at a time keeps the traversal logic simple while preserving
   the WT-style split between on-page row updates and inserted in-memory rows.
+
+## 2026-03-08: Table-level reads and txn-id writes now go straight to page-local B-tree MVCC
+
+**Decision**
+- Make `Table::get_version` call `BTreeCursor::get(...)` directly instead of routing point reads
+  through `TransactionManager`.
+- Make `Table::local_apply_put_with_txn` / `local_apply_delete_with_txn` use `BTreeCursor`
+  directly for both `TXN_NONE` and transactional writes.
+- Add page-local `mark_updates_committed(txn_id)`, `mark_updates_aborted(txn_id)`, and
+  `reconcile_page_local_updates(...)` operations on the B-tree so legacy txn-id-based callers
+  such as durability apply can keep their shape without using the old store-global MVCC map.
+- Reduce `TransactionManager` back down to global transaction lifecycle and timestamp/snapshot
+  access; it no longer owns per-store MVCC chains.
+
+**Why**
+- After scans moved into the B-tree, leaving point reads and txn-id-based local writes on the old
+  `TransactionManager` map would keep two competing MVCC ownership models alive.
+- Durability apply and similar callers still speak in terms of `txn_id`, so the minimal clean port
+  is to teach the B-tree how to commit/abort/reconcile page-local chains by transaction id.
+- This keeps the runtime data model coherent: page-local chains are the source of truth, and the
+  transaction layer only manages transaction state.

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::core::errors::StorageError;
 use crate::storage::block::file::NONE_BLOCK_ID;
 use crate::storage::btree::BTreeCursor;
+use crate::storage::mvcc::ReconcileStats;
 use crate::storage::page_store::{BlockFilePageStore, Page, PageStore};
 use crate::txn::{ReadVisibility, Transaction, TransactionManager, TxnId, TxnOp, WriteContext};
 use crate::WrongoDBError;
@@ -18,7 +19,6 @@ type ScanEntries = Vec<TableEntry>;
 #[derive(Debug)]
 pub struct Table {
     btree: BTreeCursor,
-    store_name: String,
     transaction_manager: Arc<TransactionManager>,
 }
 
@@ -33,10 +33,8 @@ impl Table {
     ) -> Result<Self, WrongoDBError> {
         let path = path.as_ref();
         let btree = Self::open_or_create_btree(path)?;
-        let store_name = store_name_from_path(path)?;
         Ok(Self {
             btree,
-            store_name,
             transaction_manager,
         })
     }
@@ -51,8 +49,7 @@ impl Table {
         txn_id: TxnId,
     ) -> Result<Option<Vec<u8>>, WrongoDBError> {
         let visibility = ReadVisibility::from_txn_id(txn_id);
-        self.transaction_manager
-            .get(&self.store_name, &mut self.btree, key, &visibility)
+        self.btree.get(key, &visibility)
     }
 
     pub fn contains_key(&mut self, key: &[u8], txn_id: TxnId) -> Result<bool, WrongoDBError> {
@@ -82,8 +79,8 @@ impl Table {
         value: &[u8],
         txn_id: crate::txn::TxnId,
     ) -> Result<(), WrongoDBError> {
-        self.transaction_manager
-            .put(&self.store_name, &mut self.btree, key, value, txn_id)
+        self.btree
+            .put(key, value, &WriteContext::from_txn_id(txn_id))
     }
 
     pub fn local_apply_delete_with_txn(
@@ -91,8 +88,7 @@ impl Table {
         key: &[u8],
         txn_id: crate::txn::TxnId,
     ) -> Result<bool, WrongoDBError> {
-        self.transaction_manager
-            .delete(&self.store_name, &mut self.btree, key, txn_id)
+        self.btree.delete(key, &WriteContext::from_txn_id(txn_id))
     }
 
     pub fn local_apply_put_in_txn(
@@ -126,16 +122,14 @@ impl Table {
         &mut self,
         txn_id: crate::txn::TxnId,
     ) -> Result<(), WrongoDBError> {
-        self.transaction_manager
-            .mark_updates_committed(&self.store_name, txn_id)
+        self.btree.mark_updates_committed(txn_id)
     }
 
     pub fn local_mark_updates_aborted(
         &mut self,
         txn_id: crate::txn::TxnId,
     ) -> Result<(), WrongoDBError> {
-        self.transaction_manager
-            .mark_updates_aborted(&self.store_name, txn_id)
+        self.btree.mark_updates_aborted(txn_id)
     }
 
     // ------------------------------------------------------------------------
@@ -143,12 +137,15 @@ impl Table {
     // ------------------------------------------------------------------------
 
     pub fn checkpoint_store(&mut self) -> Result<(), WrongoDBError> {
-        self.btree
-            .reconcile_page_local_updates(!self.transaction_manager.has_active_transactions())?;
-        let _ = self
-            .transaction_manager
-            .reconcile_store_for_checkpoint(&self.store_name, &mut self.btree)?;
+        let _ = self.reconcile_for_checkpoint()?;
         self.btree.checkpoint()
+    }
+
+    pub(crate) fn reconcile_for_checkpoint(&mut self) -> Result<ReconcileStats, WrongoDBError> {
+        self.btree.reconcile_page_local_updates(
+            self.transaction_manager.oldest_active_txn_id(),
+            !self.transaction_manager.has_active_transactions(),
+        )
     }
 
     // ------------------------------------------------------------------------
@@ -184,17 +181,6 @@ fn init_root_if_missing(page_store: &mut dyn PageStore) -> Result<(), WrongoDBEr
     let leaf_id = page_store.write_new_page(leaf)?;
     page_store.set_root_page_id(leaf_id)?;
     Ok(())
-}
-
-fn store_name_from_path(path: &Path) -> Result<String, WrongoDBError> {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return Err(StorageError(format!(
-            "unable to determine store name for path: {}",
-            path.display()
-        ))
-        .into());
-    };
-    Ok(name.to_string())
 }
 
 #[cfg(test)]
@@ -246,9 +232,7 @@ mod tests {
 
         assert_eq!(table.get_version(b"k1", TXN_NONE).unwrap(), None);
 
-        let stats = transaction_manager
-            .reconcile_store_for_checkpoint(&table.store_name, &mut table.btree)
-            .unwrap();
+        let stats = table.reconcile_for_checkpoint().unwrap();
         assert_eq!(
             stats,
             ReconcileStats {
@@ -262,9 +246,7 @@ mod tests {
             Some(b"v1".to_vec())
         );
 
-        let second_pass = transaction_manager
-            .reconcile_store_for_checkpoint(&table.store_name, &mut table.btree)
-            .unwrap();
+        let second_pass = table.reconcile_for_checkpoint().unwrap();
         assert_eq!(second_pass, ReconcileStats::default());
     }
 
@@ -297,9 +279,7 @@ mod tests {
             .commit_txn_state(&mut second_writer)
             .unwrap();
 
-        let stats = transaction_manager
-            .reconcile_store_for_checkpoint(&table.store_name, &mut table.btree)
-            .unwrap();
+        let stats = table.reconcile_for_checkpoint().unwrap();
         assert_eq!(
             stats,
             ReconcileStats {
@@ -319,9 +299,7 @@ mod tests {
 
         transaction_manager.commit_txn_state(&mut reader).unwrap();
 
-        let second_pass = transaction_manager
-            .reconcile_store_for_checkpoint(&table.store_name, &mut table.btree)
-            .unwrap();
+        let second_pass = table.reconcile_for_checkpoint().unwrap();
         assert_eq!(
             second_pass,
             ReconcileStats {
@@ -351,9 +329,7 @@ mod tests {
         table.local_mark_updates_committed(txn_id).unwrap();
         transaction_manager.commit_txn_state(&mut txn).unwrap();
 
-        let stats = transaction_manager
-            .reconcile_store_for_checkpoint(&table.store_name, &mut table.btree)
-            .unwrap();
+        let stats = table.reconcile_for_checkpoint().unwrap();
         assert_eq!(
             stats,
             ReconcileStats {
