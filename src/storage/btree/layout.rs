@@ -1,9 +1,9 @@
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::page_store::Page;
 
-use super::page::{
-    InternalPage, InternalPageError, InternalPageMut, LeafPage, LeafPageError, LeafPageMut,
-};
+use super::internal_ops;
+use super::leaf_ops;
+use super::page::{InternalPage, InternalPageError, LeafPage, LeafPageError};
 use super::{InternalEntries, LeafEntries};
 
 // ============================================================================
@@ -70,9 +70,8 @@ pub(super) fn build_leaf_page(
 ) -> Result<Page, WrongoDBError> {
     let mut page = Page::new_leaf(payload_len)
         .map_err(|e| StorageError(format!("init leaf page failed: {e}")))?;
-    let mut leaf = LeafPageMut::open(&mut page).map_err(map_leaf_err)?;
     for (key, value) in entries {
-        leaf.put(key, value).map_err(map_leaf_err)?;
+        leaf_ops::put(&mut page, key, value).map_err(map_leaf_err)?;
     }
     Ok(page)
 }
@@ -84,11 +83,8 @@ pub(super) fn build_internal_page(
 ) -> Result<Page, WrongoDBError> {
     let mut page = Page::new_internal(payload_len, first_child)
         .map_err(|e| StorageError(format!("init internal page failed: {e}")))?;
-    let mut internal = InternalPageMut::open(&mut page).map_err(map_internal_err)?;
     for (key, child) in entries {
-        internal
-            .put_separator(key, *child)
-            .map_err(map_internal_err)?;
+        internal_ops::put_separator(&mut page, key, *child).map_err(map_internal_err)?;
     }
     Ok(page)
 }

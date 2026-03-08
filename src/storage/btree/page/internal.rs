@@ -42,8 +42,8 @@ pub enum InternalPageError {
 /// and child page pointers. Each internal page has a "first child" pointer
 /// and a series of slots containing (separator key, child page) pairs.
 ///
-/// Navigation uses binary search: for a given key, the page finds the child
-/// whose subtree should contain that key.
+/// Navigation state is computed by the B+tree search layer; this type only
+/// exposes the raw separator and child entries needed for that search.
 #[derive(Debug)]
 pub struct InternalPage<'a> {
     page: &'a Page,
@@ -100,35 +100,6 @@ impl<'a> InternalPage<'a> {
         read_u64(self.page.data(), child_off)
     }
 
-    /// Finds the child page that should contain the given key.
-    ///
-    /// Uses binary search on the separator keys to determine which subtree
-    /// should contain the key. If all separators are less than the key,
-    /// returns the last child. If no slots exist, returns the first child.
-    pub fn child_for_key(&self, key: &[u8]) -> Result<u64, InternalPageError> {
-        let n = self.slot_count();
-        if n == 0 {
-            return Ok(self.first_child());
-        }
-
-        let mut lo = 0usize;
-        let mut hi = n;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let mid_key = self.key_at(mid)?;
-            if mid_key <= key {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if lo == 0 {
-            Ok(self.first_child())
-        } else {
-            self.child_at(lo - 1)
-        }
-    }
-
     // ------------------------------------------------------------------------
     // Private Helpers
     // ------------------------------------------------------------------------
@@ -183,9 +154,9 @@ impl<'a> InternalPage<'a> {
 
 /// Mutable view of an internal B+tree page.
 ///
-/// Provides write operations for internal pages, including inserting
-/// separator-key/child pairs and compaction to reclaim space from deleted
-/// entries.
+/// This type exposes low-level mutation primitives over the raw internal page
+/// format. Higher-level separator update and compaction behavior lives in
+/// `btree::internal_ops`.
 #[derive(Debug)]
 pub struct InternalPageMut<'a> {
     page: &'a mut Page,
@@ -206,84 +177,22 @@ impl<'a> InternalPageMut<'a> {
     }
 
     // ------------------------------------------------------------------------
-    // Public API: Read Operations
+    // Public API: Primitive Access
     // ------------------------------------------------------------------------
 
-    pub fn slot_count(&self) -> usize {
+    pub(crate) fn page(&self) -> &Page {
+        self.page
+    }
+
+    pub(crate) fn slot_count(&self) -> usize {
         self.page.header().slot_count as usize
     }
 
-    pub fn free_contiguous(&self) -> usize {
+    pub(crate) fn free_contiguous(&self) -> usize {
         self.page.header().free_contiguous()
     }
 
-    // ------------------------------------------------------------------------
-    // Public API: Write Operations
-    // ------------------------------------------------------------------------
-
-    /// Inserts or updates a separator key and child page pair.
-    ///
-    /// If the key already exists, the existing entry is deleted and replaced.
-    /// Attempts compaction if space is insufficient. Returns [`PageFull`]
-    /// if the page cannot accommodate the entry even after compaction.
-    ///
-    /// [`PageFull`]: InternalPageError::PageFull
-    pub fn put_separator(&mut self, key: &[u8], child: u64) -> Result<(), InternalPageError> {
-        let (idx, found) = self.find_slot(key)?;
-        if found {
-            self.delete_at(idx)?;
-        }
-
-        let record_len = record_len(key.len(), 8)?;
-        let need = record_len + SLOT_SIZE;
-        if self.free_contiguous() < need {
-            self.compact()?;
-        }
-        if self.free_contiguous() < need {
-            return Err(InternalPageError::PageFull);
-        }
-
-        let upper = self.upper();
-        let new_upper = upper
-            .checked_sub(record_len)
-            .ok_or_else(|| InternalPageError::Corrupt("upper underflow".into()))?;
-        self.write_record(new_upper, key, child)?;
-        self.set_upper(new_upper)?;
-
-        let slot_count = self.slot_count();
-        if idx > slot_count {
-            return Err(InternalPageError::Corrupt(
-                "insertion index out of bounds".into(),
-            ));
-        }
-
-        if idx < slot_count {
-            let slots_start = HEADER_SIZE;
-            let src_start = slots_start + idx * SLOT_SIZE;
-            let src_end = slots_start + slot_count * SLOT_SIZE;
-            let dst_start = slots_start + (idx + 1) * SLOT_SIZE;
-            self.page
-                .raw_mut()
-                .data_mut()
-                .copy_within(src_start..src_end, dst_start);
-        }
-
-        self.write_slot(idx, new_upper as u16, record_len as u16)?;
-        self.set_slot_count((slot_count + 1) as u16)?;
-        self.set_lower((HEADER_SIZE + (slot_count + 1) * SLOT_SIZE) as u16)?;
-        Ok(())
-    }
-
-    // ------------------------------------------------------------------------
-    // Public API: Maintenance Operations
-    // ------------------------------------------------------------------------
-
-    /// Compacts the page by rewriting all records contiguously.
-    ///
-    /// Reclaims space left by deleted or modified records. Creates a new page
-    /// with the same content but with records packed from the end, then swaps
-    /// it in place.
-    pub fn compact(&mut self) -> Result<(), InternalPageError> {
+    pub(crate) fn compact_in_place(&mut self) -> Result<(), InternalPageError> {
         validate_internal(self.page)?;
 
         let slot_count = self.slot_count();
@@ -323,7 +232,10 @@ impl<'a> InternalPageMut<'a> {
                 old_len as u16,
             )?;
         }
-        new_page.raw_mut().set_upper(upper as u16).map_err(map_page_err)?;
+        new_page
+            .raw_mut()
+            .set_upper(upper as u16)
+            .map_err(map_page_err)?;
 
         *self.page = new_page;
         self.page.raw_mut().refresh_header().map_err(map_page_err)?;
@@ -334,78 +246,44 @@ impl<'a> InternalPageMut<'a> {
     // Private Helpers
     // ------------------------------------------------------------------------
 
-    fn find_slot(&self, key: &[u8]) -> Result<(usize, bool), InternalPageError> {
-        let n = self.slot_count();
-        let mut lo = 0usize;
-        let mut hi = n;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let mid_key = self.record_key_at(mid)?;
-            match mid_key.cmp(key) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => return Ok((mid, true)),
-            }
-        }
-        Ok((lo, false))
-    }
-
-    fn slot(&self, index: usize) -> Result<(usize, usize), InternalPageError> {
+    pub(crate) fn slot(&self, index: usize) -> Result<(usize, usize), InternalPageError> {
         InternalPage::open(self.page)?.slot(index)
     }
 
-    fn record_key_at(&self, index: usize) -> Result<&[u8], InternalPageError> {
-        let (off, len) = self.slot(index)?;
-        let (klen, _vlen) = self.record_header(off, len)?;
-        let key_start = off + RECORD_HEADER_SIZE;
-        let key_end = key_start + klen;
-        Ok(&self.page.data()[key_start..key_end])
-    }
-
-    fn record_header(&self, off: usize, len: usize) -> Result<(usize, usize), InternalPageError> {
-        if len < RECORD_HEADER_SIZE {
-            return Err(InternalPageError::Corrupt("record too small".into()));
-        }
-        let klen = read_u16(self.page.data(), off + RECORD_KLEN_OFF)? as usize;
-        let vlen = read_u16(self.page.data(), off + RECORD_VLEN_OFF)? as usize;
-        let expected = RECORD_HEADER_SIZE
-            .checked_add(klen)
-            .and_then(|value| value.checked_add(vlen))
-            .ok_or_else(|| InternalPageError::Corrupt("record length overflow".into()))?;
-        if expected != len {
-            return Err(InternalPageError::Corrupt(format!(
-                "record length mismatch: slot_len={len} expected={expected}"
-            )));
-        }
-        Ok((klen, vlen))
-    }
-
-    fn upper(&self) -> usize {
+    pub(crate) fn upper(&self) -> usize {
         self.page.header().upper as usize
     }
 
-    fn set_slot_count(&mut self, value: u16) -> Result<(), InternalPageError> {
-        self.page.raw_mut().set_slot_count(value).map_err(map_page_err)
+    pub(crate) fn set_slot_count(&mut self, value: u16) -> Result<(), InternalPageError> {
+        self.page
+            .raw_mut()
+            .set_slot_count(value)
+            .map_err(map_page_err)
     }
 
-    fn set_lower(&mut self, value: u16) -> Result<(), InternalPageError> {
+    pub(crate) fn set_lower(&mut self, value: u16) -> Result<(), InternalPageError> {
         self.page.raw_mut().set_lower(value).map_err(map_page_err)
     }
 
-    fn set_upper(&mut self, value: usize) -> Result<(), InternalPageError> {
+    pub(crate) fn set_upper(&mut self, value: usize) -> Result<(), InternalPageError> {
         let upper = u16::try_from(value)
             .map_err(|_| InternalPageError::Corrupt(format!("upper too large: {value}")))?;
         self.page.raw_mut().set_upper(upper).map_err(map_page_err)
     }
 
-    fn write_slot(&mut self, index: usize, off: u16, len: u16) -> Result<(), InternalPageError> {
+    pub(crate) fn write_slot(
+        &mut self,
+        index: usize,
+        off: u16,
+        len: u16,
+    ) -> Result<(), InternalPageError> {
         let base = HEADER_SIZE + index * SLOT_SIZE;
         write_u16(self.page.raw_mut().data_mut(), base, off)?;
         write_u16(self.page.raw_mut().data_mut(), base + 2, len)?;
         Ok(())
     }
 
-    fn delete_at(&mut self, index: usize) -> Result<(), InternalPageError> {
+    pub(crate) fn delete_at(&mut self, index: usize) -> Result<(), InternalPageError> {
         let slot_count = self.slot_count();
         if index >= slot_count {
             return Err(InternalPageError::Corrupt(
@@ -427,7 +305,20 @@ impl<'a> InternalPageMut<'a> {
         Ok(())
     }
 
-    fn write_record(
+    pub(crate) fn shift_slots_right(&mut self, index: usize) -> Result<(), InternalPageError> {
+        let slot_count = self.slot_count();
+        let slots_start = HEADER_SIZE;
+        let src_start = slots_start + index * SLOT_SIZE;
+        let src_end = slots_start + slot_count * SLOT_SIZE;
+        let dst_start = slots_start + (index + 1) * SLOT_SIZE;
+        self.page
+            .raw_mut()
+            .data_mut()
+            .copy_within(src_start..src_end, dst_start);
+        Ok(())
+    }
+
+    pub(crate) fn write_record(
         &mut self,
         off: usize,
         key: &[u8],
@@ -457,6 +348,18 @@ impl<'a> InternalPageMut<'a> {
         self.page.raw_mut().data_mut()[key_start..child_start].copy_from_slice(key);
         write_u64(self.page.raw_mut().data_mut(), child_start, child)?;
         Ok(())
+    }
+
+    pub(crate) fn record_len(&self, klen: usize, vlen: usize) -> Result<usize, InternalPageError> {
+        record_len(klen, vlen)
+    }
+
+    pub(crate) const fn header_size() -> usize {
+        HEADER_SIZE
+    }
+
+    pub(crate) const fn slot_size() -> usize {
+        SLOT_SIZE
     }
 }
 

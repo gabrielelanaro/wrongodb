@@ -38,9 +38,12 @@ pub enum LeafPageError {
 /// Read-only view of a leaf B+tree page.
 ///
 /// Leaf pages store the actual key-value data at the bottom level of the
-/// B+tree. Each entry contains a key, value, and their lengths. Pages use
-/// a slot-based layout with records growing from the end and slots from
-/// the beginning.
+/// B+tree. Each entry contains a key, value, and their lengths. Pages use a
+/// slot-based layout with records growing from the end and slots from the
+/// beginning.
+///
+/// This type is intentionally low-level: it exposes slot and record access for
+/// the B+tree layer, but search semantics live in `btree::search`.
 #[derive(Debug)]
 pub struct LeafPage<'a> {
     page: &'a Page,
@@ -64,18 +67,6 @@ impl<'a> LeafPage<'a> {
     // Public API: Read Operations
     // ------------------------------------------------------------------------
 
-    /// Looks up a key in the leaf page.
-    ///
-    /// Uses binary search to find the key. Returns `Some(value)` if found,
-    /// `None` if the key is not present.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, LeafPageError> {
-        let (idx, found) = self.find_slot(key)?;
-        if !found {
-            return Ok(None);
-        }
-        Ok(Some(self.value_at(idx)?.to_vec()))
-    }
-
     pub fn slot_count(&self) -> usize {
         self.page.header().slot_count as usize
     }
@@ -96,18 +87,9 @@ impl<'a> LeafPage<'a> {
         Ok(&self.page.data()[val_start..val_end])
     }
 
-    pub fn contains_key(&self, key: &[u8]) -> Result<bool, LeafPageError> {
-        let (_idx, found) = self.find_slot(key)?;
-        Ok(found)
-    }
-
     // ------------------------------------------------------------------------
     // Private Helpers
     // ------------------------------------------------------------------------
-
-    fn validate(&self) -> Result<(), LeafPageError> {
-        validate_leaf(self.page)
-    }
 
     fn slot(&self, index: usize) -> Result<(usize, usize), LeafPageError> {
         let slot_count = self.slot_count();
@@ -132,23 +114,6 @@ impl<'a> LeafPage<'a> {
             )));
         }
         Ok((off, len))
-    }
-
-    fn find_slot(&self, key: &[u8]) -> Result<(usize, bool), LeafPageError> {
-        self.validate()?;
-        let slot_count = self.slot_count();
-        let mut lo = 0usize;
-        let mut hi = slot_count;
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let mid_key = self.key_at(mid)?;
-            match mid_key.cmp(key) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Equal => return Ok((mid, true)),
-                std::cmp::Ordering::Greater => hi = mid,
-            }
-        }
-        Ok((lo, false))
     }
 
     fn record_header(&self, off: usize, len: usize) -> Result<(usize, usize), LeafPageError> {
@@ -176,8 +141,9 @@ impl<'a> LeafPage<'a> {
 
 /// Mutable view of a leaf B+tree page.
 ///
-/// Provides write operations for leaf pages, including inserting, updating,
-/// deleting key-value pairs, and compaction to reclaim space.
+/// This type exposes low-level mutation primitives over the raw leaf page
+/// format. Higher-level insert/delete/compact behavior lives in
+/// `btree::leaf_ops`.
 #[derive(Debug)]
 pub struct LeafPageMut<'a> {
     page: &'a mut Page,
@@ -198,101 +164,22 @@ impl<'a> LeafPageMut<'a> {
     }
 
     // ------------------------------------------------------------------------
-    // Public API: Read Operations
+    // Public API: Primitive Access
     // ------------------------------------------------------------------------
 
-    pub fn slot_count(&self) -> usize {
+    pub(crate) fn page(&self) -> &Page {
+        self.page
+    }
+
+    pub(crate) fn slot_count(&self) -> usize {
         self.page.header().slot_count as usize
     }
 
-    pub fn free_contiguous(&self) -> usize {
+    pub(crate) fn free_contiguous(&self) -> usize {
         self.page.header().free_contiguous()
     }
 
-    pub fn contains_key(&self, key: &[u8]) -> Result<bool, LeafPageError> {
-        LeafPage::open(self.page)?.contains_key(key)
-    }
-
-    // ------------------------------------------------------------------------
-    // Public API: Write Operations
-    // ------------------------------------------------------------------------
-
-    /// Inserts or updates a key-value pair.
-    ///
-    /// If the key already exists, the existing entry is deleted and replaced.
-    /// Attempts compaction if space is insufficient. Returns [`PageFull`]
-    /// if the page cannot accommodate the entry even after compaction.
-    ///
-    /// [`PageFull`]: LeafPageError::PageFull
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), LeafPageError> {
-        let (idx, found) = self.find_slot(key)?;
-        if found {
-            self.delete_at(idx)?;
-        }
-
-        let record_len = record_len(key.len(), value.len())?;
-        let need = record_len + SLOT_SIZE;
-        if self.free_contiguous() < need {
-            self.compact()?;
-        }
-        if self.free_contiguous() < need {
-            return Err(LeafPageError::PageFull);
-        }
-
-        let upper = self.upper();
-        let new_upper = upper
-            .checked_sub(record_len)
-            .ok_or_else(|| LeafPageError::Corrupt("upper underflow".into()))?;
-        self.write_record(new_upper, key, value)?;
-        self.set_upper(new_upper)?;
-
-        let slot_count = self.slot_count();
-        if idx > slot_count {
-            return Err(LeafPageError::Corrupt(
-                "insertion index out of bounds".into(),
-            ));
-        }
-
-        if idx < slot_count {
-            let slots_start = HEADER_SIZE;
-            let src_start = slots_start + idx * SLOT_SIZE;
-            let src_end = slots_start + slot_count * SLOT_SIZE;
-            let dst_start = slots_start + (idx + 1) * SLOT_SIZE;
-            self.page
-                .raw_mut()
-                .data_mut()
-                .copy_within(src_start..src_end, dst_start);
-        }
-
-        self.write_slot(idx, new_upper as u16, record_len as u16)?;
-        self.set_slot_count((slot_count + 1) as u16)?;
-        self.set_lower((HEADER_SIZE + (slot_count + 1) * SLOT_SIZE) as u16)?;
-        Ok(())
-    }
-
-    /// Deletes a key from the leaf page.
-    ///
-    /// Returns `true` if the key was found and deleted, `false` if the key
-    /// was not present.
-    pub fn delete(&mut self, key: &[u8]) -> Result<bool, LeafPageError> {
-        let (idx, found) = self.find_slot(key)?;
-        if !found {
-            return Ok(false);
-        }
-        self.delete_at(idx)?;
-        Ok(true)
-    }
-
-    // ------------------------------------------------------------------------
-    // Public API: Maintenance Operations
-    // ------------------------------------------------------------------------
-
-    /// Compacts the page by rewriting all records contiguously.
-    ///
-    /// Reclaims space left by deleted or modified records. Creates a new page
-    /// with the same content but with records packed from the end, then swaps
-    /// it in place.
-    pub fn compact(&mut self) -> Result<(), LeafPageError> {
+    pub(crate) fn compact_in_place(&mut self) -> Result<(), LeafPageError> {
         self.validate()?;
 
         let slot_count = self.slot_count();
@@ -331,7 +218,10 @@ impl<'a> LeafPageMut<'a> {
                 old_len as u16,
             )?;
         }
-        new_page.raw_mut().set_upper(upper as u16).map_err(map_page_err)?;
+        new_page
+            .raw_mut()
+            .set_upper(upper as u16)
+            .map_err(map_page_err)?;
 
         *self.page = new_page;
         self.page.raw_mut().refresh_header().map_err(map_page_err)?;
@@ -346,40 +236,44 @@ impl<'a> LeafPageMut<'a> {
         validate_leaf(self.page)
     }
 
-    fn find_slot(&self, key: &[u8]) -> Result<(usize, bool), LeafPageError> {
-        LeafPage::open(self.page)?.find_slot(key)
-    }
-
-    fn slot(&self, index: usize) -> Result<(usize, usize), LeafPageError> {
+    pub(crate) fn slot(&self, index: usize) -> Result<(usize, usize), LeafPageError> {
         LeafPage::open(self.page)?.slot(index)
     }
 
-    fn upper(&self) -> usize {
+    pub(crate) fn upper(&self) -> usize {
         self.page.header().upper as usize
     }
 
-    fn set_slot_count(&mut self, value: u16) -> Result<(), LeafPageError> {
-        self.page.raw_mut().set_slot_count(value).map_err(map_page_err)
+    pub(crate) fn set_slot_count(&mut self, value: u16) -> Result<(), LeafPageError> {
+        self.page
+            .raw_mut()
+            .set_slot_count(value)
+            .map_err(map_page_err)
     }
 
-    fn set_lower(&mut self, value: u16) -> Result<(), LeafPageError> {
+    pub(crate) fn set_lower(&mut self, value: u16) -> Result<(), LeafPageError> {
         self.page.raw_mut().set_lower(value).map_err(map_page_err)
     }
 
-    fn set_upper(&mut self, value: usize) -> Result<(), LeafPageError> {
+    pub(crate) fn set_upper(&mut self, value: usize) -> Result<(), LeafPageError> {
         let upper = u16::try_from(value)
             .map_err(|_| LeafPageError::Corrupt(format!("upper too large: {value}")))?;
         self.page.raw_mut().set_upper(upper).map_err(map_page_err)
     }
 
-    fn write_slot(&mut self, index: usize, off: u16, len: u16) -> Result<(), LeafPageError> {
+    pub(crate) fn write_slot(
+        &mut self,
+        index: usize,
+        off: u16,
+        len: u16,
+    ) -> Result<(), LeafPageError> {
         let base = HEADER_SIZE + index * SLOT_SIZE;
         write_u16(self.page.raw_mut().data_mut(), base, off)?;
         write_u16(self.page.raw_mut().data_mut(), base + 2, len)?;
         Ok(())
     }
 
-    fn delete_at(&mut self, index: usize) -> Result<(), LeafPageError> {
+    pub(crate) fn delete_at(&mut self, index: usize) -> Result<(), LeafPageError> {
         self.validate()?;
         let slot_count = self.slot_count();
         if index >= slot_count {
@@ -400,7 +294,25 @@ impl<'a> LeafPageMut<'a> {
         Ok(())
     }
 
-    fn write_record(&mut self, off: usize, key: &[u8], value: &[u8]) -> Result<(), LeafPageError> {
+    pub(crate) fn shift_slots_right(&mut self, index: usize) -> Result<(), LeafPageError> {
+        let slot_count = self.slot_count();
+        let slots_start = HEADER_SIZE;
+        let src_start = slots_start + index * SLOT_SIZE;
+        let src_end = slots_start + slot_count * SLOT_SIZE;
+        let dst_start = slots_start + (index + 1) * SLOT_SIZE;
+        self.page
+            .raw_mut()
+            .data_mut()
+            .copy_within(src_start..src_end, dst_start);
+        Ok(())
+    }
+
+    pub(crate) fn write_record(
+        &mut self,
+        off: usize,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), LeafPageError> {
         let klen_u16 = u16::try_from(key.len())
             .map_err(|_| LeafPageError::Corrupt(format!("key too large: {}", key.len())))?;
         let vlen_u16 = u16::try_from(value.len())
@@ -422,9 +334,20 @@ impl<'a> LeafPageMut<'a> {
         let key_start = off + RECORD_HEADER_SIZE;
         let val_start = key_start + key.len();
         self.page.raw_mut().data_mut()[key_start..val_start].copy_from_slice(key);
-        self.page.raw_mut().data_mut()[val_start..(val_start + value.len())]
-            .copy_from_slice(value);
+        self.page.raw_mut().data_mut()[val_start..(val_start + value.len())].copy_from_slice(value);
         Ok(())
+    }
+
+    pub(crate) fn record_len(&self, klen: usize, vlen: usize) -> Result<usize, LeafPageError> {
+        record_len(klen, vlen)
+    }
+
+    pub(crate) const fn header_size() -> usize {
+        HEADER_SIZE
+    }
+
+    pub(crate) const fn slot_size() -> usize {
+        SLOT_SIZE
     }
 }
 
@@ -505,6 +428,7 @@ fn write_u16(buf: &mut [u8], off: usize, value: u16) -> Result<(), LeafPageError
 mod tests {
     use super::*;
     use crate::storage::block::file::BlockFile;
+    use crate::storage::btree::leaf_ops;
     use crate::storage::page_store::Page;
     use tempfile::tempdir;
 
@@ -512,31 +436,33 @@ mod tests {
     fn put_get_delete_roundtrip() {
         let mut page = Page::new_leaf(256).unwrap();
         {
-            let mut leaf = LeafPageMut::open(&mut page).unwrap();
-            leaf.put(b"b", b"two").unwrap();
-            leaf.put(b"a", b"one").unwrap();
-            leaf.put(b"c", b"three").unwrap();
+            leaf_ops::put(&mut page, b"b", b"two").unwrap();
+            leaf_ops::put(&mut page, b"a", b"one").unwrap();
+            leaf_ops::put(&mut page, b"c", b"three").unwrap();
         }
 
         let leaf = LeafPage::open(&page).unwrap();
-        assert_eq!(leaf.get(b"a").unwrap(), Some(b"one".to_vec()));
-        assert_eq!(leaf.get(b"b").unwrap(), Some(b"two".to_vec()));
-        assert_eq!(leaf.get(b"c").unwrap(), Some(b"three".to_vec()));
-        assert_eq!(leaf.get(b"nope").unwrap(), None);
-
-        {
-            let mut leaf = LeafPageMut::open(&mut page).unwrap();
-            assert!(leaf.delete(b"b").unwrap());
-        }
-        assert_eq!(LeafPage::open(&page).unwrap().get(b"b").unwrap(), None);
-        assert!(!LeafPageMut::open(&mut page).unwrap().delete(b"b").unwrap());
-
-        {
-            let mut leaf = LeafPageMut::open(&mut page).unwrap();
-            leaf.put(b"b", b"two-again").unwrap();
-        }
         assert_eq!(
-            LeafPage::open(&page).unwrap().get(b"b").unwrap(),
+            leaf_ops::get(leaf.page, b"a").unwrap(),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(
+            leaf_ops::get(leaf.page, b"b").unwrap(),
+            Some(b"two".to_vec())
+        );
+        assert_eq!(
+            leaf_ops::get(leaf.page, b"c").unwrap(),
+            Some(b"three".to_vec())
+        );
+        assert_eq!(leaf_ops::get(leaf.page, b"nope").unwrap(), None);
+
+        assert!(leaf_ops::delete(&mut page, b"b").unwrap());
+        assert_eq!(leaf_ops::get(&page, b"b").unwrap(), None);
+        assert!(!leaf_ops::delete(&mut page, b"b").unwrap());
+
+        leaf_ops::put(&mut page, b"b", b"two-again").unwrap();
+        assert_eq!(
+            leaf_ops::get(&page, b"b").unwrap(),
             Some(b"two-again".to_vec())
         );
     }
@@ -545,16 +471,15 @@ mod tests {
     fn delete_leaves_garbage_but_put_compacts_when_needed() {
         let mut page = Page::new_leaf(128).unwrap();
         {
-            let mut leaf = LeafPageMut::open(&mut page).unwrap();
-            leaf.put(b"a", &[b'x'; 30]).unwrap();
-            leaf.put(b"b", &[b'y'; 30]).unwrap();
-            leaf.put(b"c", &[b'z'; 30]).unwrap();
-            leaf.delete(b"b").unwrap();
-            leaf.put(b"d", &[b'w'; 30]).unwrap();
+            leaf_ops::put(&mut page, b"a", &[b'x'; 30]).unwrap();
+            leaf_ops::put(&mut page, b"b", &[b'y'; 30]).unwrap();
+            leaf_ops::put(&mut page, b"c", &[b'z'; 30]).unwrap();
+            leaf_ops::delete(&mut page, b"b").unwrap();
+            leaf_ops::put(&mut page, b"d", &[b'w'; 30]).unwrap();
         }
 
         let leaf = LeafPage::open(&page).unwrap();
-        assert_eq!(leaf.get(b"d").unwrap().unwrap().len(), 30);
+        assert_eq!(leaf_ops::get(&page, b"d").unwrap().unwrap().len(), 30);
         assert_eq!(leaf.page.header().slot_count, 3);
         assert_eq!(leaf.page.header().lower, 20);
     }
@@ -562,10 +487,8 @@ mod tests {
     #[test]
     fn page_full_is_reported() {
         let mut page = Page::new_leaf(96).unwrap();
-        let mut leaf = LeafPageMut::open(&mut page).unwrap();
-
-        leaf.put(b"a", &[b'x'; 40]).unwrap();
-        let err = leaf.put(b"b", &[b'y'; 40]).unwrap_err();
+        leaf_ops::put(&mut page, b"a", &[b'x'; 40]).unwrap();
+        let err = leaf_ops::put(&mut page, b"b", &[b'y'; 40]).unwrap_err();
         assert_eq!(err, LeafPageError::PageFull);
     }
 
@@ -578,20 +501,16 @@ mod tests {
         let block = bf.allocate_block().unwrap();
         let payload_len = bf.page_payload_len();
         let mut page = Page::new_leaf(payload_len).unwrap();
-        {
-            let mut leaf = LeafPageMut::open(&mut page).unwrap();
-            leaf.put(b"k1", b"v1").unwrap();
-            leaf.put(b"k2", b"v2").unwrap();
-        }
+        leaf_ops::put(&mut page, b"k1", b"v1").unwrap();
+        leaf_ops::put(&mut page, b"k2", b"v2").unwrap();
         bf.write_block(block, page.data()).unwrap();
         bf.close().unwrap();
 
         let mut bf2 = BlockFile::open(&path).unwrap();
         let read = bf2.read_block(block, true).unwrap();
         let page = Page::from_bytes(read).unwrap();
-        let leaf = LeafPage::open(&page).unwrap();
-        assert_eq!(leaf.get(b"k1").unwrap(), Some(b"v1".to_vec()));
-        assert_eq!(leaf.get(b"k2").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(leaf_ops::get(&page, b"k1").unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(leaf_ops::get(&page, b"k2").unwrap(), Some(b"v2".to_vec()));
         bf2.close().unwrap();
     }
 }

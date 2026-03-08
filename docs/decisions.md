@@ -1658,7 +1658,24 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 
 **Notes**
 - `RawPage` remains the cloneable serialized image used for block I/O and page-format parsing.
-- `Page` continues to expose the old `header/data/data_mut/...` API so B-tree callers do not need
-  a broad behavior change yet.
+- `Page` keeps only a narrow public surface; raw mutation lives behind crate-private helpers.
 - `RowModify` is scaffold-only in this pass; transaction and reconciliation logic still live in
   `TransactionManager`.
+
+## 2026-03-08: B-tree search and leaf updates move out of page views
+
+**Decision**
+- Treat `LeafPage` and `InternalPage` as low-level page-format views.
+- Move binary-search and child-routing helpers into `src/storage/btree/search.rs`.
+- Move leaf `get` / `contains` / `put` / `delete` / `compact` behavior into
+  `src/storage/btree/leaf_ops.rs`.
+- Move internal separator-update / compaction behavior into
+  `src/storage/btree/internal_ops.rs`.
+- Keep `BTreeCursor` as the orchestration layer that calls those helpers.
+
+**Why**
+- Page-view types should expose slot, key, and value primitives, not own tree search semantics.
+- Centralizing search in the B-tree layer makes the future page-local MVCC lookup cleaner because
+  the cursor/tree code can work with slot and insertion positions directly.
+- Reusable helper modules avoid duplicating binary-search and leaf mutation logic across the cursor,
+  range iterator, and page-layout builders.

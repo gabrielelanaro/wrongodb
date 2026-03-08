@@ -2,7 +2,8 @@ use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::page_store::{PageRead, PageType, ReadPin};
 
 use super::layout::{map_internal_err, map_leaf_err};
-use super::page::{InternalPage, InternalPageError, LeafPage, LeafPageError};
+use super::page::{InternalPage, LeafPage};
+use super::search::{internal_child_at, internal_child_index_for_key, leaf_lower_bound};
 
 // ============================================================================
 // BTreeRangeIter (Public API)
@@ -377,53 +378,4 @@ enum NextStep {
 
 fn missing_pager() -> WrongoDBError {
     StorageError("range iterator has no backing page store".into()).into()
-}
-
-fn leaf_lower_bound(leaf: &LeafPage<'_>, key: &[u8]) -> Result<usize, LeafPageError> {
-    let n = leaf.slot_count();
-    let mut lo = 0usize;
-    let mut hi = n;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let mid_key = leaf.key_at(mid)?;
-        if mid_key < key {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    Ok(lo)
-}
-
-fn internal_child_index_for_key(
-    internal: &InternalPage<'_>,
-    key: &[u8],
-) -> Result<usize, InternalPageError> {
-    let n = internal.slot_count();
-    if n == 0 {
-        return Ok(0);
-    }
-    let mut lo = 0usize;
-    let mut hi = n;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let mid_key = internal.key_at(mid)?;
-        if mid_key <= key {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    Ok(lo)
-}
-
-fn internal_child_at(
-    internal: &InternalPage<'_>,
-    child_idx: usize,
-) -> Result<u64, InternalPageError> {
-    if child_idx == 0 {
-        Ok(internal.first_child())
-    } else {
-        internal.child_at(child_idx - 1)
-    }
 }

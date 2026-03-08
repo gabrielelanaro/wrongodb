@@ -553,7 +553,9 @@ mod tests {
         let mut page = Page::new_leaf(256).unwrap();
         let replacement = Page::new_internal(256, 17).unwrap();
 
-        page.raw_mut().data_mut().copy_from_slice(replacement.data());
+        page.raw_mut()
+            .data_mut()
+            .copy_from_slice(replacement.data());
         page.raw_mut().refresh_header().unwrap();
 
         assert_eq!(page.header().page_type, PageType::Internal);

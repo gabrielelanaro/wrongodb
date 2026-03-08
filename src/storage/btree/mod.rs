@@ -1,16 +1,25 @@
 mod iter;
+mod internal_ops;
 mod layout;
+mod leaf_ops;
 pub mod page;
+mod search;
 
 pub use iter::BTreeRangeIter;
 
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::page_store::{Page, PageEdit, PageRead, PageStore, PageType};
 use layout::{
-    build_internal_page, internal_entries, leaf_entries, map_internal_err, map_leaf_err,
-    split_internal_entries, split_leaf_entries,
+    build_internal_page, internal_entries, leaf_entries, map_leaf_err, split_internal_entries,
+    split_leaf_entries,
 };
-use page::{InternalPage, InternalPageMut, LeafPage, LeafPageError, LeafPageMut};
+use internal_ops::put_separator as put_internal_separator;
+use leaf_ops::{
+    contains_key as leaf_contains_key, delete as delete_from_leaf_page, get as leaf_get,
+    put as put_in_leaf_page,
+};
+use page::{InternalPage, LeafPageError};
+use search::child_for_key;
 
 // ============================================================================
 // Type Aliases
@@ -112,16 +121,12 @@ impl BTreeCursor {
             let step = {
                 let page = self.page_store.get_page(&pin);
                 match page.header().page_type {
-                    PageType::Leaf => {
-                        let leaf = LeafPage::open(page)
-                            .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
-                        ReadStep::Found(leaf.get(key).map_err(map_leaf_err)?)
-                    }
+                    PageType::Leaf => ReadStep::Found(leaf_get(page, key).map_err(map_leaf_err)?),
                     PageType::Internal => {
                         let internal = InternalPage::open(page).map_err(|e| {
                             StorageError(format!("corrupt internal {node_id}: {e}"))
                         })?;
-                        let next = internal.child_for_key(key).map_err(|e| {
+                        let next = child_for_key(&internal, key).map_err(|e| {
                             StorageError(format!("routing failed at {node_id}: {e}"))
                         })?;
                         ReadStep::Descend(next)
@@ -169,13 +174,8 @@ impl BTreeCursor {
             let payload_len = self.page_store.page_payload_len();
             let mut root_page = Page::new_internal(payload_len, result.new_node_id)
                 .map_err(|e| StorageError(format!("init new root internal failed: {e}")))?;
-            {
-                let mut internal = InternalPageMut::open(&mut root_page)
-                    .map_err(|e| StorageError(format!("init new root internal failed: {e}")))?;
-                internal
-                    .put_separator(&split.sep_key, split.right_child)
-                    .map_err(map_internal_err)?;
-            }
+            put_internal_separator(&mut root_page, &split.sep_key, split.right_child)
+                .map_err(|e| StorageError(format!("init new root internal failed: {e}")))?;
 
             let new_root_id = self.page_store.write_new_page(root_page)?;
             self.page_store.set_root_page_id(new_root_id)?;
@@ -242,11 +242,8 @@ impl BTreeCursor {
         key: &[u8],
     ) -> Result<DeleteResult, WrongoDBError> {
         let page_id = page.page_id();
-        let deleted = {
-            let mut leaf = LeafPageMut::open(page.page_mut())
-                .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
-            leaf.delete(key).map_err(map_leaf_err)?
-        };
+        let deleted = delete_from_leaf_page(page.page_mut(), key)
+            .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
 
         Ok(DeleteResult {
             new_node_id: page_id,
@@ -328,27 +325,26 @@ impl BTreeCursor {
     ) -> Result<InsertResult, WrongoDBError> {
         let payload_len = page.page().data().len();
         let page_id = page.page_id();
+        if mode == InsertMode::Unique
+            && leaf_contains_key(page.page(), key)
+                .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?
         {
-            let mut leaf = LeafPageMut::open(page.page_mut())
-                .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
-            if mode == InsertMode::Unique && leaf.contains_key(key).map_err(map_leaf_err)? {
+            return Ok(InsertResult {
+                new_node_id: page_id,
+                split: None,
+                inserted: false,
+            });
+        }
+        match put_in_leaf_page(page.page_mut(), key, value) {
+            Ok(()) => {
                 return Ok(InsertResult {
                     new_node_id: page_id,
                     split: None,
-                    inserted: false,
+                    inserted: true,
                 });
             }
-            match leaf.put(key, value) {
-                Ok(()) => {
-                    return Ok(InsertResult {
-                        new_node_id: page_id,
-                        split: None,
-                        inserted: true,
-                    });
-                }
-                Err(LeafPageError::PageFull) => {}
-                Err(err) => return Err(map_leaf_err(err)),
-            }
+            Err(LeafPageError::PageFull) => {}
+            Err(err) => return Err(map_leaf_err(err)),
         }
 
         let mut entries = leaf_entries(page.page())?;
