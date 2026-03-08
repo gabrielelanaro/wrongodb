@@ -27,7 +27,7 @@ impl TimeWindow {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Update {
     pub txn_id: TxnId,
     pub time_window: TimeWindow,
@@ -82,7 +82,7 @@ impl Update {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct UpdateChain {
     head: Option<Box<Update>>,
 }

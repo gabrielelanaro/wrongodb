@@ -1638,3 +1638,27 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - This keeps `Session` closer to `WT_SESSION` and Mongo's `OperationContext`.
 - It prevents low-level session APIs from accumulating collection/index behavior.
 - It keeps write-path policy out of `Cursor` while also keeping it out of `Session`.
+
+## 2026-03-08: Split raw page images from in-memory page runtime state
+
+**Decision**
+- Rename the byte-oriented page payload object to `RawPage`.
+- Introduce `Page` as the in-memory page object carried by the page cache and edit path.
+- Keep dormant row-store modify state on `Page` as:
+  - `RowModify { row_updates, row_inserts }`
+  - `RowInsert { key, updates }`
+- Do not derive `Clone` for `Page`; instead expose `Page::clone_for_edit()` so copy-on-write paths
+  duplicate the raw page image and current modify state explicitly.
+
+**Why**
+- This matches the WT mental model more closely: the runtime page object owns modify state, while
+  the raw page image remains a separate serialized representation.
+- It keeps clone semantics explicit at the page-store boundary instead of letting a blanket
+  `Clone` silently define how runtime update state should be copied.
+
+**Notes**
+- `RawPage` remains the cloneable serialized image used for block I/O and page-format parsing.
+- `Page` continues to expose the old `header/data/data_mut/...` API so B-tree callers do not need
+  a broad behavior change yet.
+- `RowModify` is scaffold-only in this pass; transaction and reconciliation logic still live in
+  `TransactionManager`.

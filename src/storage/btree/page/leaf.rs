@@ -259,6 +259,7 @@ impl<'a> LeafPageMut<'a> {
             let src_end = slots_start + slot_count * SLOT_SIZE;
             let dst_start = slots_start + (idx + 1) * SLOT_SIZE;
             self.page
+                .raw_mut()
                 .data_mut()
                 .copy_within(src_start..src_end, dst_start);
         }
@@ -298,11 +299,13 @@ impl<'a> LeafPageMut<'a> {
         let page_len = self.page.data().len();
         let flags = self.page.header().flags;
         let mut new_page = Page::new_leaf(page_len).map_err(map_page_err)?;
-        new_page.set_flags(flags).map_err(map_page_err)?;
+        new_page.raw_mut().set_flags(flags).map_err(map_page_err)?;
         new_page
+            .raw_mut()
             .set_slot_count(slot_count as u16)
             .map_err(map_page_err)?;
         new_page
+            .raw_mut()
             .set_lower((HEADER_SIZE + slot_count * SLOT_SIZE) as u16)
             .map_err(map_page_err)?;
 
@@ -316,22 +319,22 @@ impl<'a> LeafPageMut<'a> {
             upper = upper
                 .checked_sub(old_len)
                 .ok_or_else(|| LeafPageError::Corrupt("compact upper underflow".into()))?;
-            new_page.data_mut()[upper..(upper + old_len)].copy_from_slice(&record);
+            new_page.raw_mut().data_mut()[upper..(upper + old_len)].copy_from_slice(&record);
             write_u16(
-                new_page.data_mut(),
+                new_page.raw_mut().data_mut(),
                 HEADER_SIZE + i * SLOT_SIZE,
                 upper as u16,
             )?;
             write_u16(
-                new_page.data_mut(),
+                new_page.raw_mut().data_mut(),
                 HEADER_SIZE + i * SLOT_SIZE + 2,
                 old_len as u16,
             )?;
         }
-        new_page.set_upper(upper as u16).map_err(map_page_err)?;
+        new_page.raw_mut().set_upper(upper as u16).map_err(map_page_err)?;
 
         *self.page = new_page;
-        self.page.refresh_header().map_err(map_page_err)?;
+        self.page.raw_mut().refresh_header().map_err(map_page_err)?;
         Ok(())
     }
 
@@ -356,23 +359,23 @@ impl<'a> LeafPageMut<'a> {
     }
 
     fn set_slot_count(&mut self, value: u16) -> Result<(), LeafPageError> {
-        self.page.set_slot_count(value).map_err(map_page_err)
+        self.page.raw_mut().set_slot_count(value).map_err(map_page_err)
     }
 
     fn set_lower(&mut self, value: u16) -> Result<(), LeafPageError> {
-        self.page.set_lower(value).map_err(map_page_err)
+        self.page.raw_mut().set_lower(value).map_err(map_page_err)
     }
 
     fn set_upper(&mut self, value: usize) -> Result<(), LeafPageError> {
         let upper = u16::try_from(value)
             .map_err(|_| LeafPageError::Corrupt(format!("upper too large: {value}")))?;
-        self.page.set_upper(upper).map_err(map_page_err)
+        self.page.raw_mut().set_upper(upper).map_err(map_page_err)
     }
 
     fn write_slot(&mut self, index: usize, off: u16, len: u16) -> Result<(), LeafPageError> {
         let base = HEADER_SIZE + index * SLOT_SIZE;
-        write_u16(self.page.data_mut(), base, off)?;
-        write_u16(self.page.data_mut(), base + 2, len)?;
+        write_u16(self.page.raw_mut().data_mut(), base, off)?;
+        write_u16(self.page.raw_mut().data_mut(), base + 2, len)?;
         Ok(())
     }
 
@@ -388,6 +391,7 @@ impl<'a> LeafPageMut<'a> {
             let src_end = slots_start + slot_count * SLOT_SIZE;
             let dst_start = slots_start + index * SLOT_SIZE;
             self.page
+                .raw_mut()
                 .data_mut()
                 .copy_within(src_start..src_end, dst_start);
         }
@@ -407,7 +411,7 @@ impl<'a> LeafPageMut<'a> {
         }
 
         {
-            let mut writer = std::io::Cursor::new(&mut self.page.data_mut()[off..]);
+            let mut writer = std::io::Cursor::new(&mut self.page.raw_mut().data_mut()[off..]);
             writer
                 .write_u16::<LittleEndian>(klen_u16)
                 .map_err(|e| LeafPageError::Corrupt(e.to_string()))?;
@@ -417,8 +421,9 @@ impl<'a> LeafPageMut<'a> {
         }
         let key_start = off + RECORD_HEADER_SIZE;
         let val_start = key_start + key.len();
-        self.page.data_mut()[key_start..val_start].copy_from_slice(key);
-        self.page.data_mut()[val_start..(val_start + value.len())].copy_from_slice(value);
+        self.page.raw_mut().data_mut()[key_start..val_start].copy_from_slice(key);
+        self.page.raw_mut().data_mut()[val_start..(val_start + value.len())]
+            .copy_from_slice(value);
         Ok(())
     }
 }

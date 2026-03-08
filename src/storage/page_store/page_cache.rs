@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::core::errors::{StorageError, WrongoDBError};
 
-use super::page::Page;
+use super::page::{Page, RawPage};
 use super::types::ReadPin;
 
 // ============================================================================
@@ -220,11 +220,12 @@ impl PageCache {
         F: FnMut(u64) -> Result<Vec<u8>, WrongoDBError>,
     {
         if let Some(entry) = self.get_mut(page_id) {
-            return Ok(entry.page.clone());
+            return Ok(entry.page.clone_for_edit());
         }
 
         let payload = read_fn(page_id)?;
-        Page::from_bytes(payload)
+        RawPage::from_bytes(payload)
+            .map(Page::from_raw)
             .map_err(|e| StorageError(format!("corrupt page {page_id}: {e}")).into())
     }
 

@@ -4,7 +4,8 @@ mod store;
 mod traits;
 mod types;
 
-pub use page::{Page, PageError, PageType};
+#[allow(unused_imports)]
+pub use page::{Page, PageError, PageType, RawPage, RowInsert, RowModify};
 pub use store::BlockFilePageStore;
 pub use traits::{PageRead, PageStore};
 pub use types::{PageEdit, ReadPin};

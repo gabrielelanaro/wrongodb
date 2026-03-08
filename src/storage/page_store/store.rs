@@ -220,7 +220,7 @@ impl PageWrite for BlockFilePageStore {
         if self.working_pages.contains(&page_id) {
             // Already a working page - return it directly (no new COW needed)
             let pin = self.load_page_and_pin(page_id)?;
-            let page = self.cache.get_page(pin.page_id()).clone();
+            let page = self.cache.get_page(pin.page_id()).clone_for_edit();
             return Ok(PageEdit {
                 page_id,
                 original_page_id: None,
@@ -232,7 +232,7 @@ impl PageWrite for BlockFilePageStore {
         let page = self.load_cow_page(page_id)?;
         self.evict_cache_if_full()?;
         let new_page_id = self.allocate_page()?;
-        let entry = self.cache.insert(new_page_id, page.clone());
+        let entry = self.cache.insert(new_page_id, page.clone_for_edit());
         entry.pin_count = 1;
         self.working_pages.insert(new_page_id);
 
@@ -377,7 +377,7 @@ mod tests {
         page_store.cache = PageCache::new(PageCacheConfig { capacity_pages: 1 });
 
         let mut page = Page::new_leaf(payload_len).unwrap();
-        page.data_mut()[8..].fill(7);
+        page.raw_mut().data_mut()[8..].fill(7);
         let expected = page.data().to_vec();
         let entry = page_store.cache.insert(page_id, page);
         entry.dirty = true;
@@ -398,7 +398,7 @@ mod tests {
         let page_id = page_store.allocate_page().unwrap();
 
         let mut page = Page::new_leaf(payload_len).unwrap();
-        page.data_mut()[8..].fill(9);
+        page.raw_mut().data_mut()[8..].fill(9);
         let entry = page_store.cache.insert(page_id, page);
         entry.dirty = true;
         entry.pin_count = 1;
