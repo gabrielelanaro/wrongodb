@@ -76,7 +76,7 @@ Order: std imports first, then third-party crates, then local crate imports (gro
 
 ### File organization
 - `src/core/`: shared types/utilities (BSON, document helpers, errors)
-- `src/storage/`: on-disk storage (block file, B-tree, WAL, table)
+- `src/storage/`: on-disk storage (block file, page store, B-tree, WAL, table)
 - `src/engine/`: database API and collection logic
 - `src/server/`: MongoDB wire-protocol server and command handlers
 - `src/txn/`: transaction management, recovery, MVCC

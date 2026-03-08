@@ -91,10 +91,11 @@ src/
 ├── api/         # Connection/session/cursor APIs and handle cache
 ├── core/        # Shared types: BSON codec, document helpers, errors
 ├── storage/     # On-disk storage engine (WiredTiger-inspired)
-│   ├── block/   # Block file I/O, allocation, free lists
-│   ├── btree/   # B+tree implementation, page cache, WAL
-│   ├── table.rs # Document storage via BTree
-│   └── wal.rs   # Connection-level global WAL
+│   ├── block/      # Block file I/O, allocation, free lists
+│   ├── page_store/ # Page cache, COW, checkpoint coordination
+│   ├── btree/      # B+tree implementation, splits, range scans
+│   ├── table.rs    # Document storage via BTree
+│   └── wal.rs      # Connection-level global WAL
 ├── index/       # Secondary indexes, key encoding
 ├── engine/      # Database API and collection logic
 │   ├── database.rs    # WrongoDB handle, config
@@ -111,7 +112,7 @@ The storage layer follows WiredTiger's design patterns:
 
 **BlockFile** (`storage/block/file.rs`): Fixed-size page I/O with checksums. Manages extent allocation (alloc/avail/discard lists) and checkpoint slots.
 
-**Pager** (`storage/btree/pager.rs`): Page cache between BTree and BlockFile. Implements copy-on-write (COW), dirty tracking, and checkpoint coordination.
+**BlockFilePageStore** (`storage/page_store/store.rs`): Page cache layer between BTree and BlockFile. Implements copy-on-write (COW), dirty tracking, and checkpoint coordination.
 
 **BTree** (`storage/btree/mod.rs`): B+tree with leaf/internal pages, splits, and range scans. Owns the WAL handle and orchestrates recovery.
 

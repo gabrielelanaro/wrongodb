@@ -352,7 +352,6 @@ impl BlockFile {
     // Lifecycle methods (resource management)
     // ------------------------------------------------------------------------
 
-    #[allow(dead_code)]
     #[cfg(test)]
     pub(crate) fn close(self) -> Result<(), WrongoDBError> {
         self.file.sync_all()?;
