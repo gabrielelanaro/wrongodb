@@ -354,11 +354,6 @@ impl CheckpointStore for BlockFilePageStore {
         self.working_pages.clear();
         Ok(())
     }
-
-    #[cfg(test)]
-    fn sync_all(&mut self) -> Result<(), WrongoDBError> {
-        self.bf.sync_all()
-    }
 }
 
 // ============================================================================
