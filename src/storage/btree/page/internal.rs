@@ -1,6 +1,10 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use thiserror::Error;
 
+// ============================================================================
+// Constants
+// ============================================================================
+
 const PAGE_TYPE_INTERNAL: u8 = 2;
 
 // Header layout (little-endian), offsets in bytes:
@@ -25,6 +29,10 @@ const RECORD_HEADER_SIZE: usize = 4;
 const RECORD_KLEN_OFF: usize = 0;
 const RECORD_VLEN_OFF: usize = 2;
 
+// ============================================================================
+// Error Types
+// ============================================================================
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum InternalPageError {
     #[error("page full")]
@@ -34,12 +42,20 @@ pub enum InternalPageError {
     Corrupt(String),
 }
 
+// ============================================================================
+// InternalPage (Public API)
+// ============================================================================
+
 #[derive(Debug)]
 pub struct InternalPage<'a> {
     buf: &'a mut [u8],
 }
 
 impl<'a> InternalPage<'a> {
+    // ------------------------------------------------------------------------
+    // Constructors
+    // ------------------------------------------------------------------------
+
     pub fn init(buf: &'a mut [u8], first_child: u64) -> Result<Self, InternalPageError> {
         if buf.len() > (u16::MAX as usize) {
             return Err(InternalPageError::Corrupt(format!(
@@ -69,6 +85,10 @@ impl<'a> InternalPage<'a> {
         page.validate()?;
         Ok(page)
     }
+
+    // ------------------------------------------------------------------------
+    // Public API: Read Operations
+    // ------------------------------------------------------------------------
 
     pub fn first_child(&self) -> Result<u64, InternalPageError> {
         read_u64(self.buf, HDR_FIRST_CHILD)
@@ -136,6 +156,20 @@ impl<'a> InternalPage<'a> {
         }
     }
 
+    pub fn free_contiguous(&self) -> usize {
+        let Ok(lower) = self.lower() else {
+            return 0;
+        };
+        let Ok(upper) = self.upper() else {
+            return 0;
+        };
+        upper.saturating_sub(lower)
+    }
+
+    // ------------------------------------------------------------------------
+    // Public API: Write Operations
+    // ------------------------------------------------------------------------
+
     /// Insert a new separator `(key, child)` or replace the child if `key` already exists.
     pub fn put_separator(&mut self, key: &[u8], child: u64) -> Result<(), InternalPageError> {
         let (idx, found) = self.find_slot(key)?;
@@ -180,15 +214,9 @@ impl<'a> InternalPage<'a> {
         Ok(())
     }
 
-    pub fn free_contiguous(&self) -> usize {
-        let Ok(lower) = self.lower() else {
-            return 0;
-        };
-        let Ok(upper) = self.upper() else {
-            return 0;
-        };
-        upper.saturating_sub(lower)
-    }
+    // ------------------------------------------------------------------------
+    // Public API: Maintenance Operations
+    // ------------------------------------------------------------------------
 
     /// Rewrite the page to remove fragmentation, preserving slot order.
     pub fn compact(&mut self) -> Result<(), InternalPageError> {
@@ -232,6 +260,10 @@ impl<'a> InternalPage<'a> {
         Ok(())
     }
 
+    // ------------------------------------------------------------------------
+    // Private Helpers: Validation
+    // ------------------------------------------------------------------------
+
     fn validate(&self) -> Result<(), InternalPageError> {
         if self.buf.len() < HEADER_SIZE {
             return Err(InternalPageError::Corrupt("buffer too small".into()));
@@ -266,6 +298,10 @@ impl<'a> InternalPage<'a> {
         Ok(())
     }
 
+    // ------------------------------------------------------------------------
+    // Private Helpers: Header Accessors
+    // ------------------------------------------------------------------------
+
     fn lower(&self) -> Result<usize, InternalPageError> {
         Ok(read_u16(self.buf, HDR_LOWER)? as usize)
     }
@@ -288,6 +324,10 @@ impl<'a> InternalPage<'a> {
     fn set_slot_count(&mut self, v: u16) -> Result<(), InternalPageError> {
         write_u16(self.buf, HDR_SLOT_COUNT, v)
     }
+
+    // ------------------------------------------------------------------------
+    // Private Helpers: Slot Operations
+    // ------------------------------------------------------------------------
 
     fn write_slot(&mut self, index: usize, off: u16, len: u16) -> Result<(), InternalPageError> {
         let base = HEADER_SIZE + index * SLOT_SIZE;
@@ -318,32 +358,6 @@ impl<'a> InternalPage<'a> {
             )));
         }
         Ok((off, len))
-    }
-
-    fn record_header(&self, off: usize, len: usize) -> Result<(usize, usize), InternalPageError> {
-        if len < RECORD_HEADER_SIZE {
-            return Err(InternalPageError::Corrupt("record too small".into()));
-        }
-        let klen = read_u16(self.buf, off + RECORD_KLEN_OFF)? as usize;
-        let vlen = read_u16(self.buf, off + RECORD_VLEN_OFF)? as usize;
-        let expected = RECORD_HEADER_SIZE
-            .checked_add(klen)
-            .and_then(|x| x.checked_add(vlen))
-            .ok_or_else(|| InternalPageError::Corrupt("record length overflow".into()))?;
-        if expected != len {
-            return Err(InternalPageError::Corrupt(format!(
-                "record length mismatch: slot_len={len} expected={expected}"
-            )));
-        }
-        Ok((klen, vlen))
-    }
-
-    fn record_key_at(&self, index: usize) -> Result<&[u8], InternalPageError> {
-        let (off, len) = self.slot(index)?;
-        let (klen, _vlen) = self.record_header(off, len)?;
-        let key_start = off + RECORD_HEADER_SIZE;
-        let key_end = key_start + klen;
-        Ok(&self.buf[key_start..key_end])
     }
 
     fn find_slot(&self, key: &[u8]) -> Result<(usize, bool), InternalPageError> {
@@ -381,6 +395,36 @@ impl<'a> InternalPage<'a> {
         Ok(())
     }
 
+    // ------------------------------------------------------------------------
+    // Private Helpers: Record Operations
+    // ------------------------------------------------------------------------
+
+    fn record_header(&self, off: usize, len: usize) -> Result<(usize, usize), InternalPageError> {
+        if len < RECORD_HEADER_SIZE {
+            return Err(InternalPageError::Corrupt("record too small".into()));
+        }
+        let klen = read_u16(self.buf, off + RECORD_KLEN_OFF)? as usize;
+        let vlen = read_u16(self.buf, off + RECORD_VLEN_OFF)? as usize;
+        let expected = RECORD_HEADER_SIZE
+            .checked_add(klen)
+            .and_then(|x| x.checked_add(vlen))
+            .ok_or_else(|| InternalPageError::Corrupt("record length overflow".into()))?;
+        if expected != len {
+            return Err(InternalPageError::Corrupt(format!(
+                "record length mismatch: slot_len={len} expected={expected}"
+            )));
+        }
+        Ok((klen, vlen))
+    }
+
+    fn record_key_at(&self, index: usize) -> Result<&[u8], InternalPageError> {
+        let (off, len) = self.slot(index)?;
+        let (klen, _vlen) = self.record_header(off, len)?;
+        let key_start = off + RECORD_HEADER_SIZE;
+        let key_end = key_start + klen;
+        Ok(&self.buf[key_start..key_end])
+    }
+
     fn write_record(
         &mut self,
         off: usize,
@@ -411,6 +455,10 @@ impl<'a> InternalPage<'a> {
         Ok(())
     }
 }
+
+// ============================================================================
+// Helper Functions (lowest-level utilities)
+// ============================================================================
 
 fn record_len(klen: usize, vlen: usize) -> Result<usize, InternalPageError> {
     let _ = u16::try_from(klen)

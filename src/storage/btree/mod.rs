@@ -12,7 +12,9 @@ use layout::{
 };
 use page::{InternalPage, LeafPage, LeafPageError};
 
-// Type aliases for B-tree operations to clarify intent and reduce complexity
+// ============================================================================
+// Type Aliases
+// ============================================================================
 
 /// Represents a key in the B-tree (stored as bytes)
 type Key = Vec<u8>;
@@ -35,7 +37,49 @@ type InternalEntries = (u64, Vec<KeyChildId>);
 /// Iterator over key-value pairs, yielding results or errors
 type KeyValueIter<'a> = BTreeRangeIter<'a>;
 
+// ============================================================================
+// Constants
+// ============================================================================
+
 const NONE_PAGE_ID: u64 = 0;
+
+// ============================================================================
+// Helper Types (used by BTree implementation)
+// ============================================================================
+
+/// A split propagated upward during recursive insert.
+///
+/// The caller must insert `sep_key -> right_child` into its internal page.
+///
+/// `sep_key` is the minimum key in `right_child` (the new right sibling).
+#[derive(Debug, Clone)]
+struct SplitInfo {
+    sep_key: Vec<u8>,
+    right_child: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InsertMode {
+    Upsert,
+    Unique,
+}
+
+#[derive(Debug, Clone)]
+struct InsertResult {
+    new_node_id: u64,
+    split: Option<SplitInfo>,
+    inserted: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DeleteResult {
+    new_node_id: u64,
+    deleted: bool,
+}
+
+// ============================================================================
+// BTree (Public API)
+// ============================================================================
 
 #[derive(Debug)]
 pub struct BTree {
@@ -43,10 +87,18 @@ pub struct BTree {
 }
 
 impl BTree {
+    // ------------------------------------------------------------------------
+    // Constructors
+    // ------------------------------------------------------------------------
+
     /// Create a BTree with the given page-store implementation.
     pub fn new(store: Box<dyn PageStore>) -> Self {
         Self { page_store: store }
     }
+
+    // ------------------------------------------------------------------------
+    // Public API: Read Operations
+    // ------------------------------------------------------------------------
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, WrongoDBError> {
         let mut node_id = self.page_store.root_page_id();
@@ -103,6 +155,22 @@ impl BTree {
         }
     }
 
+    pub fn range(
+        &mut self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<KeyValueIter<'_>, WrongoDBError> {
+        let root = self.page_store.root_page_id();
+        if root == NONE_PAGE_ID {
+            return Ok(BTreeRangeIter::empty());
+        }
+        BTreeRangeIter::new(self.page_store.as_mut() as &mut dyn PageRead, root, start, end)
+    }
+
+    // ------------------------------------------------------------------------
+    // Public API: Write Operations
+    // ------------------------------------------------------------------------
+
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
         let root = self.page_store.root_page_id();
         if root == NONE_PAGE_ID {
@@ -142,11 +210,14 @@ impl BTree {
         Ok(result.deleted)
     }
 
+    // ------------------------------------------------------------------------
+    // Public API: Lifecycle Operations
+    // ------------------------------------------------------------------------
+
     /// Explicitly checkpoint the B+tree.
     ///
     /// This flushes all dirty pages to disk and atomically swaps the root.
     /// After this returns, all previous mutations are durable.
-    ///
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         let root = self.page_store.checkpoint_prepare();
         self.page_store.checkpoint_flush_data()?;
@@ -154,22 +225,9 @@ impl BTree {
         Ok(())
     }
 
-    pub fn range(
-        &mut self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> Result<KeyValueIter<'_>, WrongoDBError> {
-        let root = self.page_store.root_page_id();
-        if root == NONE_PAGE_ID {
-            return Ok(BTreeRangeIter::empty());
-        }
-        BTreeRangeIter::new(
-            self.page_store.as_mut() as &mut dyn PageRead,
-            root,
-            start,
-            end,
-        )
-    }
+    // ------------------------------------------------------------------------
+    // Private Helpers: Delete Operations
+    // ------------------------------------------------------------------------
 
     /// Delete a key from the subtree rooted at `node_id`.
     ///
@@ -254,6 +312,10 @@ impl BTree {
             deleted: child_result.deleted,
         })
     }
+
+    // ------------------------------------------------------------------------
+    // Private Helpers: Insert Operations
+    // ------------------------------------------------------------------------
 
     /// Insert into the subtree rooted at `node_id`.
     ///
@@ -449,35 +511,9 @@ impl BTree {
     }
 }
 
-#[derive(Debug, Clone)]
-/// A split propagated upward during recursive insert.
-///
-/// The caller must insert `sep_key -> right_child` into its internal page.
-///
-/// `sep_key` is the minimum key in `right_child` (the new right sibling).
-struct SplitInfo {
-    sep_key: Vec<u8>,
-    right_child: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InsertMode {
-    Upsert,
-    Unique,
-}
-
-#[derive(Debug, Clone)]
-struct InsertResult {
-    new_node_id: u64,
-    split: Option<SplitInfo>,
-    inserted: bool,
-}
-
-#[derive(Debug, Clone)]
-struct DeleteResult {
-    new_node_id: u64,
-    deleted: bool,
-}
+// ============================================================================
+// Helper Functions (lowest-level utilities)
+// ============================================================================
 
 fn upsert_entry(entries: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &[u8], value: &[u8]) {
     match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {

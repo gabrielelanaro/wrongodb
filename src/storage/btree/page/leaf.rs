@@ -1,6 +1,10 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use thiserror::Error;
 
+// ============================================================================
+// Constants
+// ============================================================================
+
 const PAGE_TYPE_LEAF: u8 = 1;
 const HEADER_SIZE: usize = 8;
 const SLOT_SIZE: usize = 4;
@@ -26,6 +30,10 @@ const HDR_SLOT_COUNT: usize = 2;
 const HDR_LOWER: usize = 4;
 const HDR_UPPER: usize = 6;
 
+// ============================================================================
+// Error Types
+// ============================================================================
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum LeafPageError {
     #[error("page full")]
@@ -35,12 +43,20 @@ pub enum LeafPageError {
     Corrupt(String),
 }
 
+// ============================================================================
+// LeafPage (Public API)
+// ============================================================================
+
 #[derive(Debug)]
 pub struct LeafPage<'a> {
     buf: &'a mut [u8],
 }
 
 impl<'a> LeafPage<'a> {
+    // ------------------------------------------------------------------------
+    // Constructors
+    // ------------------------------------------------------------------------
+
     /// Initialize `buf` as a brand-new, empty leaf page.
     ///
     /// Algorithmic model:
@@ -81,6 +97,10 @@ impl<'a> LeafPage<'a> {
         Ok(page)
     }
 
+    // ------------------------------------------------------------------------
+    // Public API: Read Operations
+    // ------------------------------------------------------------------------
+
     /// Look up `key` and return a copy of its value (if present).
     ///
     /// Reads are driven by the slot directory: slots are kept sorted by key bytes,
@@ -92,6 +112,47 @@ impl<'a> LeafPage<'a> {
         }
         Ok(Some(self.value_at(idx)?.to_vec()))
     }
+
+    pub fn slot_count(&self) -> Result<usize, LeafPageError> {
+        Ok(self.slot_count_u16()? as usize)
+    }
+
+    pub fn key_at(&self, index: usize) -> Result<&[u8], LeafPageError> {
+        let (off, len) = self.slot(index)?;
+        let (klen, _vlen) = self.record_header(off, len)?;
+        // Key bytes start immediately after the record header (klen/vlen).
+        let key_start = off + RECORD_HEADER_SIZE;
+        let key_end = key_start + klen;
+        Ok(&self.buf[key_start..key_end])
+    }
+
+    pub fn value_at(&self, index: usize) -> Result<&[u8], LeafPageError> {
+        let (off, len) = self.slot(index)?;
+        let (klen, vlen) = self.record_header(off, len)?;
+        // Value bytes start immediately after (header + key bytes).
+        let val_start = off + RECORD_HEADER_SIZE + klen;
+        let val_end = val_start + vlen;
+        Ok(&self.buf[val_start..val_end])
+    }
+
+    pub fn free_contiguous(&self) -> usize {
+        let Ok(lower) = self.lower() else {
+            return 0;
+        };
+        let Ok(upper) = self.upper() else {
+            return 0;
+        };
+        upper.saturating_sub(lower)
+    }
+
+    pub fn contains_key(&self, key: &[u8]) -> Result<bool, LeafPageError> {
+        let (_idx, found) = self.find_slot(key)?;
+        Ok(found)
+    }
+
+    // ------------------------------------------------------------------------
+    // Public API: Write Operations
+    // ------------------------------------------------------------------------
 
     /// Insert or replace `key -> value`.
     ///
@@ -166,37 +227,9 @@ impl<'a> LeafPage<'a> {
         Ok(true)
     }
 
-    pub fn slot_count(&self) -> Result<usize, LeafPageError> {
-        Ok(self.slot_count_u16()? as usize)
-    }
-
-    pub fn key_at(&self, index: usize) -> Result<&[u8], LeafPageError> {
-        let (off, len) = self.slot(index)?;
-        let (klen, _vlen) = self.record_header(off, len)?;
-        // Key bytes start immediately after the record header (klen/vlen).
-        let key_start = off + RECORD_HEADER_SIZE;
-        let key_end = key_start + klen;
-        Ok(&self.buf[key_start..key_end])
-    }
-
-    pub fn value_at(&self, index: usize) -> Result<&[u8], LeafPageError> {
-        let (off, len) = self.slot(index)?;
-        let (klen, vlen) = self.record_header(off, len)?;
-        // Value bytes start immediately after (header + key bytes).
-        let val_start = off + RECORD_HEADER_SIZE + klen;
-        let val_end = val_start + vlen;
-        Ok(&self.buf[val_start..val_end])
-    }
-
-    pub fn free_contiguous(&self) -> usize {
-        let Ok(lower) = self.lower() else {
-            return 0;
-        };
-        let Ok(upper) = self.upper() else {
-            return 0;
-        };
-        upper.saturating_sub(lower)
-    }
+    // ------------------------------------------------------------------------
+    // Public API: Maintenance Operations
+    // ------------------------------------------------------------------------
 
     /// Rewrite the page to remove fragmentation.
     ///
@@ -246,6 +279,10 @@ impl<'a> LeafPage<'a> {
         Ok(())
     }
 
+    // ------------------------------------------------------------------------
+    // Private Helpers: Validation
+    // ------------------------------------------------------------------------
+
     fn validate(&self) -> Result<(), LeafPageError> {
         if self.buf.len() < HEADER_SIZE {
             return Err(LeafPageError::Corrupt("buffer too small".into()));
@@ -279,6 +316,10 @@ impl<'a> LeafPage<'a> {
         Ok(())
     }
 
+    // ------------------------------------------------------------------------
+    // Private Helpers: Header Accessors
+    // ------------------------------------------------------------------------
+
     fn slot_count_u16(&self) -> Result<u16, LeafPageError> {
         read_u16(self.buf, HDR_SLOT_COUNT)
     }
@@ -305,6 +346,10 @@ impl<'a> LeafPage<'a> {
         }
         write_u16(self.buf, HDR_UPPER, v as u16)
     }
+
+    // ------------------------------------------------------------------------
+    // Private Helpers: Slot Operations
+    // ------------------------------------------------------------------------
 
     fn slot(&self, index: usize) -> Result<(usize, usize), LeafPageError> {
         let slot_count = self.slot_count()?;
@@ -337,24 +382,6 @@ impl<'a> LeafPage<'a> {
         Ok(())
     }
 
-    fn record_header(&self, off: usize, len: usize) -> Result<(usize, usize), LeafPageError> {
-        if len < RECORD_HEADER_SIZE {
-            return Err(LeafPageError::Corrupt("record too small".into()));
-        }
-        let klen = read_u16(self.buf, off + RECORD_KLEN_OFF)? as usize;
-        let vlen = read_u16(self.buf, off + RECORD_VLEN_OFF)? as usize;
-        let expected = RECORD_HEADER_SIZE
-            .checked_add(klen)
-            .and_then(|x| x.checked_add(vlen))
-            .ok_or_else(|| LeafPageError::Corrupt("record length overflow".into()))?;
-        if expected != len {
-            return Err(LeafPageError::Corrupt(format!(
-                "record length mismatch: slot_len={len} expected={expected}"
-            )));
-        }
-        Ok((klen, vlen))
-    }
-
     fn find_slot(&self, key: &[u8]) -> Result<(usize, bool), LeafPageError> {
         self.validate()?;
         let slot_count = self.slot_count()?;
@@ -375,11 +402,6 @@ impl<'a> LeafPage<'a> {
         Ok((lo, false))
     }
 
-    pub fn contains_key(&self, key: &[u8]) -> Result<bool, LeafPageError> {
-        let (_idx, found) = self.find_slot(key)?;
-        Ok(found)
-    }
-
     fn delete_at(&mut self, index: usize) -> Result<(), LeafPageError> {
         self.validate()?;
         let slot_count = self.slot_count()?;
@@ -397,6 +419,28 @@ impl<'a> LeafPage<'a> {
         self.set_slot_count((slot_count - 1) as u16)?;
         self.set_lower((HEADER_SIZE + (slot_count - 1) * SLOT_SIZE) as u16)?;
         Ok(())
+    }
+
+    // ------------------------------------------------------------------------
+    // Private Helpers: Record Operations
+    // ------------------------------------------------------------------------
+
+    fn record_header(&self, off: usize, len: usize) -> Result<(usize, usize), LeafPageError> {
+        if len < RECORD_HEADER_SIZE {
+            return Err(LeafPageError::Corrupt("record too small".into()));
+        }
+        let klen = read_u16(self.buf, off + RECORD_KLEN_OFF)? as usize;
+        let vlen = read_u16(self.buf, off + RECORD_VLEN_OFF)? as usize;
+        let expected = RECORD_HEADER_SIZE
+            .checked_add(klen)
+            .and_then(|x| x.checked_add(vlen))
+            .ok_or_else(|| LeafPageError::Corrupt("record length overflow".into()))?;
+        if expected != len {
+            return Err(LeafPageError::Corrupt(format!(
+                "record length mismatch: slot_len={len} expected={expected}"
+            )));
+        }
+        Ok((klen, vlen))
     }
 
     fn write_record(&mut self, off: usize, key: &[u8], value: &[u8]) -> Result<(), LeafPageError> {
@@ -423,6 +467,10 @@ impl<'a> LeafPage<'a> {
         Ok(())
     }
 }
+
+// ============================================================================
+// Helper Functions (lowest-level utilities)
+// ============================================================================
 
 fn record_len(klen: usize, vlen: usize) -> Result<usize, LeafPageError> {
     let _ = u16::try_from(klen)
@@ -463,6 +511,10 @@ fn write_u16(buf: &mut [u8], off: usize, v: u16) -> Result<(), LeafPageError> {
     w.write_u16::<LittleEndian>(v)
         .map_err(|e| LeafPageError::Corrupt(e.to_string()))
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {

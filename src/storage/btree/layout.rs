@@ -3,8 +3,16 @@ use crate::core::errors::{StorageError, WrongoDBError};
 use super::page::{InternalPage, InternalPageError, LeafPage, LeafPageError};
 use super::{InternalEntries, LeafEntries};
 
+// ============================================================================
+// Constants
+// ============================================================================
+
 const PAGE_TYPE_LEAF: u8 = 1;
 const PAGE_TYPE_INTERNAL: u8 = 2;
+
+// ============================================================================
+// Type Aliases
+// ============================================================================
 
 type PageBytes = Vec<u8>;
 type InternalKeyChildEntries = Vec<(Vec<u8>, u64)>;
@@ -18,11 +26,19 @@ pub(super) type InternalSplit = (
     usize,
 );
 
+// ============================================================================
+// Helper Types
+// ============================================================================
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PageType {
     Leaf,
     Internal,
 }
+
+// ============================================================================
+// Public Functions: Page Type Detection
+// ============================================================================
 
 pub(super) fn page_type(payload: &[u8]) -> Result<PageType, WrongoDBError> {
     let Some(t) = payload.first().copied() else {
@@ -35,6 +51,10 @@ pub(super) fn page_type(payload: &[u8]) -> Result<PageType, WrongoDBError> {
     }
 }
 
+// ============================================================================
+// Public Functions: Error Mapping
+// ============================================================================
+
 pub(super) fn map_leaf_err(e: LeafPageError) -> WrongoDBError {
     StorageError(e.to_string()).into()
 }
@@ -42,6 +62,10 @@ pub(super) fn map_leaf_err(e: LeafPageError) -> WrongoDBError {
 pub(super) fn map_internal_err(e: InternalPageError) -> WrongoDBError {
     StorageError(e.to_string()).into()
 }
+
+// ============================================================================
+// Public Functions: Entry Extraction
+// ============================================================================
 
 pub(super) fn leaf_entries(buf: &mut [u8]) -> Result<LeafEntries, WrongoDBError> {
     let leaf = LeafPage::open(buf).map_err(|e| StorageError(format!("corrupt leaf: {e}")))?;
@@ -80,6 +104,39 @@ pub(super) fn internal_entries(buf: &mut [u8]) -> Result<InternalEntries, Wrongo
     Ok((first_child, out))
 }
 
+// ============================================================================
+// Public Functions: Page Building
+// ============================================================================
+
+pub(super) fn build_leaf_page(
+    entries: &[(Vec<u8>, Vec<u8>)],
+    payload_len: usize,
+) -> Result<Vec<u8>, WrongoDBError> {
+    let mut bytes = vec![0u8; payload_len];
+    let mut page = LeafPage::init(&mut bytes).map_err(map_leaf_err)?;
+    for (k, v) in entries {
+        page.put(k, v).map_err(map_leaf_err)?;
+    }
+    Ok(bytes)
+}
+
+pub(super) fn build_internal_page(
+    first_child: u64,
+    entries: &[(Vec<u8>, u64)],
+    payload_len: usize,
+) -> Result<Vec<u8>, WrongoDBError> {
+    let mut bytes = vec![0u8; payload_len];
+    let mut page = InternalPage::init(&mut bytes, first_child).map_err(map_internal_err)?;
+    for (k, child) in entries {
+        page.put_separator(k, *child).map_err(map_internal_err)?;
+    }
+    Ok(bytes)
+}
+
+// ============================================================================
+// Public Functions: Split Operations
+// ============================================================================
+
 pub(super) fn split_leaf_entries(
     entries: &[(Vec<u8>, Vec<u8>)],
     payload_len: usize,
@@ -116,18 +173,6 @@ pub(super) fn split_leaf_entries(
     }
 
     Err(StorageError("leaf split impossible (record too large?)".into()).into())
-}
-
-pub(super) fn build_leaf_page(
-    entries: &[(Vec<u8>, Vec<u8>)],
-    payload_len: usize,
-) -> Result<Vec<u8>, WrongoDBError> {
-    let mut bytes = vec![0u8; payload_len];
-    let mut page = LeafPage::init(&mut bytes).map_err(map_leaf_err)?;
-    for (k, v) in entries {
-        page.put(k, v).map_err(map_leaf_err)?;
-    }
-    Ok(bytes)
 }
 
 /// Split an internal node into (left_bytes, right_bytes, promoted_key).
@@ -197,17 +242,4 @@ pub(super) fn split_internal_entries(
     }
 
     Err(StorageError("internal split impossible (record too large?)".into()).into())
-}
-
-pub(super) fn build_internal_page(
-    first_child: u64,
-    entries: &[(Vec<u8>, u64)],
-    payload_len: usize,
-) -> Result<Vec<u8>, WrongoDBError> {
-    let mut bytes = vec![0u8; payload_len];
-    let mut page = InternalPage::init(&mut bytes, first_child).map_err(map_internal_err)?;
-    for (k, child) in entries {
-        page.put_separator(k, *child).map_err(map_internal_err)?;
-    }
-    Ok(bytes)
 }
