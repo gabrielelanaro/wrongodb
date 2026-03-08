@@ -66,34 +66,10 @@ impl Table {
         txn_id: TxnId,
     ) -> Result<ScanEntries, WrongoDBError> {
         let visibility = ReadVisibility::from_txn_id(txn_id);
-        let entries = self
-            .btree
-            .range(start_key, end_key)
+        self.btree
+            .range(start_key, end_key, &visibility)
             .map_err(|e| StorageError(format!("table scan failed: {e}")))?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut keys: Vec<Vec<u8>> = entries.into_iter().map(|(key, _)| key.to_vec()).collect();
-        keys.extend(self.transaction_manager.mvcc_keys_in_range(
-            &self.store_name,
-            start_key,
-            end_key,
-        ));
-        keys.sort();
-        keys.dedup();
-
-        let mut out = Vec::new();
-        for key in keys {
-            if let Some(bytes) = self.transaction_manager.get(
-                &self.store_name,
-                &mut self.btree,
-                &key,
-                &visibility,
-            )? {
-                out.push((key, bytes));
-            }
-        }
-
-        Ok(out)
+            .collect::<Result<Vec<_>, _>>()
     }
 
     // ------------------------------------------------------------------------
@@ -387,5 +363,54 @@ mod tests {
             }
         );
         assert_eq!(table.get_version(b"k1", TXN_NONE).unwrap(), None);
+    }
+
+    #[test]
+    fn scan_range_merges_page_local_inserts_and_slot_updates() {
+        let (_tmp, transaction_manager, mut table) = open_table("table.idx.wt");
+
+        table
+            .local_apply_put_with_txn(b"k1", b"v1", TXN_NONE)
+            .unwrap();
+        table
+            .local_apply_put_with_txn(b"k3", b"v3", TXN_NONE)
+            .unwrap();
+
+        let mut txn = transaction_manager.begin_snapshot_txn();
+        table
+            .local_apply_put_in_txn(b"k2", b"v2", &mut txn)
+            .unwrap();
+        table
+            .local_apply_put_in_txn(b"k3", b"v3x", &mut txn)
+            .unwrap();
+
+        let entries = table.scan_range(None, None, txn.id()).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                (b"k1".to_vec(), b"v1".to_vec()),
+                (b"k2".to_vec(), b"v2".to_vec()),
+                (b"k3".to_vec(), b"v3x".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_range_skips_page_local_tombstones() {
+        let (_tmp, transaction_manager, mut table) = open_table("table.idx.wt");
+
+        table
+            .local_apply_put_with_txn(b"k1", b"v1", TXN_NONE)
+            .unwrap();
+        table
+            .local_apply_put_with_txn(b"k2", b"v2", TXN_NONE)
+            .unwrap();
+
+        let mut txn = transaction_manager.begin_snapshot_txn();
+        let deleted = table.local_apply_delete_in_txn(b"k1", &mut txn).unwrap();
+        assert!(deleted);
+
+        let entries = table.scan_range(None, None, txn.id()).unwrap();
+        assert_eq!(entries, vec![(b"k2".to_vec(), b"v2".to_vec())]);
     }
 }

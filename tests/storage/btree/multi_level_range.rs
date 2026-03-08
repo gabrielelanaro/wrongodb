@@ -72,7 +72,7 @@ fn ordered_range_scan_is_sorted_and_respects_bounds() {
     }
 
     let all: Vec<Vec<u8>> = tree
-        .range(None, None)
+        .range(None, None, &ReadVisibility::from_txn_id(TXN_NONE))
         .unwrap()
         .map(|r| r.unwrap().0)
         .collect();
@@ -82,7 +82,11 @@ fn ordered_range_scan_is_sorted_and_respects_bounds() {
     assert_eq!(all.last().unwrap(), b"k0499");
 
     let slice: Vec<Vec<u8>> = tree
-        .range(Some(b"k0100"), Some(b"k0200"))
+        .range(
+            Some(b"k0100"),
+            Some(b"k0200"),
+            &ReadVisibility::from_txn_id(TXN_NONE),
+        )
         .unwrap()
         .map(|r| r.unwrap().0)
         .collect();
@@ -97,7 +101,11 @@ fn ordered_range_scan_is_sorted_and_respects_bounds() {
 
     let mut tree2 = open_tree(&path).unwrap();
     let slice2: Vec<Vec<u8>> = tree2
-        .range(Some(b"k0100"), Some(b"k0200"))
+        .range(
+            Some(b"k0100"),
+            Some(b"k0200"),
+            &ReadVisibility::from_txn_id(TXN_NONE),
+        )
         .unwrap()
         .map(|r| r.unwrap().0)
         .collect();

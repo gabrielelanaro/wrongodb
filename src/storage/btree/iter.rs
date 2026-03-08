@@ -1,9 +1,11 @@
 use crate::core::errors::{StorageError, WrongoDBError};
-use crate::storage::page_store::{PageRead, PageType, ReadPin};
+use crate::storage::page_store::{Page, PageRead, PageType, ReadPin, RowInsert};
+use crate::txn::{ReadVisibility, TXN_NONE};
 
 use super::layout::{map_internal_err, map_leaf_err};
 use super::page::{InternalPage, LeafPage};
 use super::search::{internal_child_at, internal_child_index_for_key, leaf_lower_bound};
+use super::visible_chain_value;
 
 // ============================================================================
 // BTreeRangeIter (Public API)
@@ -17,13 +19,16 @@ use super::search::{internal_child_at, internal_child_index_for_key, leaf_lower_
 /// Key design decisions:
 /// - **Pager ownership**: Takes `&mut dyn PageRead` to allow unpinning pages during traversal
 /// - **Lazy navigation**: Only pins pages as needed, releases internal nodes after descending
-/// - **Stack-based cursor**: Tracks position through internal nodes for efficient advance
+/// - **Leaf-local visibility merge**: Each leaf is materialized into a visible row view that merges
+///   base rows, `row_updates`, and `row_inserts` before iteration continues
 pub struct BTreeRangeIter<'a> {
     pager: Option<&'a mut (dyn PageRead + 'a)>,
     end: Option<Vec<u8>>,
+    visibility: ReadVisibility,
     stack: Vec<CursorFrame>,
     leaf: Option<ReadPin>,
-    slot_idx: usize,
+    leaf_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    entry_idx: usize,
     done: bool,
 }
 
@@ -39,9 +44,11 @@ impl<'a> BTreeRangeIter<'a> {
         Self {
             pager: None,
             end: None,
+            visibility: ReadVisibility::from_txn_id(TXN_NONE),
             stack: Vec::new(),
             leaf: None,
-            slot_idx: 0,
+            leaf_entries: Vec::new(),
+            entry_idx: 0,
             done: true,
         }
     }
@@ -58,13 +65,16 @@ impl<'a> BTreeRangeIter<'a> {
         root: u64,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
+        visibility: &ReadVisibility,
     ) -> Result<Self, WrongoDBError> {
         let mut iter = Self {
             pager: Some(pager),
             end: end.map(|value| value.to_vec()),
+            visibility: *visibility,
             stack: Vec::new(),
             leaf: None,
-            slot_idx: 0,
+            leaf_entries: Vec::new(),
+            entry_idx: 0,
             done: false,
         };
         iter.seek(root, start)?;
@@ -80,6 +90,8 @@ impl<'a> BTreeRangeIter<'a> {
             let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
             pager.unpin_page(leaf_pin);
         }
+        self.leaf_entries.clear();
+        self.entry_idx = 0;
         Ok(())
     }
 
@@ -131,7 +143,7 @@ impl<'a> BTreeRangeIter<'a> {
             match step {
                 SeekStep::Leaf { slot_idx } => {
                     self.leaf = Some(pin);
-                    self.slot_idx = slot_idx;
+                    self.load_current_leaf_entries(start, Some(slot_idx))?;
                     return Ok(());
                 }
                 SeekStep::Descend {
@@ -225,7 +237,7 @@ impl<'a> BTreeRangeIter<'a> {
             match step {
                 AdvanceStep::Descend(next_id) if next_id == node_id => {
                     self.leaf = Some(pin);
-                    self.slot_idx = 0;
+                    self.load_current_leaf_entries(None, None)?;
                     return Ok(());
                 }
                 AdvanceStep::Descend(next_id) => {
@@ -236,6 +248,25 @@ impl<'a> BTreeRangeIter<'a> {
                 AdvanceStep::KeepClimbing => unreachable!(),
             }
         }
+    }
+
+    fn load_current_leaf_entries(
+        &mut self,
+        start: Option<&[u8]>,
+        slot_idx_hint: Option<usize>,
+    ) -> Result<(), WrongoDBError> {
+        let leaf_pin = self
+            .leaf
+            .as_ref()
+            .ok_or_else(|| StorageError("range iterator missing current leaf pin".into()))?;
+        let pager = self.pager.as_deref_mut().ok_or_else(missing_pager)?;
+        let page = pager.get_page(leaf_pin);
+        self.leaf_entries = collect_visible_leaf_entries(page, &self.visibility)?;
+        self.entry_idx = match start {
+            Some(start_key) => lower_bound_entry(&self.leaf_entries, start_key),
+            None => slot_idx_hint.unwrap_or(0).min(self.leaf_entries.len()),
+        };
+        Ok(())
     }
 }
 
@@ -257,79 +288,33 @@ impl<'a> Iterator for BTreeRangeIter<'a> {
                 return None;
             };
 
-            let step = {
-                let pager = match self.pager.as_deref_mut() {
-                    Some(pager) => pager,
-                    None => {
+            if self.entry_idx < self.leaf_entries.len() {
+                let (key, value) = self.leaf_entries[self.entry_idx].clone();
+                if let Some(end) = &self.end {
+                    if key.as_slice() >= end.as_slice() {
                         self.done = true;
-                        return Some(Err(missing_pager()));
-                    }
-                };
-                let page = pager.get_page(&leaf_pin);
-                let leaf = match LeafPage::open(page) {
-                    Ok(leaf) => leaf,
-                    Err(err) => {
-                        return Some(Err(StorageError(format!(
-                            "corrupt leaf {}: {err}",
-                            leaf_pin.page_id()
-                        ))
-                        .into()));
-                    }
-                };
-
-                if self.slot_idx < leaf.slot_count() {
-                    let key = match leaf.key_at(self.slot_idx) {
-                        Ok(value) => value.to_vec(),
-                        Err(err) => return Some(Err(map_leaf_err(err))),
-                    };
-                    if let Some(end) = &self.end {
-                        if key.as_slice() >= end.as_slice() {
-                            NextStep::End
-                        } else {
-                            let value = match leaf.value_at(self.slot_idx) {
-                                Ok(value) => value.to_vec(),
-                                Err(err) => return Some(Err(map_leaf_err(err))),
-                            };
-                            NextStep::Yield(key, value)
+                        if let Some(pager) = self.pager.as_deref_mut() {
+                            pager.unpin_page(leaf_pin);
                         }
-                    } else {
-                        let value = match leaf.value_at(self.slot_idx) {
-                            Ok(value) => value.to_vec(),
-                            Err(err) => return Some(Err(map_leaf_err(err))),
-                        };
-                        NextStep::Yield(key, value)
+                        return None;
                     }
-                } else {
-                    NextStep::Advance
                 }
-            };
 
-            match step {
-                NextStep::Yield(key, value) => {
-                    self.slot_idx += 1;
-                    self.leaf = Some(leaf_pin);
-                    return Some(Ok((key, value)));
-                }
-                NextStep::End => {
+                self.entry_idx += 1;
+                self.leaf = Some(leaf_pin);
+                return Some(Ok((key, value)));
+            }
+
+            self.leaf = Some(leaf_pin);
+            match self.advance_to_next_leaf() {
+                Ok(true) => continue,
+                Ok(false) => {
                     self.done = true;
-                    if let Some(pager) = self.pager.as_deref_mut() {
-                        pager.unpin_page(leaf_pin);
-                    }
                     return None;
                 }
-                NextStep::Advance => {
-                    self.leaf = Some(leaf_pin);
-                    match self.advance_to_next_leaf() {
-                        Ok(true) => continue,
-                        Ok(false) => {
-                            self.done = true;
-                            return None;
-                        }
-                        Err(err) => {
-                            self.done = true;
-                            return Some(Err(err));
-                        }
-                    }
+                Err(err) => {
+                    self.done = true;
+                    return Some(Err(err));
                 }
             }
         }
@@ -365,16 +350,68 @@ enum AdvanceStep {
     KeepClimbing,
 }
 
-/// Result of processing a leaf during iteration.
-enum NextStep {
-    Yield(Vec<u8>, Vec<u8>),
-    Advance,
-    End,
-}
-
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+fn collect_visible_leaf_entries(
+    page: &Page,
+    visibility: &ReadVisibility,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
+    let leaf =
+        LeafPage::open(page).map_err(|err| StorageError(format!("corrupt leaf page: {err}")))?;
+    let mut out = Vec::new();
+
+    let Some(modify) = page.row_modify() else {
+        for slot_idx in 0..leaf.slot_count() {
+            out.push((
+                leaf.key_at(slot_idx).map_err(map_leaf_err)?.to_vec(),
+                leaf.value_at(slot_idx).map_err(map_leaf_err)?.to_vec(),
+            ));
+        }
+        return Ok(out);
+    };
+
+    for slot_idx in 0..leaf.slot_count() {
+        append_visible_bucket(&mut out, &modify.row_inserts()[slot_idx], visibility);
+
+        let key = leaf.key_at(slot_idx).map_err(map_leaf_err)?.to_vec();
+        match modify.row_updates()[slot_idx]
+            .as_ref()
+            .and_then(|chain| visible_chain_value(chain, visibility))
+        {
+            Some(Some(value)) => out.push((key, value)),
+            Some(None) => {}
+            None => out.push((key, leaf.value_at(slot_idx).map_err(map_leaf_err)?.to_vec())),
+        }
+    }
+
+    append_visible_bucket(
+        &mut out,
+        &modify.row_inserts()[leaf.slot_count()],
+        visibility,
+    );
+
+    Ok(out)
+}
+
+fn append_visible_bucket(
+    out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    bucket: &[RowInsert],
+    visibility: &ReadVisibility,
+) {
+    for insert in bucket {
+        if let Some(Some(value)) = visible_chain_value(insert.updates(), visibility) {
+            out.push((insert.key().to_vec(), value));
+        }
+    }
+}
+
+fn lower_bound_entry(entries: &[(Vec<u8>, Vec<u8>)], key: &[u8]) -> usize {
+    entries
+        .binary_search_by(|(entry_key, _)| entry_key.as_slice().cmp(key))
+        .unwrap_or_else(|index| index)
+}
 
 fn missing_pager() -> WrongoDBError {
     StorageError("range iterator has no backing page store".into()).into()

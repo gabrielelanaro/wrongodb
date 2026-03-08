@@ -80,21 +80,4 @@ impl MvccState {
 
         (entries_to_materialize, stats)
     }
-
-    // ------------------------------------------------------------------------
-    // Key Range Queries
-    // ------------------------------------------------------------------------
-
-    pub fn keys_in_range(&self, start: Option<&[u8]>, end: Option<&[u8]>) -> Vec<Vec<u8>> {
-        let mut keys: Vec<Vec<u8>> = self.chains.keys().cloned().collect();
-        if start.is_some() || end.is_some() {
-            keys.retain(|key| {
-                let after_start = start.is_none_or(|s| key.as_slice() >= s);
-                let before_end = end.is_none_or(|e| key.as_slice() < e);
-                after_start && before_end
-            });
-        }
-        keys.sort();
-        keys
-    }
 }

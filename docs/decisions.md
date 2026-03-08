@@ -1737,3 +1737,22 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - The checkpoint sweep is the minimal bridge needed to keep the new session-bound MVCC write path
   compatible with the existing persisted base-page/checkpoint model while scans and full
   reconciliation are still being migrated.
+
+## 2026-03-08: Range scans merge page-local row updates and inserts inside the B-tree
+
+**Decision**
+- Change `BTreeCursor::range` to take `ReadVisibility`, matching the point-read boundary.
+- Rewrite `BTreeRangeIter` so each pinned leaf is materialized into a visible row view before
+  iteration continues.
+- Merge three sources in sorted order inside that leaf-local view:
+  base rows, `row_updates`, and `row_inserts`.
+- Make `Table::scan_range` consume `BTreeCursor::range(...)` directly and remove the old
+  `TransactionManager::mvcc_keys_in_range` scan indirection.
+
+**Why**
+- Scan visibility should follow the same ownership boundary as point reads: the B-tree owns
+  search/iteration, while transaction code only supplies visibility context.
+- Once updates are page-local, the old "scan base keys, union global MVCC keys, then re-read every
+  key through TransactionManager" path is both redundant and structurally wrong.
+- Materializing one visible leaf view at a time keeps the traversal logic simple while preserving
+  the WT-style split between on-page row updates and inserted in-memory rows.

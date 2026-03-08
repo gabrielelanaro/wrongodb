@@ -162,6 +162,7 @@ impl BTreeCursor {
         &mut self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
+        visibility: &ReadVisibility,
     ) -> Result<KeyValueIter<'_>, WrongoDBError> {
         let root = self.page_store.root_page_id();
         if root == NONE_PAGE_ID {
@@ -172,6 +173,7 @@ impl BTreeCursor {
             root,
             start,
             end,
+            visibility,
         )
     }
 
@@ -746,7 +748,7 @@ impl BTreeCursor {
 // Helper Functions
 // ============================================================================
 
-fn visible_chain_value(
+pub(super) fn visible_chain_value(
     chain: &UpdateChain,
     visibility: &ReadVisibility,
 ) -> Option<Option<Vec<u8>>> {

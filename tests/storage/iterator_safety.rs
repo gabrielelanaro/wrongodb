@@ -62,7 +62,9 @@ fn range_scan_works_with_cache_eviction() {
 
     // Now iterate over all keys - this should work even with eviction
     let mut count = 0;
-    let iter = btree.range(None, None).unwrap();
+    let iter = btree
+        .range(None, None, &ReadVisibility::from_txn_id(TXN_NONE))
+        .unwrap();
     for result in iter {
         let (k, v): (Vec<u8>, Vec<u8>) = result.unwrap();
         assert!(k.starts_with(b"key"));
@@ -137,13 +139,17 @@ fn range_scan_handles_empty_ranges() {
     let mut btree = create_tree(&path, 256).unwrap();
 
     // Empty range scan
-    let iter = btree.range(Some(b"z"), Some(b"zz")).unwrap();
+    let iter = btree
+        .range(Some(b"z"), Some(b"zz"), &ReadVisibility::from_txn_id(TXN_NONE))
+        .unwrap();
     let count = iter.count();
     assert_eq!(count, 0);
 
     // Range with no matches
     btree.put(b"key1", b"value1").unwrap();
-    let iter = btree.range(Some(b"z"), Some(b"zz")).unwrap();
+    let iter = btree
+        .range(Some(b"z"), Some(b"zz"), &ReadVisibility::from_txn_id(TXN_NONE))
+        .unwrap();
     let count = iter.count();
     assert_eq!(count, 0);
 }

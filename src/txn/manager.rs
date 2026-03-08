@@ -164,19 +164,6 @@ impl TransactionManager {
         Ok(())
     }
 
-    pub fn mvcc_keys_in_range(
-        &self,
-        store_name: &str,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> Vec<Vec<u8>> {
-        let stores = self.stores.read();
-        stores
-            .get(store_name)
-            .map(|state| state.keys_in_range(start, end))
-            .unwrap_or_default()
-    }
-
     pub(crate) fn reconcile_store_for_checkpoint(
         &self,
         store_name: &str,
