@@ -117,6 +117,15 @@ impl PageCache {
         &entry.page
     }
 
+    #[allow(dead_code)]
+    pub fn get_page_mut(&mut self, page_id: u64) -> &mut Page {
+        let entry = self
+            .get_mut(page_id)
+            .expect("pinned page must exist in cache");
+        debug_assert!(entry.pin_count > 0, "page {} must be pinned", page_id);
+        &mut entry.page
+    }
+
     // ------------------------------------------------------------------------
     // Public API - Modification Operations
     // ------------------------------------------------------------------------

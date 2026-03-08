@@ -8,8 +8,8 @@ mod search;
 pub use iter::BTreeRangeIter;
 
 use crate::core::errors::{StorageError, WrongoDBError};
-use crate::storage::page_store::{Page, PageEdit, PageRead, PageStore, PageType};
-use crate::txn::{ReadVisibility, UpdateChain, UpdateType};
+use crate::storage::page_store::{Page, PageEdit, PageRead, PageStore, PageType, RowInsert};
+use crate::txn::{ReadVisibility, Update, UpdateChain, UpdateType, WriteContext};
 use internal_ops::put_separator as put_internal_separator;
 use layout::{
     build_internal_page, internal_entries, leaf_entries, map_leaf_err, split_internal_entries,
@@ -73,6 +73,14 @@ enum ReadStep {
     Descend(u64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+struct LeafPosition {
+    page_id: u64,
+    index: usize,
+    found: bool,
+}
+
 // ============================================================================
 // BTreeCursor (Public API)
 // ============================================================================
@@ -83,7 +91,7 @@ enum ReadStep {
 ///
 /// - **Point queries**: `get` retrieves a single key-value pair
 /// - **Range scans**: `range` returns an iterator over key ranges
-/// - **Mutations**: `put` and `delete` modify tree structure with automatic splitting
+/// - **Mutations**: `put` and `delete` attach page-local MVCC updates
 /// - **Checkpointing**: `checkpoint` flushes dirty pages and creates a consistent recovery point
 ///
 /// The cursor owns a [`PageStore`] which handles page caching, copy-on-write,
@@ -170,13 +178,37 @@ impl BTreeCursor {
     // Public API: Write Operations
     // ------------------------------------------------------------------------
 
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
+    #[allow(dead_code)]
+    pub fn put(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        write_context: &WriteContext,
+    ) -> Result<(), WrongoDBError> {
+        let position = self.find_leaf_position(key)?;
+        let pin = self.page_store.pin_page(position.page_id)?;
+        {
+            let page = self.page_store.get_page_mut(&pin);
+            let update = Update::new(write_context.txn_id(), UpdateType::Standard, value.to_vec());
+            apply_leaf_update(page, key, position, update).map_err(|e| {
+                StorageError(format!("leaf update failed at {}: {e}", position.page_id))
+            })?;
+        }
+        self.page_store.unpin_page(pin);
+        Ok(())
+    }
+
+    pub(crate) fn materialize_put(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), WrongoDBError> {
         let root = self.page_store.root_page_id();
         if root == NONE_PAGE_ID {
             return Err(StorageError("btree missing root".into()).into());
         }
 
-        let result = self.insert_recursive(root, key, value, InsertMode::Upsert)?;
+        let result = self.materialize_insert_recursive(root, key, value, InsertMode::Upsert)?;
         if let Some(split) = result.split {
             let payload_len = self.page_store.page_payload_len();
             let mut root_page = Page::new_internal(payload_len, result.new_node_id)
@@ -193,13 +225,35 @@ impl BTreeCursor {
         Ok(())
     }
 
-    pub fn delete(&mut self, key: &[u8]) -> Result<bool, WrongoDBError> {
+    #[allow(dead_code)]
+    pub fn delete(
+        &mut self,
+        key: &[u8],
+        write_context: &WriteContext,
+    ) -> Result<bool, WrongoDBError> {
+        let position = self.find_leaf_position(key)?;
+        let pin = self.page_store.pin_page(position.page_id)?;
+        {
+            let page = self.page_store.get_page_mut(&pin);
+            let update = Update::new(write_context.txn_id(), UpdateType::Tombstone, Vec::new());
+            apply_leaf_update(page, key, position, update).map_err(|e| {
+                StorageError(format!(
+                    "leaf tombstone failed at {}: {e}",
+                    position.page_id
+                ))
+            })?;
+        }
+        self.page_store.unpin_page(pin);
+        Ok(true)
+    }
+
+    pub(crate) fn materialize_delete(&mut self, key: &[u8]) -> Result<bool, WrongoDBError> {
         let root = self.page_store.root_page_id();
         if root == NONE_PAGE_ID {
             return Ok(false);
         }
 
-        let result = self.delete_recursive(root, key)?;
+        let result = self.materialize_delete_recursive(root, key)?;
         self.page_store.set_root_page_id(result.new_node_id)?;
         Ok(result.deleted)
     }
@@ -254,7 +308,51 @@ impl BTreeCursor {
         Ok(Some(leaf.value_at(position.index)?.to_vec()))
     }
 
-    fn delete_recursive(
+    #[allow(dead_code)]
+    fn find_leaf_position(&mut self, key: &[u8]) -> Result<LeafPosition, WrongoDBError> {
+        let mut node_id = self.page_store.root_page_id();
+        if node_id == NONE_PAGE_ID {
+            return Err(StorageError("btree missing root".into()).into());
+        }
+
+        loop {
+            let pin = self.page_store.pin_page(node_id)?;
+            let step = {
+                let page = self.page_store.get_page(&pin);
+                match page.header().page_type {
+                    PageType::Leaf => {
+                        let leaf = LeafPage::open(page)
+                            .map_err(|e| StorageError(format!("corrupt leaf {node_id}: {e}")))?;
+                        let position = search_leaf(&leaf, key).map_err(|e| {
+                            StorageError(format!("leaf search failed at {node_id}: {e}"))
+                        })?;
+                        Ok::<_, WrongoDBError>(Some(LeafPosition {
+                            page_id: node_id,
+                            index: position.index,
+                            found: position.found,
+                        }))
+                    }
+                    PageType::Internal => {
+                        let internal = InternalPage::open(page).map_err(|e| {
+                            StorageError(format!("corrupt internal {node_id}: {e}"))
+                        })?;
+                        let next = child_for_key(&internal, key).map_err(|e| {
+                            StorageError(format!("routing failed at {node_id}: {e}"))
+                        })?;
+                        node_id = next;
+                        Ok(None)
+                    }
+                }
+            };
+            self.page_store.unpin_page(pin);
+
+            if let Some(position) = step? {
+                return Ok(position);
+            }
+        }
+    }
+
+    fn materialize_delete_recursive(
         &mut self,
         node_id: u64,
         key: &[u8],
@@ -308,7 +406,7 @@ impl BTreeCursor {
             entries[child_idx - 1].1
         };
 
-        let child_result = self.delete_recursive(child_id, key)?;
+        let child_result = self.materialize_delete_recursive(child_id, key)?;
         if child_idx == 0 {
             first_child = child_result.new_node_id;
         } else {
@@ -328,7 +426,7 @@ impl BTreeCursor {
     // Private Helpers: Insert Operations
     // ------------------------------------------------------------------------
 
-    fn insert_recursive(
+    fn materialize_insert_recursive(
         &mut self,
         node_id: u64,
         key: &[u8],
@@ -425,7 +523,7 @@ impl BTreeCursor {
             entries[child_idx - 1].1
         };
 
-        let child_result = self.insert_recursive(child_id, key, value, mode)?;
+        let child_result = self.materialize_insert_recursive(child_id, key, value, mode)?;
         if !child_result.inserted {
             return Ok(InsertResult {
                 new_node_id: page_id,
@@ -498,6 +596,41 @@ fn visible_chain_value(
     None
 }
 
+#[allow(dead_code)]
+fn apply_leaf_update(
+    page: &mut Page,
+    key: &[u8],
+    position: LeafPosition,
+    update: Update,
+) -> Result<(), crate::storage::page_store::PageError> {
+    let row_modify = page.ensure_row_modify()?;
+    if position.found {
+        let chain =
+            row_modify.row_updates_mut()[position.index].get_or_insert_with(UpdateChain::default);
+        prepend_update(chain, update);
+        return Ok(());
+    }
+
+    let bucket = &mut row_modify.row_inserts_mut()[position.index];
+    match bucket.binary_search_by(|insert| insert.key().cmp(key)) {
+        Ok(index) => prepend_update(bucket[index].updates_mut(), update),
+        Err(index) => {
+            let mut chain = UpdateChain::default();
+            prepend_update(&mut chain, update);
+            bucket.insert(index, RowInsert::new(key.to_vec(), chain));
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn prepend_update(chain: &mut UpdateChain, update: Update) {
+    if let Some(head) = chain.head_mut() {
+        head.mark_stopped(update.txn_id);
+    }
+    chain.prepend(update);
+}
+
 fn upsert_entry(entries: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &[u8], value: &[u8]) {
     match entries.binary_search_by(|(existing_key, _)| existing_key.as_slice().cmp(key)) {
         Ok(index) => entries[index].1 = value.to_vec(),
@@ -521,4 +654,86 @@ fn child_index_for_key(entries: &[(Vec<u8>, u64)], key: &[u8]) -> usize {
         index = entry_idx + 1;
     }
     index
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::storage::page_store::{BlockFilePageStore, PageWrite, RootStore};
+    use crate::txn::{WriteContext, TXN_NONE};
+
+    fn create_tree(path: &Path) -> BTreeCursor {
+        let mut store = BlockFilePageStore::create(path, 512).unwrap();
+        let payload_len = store.page_payload_len();
+        let root = Page::new_leaf(payload_len).unwrap();
+        let root_id = store.write_new_page(root).unwrap();
+        store.set_root_page_id(root_id).unwrap();
+        BTreeCursor::new(Box::new(store))
+    }
+
+    #[test]
+    fn put_shadows_existing_base_row() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("btree_put_existing.wt");
+        let mut tree = create_tree(&path);
+        let writer = WriteContext::from_txn_id(7);
+
+        tree.materialize_put(b"k1", b"base").unwrap();
+        tree.put(b"k1", b"txn", &writer).unwrap();
+
+        assert_eq!(
+            tree.get(b"k1", &ReadVisibility::from_txn_id(7)).unwrap(),
+            Some(b"txn".to_vec())
+        );
+        assert_eq!(
+            tree.get(b"k1", &ReadVisibility::from_txn_id(TXN_NONE))
+                .unwrap(),
+            Some(b"base".to_vec())
+        );
+    }
+
+    #[test]
+    fn put_exposes_inserted_row_before_materialization() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("btree_put_insert.wt");
+        let mut tree = create_tree(&path);
+        let writer = WriteContext::from_txn_id(9);
+
+        tree.put(b"k1", b"txn", &writer).unwrap();
+
+        assert_eq!(
+            tree.get(b"k1", &ReadVisibility::from_txn_id(9)).unwrap(),
+            Some(b"txn".to_vec())
+        );
+        assert_eq!(
+            tree.get(b"k1", &ReadVisibility::from_txn_id(TXN_NONE))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn delete_hides_existing_base_row() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("btree_delete_existing.wt");
+        let mut tree = create_tree(&path);
+        let writer = WriteContext::from_txn_id(11);
+
+        tree.materialize_put(b"k1", b"base").unwrap();
+        tree.delete(b"k1", &writer).unwrap();
+
+        assert_eq!(
+            tree.get(b"k1", &ReadVisibility::from_txn_id(11)).unwrap(),
+            None
+        );
+        assert_eq!(
+            tree.get(b"k1", &ReadVisibility::from_txn_id(TXN_NONE))
+                .unwrap(),
+            Some(b"base".to_vec())
+        );
+    }
 }

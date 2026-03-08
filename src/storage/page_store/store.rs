@@ -196,6 +196,10 @@ impl PageRead for BlockFilePageStore {
         self.cache.get_page(pin.page_id())
     }
 
+    fn get_page_mut(&mut self, pin: &ReadPin) -> &mut Page {
+        self.cache.get_page_mut(pin.page_id())
+    }
+
     fn unpin_page(&mut self, pin: ReadPin) {
         let _ = self.cache.unpin(pin.page_id());
     }

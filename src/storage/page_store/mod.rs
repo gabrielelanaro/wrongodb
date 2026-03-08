@@ -8,4 +8,6 @@ mod types;
 pub use page::{Page, PageError, PageType, RawPage, RowInsert, RowModify};
 pub use store::BlockFilePageStore;
 pub use traits::{PageRead, PageStore};
+#[allow(unused_imports)]
+pub(crate) use traits::{PageWrite, RootStore};
 pub use types::{PageEdit, ReadPin};

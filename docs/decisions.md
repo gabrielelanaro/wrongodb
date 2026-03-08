@@ -1694,3 +1694,24 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - A small visibility object preserves a clean boundary: transaction code produces read context, and
   storage code consumes it.
 - This is the right API shape for the later move from global MVCC maps to page-owned update chains.
+
+## 2026-03-08: B-tree writes split MVCC update attachment from base-page materialization
+
+**Decision**
+- Introduce `txn::WriteContext` as the write-time context consumed by `BTreeCursor::put` and
+  `BTreeCursor::delete`.
+- Treat those public B-tree write methods as page-local MVCC operations that attach updates to
+  `Page::row_modify`.
+- Demote the old physical tree rewrite path to crate-private `materialize_put` /
+  `materialize_delete` helpers used by reconciliation and other base-image materialization paths.
+- Reuse the normal pin/unpin read path to mutate page-local runtime state in place via a mutable
+  pinned-page accessor, instead of routing MVCC updates through the page-image COW edit path.
+
+**Why**
+- Public B-tree writes should reflect the logical write model: user writes create update chains,
+  they do not immediately rewrite raw pages.
+- The existing `PageEdit` / `pin_page_mut` lifecycle is for physical page-image mutation, which may
+  allocate a new page id. That is the wrong semantic for page-local runtime MVCC state.
+- Keeping materialization private makes the boundary clearer: `BTreeCursor` owns write policy,
+  while the page store still provides the lower-level mechanisms needed by reconciliation and
+  structural page rewrites.

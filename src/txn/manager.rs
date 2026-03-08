@@ -50,7 +50,7 @@ impl TransactionManager {
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
         if txn_id == TXN_NONE {
-            btree.put(key, value)?;
+            btree.materialize_put(key, value)?;
             return Ok(());
         }
 
@@ -77,7 +77,7 @@ impl TransactionManager {
         txn_id: TxnId,
     ) -> Result<bool, WrongoDBError> {
         if txn_id == TXN_NONE {
-            return btree.delete(key);
+            return btree.materialize_delete(key);
         }
 
         let mut stores = self.stores.write();
@@ -192,9 +192,9 @@ impl TransactionManager {
 
         for (key, update_type, data) in entries {
             match update_type {
-                UpdateType::Standard => btree.put(&key, &data)?,
+                UpdateType::Standard => btree.materialize_put(&key, &data)?,
                 UpdateType::Tombstone => {
-                    let _ = btree.delete(&key)?;
+                    let _ = btree.materialize_delete(&key)?;
                 }
                 UpdateType::Reserve => {}
             }

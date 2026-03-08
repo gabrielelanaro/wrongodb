@@ -6,6 +6,7 @@ pub(crate) mod recovery_unit;
 pub mod snapshot;
 pub mod transaction;
 pub mod update;
+pub mod write_context;
 
 pub(crate) use active_write_unit::ActiveWriteUnit;
 pub use global_txn::GlobalTxnState;
@@ -17,6 +18,7 @@ pub(crate) use recovery_unit::{NoopRecoveryUnit, RecoveryUnit, WalRecoveryUnit};
 #[allow(unused_imports)]
 pub use transaction::{Transaction, TxnState};
 pub use update::{Update, UpdateChain, UpdateType};
+pub use write_context::WriteContext;
 
 pub type TxnId = u64;
 pub const TXN_NONE: TxnId = 0;
