@@ -296,11 +296,11 @@ impl BlockFile {
 
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, WrongoDBError> {
         let path = path.as_ref();
-        if !path.exists() {
-            return Err(StorageError(format!("file not found: {path:?}")).into());
-        }
-
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| StorageError(format!("failed to open {path:?}: {e}")))?;
 
         let mut prefix = vec![0u8; CHECKSUM_SIZE + HEADER_FIXED_SIZE];
         file.read_exact(&mut prefix)
@@ -333,7 +333,6 @@ impl BlockFile {
             return Err(StorageError("header checksum mismatch".into()).into());
         }
 
-        let payload0 = &page0[CHECKSUM_SIZE..];
         let (header, extents) = FileHeader::unpack(payload0)?;
 
         let active_checkpoint_slot = Self::select_checkpoint_slot(&header)?;
@@ -559,22 +558,11 @@ impl BlockFile {
         let mut best_idx: Option<usize> = None;
         let mut best_gen = 0u64;
         for (idx, slot) in header.checkpoint_slots.iter().enumerate() {
-            if !slot.is_valid() {
-                continue;
-            }
-            match best_idx {
-                None => {
-                    best_idx = Some(idx);
-                    best_gen = slot.generation;
-                }
-                Some(_) if slot.generation > best_gen => {
-                    best_idx = Some(idx);
-                    best_gen = slot.generation;
-                }
-                _ => {}
+            if slot.is_valid() && (best_idx.is_none() || slot.generation > best_gen) {
+                best_idx = Some(idx);
+                best_gen = slot.generation;
             }
         }
-
         best_idx.ok_or_else(|| StorageError("no valid checkpoint slots found".into()).into())
     }
 }
