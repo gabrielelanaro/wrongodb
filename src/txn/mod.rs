@@ -16,8 +16,8 @@ pub use read_visibility::ReadVisibility;
 #[allow(unused_imports)]
 pub(crate) use recovery_unit::{NoopRecoveryUnit, RecoveryUnit, WalRecoveryUnit};
 #[allow(unused_imports)]
-pub use transaction::{Transaction, TxnState};
-pub use update::{Update, UpdateChain, UpdateType};
+pub use transaction::{Transaction, TxnOp, TxnState};
+pub use update::{Update, UpdateChain, UpdateRef, UpdateType};
 pub use write_context::WriteContext;
 
 pub type TxnId = u64;

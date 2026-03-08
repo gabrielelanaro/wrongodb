@@ -1,3 +1,7 @@
+use std::sync::Arc;
+
+use parking_lot::RwLock;
+
 use super::{Timestamp, TxnId, TS_MAX, TS_NONE, TXN_ABORTED};
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -31,10 +35,12 @@ impl TimeWindow {
 pub struct Update {
     pub txn_id: TxnId,
     pub time_window: TimeWindow,
-    pub next: Option<Box<Update>>,
+    pub next: Option<UpdateRef>,
     pub type_: UpdateType,
     pub data: Vec<u8>,
 }
+
+pub type UpdateRef = Arc<RwLock<Update>>;
 
 impl Update {
     pub fn new(txn_id: TxnId, update_type: UpdateType, data: Vec<u8>) -> Self {
@@ -57,6 +63,16 @@ impl Update {
 
     pub fn is_current(&self) -> bool {
         self.time_window.stop_ts == TS_MAX
+    }
+
+    pub fn mark_committed(&mut self, commit_ts: Timestamp) {
+        self.time_window.start_ts = commit_ts;
+        self.time_window.stop_ts = TS_MAX;
+    }
+
+    pub fn mark_aborted(&mut self) {
+        self.time_window.stop_ts = TS_NONE;
+        self.time_window.stop_txn = TXN_ABORTED;
     }
 
     /// Check if this update is obsolete - no active transaction can see it.
@@ -84,27 +100,29 @@ impl Update {
 
 #[derive(Debug, Default, Clone)]
 pub struct UpdateChain {
-    head: Option<Box<Update>>,
+    head: Option<UpdateRef>,
 }
 
 impl UpdateChain {
-    pub fn prepend(&mut self, mut update: Update) {
+    pub fn prepend(&mut self, mut update: Update) -> UpdateRef {
         update.next = self.head.take();
-        self.head = Some(Box::new(update));
+        let update_ref = Arc::new(RwLock::new(update));
+        self.head = Some(update_ref.clone());
+        update_ref
     }
 
-    pub fn head_mut(&mut self) -> Option<&mut Update> {
-        self.head.as_deref_mut()
+    pub fn head(&self) -> Option<UpdateRef> {
+        self.head.clone()
     }
 
     pub fn mark_aborted(&mut self, txn_id: TxnId) {
-        let mut current = self.head.as_deref_mut();
-        while let Some(update) = current {
+        let mut current = self.head.clone();
+        while let Some(update_ref) = current {
+            let mut update = update_ref.write();
             if update.txn_id == txn_id {
-                update.time_window.stop_ts = TS_NONE;
-                update.time_window.stop_txn = TXN_ABORTED;
+                update.mark_aborted();
             }
-            current = update.next.as_deref_mut();
+            current = update.next.clone();
         }
     }
 
@@ -113,31 +131,43 @@ impl UpdateChain {
     pub fn truncate_obsolete(&mut self, oldest_active_txn_id: TxnId) -> usize {
         let mut removed = 0;
 
-        // Remove obsolete updates from the head
-        while let Some(head) = self.head.as_ref() {
-            if head.is_obsolete(oldest_active_txn_id) {
-                self.head = self.head.take().unwrap().next;
+        while let Some(head_ref) = self.head.clone() {
+            let (obsolete, next) = {
+                let head = head_ref.read();
+                (head.is_obsolete(oldest_active_txn_id), head.next.clone())
+            };
+            if obsolete {
+                self.head = next;
                 removed += 1;
             } else {
                 break;
             }
         }
 
-        // Remove obsolete updates from the middle/end using raw pointers
-        // This is safe because we maintain the invariants of the linked list
-        if let Some(mut current_ptr) = self.head.as_mut() {
-            while let Some(next_box) = current_ptr.next.as_mut() {
-                if next_box.is_obsolete(oldest_active_txn_id) {
-                    // Remove the obsolete next node
-                    current_ptr.next = next_box.next.take();
-                    removed += 1;
-                } else {
-                    // Move to the next node
-                    current_ptr = current_ptr
-                        .next
-                        .as_mut()
-                        .expect("we just checked it's Some");
-                }
+        let mut current = self.head.clone();
+        while let Some(current_ref) = current.clone() {
+            let next_ref = {
+                let current_guard = current_ref.read();
+                current_guard.next.clone()
+            };
+
+            let Some(next_ref) = next_ref else {
+                break;
+            };
+
+            let (obsolete, next_next) = {
+                let next_guard = next_ref.read();
+                (
+                    next_guard.is_obsolete(oldest_active_txn_id),
+                    next_guard.next.clone(),
+                )
+            };
+
+            if obsolete {
+                current_ref.write().next = next_next;
+                removed += 1;
+            } else {
+                current = Some(next_ref);
             }
         }
 
@@ -150,7 +180,8 @@ impl UpdateChain {
     }
 
     pub fn latest_committed_entry(&self) -> Option<(UpdateType, Vec<u8>)> {
-        for update in self.iter() {
+        for update_ref in self.iter() {
+            let update = update_ref.read();
             if !update.is_committed() {
                 continue;
             }
@@ -168,36 +199,38 @@ impl UpdateChain {
             return false;
         }
 
-        let Some(head) = self.head.as_ref() else {
+        let Some(head_ref) = self.head.as_ref() else {
             return false;
         };
+        let head = head_ref.read();
         if !head.is_committed() || !head.is_current() {
             return false;
         }
 
+        drop(head);
         self.head = None;
         true
     }
 
     /// Iterate over all updates in the chain (from head to tail).
-    pub fn iter(&self) -> UpdateChainIter<'_> {
+    pub fn iter(&self) -> UpdateChainIter {
         UpdateChainIter {
-            current: self.head.as_deref(),
+            current: self.head.clone(),
         }
     }
 }
 
 /// Iterator over updates in an UpdateChain.
-pub struct UpdateChainIter<'a> {
-    current: Option<&'a Update>,
+pub struct UpdateChainIter {
+    current: Option<UpdateRef>,
 }
 
-impl<'a> Iterator for UpdateChainIter<'a> {
-    type Item = &'a Update;
+impl Iterator for UpdateChainIter {
+    type Item = UpdateRef;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let current = self.current?;
-        self.current = current.next.as_deref();
+        let current = self.current.clone()?;
+        self.current = current.read().next.clone();
         Some(current)
     }
 }

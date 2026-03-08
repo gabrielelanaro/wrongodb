@@ -60,8 +60,8 @@ impl TransactionManager {
             .or_insert_with(MvccState::new);
 
         let chain = state.chain_mut_or_create(key);
-        if let Some(head) = chain.head_mut() {
-            head.mark_stopped(txn_id);
+        if let Some(head) = chain.head() {
+            head.write().mark_stopped(txn_id);
         }
 
         let update = Update::new(txn_id, UpdateType::Standard, value.to_vec());
@@ -86,8 +86,8 @@ impl TransactionManager {
             .or_insert_with(MvccState::new);
 
         let chain = state.chain_mut_or_create(key);
-        if let Some(head) = chain.head_mut() {
-            head.mark_stopped(txn_id);
+        if let Some(head) = chain.head() {
+            head.write().mark_stopped(txn_id);
         }
 
         let update = Update::new(txn_id, UpdateType::Tombstone, Vec::new());
@@ -106,8 +106,9 @@ impl TransactionManager {
             let stores = self.stores.read();
             if let Some(state) = stores.get(store_name) {
                 if let Some(chain) = state.chain(key) {
-                    for update in chain.iter() {
-                        if !visibility.can_see(update) {
+                    for update_ref in chain.iter() {
+                        let update = update_ref.read();
+                        if !visibility.can_see(&update) {
                             continue;
                         }
 
@@ -136,7 +137,8 @@ impl TransactionManager {
         };
 
         for chain in state.chains_mut() {
-            if let Some(head) = chain.head_mut() {
+            if let Some(head) = chain.head() {
+                let mut head = head.write();
                 if head.txn_id == txn_id {
                     head.time_window.start_ts = txn_id;
                     head.time_window.stop_ts = TS_MAX;

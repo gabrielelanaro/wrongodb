@@ -596,6 +596,9 @@ mod tests {
         let updates = cloned.row_modify().unwrap().row_updates();
         let cloned_chain = updates[0].as_ref().unwrap();
 
-        assert_eq!(cloned_chain.iter().next().unwrap().data, b"v1".to_vec());
+        assert_eq!(
+            cloned_chain.iter().next().unwrap().read().data,
+            b"v1".to_vec()
+        );
     }
 }

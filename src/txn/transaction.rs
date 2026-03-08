@@ -1,7 +1,7 @@
 use crate::core::errors::WrongoDBError;
 use crate::txn::global_txn::GlobalTxnState;
 use crate::txn::snapshot::Snapshot;
-use crate::txn::update::Update;
+use crate::txn::update::{Update, UpdateRef};
 use crate::txn::{Timestamp, TxnId, TXN_NONE};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -9,6 +9,12 @@ pub enum TxnState {
     Active,
     Committed { commit_ts: Timestamp },
     Aborted,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum TxnOp {
+    PageUpdate(UpdateRef),
 }
 
 #[derive(Debug)]
@@ -19,6 +25,7 @@ pub struct Transaction {
     #[cfg_attr(not(test), allow(dead_code))]
     read_ts: Option<Timestamp>,
     state: TxnState,
+    ops: Vec<TxnOp>,
 }
 
 impl Transaction {
@@ -28,6 +35,7 @@ impl Transaction {
             snapshot: Some(snapshot),
             read_ts: None,
             state: TxnState::Active,
+            ops: Vec::new(),
         }
     }
 
@@ -52,6 +60,8 @@ impl Transaction {
                     global.unregister_active(self.id);
                 }
 
+                self.mark_ops_committed(commit_ts);
+
                 Ok(commit_ts)
             }
             TxnState::Committed { .. } => Err(WrongoDBError::InvalidTransactionState(
@@ -75,6 +85,8 @@ impl Transaction {
                     global.unregister_active(self.id);
                 }
 
+                self.mark_ops_aborted();
+
                 Ok(())
             }
             TxnState::Committed { .. } => Err(WrongoDBError::InvalidTransactionState(
@@ -92,6 +104,11 @@ impl Transaction {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+    pub fn record_op(&mut self, op: TxnOp) {
+        self.ops.push(op);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn can_see(&self, update: &Update) -> bool {
         let visible_txn = match &self.snapshot {
             Some(snapshot) => snapshot.is_visible(update.txn_id),
@@ -105,5 +122,21 @@ impl Transaction {
             return true;
         };
         update.time_window.start_ts <= read_ts && read_ts < update.time_window.stop_ts
+    }
+
+    fn mark_ops_committed(&mut self, commit_ts: Timestamp) {
+        for op in self.ops.drain(..) {
+            match op {
+                TxnOp::PageUpdate(update_ref) => update_ref.write().mark_committed(commit_ts),
+            }
+        }
+    }
+
+    fn mark_ops_aborted(&mut self) {
+        for op in self.ops.drain(..) {
+            match op {
+                TxnOp::PageUpdate(update_ref) => update_ref.write().mark_aborted(),
+            }
+        }
     }
 }

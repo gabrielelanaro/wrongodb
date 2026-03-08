@@ -9,7 +9,7 @@ pub use iter::BTreeRangeIter;
 
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::page_store::{Page, PageEdit, PageRead, PageStore, PageType, RowInsert};
-use crate::txn::{ReadVisibility, Update, UpdateChain, UpdateType, WriteContext};
+use crate::txn::{ReadVisibility, Update, UpdateChain, UpdateRef, UpdateType, WriteContext};
 use internal_ops::put_separator as put_internal_separator;
 use layout::{
     build_internal_page, internal_entries, leaf_entries, map_leaf_err, split_internal_entries,
@@ -185,16 +185,11 @@ impl BTreeCursor {
         value: &[u8],
         write_context: &WriteContext,
     ) -> Result<(), WrongoDBError> {
-        let position = self.find_leaf_position(key)?;
-        let pin = self.page_store.pin_page(position.page_id)?;
-        {
-            let page = self.page_store.get_page_mut(&pin);
-            let update = Update::new(write_context.txn_id(), UpdateType::Standard, value.to_vec());
-            apply_leaf_update(page, key, position, update).map_err(|e| {
-                StorageError(format!("leaf update failed at {}: {e}", position.page_id))
-            })?;
+        if write_context.txn_id() == crate::txn::TXN_NONE {
+            return self.materialize_put(key, value);
         }
-        self.page_store.unpin_page(pin);
+
+        let _ = self.put_with_update_ref(key, value, write_context)?;
         Ok(())
     }
 
@@ -231,19 +226,11 @@ impl BTreeCursor {
         key: &[u8],
         write_context: &WriteContext,
     ) -> Result<bool, WrongoDBError> {
-        let position = self.find_leaf_position(key)?;
-        let pin = self.page_store.pin_page(position.page_id)?;
-        {
-            let page = self.page_store.get_page_mut(&pin);
-            let update = Update::new(write_context.txn_id(), UpdateType::Tombstone, Vec::new());
-            apply_leaf_update(page, key, position, update).map_err(|e| {
-                StorageError(format!(
-                    "leaf tombstone failed at {}: {e}",
-                    position.page_id
-                ))
-            })?;
+        if write_context.txn_id() == crate::txn::TXN_NONE {
+            return self.materialize_delete(key);
         }
-        self.page_store.unpin_page(pin);
+
+        let _ = self.delete_with_update_ref(key, write_context)?;
         Ok(true)
     }
 
@@ -306,6 +293,46 @@ impl BTreeCursor {
         }
 
         Ok(Some(leaf.value_at(position.index)?.to_vec()))
+    }
+
+    pub(crate) fn put_with_update_ref(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        write_context: &WriteContext,
+    ) -> Result<UpdateRef, WrongoDBError> {
+        let position = self.find_leaf_position(key)?;
+        let pin = self.page_store.pin_page(position.page_id)?;
+        let update_ref = {
+            let page = self.page_store.get_page_mut(&pin);
+            let update = Update::new(write_context.txn_id(), UpdateType::Standard, value.to_vec());
+            apply_leaf_update(page, key, position, update).map_err(|e| {
+                StorageError(format!("leaf update failed at {}: {e}", position.page_id))
+            })?
+        };
+        self.page_store.unpin_page(pin);
+        Ok(update_ref)
+    }
+
+    pub(crate) fn delete_with_update_ref(
+        &mut self,
+        key: &[u8],
+        write_context: &WriteContext,
+    ) -> Result<UpdateRef, WrongoDBError> {
+        let position = self.find_leaf_position(key)?;
+        let pin = self.page_store.pin_page(position.page_id)?;
+        let update_ref = {
+            let page = self.page_store.get_page_mut(&pin);
+            let update = Update::new(write_context.txn_id(), UpdateType::Tombstone, Vec::new());
+            apply_leaf_update(page, key, position, update).map_err(|e| {
+                StorageError(format!(
+                    "leaf tombstone failed at {}: {e}",
+                    position.page_id
+                ))
+            })?
+        };
+        self.page_store.unpin_page(pin);
+        Ok(update_ref)
     }
 
     #[allow(dead_code)]
@@ -581,8 +608,9 @@ fn visible_chain_value(
     chain: &UpdateChain,
     visibility: &ReadVisibility,
 ) -> Option<Option<Vec<u8>>> {
-    for update in chain.iter() {
-        if !visibility.can_see(update) {
+    for update_ref in chain.iter() {
+        let update = update_ref.read();
+        if !visibility.can_see(&update) {
             continue;
         }
 
@@ -602,33 +630,32 @@ fn apply_leaf_update(
     key: &[u8],
     position: LeafPosition,
     update: Update,
-) -> Result<(), crate::storage::page_store::PageError> {
+) -> Result<UpdateRef, crate::storage::page_store::PageError> {
     let row_modify = page.ensure_row_modify()?;
     if position.found {
         let chain =
             row_modify.row_updates_mut()[position.index].get_or_insert_with(UpdateChain::default);
-        prepend_update(chain, update);
-        return Ok(());
+        return Ok(prepend_update(chain, update));
     }
 
     let bucket = &mut row_modify.row_inserts_mut()[position.index];
     match bucket.binary_search_by(|insert| insert.key().cmp(key)) {
-        Ok(index) => prepend_update(bucket[index].updates_mut(), update),
+        Ok(index) => Ok(prepend_update(bucket[index].updates_mut(), update)),
         Err(index) => {
             let mut chain = UpdateChain::default();
-            prepend_update(&mut chain, update);
+            let update_ref = prepend_update(&mut chain, update);
             bucket.insert(index, RowInsert::new(key.to_vec(), chain));
+            Ok(update_ref)
         }
     }
-    Ok(())
 }
 
 #[allow(dead_code)]
-fn prepend_update(chain: &mut UpdateChain, update: Update) {
-    if let Some(head) = chain.head_mut() {
-        head.mark_stopped(update.txn_id);
+fn prepend_update(chain: &mut UpdateChain, update: Update) -> UpdateRef {
+    if let Some(head) = chain.head() {
+        head.write().mark_stopped(update.txn_id);
     }
-    chain.prepend(update);
+    chain.prepend(update)
 }
 
 fn upsert_entry(entries: &mut Vec<(Vec<u8>, Vec<u8>)>, key: &[u8], value: &[u8]) {
