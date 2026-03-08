@@ -24,6 +24,10 @@ pub struct Table {
 }
 
 impl Table {
+    // ------------------------------------------------------------------------
+    // Constructors
+    // ------------------------------------------------------------------------
+
     pub fn open_or_create_store<P: AsRef<Path>>(
         path: P,
         transaction_manager: Arc<TransactionManager>,
@@ -38,6 +42,23 @@ impl Table {
         })
     }
 
+    // ------------------------------------------------------------------------
+    // Read Operations
+    // ------------------------------------------------------------------------
+
+    pub fn get_version(
+        &mut self,
+        key: &[u8],
+        txn_id: TxnId,
+    ) -> Result<Option<Vec<u8>>, WrongoDBError> {
+        self.transaction_manager
+            .get(&self.store_name, &mut self.btree, key, txn_id)
+    }
+
+    pub fn contains_key(&mut self, key: &[u8], txn_id: TxnId) -> Result<bool, WrongoDBError> {
+        Ok(self.get_version(key, txn_id)?.is_some())
+    }
+
     pub fn scan_range(
         &mut self,
         start_key: Option<&[u8]>,
@@ -47,7 +68,7 @@ impl Table {
         let entries = self
             .btree
             .range(start_key, end_key)
-            .map_err(|e| crate::core::errors::StorageError(format!("table scan failed: {e}")))?
+            .map_err(|e| StorageError(format!("table scan failed: {e}")))?
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut keys: Vec<Vec<u8>> = entries.into_iter().map(|(key, _)| key.to_vec()).collect();
@@ -72,12 +93,9 @@ impl Table {
         Ok(out)
     }
 
-    pub fn checkpoint_store(&mut self) -> Result<(), WrongoDBError> {
-        let _ = self
-            .transaction_manager
-            .reconcile_store_for_checkpoint(&self.store_name, &mut self.btree)?;
-        self.btree.checkpoint()
-    }
+    // ------------------------------------------------------------------------
+    // Write Operations
+    // ------------------------------------------------------------------------
 
     pub fn local_apply_put_with_txn(
         &mut self,
@@ -98,6 +116,10 @@ impl Table {
             .delete(&self.store_name, &mut self.btree, key, txn_id)
     }
 
+    // ------------------------------------------------------------------------
+    // Transaction Lifecycle
+    // ------------------------------------------------------------------------
+
     pub fn local_mark_updates_committed(
         &mut self,
         txn_id: crate::txn::TxnId,
@@ -114,18 +136,20 @@ impl Table {
             .mark_updates_aborted(&self.store_name, txn_id)
     }
 
-    pub fn get_version(
-        &mut self,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<Option<Vec<u8>>, WrongoDBError> {
-        self.transaction_manager
-            .get(&self.store_name, &mut self.btree, key, txn_id)
+    // ------------------------------------------------------------------------
+    // Checkpoint
+    // ------------------------------------------------------------------------
+
+    pub fn checkpoint_store(&mut self) -> Result<(), WrongoDBError> {
+        let _ = self
+            .transaction_manager
+            .reconcile_store_for_checkpoint(&self.store_name, &mut self.btree)?;
+        self.btree.checkpoint()
     }
 
-    pub fn contains_key(&mut self, key: &[u8], txn_id: TxnId) -> Result<bool, WrongoDBError> {
-        Ok(self.get_version(key, txn_id)?.is_some())
-    }
+    // ------------------------------------------------------------------------
+    // Private Helpers
+    // ------------------------------------------------------------------------
 
     fn open_or_create_btree(path: &Path) -> Result<BTree, WrongoDBError> {
         if path.exists() {
@@ -140,6 +164,10 @@ impl Table {
         }
     }
 }
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
 
 fn init_root_if_missing(page_store: &mut dyn PageStore) -> Result<(), WrongoDBError> {
     if page_store.root_page_id() != NONE_BLOCK_ID {
