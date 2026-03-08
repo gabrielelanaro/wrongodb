@@ -1,3 +1,7 @@
+// ============================================================================
+// PinnedPage - Read-only pinned page handle
+// ============================================================================
+
 #[derive(Debug)]
 pub struct PinnedPage {
     pub(crate) page_id: u64,
@@ -5,6 +9,10 @@ pub struct PinnedPage {
 }
 
 impl PinnedPage {
+    // ------------------------------------------------------------------------
+    // Public API
+    // ------------------------------------------------------------------------
+
     pub fn page_id(&self) -> u64 {
         self.page_id
     }
@@ -18,6 +26,10 @@ impl PinnedPage {
     }
 }
 
+// ============================================================================
+// PinnedPageMut - Mutable pinned page handle (copy-on-write)
+// ============================================================================
+
 #[derive(Debug)]
 pub struct PinnedPageMut {
     pub(crate) page_id: u64,
@@ -26,6 +38,10 @@ pub struct PinnedPageMut {
 }
 
 impl PinnedPageMut {
+    // ------------------------------------------------------------------------
+    // Public API
+    // ------------------------------------------------------------------------
+
     pub fn page_id(&self) -> u64 {
         self.page_id
     }

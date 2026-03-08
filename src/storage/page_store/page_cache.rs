@@ -2,7 +2,15 @@ use std::collections::HashMap;
 
 use crate::core::errors::{StorageError, WrongoDBError};
 
+// ============================================================================
+// Constants
+// ============================================================================
+
 const DEFAULT_CACHE_CAPACITY_PAGES: usize = 256;
+
+// ============================================================================
+// PageCacheConfig
+// ============================================================================
 
 #[derive(Debug, Clone)]
 pub(crate) struct PageCacheConfig {
@@ -17,6 +25,10 @@ impl Default for PageCacheConfig {
     }
 }
 
+// ============================================================================
+// PageCacheEntry
+// ============================================================================
+
 #[derive(Debug)]
 pub(crate) struct PageCacheEntry {
     pub page_id: u64,
@@ -27,6 +39,10 @@ pub(crate) struct PageCacheEntry {
 }
 
 impl PageCacheEntry {
+    // ------------------------------------------------------------------------
+    // Constructors
+    // ------------------------------------------------------------------------
+
     pub fn new(page_id: u64, payload: Vec<u8>) -> Self {
         Self {
             page_id,
@@ -38,6 +54,10 @@ impl PageCacheEntry {
     }
 }
 
+// ============================================================================
+// PageCache
+// ============================================================================
+
 #[derive(Debug)]
 pub(crate) struct PageCache {
     config: PageCacheConfig,
@@ -46,6 +66,10 @@ pub(crate) struct PageCache {
 }
 
 impl PageCache {
+    // ------------------------------------------------------------------------
+    // Constructors
+    // ------------------------------------------------------------------------
+
     pub fn new(config: PageCacheConfig) -> Self {
         Self {
             config,
@@ -53,6 +77,10 @@ impl PageCache {
             access_counter: 0,
         }
     }
+
+    // ------------------------------------------------------------------------
+    // Public API - Query Operations
+    // ------------------------------------------------------------------------
 
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -81,6 +109,10 @@ impl PageCache {
         Some(entry)
     }
 
+    // ------------------------------------------------------------------------
+    // Public API - Modification Operations
+    // ------------------------------------------------------------------------
+
     pub fn insert(&mut self, page_id: u64, payload: Vec<u8>) -> &mut PageCacheEntry {
         let mut entry = PageCacheEntry::new(page_id, payload);
         entry.last_access = self.next_access();
@@ -93,6 +125,10 @@ impl PageCache {
     pub fn remove(&mut self, page_id: u64) -> Option<PageCacheEntry> {
         self.entries.remove(&page_id)
     }
+
+    // ------------------------------------------------------------------------
+    // Public API - Pin/Unpin Operations
+    // ------------------------------------------------------------------------
 
     pub fn pin(&mut self, page_id: u64) -> Result<(), WrongoDBError> {
         let entry = self
@@ -112,6 +148,10 @@ impl PageCache {
         entry.pin_count -= 1;
         Ok(())
     }
+
+    // ------------------------------------------------------------------------
+    // Public API - Eviction Operations
+    // ------------------------------------------------------------------------
 
     pub fn lru_unpinned(&self) -> Option<u64> {
         let mut candidate: Option<(u64, u64)> = None;
@@ -140,10 +180,9 @@ impl PageCache {
         Ok(self.entries.remove(&candidate))
     }
 
-    fn next_access(&mut self) -> u64 {
-        self.access_counter = self.access_counter.saturating_add(1);
-        self.access_counter
-    }
+    // ------------------------------------------------------------------------
+    // Public API - I/O Operations
+    // ------------------------------------------------------------------------
 
     /// Load a page from storage into cache and pin it.
     pub fn load_and_pin<F>(
@@ -226,6 +265,15 @@ impl PageCache {
             entry.dirty = false;
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------------------------
+    // Private Helpers
+    // ------------------------------------------------------------------------
+
+    fn next_access(&mut self) -> u64 {
+        self.access_counter = self.access_counter.saturating_add(1);
+        self.access_counter
     }
 }
 

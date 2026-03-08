@@ -8,6 +8,10 @@ use super::page_cache::{PageCache, PageCacheConfig};
 use super::traits::{CheckpointStore, PageRead, PageWrite, RootStore};
 use super::types::{PinnedPage, PinnedPageMut};
 
+// ============================================================================
+// BlockFilePageStore - File-backed page store implementation
+// ============================================================================
+
 /// File-backed page store implementation.
 #[derive(Debug)]
 pub struct BlockFilePageStore {
@@ -18,6 +22,10 @@ pub struct BlockFilePageStore {
 }
 
 impl BlockFilePageStore {
+    // ------------------------------------------------------------------------
+    // Constructors
+    // ------------------------------------------------------------------------
+
     pub fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
         let mut bf = BlockFile::create(&path, page_size)?;
         if let Ok(raw) = std::env::var("WRONGO_PREALLOC_PAGES") {
@@ -50,6 +58,10 @@ impl BlockFilePageStore {
         })
     }
 
+    // ------------------------------------------------------------------------
+    // Lifecycle - Checkpoint
+    // ------------------------------------------------------------------------
+
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         let root = self.checkpoint_prepare();
         self.checkpoint_flush_data()?;
@@ -57,47 +69,28 @@ impl BlockFilePageStore {
         Ok(())
     }
 
+    // ------------------------------------------------------------------------
+    // Public API - Page Read Operations
+    // ------------------------------------------------------------------------
+
     fn page_payload_len(&self) -> usize {
         self.bf.page_payload_len()
-    }
-
-    fn root_page_id(&self) -> u64 {
-        self.working_root
-    }
-
-    fn set_root_page_id(&mut self, root_page_id: u64) -> Result<(), WrongoDBError> {
-        self.working_root = root_page_id;
-        Ok(())
-    }
-
-    /// Prepare for checkpoint by capturing the current working root.
-    fn checkpoint_prepare(&self) -> u64 {
-        self.working_root
-    }
-
-    /// Flush all dirty cached pages to disk.
-    fn checkpoint_flush_data(&mut self) -> Result<(), WrongoDBError> {
-        self.flush_cache()
-    }
-
-    /// Commit the checkpoint by atomically swapping the root and reclaiming retired blocks.
-    fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError> {
-        self.bf.set_root_block_id(new_root)?;
-        // Ensure the new checkpoint root is durable before reclaiming blocks.
-        self.bf.sync_all()?;
-        // Reclaim discarded extents now that the checkpoint root is durable.
-        self.bf.reclaim_discarded()?;
-        // Free-list updates are best-effort; sync so reuse after a successful checkpoint
-        // is durable, but crashes before this point may still leak space.
-        self.bf.sync_all()?;
-        self.working_pages.clear();
-        Ok(())
     }
 
     fn pin_page(&mut self, page_id: u64) -> Result<PinnedPage, WrongoDBError> {
         let payload = self.load_page_and_pin(page_id)?;
         Ok(PinnedPage { page_id, payload })
     }
+
+    fn unpin_page(&mut self, page_id: u64) {
+        if let Err(err) = self.cache.unpin(page_id) {
+            debug_assert!(false, "{err}");
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Public API - Page Write Operations
+    // ------------------------------------------------------------------------
 
     fn pin_page_mut(&mut self, page_id: u64) -> Result<PinnedPageMut, WrongoDBError> {
         if self.working_pages.contains(&page_id) {
@@ -120,12 +113,6 @@ impl BlockFilePageStore {
             payload,
             original_page_id: Some(page_id),
         })
-    }
-
-    fn unpin_page(&mut self, page_id: u64) {
-        if let Err(err) = self.cache.unpin(page_id) {
-            debug_assert!(false, "{err}");
-        }
     }
 
     fn unpin_page_mut_commit(&mut self, page: PinnedPageMut) -> Result<(), WrongoDBError> {
@@ -180,19 +167,64 @@ impl BlockFilePageStore {
         Ok(())
     }
 
-    fn write_page(&mut self, page_id: u64, payload: &[u8]) -> Result<(), WrongoDBError> {
-        self.bf.write_block(page_id, payload)
-    }
-
-    fn allocate_page(&mut self) -> Result<u64, WrongoDBError> {
-        self.bf.allocate_block()
-    }
-
     fn write_new_page(&mut self, payload: &[u8]) -> Result<u64, WrongoDBError> {
         let page_id = self.allocate_page()?;
         self.working_pages.insert(page_id);
         self.write_page(page_id, payload)?;
         Ok(page_id)
+    }
+
+    // ------------------------------------------------------------------------
+    // Public API - Root Management
+    // ------------------------------------------------------------------------
+
+    fn root_page_id(&self) -> u64 {
+        self.working_root
+    }
+
+    fn set_root_page_id(&mut self, root_page_id: u64) -> Result<(), WrongoDBError> {
+        self.working_root = root_page_id;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------------
+    // Private Helpers - Checkpoint Operations
+    // ------------------------------------------------------------------------
+
+    /// Prepare for checkpoint by capturing the current working root.
+    fn checkpoint_prepare(&self) -> u64 {
+        self.working_root
+    }
+
+    /// Flush all dirty cached pages to disk.
+    fn checkpoint_flush_data(&mut self) -> Result<(), WrongoDBError> {
+        self.flush_cache()
+    }
+
+    /// Commit the checkpoint by atomically swapping the root and reclaiming retired blocks.
+    fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError> {
+        self.bf.set_root_block_id(new_root)?;
+        // Ensure the new checkpoint root is durable before reclaiming blocks.
+        self.bf.sync_all()?;
+        // Reclaim discarded extents now that the checkpoint root is durable.
+        self.bf.reclaim_discarded()?;
+        // Free-list updates are best-effort; sync so reuse after a successful checkpoint
+        // is durable, but crashes before this point may still leak space.
+        self.bf.sync_all()?;
+        self.working_pages.clear();
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------------
+    // Private Helpers - Page I/O
+    // ------------------------------------------------------------------------
+
+    fn allocate_page(&mut self) -> Result<u64, WrongoDBError> {
+        self.bf.allocate_block()
+    }
+
+    fn write_page(&mut self, page_id: u64, payload: &[u8]) -> Result<(), WrongoDBError> {
+        self.bf.write_block(page_id, payload)
     }
 
     fn retire_page(&mut self, page_id: u64) -> Result<(), WrongoDBError> {
@@ -202,6 +234,10 @@ impl BlockFilePageStore {
         self.bf.free_block(page_id)?;
         Ok(())
     }
+
+    // ------------------------------------------------------------------------
+    // Private Helpers - Cache Operations
+    // ------------------------------------------------------------------------
 
     fn load_page_and_pin(&mut self, page_id: u64) -> Result<Vec<u8>, WrongoDBError> {
         if !self.cache.contains(page_id) {
@@ -226,6 +262,10 @@ impl BlockFilePageStore {
             .flush(|page_id, payload| self.bf.write_block(page_id, payload))
     }
 }
+
+// ============================================================================
+// Trait Implementations
+// ============================================================================
 
 impl PageRead for BlockFilePageStore {
     fn page_payload_len(&self) -> usize {
