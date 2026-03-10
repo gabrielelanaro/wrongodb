@@ -7,9 +7,10 @@ use crate::api::session::Session;
 use crate::collection_write_path::CollectionWritePath;
 use crate::document_query::DocumentQuery;
 use crate::durability::{DurabilityBackend, StoreCommandApplier};
-use crate::recovery::RecoveryManager;
+use crate::recovery::recover_from_wal;
 use crate::schema::SchemaCatalog;
 use crate::storage::table_cache::TableCache;
+use crate::storage::wal::{GlobalWal, WalReader};
 use crate::store_write_path::StoreWritePath;
 use crate::txn::{GlobalTxnState, TransactionManager};
 use crate::WrongoDBError;
@@ -163,7 +164,9 @@ impl Connection {
         ));
 
         if config.wal_enabled {
-            RecoveryManager::new(applier.clone()).recover(&base_path)?;
+            if let Some(recovery_reader) = open_recovery_reader(&base_path) {
+                recover_from_wal(applier.clone(), recovery_reader)?;
+            }
         }
 
         let durability_backend = Arc::new(DurabilityBackend::open(
@@ -218,5 +221,20 @@ impl Connection {
             .status()
             .map(|status| (status.is_writable_primary, status.leader_hint))
             .unwrap_or((true, None))
+    }
+}
+
+fn open_recovery_reader(base_path: &Path) -> Option<WalReader> {
+    let wal_path = GlobalWal::path_for_db(base_path);
+    if !wal_path.exists() {
+        return None;
+    }
+
+    match WalReader::open(&wal_path) {
+        Ok(reader) => Some(reader),
+        Err(err) => {
+            eprintln!("Skipping global WAL recovery (failed to open WAL): {err}");
+            None
+        }
     }
 }

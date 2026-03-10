@@ -1,3 +1,3 @@
-pub(crate) mod manager;
+pub(crate) mod recover_from_wal;
 
-pub(crate) use manager::RecoveryManager;
+pub(crate) use recover_from_wal::recover_from_wal;

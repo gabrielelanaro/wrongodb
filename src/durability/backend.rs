@@ -10,7 +10,6 @@ use crate::core::errors::StorageError;
 use crate::durability::{DurableOp, StoreCommandApplier};
 use crate::raft::node::{RaftNodeConfig, RaftNodeCore};
 use crate::raft::service::{RaftServiceConfig, RaftServiceHandle};
-use crate::recovery::manager::warn_legacy_per_table_wal_files;
 use crate::storage::wal::GlobalWal;
 use crate::txn::{NoopRecoveryUnit, RecoveryUnit, WalRecoveryUnit};
 use crate::WrongoDBError;
@@ -79,7 +78,6 @@ impl DurabilityBackend {
             return Ok(Self::Disabled);
         }
 
-        warn_legacy_per_table_wal_files(base_path);
         match raft_mode {
             RaftMode::Standalone => Ok(Self::LocalWal(LocalWalDurabilityBackend::open(base_path)?)),
             clustered_mode => Ok(Self::Raft(RaftDurabilityBackend::open(
