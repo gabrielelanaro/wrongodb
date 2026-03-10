@@ -10,6 +10,15 @@ use crate::storage::table_cache::TableCache;
 use crate::txn::{Transaction, TransactionManager, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
+/// Applies committed durable commands and finalizes recovery state.
+///
+/// Recovery depends on this narrow interface so replay logic can be tested
+/// independently from the concrete store implementation.
+pub(crate) trait CommandApplier: Send + Sync {
+    fn apply(&self, cmd: CommittedDurableOp) -> Result<(), WrongoDBError>;
+    fn checkpoint_open_stores(&self) -> Result<(), WrongoDBError>;
+}
+
 #[derive(Debug)]
 pub(crate) struct StoreCommandApplier {
     table_cache: Arc<TableCache>,
@@ -27,17 +36,6 @@ impl StoreCommandApplier {
             transaction_manager,
             in_flight_txns: Mutex::new(HashMap::new()),
         }
-    }
-
-    pub(crate) fn apply(&self, cmd: CommittedDurableOp) -> Result<(), WrongoDBError> {
-        self.apply_op(cmd.op)
-    }
-
-    pub(crate) fn checkpoint_open_stores(&self) -> Result<(), WrongoDBError> {
-        for table in self.table_cache.all_handles() {
-            table.write().checkpoint_store()?;
-        }
-        Ok(())
     }
 
     fn apply_op(&self, op: DurableOp) -> Result<(), WrongoDBError> {
@@ -92,6 +90,19 @@ impl StoreCommandApplier {
                 }
             }
             DurableOp::Checkpoint => {}
+        }
+        Ok(())
+    }
+}
+
+impl CommandApplier for StoreCommandApplier {
+    fn apply(&self, cmd: CommittedDurableOp) -> Result<(), WrongoDBError> {
+        self.apply_op(cmd.op)
+    }
+
+    fn checkpoint_open_stores(&self) -> Result<(), WrongoDBError> {
+        for table in self.table_cache.all_handles() {
+            table.write().checkpoint_store()?;
         }
         Ok(())
     }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::core::errors::StorageError;
-use crate::durability::{CommittedDurableOp, DurableOp, StoreCommandApplier};
+use crate::durability::{CommandApplier, CommittedDurableOp, DurableOp};
 use crate::storage::wal::{RecoveryError, WalReader, WalRecord, WalRecordHeader};
 use crate::txn::{TxnId, TXN_NONE};
 use crate::WrongoDBError;
@@ -69,18 +69,23 @@ impl StagedRecoveryChanges {
 }
 
 pub(crate) fn recover_from_wal(
-    applier: Arc<StoreCommandApplier>,
+    applier: Arc<impl CommandApplier>,
     mut reader: impl WalReader,
 ) -> Result<(), WrongoDBError> {
     let mut staged_changes = StagedRecoveryChanges::default();
     while let Some(action) = read_next_recovery_action(&mut reader)? {
         match action {
-            RecoveryAction::ApplyChange(command) => apply_change(&applier, command)?,
+            RecoveryAction::ApplyChange(command) => apply_change(applier.as_ref(), command)?,
             RecoveryAction::StageTransactionChange { txn_id, change } => {
                 stage_transaction_change(&mut staged_changes, txn_id, change);
             }
             RecoveryAction::ApplyBufferedTransaction { txn_id, commit } => {
-                apply_buffered_transaction(&applier, &mut staged_changes, txn_id, commit)?;
+                apply_buffered_transaction(
+                    applier.as_ref(),
+                    &mut staged_changes,
+                    txn_id,
+                    commit,
+                )?;
             }
             RecoveryAction::DiscardBufferedTransaction { txn_id } => {
                 discard_buffered_transaction(&mut staged_changes, txn_id);
@@ -90,7 +95,7 @@ pub(crate) fn recover_from_wal(
     }
 
     discard_incomplete_transactions(&mut staged_changes);
-    checkpoint_open_stores(&applier)?;
+    checkpoint_open_stores(applier.as_ref())?;
 
     Ok(())
 }
@@ -106,7 +111,7 @@ fn read_next_recovery_action(
 }
 
 fn apply_change(
-    applier: &Arc<StoreCommandApplier>,
+    applier: &impl CommandApplier,
     command: CommittedDurableOp,
 ) -> Result<(), WrongoDBError> {
     applier.apply(command)
@@ -121,7 +126,7 @@ fn stage_transaction_change(
 }
 
 fn apply_buffered_transaction(
-    applier: &Arc<StoreCommandApplier>,
+    applier: &impl CommandApplier,
     staged_changes: &mut StagedRecoveryChanges,
     txn_id: TxnId,
     commit: CommittedDurableOp,
@@ -143,7 +148,7 @@ fn discard_incomplete_transactions(staged_changes: &mut StagedRecoveryChanges) {
     staged_changes.discard_all();
 }
 
-fn checkpoint_open_stores(applier: &Arc<StoreCommandApplier>) -> Result<(), WrongoDBError> {
+fn checkpoint_open_stores(applier: &impl CommandApplier) -> Result<(), WrongoDBError> {
     applier.checkpoint_open_stores()
 }
 
@@ -246,77 +251,183 @@ fn classify_recovery_action(header: WalRecordHeader, record: WalRecord) -> Recov
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::collections::VecDeque;
     use std::sync::Arc;
 
-    use tempfile::tempdir;
+    use parking_lot::Mutex;
 
-    use crate::durability::StoreCommandApplier;
+    use crate::durability::{CommandApplier, CommittedDurableOp, DurableOp};
     use crate::recovery::recover_from_wal;
-    use crate::storage::table_cache::TableCache;
-    use crate::storage::wal::{GlobalWal, WalFileReader};
-    use crate::txn::{GlobalTxnState, TransactionManager, TXN_NONE};
+    use crate::storage::wal::{Lsn, RecoveryError, WalReader, WalRecord, WalRecordHeader};
+    use crate::txn::TXN_NONE;
 
     const TEST_STORE: &str = "test.main.wt";
 
-    fn new_applier(base_path: &Path) -> Arc<StoreCommandApplier> {
-        let transaction_manager =
-            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let table_cache = Arc::new(TableCache::new(
-            base_path.to_path_buf(),
-            transaction_manager.clone(),
-        ));
-        Arc::new(StoreCommandApplier::new(table_cache, transaction_manager))
+    #[derive(Debug, Default)]
+    struct RecordingCommandApplier {
+        applied: Mutex<Vec<CommittedDurableOp>>,
+        checkpoint_count: Mutex<usize>,
+    }
+
+    impl RecordingCommandApplier {
+        fn applied(&self) -> Vec<CommittedDurableOp> {
+            self.applied.lock().clone()
+        }
+
+        fn checkpoint_count(&self) -> usize {
+            *self.checkpoint_count.lock()
+        }
+    }
+
+    impl CommandApplier for RecordingCommandApplier {
+        fn apply(&self, cmd: CommittedDurableOp) -> Result<(), crate::WrongoDBError> {
+            self.applied.lock().push(cmd);
+            Ok(())
+        }
+
+        fn checkpoint_open_stores(&self) -> Result<(), crate::WrongoDBError> {
+            *self.checkpoint_count.lock() += 1;
+            Ok(())
+        }
+    }
+
+    struct TestWalReader {
+        records: VecDeque<(WalRecordHeader, WalRecord)>,
+    }
+
+    impl TestWalReader {
+        fn new(records: Vec<(WalRecordHeader, WalRecord)>) -> Self {
+            Self {
+                records: records.into(),
+            }
+        }
+    }
+
+    impl WalReader for TestWalReader {
+        fn read_record(&mut self) -> Result<Option<(WalRecordHeader, WalRecord)>, RecoveryError> {
+            Ok(self.records.pop_front())
+        }
+    }
+
+    fn wal_entry(index: u64, term: u64, record: WalRecord) -> (WalRecordHeader, WalRecord) {
+        let record_type = record.record_type() as u8;
+        (
+            WalRecordHeader {
+                record_type,
+                flags: 0,
+                payload_len: 0,
+                raft_term: term,
+                raft_index: index,
+                lsn: Lsn::new(0, index),
+                prev_lsn: Lsn::new(0, index.saturating_sub(1)),
+                crc32: 0,
+            },
+            record,
+        )
     }
 
     #[test]
-    fn test_recover_from_wal_replays_autocommit_writes_to_persisted_store() {
-        let dir = tempdir().unwrap();
-        let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
-        wal.log_put(TEST_STORE, b"k1", b"v1", TXN_NONE, 0).unwrap();
-        wal.sync().unwrap();
+    fn test_recover_from_wal_replays_autocommit_writes() {
+        let applier = Arc::new(RecordingCommandApplier::default());
+        let reader = TestWalReader::new(vec![wal_entry(
+            1,
+            11,
+            WalRecord::Put {
+                store_name: TEST_STORE.to_string(),
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+                txn_id: TXN_NONE,
+            },
+        )]);
 
-        let reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
-        recover_from_wal(new_applier(dir.path()), reader).unwrap();
+        recover_from_wal(applier.clone(), reader).unwrap();
 
-        let transaction_manager =
-            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let table = TableCache::new(dir.path().to_path_buf(), transaction_manager)
-            .get_or_open_store(TEST_STORE)
-            .unwrap();
         assert_eq!(
-            table.write().get_version(b"k1", TXN_NONE).unwrap(),
-            Some(b"v1".to_vec())
+            applier.applied(),
+            vec![CommittedDurableOp {
+                index: 1,
+                term: 11,
+                op: DurableOp::Put {
+                    store_name: TEST_STORE.to_string(),
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                    txn_id: TXN_NONE,
+                },
+            }]
         );
+        assert_eq!(applier.checkpoint_count(), 1);
     }
 
     #[test]
     fn test_recover_from_wal_applies_only_committed_transactional_changes() {
-        let dir = tempdir().unwrap();
-        let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
+        let applier = Arc::new(RecordingCommandApplier::default());
+        let reader = TestWalReader::new(vec![
+            wal_entry(
+                1,
+                11,
+                WalRecord::Put {
+                    store_name: TEST_STORE.to_string(),
+                    key: b"committed".to_vec(),
+                    value: b"v1".to_vec(),
+                    txn_id: 7,
+                },
+            ),
+            wal_entry(
+                2,
+                11,
+                WalRecord::TxnCommit {
+                    txn_id: 7,
+                    commit_ts: 7,
+                },
+            ),
+            wal_entry(
+                3,
+                11,
+                WalRecord::Put {
+                    store_name: TEST_STORE.to_string(),
+                    key: b"aborted".to_vec(),
+                    value: b"v2".to_vec(),
+                    txn_id: 8,
+                },
+            ),
+            wal_entry(4, 11, WalRecord::TxnAbort { txn_id: 8 }),
+            wal_entry(
+                5,
+                11,
+                WalRecord::Put {
+                    store_name: TEST_STORE.to_string(),
+                    key: b"incomplete".to_vec(),
+                    value: b"v3".to_vec(),
+                    txn_id: 9,
+                },
+            ),
+        ]);
 
-        wal.log_put(TEST_STORE, b"committed", b"v1", 7, 0).unwrap();
-        wal.log_txn_commit(7, 7, 0).unwrap();
-        wal.log_put(TEST_STORE, b"aborted", b"v2", 8, 0).unwrap();
-        wal.log_txn_abort(8, 0).unwrap();
-        wal.log_put(TEST_STORE, b"incomplete", b"v3", 9, 0).unwrap();
-        wal.sync().unwrap();
-
-        let reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
-        recover_from_wal(new_applier(dir.path()), reader).unwrap();
-
-        let transaction_manager =
-            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let table = TableCache::new(dir.path().to_path_buf(), transaction_manager)
-            .get_or_open_store(TEST_STORE)
-            .unwrap();
-        let mut table = table.write();
+        recover_from_wal(applier.clone(), reader).unwrap();
 
         assert_eq!(
-            table.get_version(b"committed", TXN_NONE).unwrap(),
-            Some(b"v1".to_vec())
+            applier.applied(),
+            vec![
+                CommittedDurableOp {
+                    index: 1,
+                    term: 11,
+                    op: DurableOp::Put {
+                        store_name: TEST_STORE.to_string(),
+                        key: b"committed".to_vec(),
+                        value: b"v1".to_vec(),
+                        txn_id: 7,
+                    },
+                },
+                CommittedDurableOp {
+                    index: 2,
+                    term: 11,
+                    op: DurableOp::TxnCommit {
+                        txn_id: 7,
+                        commit_ts: 7,
+                    },
+                },
+            ]
         );
-        assert_eq!(table.get_version(b"aborted", TXN_NONE).unwrap(), None);
-        assert_eq!(table.get_version(b"incomplete", TXN_NONE).unwrap(), None);
+        assert_eq!(applier.checkpoint_count(), 1);
     }
 }
