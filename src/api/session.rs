@@ -372,7 +372,7 @@ mod tests {
     use crate::durability::DurabilityBackend;
     use crate::schema::SchemaCatalog;
     use crate::storage::table_cache::TableCache;
-    use crate::storage::wal::{WalReader, WalRecord};
+    use crate::storage::wal::{WalFileReader, WalReader, WalRecord};
     use crate::store_write_path::StoreWritePath;
     use crate::txn::GlobalTxnState;
 
@@ -402,7 +402,7 @@ mod tests {
 
     fn read_wal_records(db_dir: &std::path::Path) -> Vec<WalRecord> {
         let wal_path = db_dir.join("global.wal");
-        let mut reader = WalReader::open(&wal_path).unwrap();
+        let mut reader = WalFileReader::open(&wal_path).unwrap();
         let mut records = Vec::new();
         while let Some((_header, record)) = reader.read_record().unwrap() {
             records.push(record);

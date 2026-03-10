@@ -522,7 +522,7 @@ mod tests {
     use crate::raft::log_store::RaftLogStore;
     use crate::raft::protocol::{AppendEntriesRequest, ProtocolLogEntry, RequestVoteRequest};
     use crate::raft::role_engine::{RaftEffect, RaftRole};
-    use crate::storage::wal::{WalReader, WalRecord};
+    use crate::storage::wal::{WalFileReader, WalReader, WalRecord};
 
     fn entry(term: u64, payload: &[u8]) -> ProtocolLogEntry {
         ProtocolLogEntry {
@@ -684,7 +684,7 @@ mod tests {
         assert_eq!(reopened.protocol_state().commit_index, 0);
         assert_eq!(reopened.applied_index(), 0);
 
-        let mut reader = WalReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
+        let mut reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
         assert!(reader.read_record().unwrap().is_none());
     }
 
@@ -804,7 +804,7 @@ mod tests {
         node.apply_committed_entries().unwrap();
         node.sync().unwrap();
 
-        let mut reader = WalReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
+        let mut reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
         let (header, _record) = reader.read_record().unwrap().unwrap();
         assert_eq!(header.raft_term, 5);
         assert_eq!(header.raft_index, 1);
@@ -879,7 +879,7 @@ mod tests {
         assert_eq!(reopened.current_term(), 8);
         assert_eq!(reopened.voted_for(), Some("node-b"));
 
-        let mut reader = WalReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
+        let mut reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
         assert!(reader.read_record().unwrap().is_none());
     }
 
@@ -908,7 +908,7 @@ mod tests {
         node.apply_committed_entries().unwrap();
         node.sync().unwrap();
 
-        let mut reader = WalReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
+        let mut reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
         let mut types = Vec::new();
         while let Some((_header, record)) = reader.read_record().unwrap() {
             let t = match record {

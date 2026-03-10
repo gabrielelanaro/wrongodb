@@ -396,7 +396,7 @@ mod tests {
     use super::*;
     use crate::raft::hard_state::RaftHardStateStore;
     use crate::raft::runtime::RaftInboundMessage;
-    use crate::storage::wal::{GlobalWal, WalReader, WalRecord};
+    use crate::storage::wal::{GlobalWal, WalFileReader, WalReader, WalRecord};
 
     fn new_txn_manager() -> Arc<TransactionManager> {
         Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())))
@@ -463,7 +463,7 @@ mod tests {
             .unwrap();
 
         let wal_path = GlobalWal::path_for_db(dir.path());
-        let mut reader = WalReader::open(wal_path).unwrap();
+        let mut reader = WalFileReader::open(wal_path).unwrap();
         let mut found_commit = false;
         while let Some((_header, record)) = reader.read_record().unwrap() {
             if matches!(

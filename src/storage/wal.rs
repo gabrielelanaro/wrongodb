@@ -102,8 +102,13 @@ pub enum RecoveryError {
     Io(std::io::Error),
 }
 
-/// WAL reader for recovery operations.
-pub struct WalReader {
+/// Reader interface for sequential WAL replay.
+pub trait WalReader {
+    fn read_record(&mut self) -> Result<Option<(WalRecordHeader, WalRecord)>, RecoveryError>;
+}
+
+/// File-backed WAL reader for recovery operations.
+pub struct WalFileReader {
     file: File,
     current_offset: u64,
     last_valid_lsn: Lsn,
@@ -441,10 +446,10 @@ impl From<std::io::Error> for RecoveryError {
 }
 
 // ============================================================================
-// WalReader Implementation
+// WalFileReader Implementation
 // ============================================================================
 
-impl WalReader {
+impl WalFileReader {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, RecoveryError> {
         let path = path.as_ref();
         if !path.exists() {
@@ -479,8 +484,10 @@ impl WalReader {
             last_valid_lsn: Lsn::new(0, 0),
         })
     }
+}
 
-    pub fn read_record(&mut self) -> Result<Option<(WalRecordHeader, WalRecord)>, RecoveryError> {
+impl WalReader for WalFileReader {
+    fn read_record(&mut self) -> Result<Option<(WalRecordHeader, WalRecord)>, RecoveryError> {
         self.file.seek(SeekFrom::Start(self.current_offset))?;
 
         let mut header_bytes = vec![0u8; RECORD_HEADER_SIZE];
@@ -1147,7 +1154,7 @@ fn deserialize_bytes(data: &[u8], cursor: &mut usize) -> Result<Vec<u8>, WrongoD
 }
 
 fn scan_wal_tail(path: &Path) -> Result<(Lsn, u64, u64, u64, Option<String>), WrongoDBError> {
-    let mut reader = WalReader::open(path).map_err(|e| {
+    let mut reader = WalFileReader::open(path).map_err(|e| {
         StorageError(format!(
             "failed to open WAL reader while scanning tail: {e}"
         ))
@@ -1252,7 +1259,7 @@ mod tests {
         wal.log_txn_commit(1, 1, 7).unwrap();
         wal.sync().unwrap();
 
-        let mut reader = WalReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
+        let mut reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
         let (header, record) = reader.read_record().unwrap().unwrap();
         assert_eq!(header.raft_term, 7);
         assert_eq!(header.raft_index, 1);
@@ -1291,7 +1298,7 @@ mod tests {
         file.write_all(&[0xAA]).unwrap();
         file.sync_all().unwrap();
 
-        let mut reader = WalReader::open(&wal_path).unwrap();
+        let mut reader = WalFileReader::open(&wal_path).unwrap();
         let err = reader.read_record().unwrap_err();
         assert!(matches!(err, RecoveryError::ChecksumMismatch { .. }));
     }
@@ -1306,7 +1313,7 @@ mod tests {
         wal.log_txn_commit(1, 1, 3).unwrap();
         wal.sync().unwrap();
 
-        let mut reader = WalReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
+        let mut reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
         let mut indexes = Vec::new();
         while let Some((header, _)) = reader.read_record().unwrap() {
             indexes.push(header.raft_index);
@@ -1330,7 +1337,7 @@ mod tests {
         wal.log_put("users.main.wt", b"k2", b"v2", 2, 6).unwrap();
         wal.sync().unwrap();
 
-        let mut reader = WalReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
+        let mut reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
         let (header, _) = reader.read_record().unwrap().unwrap();
         assert_eq!(header.raft_index, 4);
         assert_eq!(header.raft_term, 6);
@@ -1374,7 +1381,7 @@ mod tests {
         header.crc32 = header.compute_crc32();
         fs::write(&wal_path, header.serialize()).unwrap();
 
-        let err = match WalReader::open(&wal_path) {
+        let err = match WalFileReader::open(&wal_path) {
             Ok(_) => panic!("expected v1 header to be rejected"),
             Err(err) => err,
         };

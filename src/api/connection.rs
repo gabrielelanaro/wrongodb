@@ -10,7 +10,7 @@ use crate::durability::{DurabilityBackend, StoreCommandApplier};
 use crate::recovery::recover_from_wal;
 use crate::schema::SchemaCatalog;
 use crate::storage::table_cache::TableCache;
-use crate::storage::wal::{GlobalWal, WalReader};
+use crate::storage::wal::{GlobalWal, WalFileReader};
 use crate::store_write_path::StoreWritePath;
 use crate::txn::{GlobalTxnState, TransactionManager};
 use crate::WrongoDBError;
@@ -224,13 +224,13 @@ impl Connection {
     }
 }
 
-fn open_recovery_reader(base_path: &Path) -> Option<WalReader> {
+fn open_recovery_reader(base_path: &Path) -> Option<WalFileReader> {
     let wal_path = GlobalWal::path_for_db(base_path);
     if !wal_path.exists() {
         return None;
     }
 
-    match WalReader::open(&wal_path) {
+    match WalFileReader::open(&wal_path) {
         Ok(reader) => Some(reader),
         Err(err) => {
             eprintln!("Skipping global WAL recovery (failed to open WAL): {err}");

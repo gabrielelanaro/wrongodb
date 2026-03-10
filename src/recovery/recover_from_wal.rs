@@ -70,7 +70,7 @@ impl StagedRecoveryChanges {
 
 pub(crate) fn recover_from_wal(
     applier: Arc<StoreCommandApplier>,
-    mut reader: WalReader,
+    mut reader: impl WalReader,
 ) -> Result<(), WrongoDBError> {
     let mut staged_changes = StagedRecoveryChanges::default();
     while let Some(action) = read_next_recovery_action(&mut reader)? {
@@ -96,7 +96,7 @@ pub(crate) fn recover_from_wal(
 }
 
 fn read_next_recovery_action(
-    reader: &mut WalReader,
+    reader: &mut dyn WalReader,
 ) -> Result<Option<RecoveryAction>, WrongoDBError> {
     let Some((header, record)) = next_recovery_record(reader, "recovery")? else {
         return Ok(None);
@@ -148,7 +148,7 @@ fn checkpoint_open_stores(applier: &Arc<StoreCommandApplier>) -> Result<(), Wron
 }
 
 fn next_recovery_record(
-    reader: &mut WalReader,
+    reader: &mut dyn WalReader,
     pass: &str,
 ) -> Result<Option<(WalRecordHeader, WalRecord)>, WrongoDBError> {
     match reader.read_record() {
@@ -254,7 +254,7 @@ mod tests {
     use crate::durability::StoreCommandApplier;
     use crate::recovery::recover_from_wal;
     use crate::storage::table_cache::TableCache;
-    use crate::storage::wal::{GlobalWal, WalReader};
+    use crate::storage::wal::{GlobalWal, WalFileReader};
     use crate::txn::{GlobalTxnState, TransactionManager, TXN_NONE};
 
     const TEST_STORE: &str = "test.main.wt";
@@ -276,7 +276,7 @@ mod tests {
         wal.log_put(TEST_STORE, b"k1", b"v1", TXN_NONE, 0).unwrap();
         wal.sync().unwrap();
 
-        let reader = WalReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
+        let reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
         recover_from_wal(new_applier(dir.path()), reader).unwrap();
 
         let transaction_manager =
@@ -302,7 +302,7 @@ mod tests {
         wal.log_put(TEST_STORE, b"incomplete", b"v3", 9, 0).unwrap();
         wal.sync().unwrap();
 
-        let reader = WalReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
+        let reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
         recover_from_wal(new_applier(dir.path()), reader).unwrap();
 
         let transaction_manager =
