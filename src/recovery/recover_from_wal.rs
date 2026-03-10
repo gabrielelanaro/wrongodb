@@ -7,6 +7,10 @@ use crate::storage::wal::{RecoveryError, WalReader, WalRecord, WalRecordHeader};
 use crate::txn::{TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
+// ============================================================================
+// Recovery Planning
+// ============================================================================
+
 #[derive(Debug)]
 enum RecoveryAction {
     ApplyChange(CommittedDurableOp),
@@ -68,6 +72,15 @@ impl StagedRecoveryChanges {
     }
 }
 
+// ============================================================================
+// Public API
+// ============================================================================
+
+/// Replays committed WAL operations into the storage command applier.
+///
+/// Recovery buffers transactional changes until a matching commit record is
+/// observed, discards incomplete transactions at the end of the log, and
+/// checkpoints any stores opened during replay.
 pub(crate) fn recover_from_wal(
     applier: Arc<impl CommandApplier>,
     mut reader: impl WalReader,
@@ -99,6 +112,10 @@ pub(crate) fn recover_from_wal(
 
     Ok(())
 }
+
+// ============================================================================
+// Private Helpers
+// ============================================================================
 
 fn read_next_recovery_action(
     reader: &mut dyn WalReader,
@@ -248,6 +265,10 @@ fn classify_recovery_action(header: WalRecordHeader, record: WalRecord) -> Recov
         WalRecord::Checkpoint => RecoveryAction::Ignore,
     }
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
