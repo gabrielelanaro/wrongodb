@@ -5,7 +5,7 @@ use std::fs;
 use crate::common::kv::insert_kv;
 use tempfile::tempdir;
 
-use wrongodb::{Connection, ConnectionConfig};
+use wrongodb::{Connection, ConnectionConfig, RaftMode};
 
 fn global_wal_path(db_dir: &std::path::Path) -> std::path::PathBuf {
     db_dir.join("global.wal")
@@ -26,7 +26,7 @@ fn global_wal_created_when_enabled() {
 fn global_wal_not_created_when_disabled() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("db");
-    let cfg = ConnectionConfig::new().wal_enabled(false);
+    let cfg = ConnectionConfig::new(false, RaftMode::Standalone);
 
     let conn = Connection::open(&db_path, cfg).unwrap();
     insert_kv(&conn, "test", b"k1", b"v1").unwrap();

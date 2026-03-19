@@ -563,14 +563,17 @@ mod tests {
         let dir = tempdir().unwrap();
         let conn = Connection::open(
             dir.path(),
-            ConnectionConfig::new().raft_mode(RaftMode::Cluster {
-                local_node_id: "n1".to_string(),
-                local_raft_addr: free_local_addr(),
-                peers: vec![RaftPeerConfig {
-                    node_id: "n2".to_string(),
-                    raft_addr: free_local_addr(),
-                }],
-            }),
+            ConnectionConfig::new(
+                true,
+                RaftMode::Cluster {
+                    local_node_id: "n1".to_string(),
+                    local_raft_addr: free_local_addr(),
+                    peers: vec![RaftPeerConfig {
+                        node_id: "n2".to_string(),
+                        raft_addr: free_local_addr(),
+                    }],
+                },
+            ),
         )
         .unwrap();
         let mut session = conn.open_session();

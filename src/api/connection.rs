@@ -79,12 +79,16 @@ impl Default for ConnectionConfig {
 }
 
 impl ConnectionConfig {
-    /// Create a config with the default durable standalone settings.
+    /// Create a config from explicit durability and replication policy inputs.
     ///
-    /// This exists so callers can start from the common case and override only
-    /// the coarse durability/replication knobs they care about.
-    pub fn new() -> Self {
-        Self::default()
+    /// Callers provide the policy-affecting inputs at the construction site so
+    /// the database startup mode stays visible instead of being implied by a
+    /// hidden default.
+    pub fn new(wal_enabled: bool, raft_mode: RaftMode) -> Self {
+        Self {
+            wal_enabled,
+            raft_mode,
+        }
     }
 
     /// Override whether local durability is enabled.

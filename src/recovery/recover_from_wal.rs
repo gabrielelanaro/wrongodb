@@ -93,12 +93,7 @@ pub(crate) fn recover_from_wal(
                 stage_transaction_change(&mut staged_changes, txn_id, change);
             }
             RecoveryAction::ApplyBufferedTransaction { txn_id, commit } => {
-                apply_buffered_transaction(
-                    applier.as_ref(),
-                    &mut staged_changes,
-                    txn_id,
-                    commit,
-                )?;
+                apply_buffered_transaction(applier.as_ref(), &mut staged_changes, txn_id, commit)?;
             }
             RecoveryAction::DiscardBufferedTransaction { txn_id } => {
                 discard_buffered_transaction(&mut staged_changes, txn_id);

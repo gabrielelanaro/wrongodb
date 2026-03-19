@@ -23,11 +23,7 @@ fn insert_kv(conn: &Connection, key: &[u8], value: &[u8]) -> Result<(), WrongoDB
 fn standalone_local_wal_mode_allows_public_cursor_writes() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("db");
-    let conn = Connection::open(
-        &path,
-        ConnectionConfig::new().raft_mode(RaftMode::Standalone),
-    )
-    .unwrap();
+    let conn = Connection::open(&path, ConnectionConfig::new(true, RaftMode::Standalone)).unwrap();
 
     insert_kv(&conn, b"alice", b"value").unwrap();
 
@@ -45,14 +41,17 @@ fn cluster_mode_rejects_public_cursor_writes() {
     let peer_raft_addr = free_local_addr();
     let conn = Connection::open(
         &path,
-        ConnectionConfig::new().raft_mode(RaftMode::Cluster {
-            local_node_id: "n1".to_string(),
-            local_raft_addr,
-            peers: vec![RaftPeerConfig {
-                node_id: "n2".to_string(),
-                raft_addr: peer_raft_addr,
-            }],
-        }),
+        ConnectionConfig::new(
+            true,
+            RaftMode::Cluster {
+                local_node_id: "n1".to_string(),
+                local_raft_addr,
+                peers: vec![RaftPeerConfig {
+                    node_id: "n2".to_string(),
+                    raft_addr: peer_raft_addr,
+                }],
+            },
+        ),
     )
     .unwrap();
 

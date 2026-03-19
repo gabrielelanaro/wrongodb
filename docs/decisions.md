@@ -1,5 +1,19 @@
 # Decisions
 
+## 2026-03-19: Make `ConnectionConfig::new` explicit about WAL and RAFT policy
+
+**Decision**
+- Change `ConnectionConfig::new` to take `wal_enabled: bool` and `raft_mode: RaftMode`.
+- Keep `Default` as the conventional standalone durable preset for callers that want the common
+  startup mode explicitly.
+- Update connection startup call sites to pass the policy at construction time.
+
+**Why**
+- `ConnectionConfig` carries startup semantics, so `new()` should not silently pick the write
+  policy.
+- Making the parameters explicit keeps standalone vs clustered behavior visible at the call site
+  and aligns the API with the refactor rule.
+
 ## 2026-03-08: Cache parsed page headers in the page-store and pin pages by token
 
 **Decision**

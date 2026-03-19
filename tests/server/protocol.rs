@@ -202,14 +202,17 @@ async fn test_non_leader_mode_rejects_writes_but_keeps_connection_alive() {
     let db_path = tmp.path().join("test_cluster_non_leader.db");
     let local_raft_addr = free_local_addr();
     let peer_raft_addr = free_local_addr();
-    let cfg = ConnectionConfig::new().raft_mode(RaftMode::Cluster {
-        local_node_id: "n1".to_string(),
-        local_raft_addr,
-        peers: vec![RaftPeerConfig {
-            node_id: "n2".to_string(),
-            raft_addr: peer_raft_addr,
-        }],
-    });
+    let cfg = ConnectionConfig::new(
+        true,
+        RaftMode::Cluster {
+            local_node_id: "n1".to_string(),
+            local_raft_addr,
+            peers: vec![RaftPeerConfig {
+                node_id: "n2".to_string(),
+                raft_addr: peer_raft_addr,
+            }],
+        },
+    );
     let conn = Connection::open(&db_path, cfg).unwrap();
     let conn = Arc::new(conn);
 
