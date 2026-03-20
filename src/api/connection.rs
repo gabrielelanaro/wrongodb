@@ -4,55 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::api::session::Session;
-use crate::collection_write_path::CollectionWritePath;
-use crate::document_query::DocumentQuery;
 use crate::durability::{DurabilityBackend, StoreCommandApplier};
 use crate::recovery::recover_from_wal;
+use crate::replication::{RaftMode, ReplicationCoordinator};
 use crate::schema::SchemaCatalog;
 use crate::storage::table_cache::TableCache;
 use crate::storage::wal::{GlobalWal, WalFileReader};
-use crate::store_write_path::StoreWritePath;
 use crate::txn::{GlobalTxnState, TransactionManager};
 use crate::WrongoDBError;
-
-/// Network identity for a remote RAFT peer.
-///
-/// This is part of the public configuration surface because clustered mode
-/// needs an explicit startup-time description of the peer set. WrongoDB does
-/// not do peer discovery dynamically, so callers provide this directly.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RaftPeerConfig {
-    /// Stable node identifier used in RAFT protocol messages.
-    pub node_id: String,
-    /// Socket address used for RAFT transport.
-    pub raft_addr: String,
-}
-
-/// Durability/replication mode for a connection.
-///
-/// This exists to keep the public API honest about the two supported write
-/// paths:
-/// - local durability on a single node
-/// - deferred apply through clustered RAFT replication
-///
-/// Callers choose this once at connection startup because it changes the
-/// meaning of write execution, recovery, and which low-level APIs remain
-/// writable.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum RaftMode {
-    /// Single-node mode with local durability only.
-    #[default]
-    Standalone,
-    /// Multi-node RAFT replication mode.
-    Cluster {
-        /// Stable identifier for the local node.
-        local_node_id: String,
-        /// Socket address the local RAFT service listens on.
-        local_raft_addr: String,
-        /// Static peer list for the cluster.
-        peers: Vec<RaftPeerConfig>,
-    },
-}
 
 /// Configuration used when opening a [`Connection`].
 ///
@@ -126,8 +85,7 @@ pub struct Connection {
     table_cache: Arc<TableCache>,
     transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
-    pub(crate) document_query: DocumentQuery,
-    pub(crate) collection_write_path: CollectionWritePath,
+    replication_coordinator: Arc<ReplicationCoordinator>,
 }
 
 impl fmt::Debug for Connection {
@@ -173,19 +131,16 @@ impl Connection {
             }
         }
 
-        let durability_backend = Arc::new(DurabilityBackend::open(
+        let standalone_local_wal =
+            config.wal_enabled && matches!(&config.raft_mode, RaftMode::Standalone);
+        let durability_backend =
+            Arc::new(DurabilityBackend::open(&base_path, standalone_local_wal)?);
+        let replication_coordinator = Arc::new(ReplicationCoordinator::open(
             &base_path,
             config.wal_enabled,
             applier,
             config.raft_mode,
         )?);
-        let document_query = DocumentQuery::new(schema_catalog.clone());
-        let store_write_path = StoreWritePath::new(table_cache.clone(), durability_backend.clone());
-        let collection_write_path = CollectionWritePath::new(
-            schema_catalog.clone(),
-            document_query.clone(),
-            store_write_path,
-        );
 
         Ok(Self {
             base_path,
@@ -194,8 +149,7 @@ impl Connection {
             wal_enabled: config.wal_enabled,
             transaction_manager,
             durability_backend,
-            document_query,
-            collection_write_path,
+            replication_coordinator,
         })
     }
 
@@ -213,18 +167,24 @@ impl Connection {
             self.schema_catalog.clone(),
             self.transaction_manager.clone(),
             self.durability_backend.clone(),
+            self.replication_coordinator.clone(),
         )
     }
 
-    pub(crate) fn base_path(&self) -> &Path {
-        &self.base_path
+    pub(crate) fn schema_catalog(&self) -> Arc<SchemaCatalog> {
+        self.schema_catalog.clone()
     }
 
-    pub(crate) fn raft_hello_state(&self) -> (bool, Option<String>) {
-        self.durability_backend
-            .status()
-            .map(|status| (status.is_writable_primary, status.leader_hint))
-            .unwrap_or((true, None))
+    pub(crate) fn table_cache(&self) -> Arc<TableCache> {
+        self.table_cache.clone()
+    }
+
+    pub(crate) fn durability_backend(&self) -> Arc<DurabilityBackend> {
+        self.durability_backend.clone()
+    }
+
+    pub(crate) fn replication_coordinator(&self) -> Arc<ReplicationCoordinator> {
+        self.replication_coordinator.clone()
     }
 }
 

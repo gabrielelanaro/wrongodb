@@ -1,5 +1,53 @@
 # Decisions
 
+## 2026-03-20: Split RAFT coordination out of local durability
+
+**Decision**
+- Introduce an internal `replication` module that owns:
+  - RAFT startup/config parsing
+  - leader/hello state
+  - deferred-replication write coordination
+  - RAFT runtime test hooks
+- Keep `durability` focused on local WAL and recovery only.
+- Rewire `Session`, `StoreWritePath`, and `DatabaseContext` to consult the replication
+  coordinator for:
+  - write-path mode
+  - replicated commit/abort/checkpoint markers
+  - hello/isWritablePrimary state
+- Keep the public startup API stable for now by leaving `RaftMode` on `ConnectionConfig`,
+  but move the type definitions themselves out of `api::connection`.
+
+**Why**
+- RAFT topology and write admission are not local durability concerns.
+- The previous `DurabilityBackend` had become a mixed local-WAL plus replication service, which
+  obscured the intended WT-like storage boundary.
+- This split is the smallest incremental step that removes RAFT runtime logic from durability
+  without redesigning the public startup API in the same patch.
+
+## 2026-03-20: Introduce internal `DatabaseContext` above the WT-like storage API
+
+**Decision**
+- Add a crate-private `DatabaseContext` that groups database-layer services above storage:
+  - `DocumentQuery`
+  - `CollectionWritePath`
+  - collection-listing helpers
+  - hello/topology helpers
+- Keep the public `Connection` / `Session` API WT-like:
+  - `Connection` remains the long-lived storage root
+  - `Session` remains the storage session opened from `Connection`
+- Remove upper-layer query/write/topology helpers from `Connection`.
+- Make the server command layer depend on `DatabaseContext`, while commands still use
+  `ctx.connection().open_session()` for WT-like storage session access.
+- Keep `DatabaseContext` internal and do not re-export it from the crate root.
+
+**Why**
+- `Connection` had started mixing storage concerns with higher-level database and wire-protocol
+  services, which weakened the intended WT-style boundary.
+- Introducing a small internal container is the incremental step that moves non-storage concerns
+  upward without renaming or redesigning the public storage API.
+- Building `DatabaseContext` from `Arc<Connection>` keeps the dependency one-way:
+  upper layers depend on storage, but storage stays unaware of upper layers.
+
 ## 2026-03-19: Make `ConnectionConfig::new` explicit about WAL and RAFT policy
 
 **Decision**

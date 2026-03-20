@@ -23,8 +23,8 @@ fn lib_rs_only_reexports_supported_surface() {
 fn api_mod_only_reexports_connection_session_and_cursor_surface() {
     let api_mod = read("src/api/mod.rs");
 
-    assert!(api_mod
-        .contains("pub use connection::{Connection, ConnectionConfig, RaftMode, RaftPeerConfig};"));
+    assert!(api_mod.contains("pub use crate::replication::{RaftMode, RaftPeerConfig};"));
+    assert!(api_mod.contains("pub use connection::{Connection, ConnectionConfig};"));
     assert!(api_mod.contains("pub use cursor::{Cursor, CursorEntry};"));
     assert!(api_mod.contains("pub use session::{Session, WriteUnitOfWork};"));
 }

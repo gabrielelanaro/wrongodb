@@ -182,3 +182,87 @@ where
     }
     Ok(results)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::collection_write_path::CollectionWritePath;
+    use crate::durability::DurabilityBackend;
+    use crate::replication::ReplicationCoordinator;
+    use crate::schema::SchemaCatalog;
+    use crate::storage::table_cache::TableCache;
+    use crate::store_write_path::StoreWritePath;
+    use crate::txn::{GlobalTxnState, TransactionManager};
+
+    struct QueryTestFixture {
+        query: DocumentQuery,
+        write_path: CollectionWritePath,
+        session: Session,
+    }
+
+    impl QueryTestFixture {
+        fn new() -> Self {
+            let dir = tempdir().unwrap();
+            let base_path = dir.path().to_path_buf();
+            std::mem::forget(dir);
+
+            let transaction_manager =
+                Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+            let table_cache = Arc::new(TableCache::new(
+                base_path.clone(),
+                transaction_manager.clone(),
+            ));
+            let schema_catalog = Arc::new(SchemaCatalog::new(base_path));
+            let backend = Arc::new(DurabilityBackend::Disabled);
+            let replication = Arc::new(ReplicationCoordinator::standalone());
+            let query = DocumentQuery::new(schema_catalog.clone());
+            let write_path = CollectionWritePath::new(
+                schema_catalog.clone(),
+                query.clone(),
+                StoreWritePath::new(table_cache.clone(), backend.clone(), replication.clone()),
+            );
+            let session = Session::new(
+                table_cache,
+                schema_catalog,
+                transaction_manager,
+                backend,
+                replication,
+            );
+
+            Self {
+                query,
+                write_path,
+                session,
+            }
+        }
+
+        fn into_parts(self) -> (DocumentQuery, CollectionWritePath, Session) {
+            (self.query, self.write_path, self.session)
+        }
+    }
+
+    #[test]
+    fn indexed_lookup_survives_checkpoint_reconciliation() {
+        let (query, write_path, mut session) = QueryTestFixture::new().into_parts();
+
+        write_path
+            .create_index(&mut session, "test", "name")
+            .unwrap();
+        write_path
+            .insert_one(&mut session, "test", json!({"_id": 1, "name": "alice"}))
+            .unwrap();
+
+        session.checkpoint().unwrap();
+
+        let docs = query
+            .find(&mut session, "test", Some(json!({"name": "alice"})))
+            .unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].get("name"), Some(&json!("alice")));
+    }
+}

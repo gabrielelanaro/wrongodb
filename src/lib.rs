@@ -1,11 +1,13 @@
 mod api;
 mod collection_write_path;
 mod core;
+mod database_context;
 mod document_query;
 mod durability;
 mod index;
 mod raft;
 mod recovery;
+mod replication;
 mod schema;
 mod server;
 mod storage;

@@ -1,6 +1,7 @@
 use bson::Document;
 
-use crate::{Connection, WrongoDBError};
+use crate::database_context::DatabaseContext;
+use crate::WrongoDBError;
 
 pub(crate) mod handlers;
 mod registry;
@@ -13,5 +14,5 @@ pub(crate) trait Command: Send + Sync {
     fn names(&self) -> &[&str];
 
     /// Execute the command with the given document and connection
-    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError>;
+    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError>;
 }

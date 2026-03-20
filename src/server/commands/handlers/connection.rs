@@ -1,5 +1,6 @@
+use crate::database_context::DatabaseContext;
 use crate::server::commands::Command;
-use crate::{Connection, WrongoDBError};
+use crate::WrongoDBError;
 use bson::{doc, Bson, Document};
 
 /// Handles: hello, isMaster, ismaster
@@ -10,8 +11,8 @@ impl Command for HelloCommand {
         &["hello", "ismaster", "isMaster"]
     }
 
-    fn execute(&self, _doc: &Document, db: &Connection) -> Result<Document, WrongoDBError> {
-        let (is_writable_primary, leader_hint) = db.raft_hello_state();
+    fn execute(&self, _doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
+        let (is_writable_primary, leader_hint) = db.hello_state();
         let mut response = doc! {
             "ok": Bson::Double(1.0),
             "isMaster": Bson::Boolean(is_writable_primary),
@@ -43,7 +44,7 @@ impl Command for PingCommand {
         &["ping"]
     }
 
-    fn execute(&self, _doc: &Document, _db: &Connection) -> Result<Document, WrongoDBError> {
+    fn execute(&self, _doc: &Document, _db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         Ok(doc! { "ok": Bson::Double(1.0) })
     }
 }
@@ -56,7 +57,7 @@ impl Command for BuildInfoCommand {
         &["buildInfo", "buildinfo"]
     }
 
-    fn execute(&self, _doc: &Document, _db: &Connection) -> Result<Document, WrongoDBError> {
+    fn execute(&self, _doc: &Document, _db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         Ok(doc! {
             "ok": Bson::Double(1.0),
             "version": "0.0.1-wrongodb",
@@ -81,7 +82,7 @@ impl Command for ServerStatusCommand {
         &["serverStatus"]
     }
 
-    fn execute(&self, _doc: &Document, _db: &Connection) -> Result<Document, WrongoDBError> {
+    fn execute(&self, _doc: &Document, _db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         Ok(doc! {
             "ok": Bson::Double(1.0),
             "host": "localhost",
@@ -105,7 +106,7 @@ impl Command for ConnectionStatusCommand {
         &["connectionStatus"]
     }
 
-    fn execute(&self, _doc: &Document, _db: &Connection) -> Result<Document, WrongoDBError> {
+    fn execute(&self, _doc: &Document, _db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         Ok(doc! {
             "ok": Bson::Double(1.0),
             "authInfo": {

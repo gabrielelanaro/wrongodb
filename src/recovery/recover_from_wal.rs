@@ -268,14 +268,20 @@ fn classify_recovery_action(header: WalRecordHeader, record: WalRecord) -> Recov
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::path::Path;
     use std::sync::Arc;
 
     use parking_lot::Mutex;
+    use tempfile::tempdir;
 
-    use crate::durability::{CommandApplier, CommittedDurableOp, DurableOp};
+    use crate::durability::{CommandApplier, CommittedDurableOp, DurableOp, StoreCommandApplier};
     use crate::recovery::recover_from_wal;
-    use crate::storage::wal::{Lsn, RecoveryError, WalReader, WalRecord, WalRecordHeader};
-    use crate::txn::TXN_NONE;
+    use crate::schema::SchemaCatalog;
+    use crate::storage::table_cache::TableCache;
+    use crate::storage::wal::{
+        GlobalWal, Lsn, RecoveryError, WalFileReader, WalReader, WalRecord, WalRecordHeader,
+    };
+    use crate::txn::{GlobalTxnState, TransactionManager, TXN_NONE};
 
     const TEST_STORE: &str = "test.main.wt";
 
@@ -340,6 +346,26 @@ mod tests {
             },
             record,
         )
+    }
+
+    fn recover_store_from_wal(base_path: &Path, store_name: &str, key: &[u8]) -> Option<Vec<u8>> {
+        let transaction_manager =
+            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+        let table_cache = Arc::new(TableCache::new(
+            base_path.to_path_buf(),
+            transaction_manager.clone(),
+        ));
+        let _schema_catalog = Arc::new(SchemaCatalog::new(base_path.to_path_buf()));
+        let applier = Arc::new(StoreCommandApplier::new(
+            table_cache.clone(),
+            transaction_manager,
+        ));
+        let reader = WalFileReader::open(GlobalWal::path_for_db(base_path)).unwrap();
+        recover_from_wal(applier, reader).unwrap();
+
+        let table = table_cache.get_or_open_store(store_name).unwrap();
+        let recovered = table.write().get_version(key, TXN_NONE).unwrap();
+        recovered
     }
 
     #[test]
@@ -445,5 +471,18 @@ mod tests {
             ]
         );
         assert_eq!(applier.checkpoint_count(), 1);
+    }
+
+    #[test]
+    fn test_recover_from_wal_skips_aborted_write_from_real_wal_file() {
+        let dir = tempdir().unwrap();
+        let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
+        wal.log_put("items.main.wt", b"abort-me", b"v1", 7, 0)
+            .unwrap();
+        wal.log_txn_abort(7, 0).unwrap();
+        wal.sync().unwrap();
+
+        let recovered = recover_store_from_wal(dir.path(), "items.main.wt", b"abort-me");
+        assert_eq!(recovered, None);
     }
 }

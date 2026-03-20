@@ -1,5 +1,6 @@
+use crate::database_context::DatabaseContext;
 use crate::server::commands::Command;
-use crate::{Connection, WrongoDBError};
+use crate::WrongoDBError;
 use bson::{doc, oid::ObjectId, Bson, Document};
 use serde_json::{Map, Value};
 
@@ -71,9 +72,9 @@ impl Command for InsertCommand {
         &["insert"]
     }
 
-    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("insert").unwrap_or("test");
-        let mut session = conn.open_session();
+        let mut session = db.connection().open_session();
 
         let inserted_ids: Vec<ObjectId> = if let Ok(docs) = doc.get_array("documents") {
             let mut ids = Vec::new();
@@ -88,7 +89,7 @@ impl Command for InsertCommand {
                         _ => ObjectId::new(),
                     };
                     let json_doc = bson_to_json_document(&doc_with_id);
-                    conn.collection_write_path.insert_one(
+                    db.collection_write_path().insert_one(
                         &mut session,
                         coll_name,
                         Value::Object(json_doc),
@@ -121,15 +122,15 @@ impl Command for FindCommand {
         &["find"]
     }
 
-    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("find").unwrap_or("test");
-        let mut session = conn.open_session();
+        let mut session = db.connection().open_session();
 
         let filter = doc.get("filter").and_then(|f| f.as_document()).cloned();
         let filter_json = filter.map(|d| bson_to_value(&d));
 
-        let mut results = conn
-            .document_query
+        let mut results = db
+            .document_query()
             .find(&mut session, coll_name, filter_json)?;
 
         let skip = doc.get("skip").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -178,9 +179,9 @@ impl Command for UpdateCommand {
         &["update"]
     }
 
-    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("update").unwrap_or("test");
-        let mut session = conn.open_session();
+        let mut session = db.connection().open_session();
         let mut n_matched = 0i32;
         let mut n_modified = 0i32;
 
@@ -198,14 +199,14 @@ impl Command for UpdateCommand {
                     let multi = update_doc.get_bool("multi").unwrap_or(false);
 
                     let result = if multi {
-                        conn.collection_write_path.update_many(
+                        db.collection_write_path().update_many(
                             &mut session,
                             coll_name,
                             filter_json,
                             update_json,
                         )?
                     } else {
-                        conn.collection_write_path.update_one(
+                        db.collection_write_path().update_one(
                             &mut session,
                             coll_name,
                             filter_json,
@@ -234,9 +235,9 @@ impl Command for DeleteCommand {
         &["delete"]
     }
 
-    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("delete").unwrap_or("test");
-        let mut session = conn.open_session();
+        let mut session = db.connection().open_session();
         let mut n_deleted = 0i32;
 
         if let Ok(deletes) = doc.get_array("deletes") {
@@ -248,13 +249,13 @@ impl Command for DeleteCommand {
                     let limit = delete_doc.get_i32("limit").unwrap_or(0);
 
                     if limit == 1 {
-                        n_deleted += conn.collection_write_path.delete_one(
+                        n_deleted += db.collection_write_path().delete_one(
                             &mut session,
                             coll_name,
                             filter_json,
                         )? as i32;
                     } else {
-                        n_deleted += conn.collection_write_path.delete_many(
+                        n_deleted += db.collection_write_path().delete_many(
                             &mut session,
                             coll_name,
                             filter_json,

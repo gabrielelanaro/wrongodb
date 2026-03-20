@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use crate::api::WriteUnitOfWork;
 use crate::core::errors::{DocumentValidationError, StorageError};
-use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp, WritePathMode};
+use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp};
+use crate::replication::{ReplicationCoordinator, WritePathMode};
 use crate::storage::table_cache::TableCache;
 use crate::txn::TxnId;
 use crate::WrongoDBError;
@@ -11,16 +12,19 @@ use crate::WrongoDBError;
 pub(crate) struct StoreWritePath {
     table_cache: Arc<TableCache>,
     durability_backend: Arc<DurabilityBackend>,
+    replication_coordinator: Arc<ReplicationCoordinator>,
 }
 
 impl StoreWritePath {
     pub(crate) fn new(
         table_cache: Arc<TableCache>,
         durability_backend: Arc<DurabilityBackend>,
+        replication_coordinator: Arc<ReplicationCoordinator>,
     ) -> Self {
         Self {
             table_cache,
             durability_backend,
+            replication_coordinator,
         }
     }
 
@@ -37,7 +41,7 @@ impl StoreWritePath {
         value: &[u8],
     ) -> Result<(), WrongoDBError> {
         let txn_id = write_unit.txn_id();
-        match self.durability_backend.write_path_mode() {
+        match self.replication_coordinator.write_path_mode() {
             WritePathMode::LocalApply => {
                 let mut cursor = write_unit.open_store_cursor_by_name(store_name)?;
                 cursor.insert(key, value)
@@ -59,7 +63,7 @@ impl StoreWritePath {
         value: &[u8],
     ) -> Result<(), WrongoDBError> {
         let txn_id = write_unit.txn_id();
-        match self.durability_backend.write_path_mode() {
+        match self.replication_coordinator.write_path_mode() {
             WritePathMode::LocalApply => {
                 let mut cursor = write_unit.open_store_cursor_by_name(store_name)?;
                 cursor.update(key, value)
@@ -82,7 +86,7 @@ impl StoreWritePath {
         key: &[u8],
     ) -> Result<(), WrongoDBError> {
         let txn_id = write_unit.txn_id();
-        match self.durability_backend.write_path_mode() {
+        match self.replication_coordinator.write_path_mode() {
             WritePathMode::LocalApply => {
                 let mut cursor = write_unit.open_store_cursor_by_name(store_name)?;
                 cursor.delete(key)
@@ -116,7 +120,8 @@ impl StoreWritePath {
         value: &[u8],
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
-        self.durability_backend.record(
+        self.replication_coordinator.record(
+            self.durability_backend.as_ref(),
             DurableOp::Put {
                 store_name: store_name.to_string(),
                 key: key.to_vec(),
@@ -133,7 +138,8 @@ impl StoreWritePath {
         key: &[u8],
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
-        self.durability_backend.record(
+        self.replication_coordinator.record(
+            self.durability_backend.as_ref(),
             DurableOp::Delete {
                 store_name: store_name.to_string(),
                 key: key.to_vec(),

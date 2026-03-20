@@ -1,6 +1,7 @@
 use super::crud::{bson_to_value, value_to_bson_value};
+use crate::database_context::DatabaseContext;
 use crate::server::commands::Command;
-use crate::{Connection, WrongoDBError};
+use crate::WrongoDBError;
 use bson::{doc, Bson, Document};
 use serde_json::Value;
 
@@ -12,14 +13,14 @@ impl Command for CountCommand {
         &["count"]
     }
 
-    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("count").unwrap_or("test");
-        let mut session = conn.open_session();
+        let mut session = db.connection().open_session();
         let query = doc.get("query").and_then(|q| q.as_document()).cloned();
         let filter_json = query.map(|d| bson_to_value(&d));
 
-        let count = conn
-            .document_query
+        let count = db
+            .document_query()
             .count(&mut session, coll_name, filter_json)?;
 
         Ok(doc! {
@@ -37,15 +38,15 @@ impl Command for DistinctCommand {
         &["distinct"]
     }
 
-    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("distinct").unwrap_or("test");
-        let mut session = conn.open_session();
+        let mut session = db.connection().open_session();
         let key = doc.get_str("key").unwrap_or("_id");
         let query = doc.get("query").and_then(|q| q.as_document()).cloned();
         let filter_json = query.map(|d| bson_to_value(&d));
 
-        let values = conn
-            .document_query
+        let values = db
+            .document_query()
             .distinct(&mut session, coll_name, key, filter_json)?;
         let values_bson: Vec<Bson> = values
             .into_iter()
@@ -68,12 +69,12 @@ impl Command for AggregateCommand {
         &["aggregate"]
     }
 
-    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("aggregate").unwrap_or("test");
-        let mut session = conn.open_session();
+        let mut session = db.connection().open_session();
         let pipeline = doc.get_array("pipeline").cloned().unwrap_or_default();
 
-        let mut results = conn.document_query.find(&mut session, coll_name, None)?;
+        let mut results = db.document_query().find(&mut session, coll_name, None)?;
 
         for stage in pipeline {
             if let Bson::Document(stage_doc) = stage {

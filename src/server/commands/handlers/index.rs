@@ -1,5 +1,6 @@
+use crate::database_context::DatabaseContext;
 use crate::server::commands::Command;
-use crate::{Connection, WrongoDBError};
+use crate::WrongoDBError;
 use bson::{doc, Bson, Document};
 
 /// Handles: listIndexes
@@ -10,9 +11,9 @@ impl Command for ListIndexesCommand {
         &["listIndexes"]
     }
 
-    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("listIndexes").unwrap_or("test");
-        let indexes = conn.document_query.list_indexes(coll_name)?;
+        let indexes = db.document_query().list_indexes(coll_name)?;
 
         let indexes_bson: Vec<Bson> = indexes
             .into_iter()
@@ -55,9 +56,9 @@ impl Command for CreateIndexesCommand {
         &["createIndexes"]
     }
 
-    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("createIndexes").unwrap_or("test");
-        let mut session = conn.open_session();
+        let mut session = db.connection().open_session();
         let mut created = 0i32;
 
         if let Ok(indexes) = doc.get_array("indexes") {
@@ -65,7 +66,7 @@ impl Command for CreateIndexesCommand {
                 if let Bson::Document(spec) = index_spec {
                     if let Ok(key_doc) = spec.get_document("key") {
                         for (field, _) in key_doc {
-                            let _ = conn.collection_write_path.create_index(
+                            let _ = db.collection_write_path().create_index(
                                 &mut session,
                                 coll_name,
                                 field,
@@ -77,7 +78,7 @@ impl Command for CreateIndexesCommand {
             }
         }
 
-        let total_indexes = conn.document_query.list_indexes(coll_name)?.len() as i32 + 1;
+        let total_indexes = db.document_query().list_indexes(coll_name)?.len() as i32 + 1;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),

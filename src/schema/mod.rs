@@ -103,6 +103,23 @@ impl SchemaCatalog {
         Ok(self.collection_schema(collection)?.index_names())
     }
 
+    pub(crate) fn list_collections(&self) -> Result<Vec<String>, WrongoDBError> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&self.base_path)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            if let Some(name) = file_name.strip_suffix(".main.wt") {
+                names.push(name.to_string());
+            }
+        }
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
     pub(crate) fn all_store_names(&self) -> Result<Vec<String>, WrongoDBError> {
         let mut names = Vec::new();
         for entry in fs::read_dir(&self.base_path)? {

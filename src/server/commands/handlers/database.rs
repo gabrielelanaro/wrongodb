@@ -1,8 +1,6 @@
-use std::fs;
-use std::path::Path;
-
+use crate::database_context::DatabaseContext;
 use crate::server::commands::Command;
-use crate::{Connection, WrongoDBError};
+use crate::WrongoDBError;
 use bson::{doc, spec::BinarySubtype, Binary, Bson, Document};
 
 /// Handles: listDatabases
@@ -13,7 +11,7 @@ impl Command for ListDatabasesCommand {
         &["listDatabases"]
     }
 
-    fn execute(&self, _doc: &Document, _conn: &Connection) -> Result<Document, WrongoDBError> {
+    fn execute(&self, _doc: &Document, _db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         Ok(doc! {
             "ok": Bson::Double(1.0),
             "databases": Bson::Array(vec![
@@ -37,8 +35,8 @@ impl Command for ListCollectionsCommand {
         &["listCollections"]
     }
 
-    fn execute(&self, _doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
-        let collections = list_collections(conn.base_path())?;
+    fn execute(&self, _doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
+        let collections = db.list_collections()?;
         let collections_bson: Vec<Bson> = collections
             .into_iter()
             .enumerate()
@@ -86,15 +84,15 @@ impl Command for DbStatsCommand {
         &["dbStats"]
     }
 
-    fn execute(&self, _doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
-        let collections = list_collections(conn.base_path())?;
+    fn execute(&self, _doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
+        let collections = db.list_collections()?;
         let mut document_count = 0usize;
         let mut index_count = 0usize;
 
         for name in &collections {
-            let mut session = conn.open_session();
-            document_count += conn.document_query.count(&mut session, name, None)?;
-            index_count += conn.document_query.list_indexes(name)?.len();
+            let mut session = db.connection().open_session();
+            document_count += db.document_query().count(&mut session, name, None)?;
+            index_count += db.document_query().list_indexes(name)?.len();
         }
 
         Ok(doc! {
@@ -119,10 +117,10 @@ impl Command for CollStatsCommand {
         &["collStats"]
     }
 
-    fn execute(&self, doc: &Document, conn: &Connection) -> Result<Document, WrongoDBError> {
+    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("collStats").unwrap_or("test");
-        let mut session = conn.open_session();
-        let count = conn.document_query.count(&mut session, coll_name, None)?;
+        let mut session = db.connection().open_session();
+        let count = db.document_query().count(&mut session, coll_name, None)?;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),
@@ -135,21 +133,4 @@ impl Command for CollStatsCommand {
             "totalIndexSize": Bson::Int64(0),
         })
     }
-}
-
-pub(crate) fn list_collections(base: &Path) -> Result<Vec<String>, WrongoDBError> {
-    let mut names = Vec::new();
-    for entry in fs::read_dir(base)? {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        let file_name = match file_name.to_str() {
-            Some(s) => s,
-            None => continue,
-        };
-        if let Some(name) = file_name.strip_suffix(".main.wt") {
-            names.push(name.to_string());
-        }
-    }
-    names.sort();
-    Ok(names)
 }

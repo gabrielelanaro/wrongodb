@@ -463,10 +463,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::apply_update;
-    use crate::api::connection::{Connection, ConnectionConfig, RaftMode, RaftPeerConfig};
+    use crate::api::connection::{Connection, ConnectionConfig};
     use crate::collection_write_path::CollectionWritePath;
+    use crate::core::bson::{encode_document, encode_id_value};
     use crate::document_query::DocumentQuery;
-    use crate::durability::DurabilityBackend;
+    use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp};
+    use crate::replication::{RaftMode, RaftPeerConfig, ReplicationCoordinator, WritePathMode};
     use crate::schema::SchemaCatalog;
     use crate::storage::table_cache::TableCache;
     use crate::store_write_path::StoreWritePath;
@@ -483,7 +485,15 @@ mod tests {
     fn test_services(
         base_path: std::path::PathBuf,
         backend: DurabilityBackend,
-    ) -> (CollectionWritePath, crate::api::Session) {
+    ) -> (CollectionWritePath, DocumentQuery, crate::api::Session) {
+        test_services_with_replication(base_path, backend, ReplicationCoordinator::standalone())
+    }
+
+    fn test_services_with_replication(
+        base_path: std::path::PathBuf,
+        backend: DurabilityBackend,
+        replication: ReplicationCoordinator,
+    ) -> (CollectionWritePath, DocumentQuery, crate::api::Session) {
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
         let table_cache = Arc::new(TableCache::new(
@@ -492,13 +502,23 @@ mod tests {
         ));
         let schema_catalog = Arc::new(SchemaCatalog::new(base_path));
         let backend = Arc::new(backend);
+        let replication = Arc::new(replication);
         let document_query = DocumentQuery::new(schema_catalog.clone());
-        let store_write_path = StoreWritePath::new(table_cache.clone(), backend.clone());
-        let service =
-            CollectionWritePath::new(schema_catalog.clone(), document_query, store_write_path);
-        let session =
-            crate::api::Session::new(table_cache, schema_catalog, transaction_manager, backend);
-        (service, session)
+        let store_write_path =
+            StoreWritePath::new(table_cache.clone(), backend.clone(), replication.clone());
+        let service = CollectionWritePath::new(
+            schema_catalog.clone(),
+            document_query.clone(),
+            store_write_path,
+        );
+        let session = crate::api::Session::new(
+            table_cache,
+            schema_catalog,
+            transaction_manager,
+            backend,
+            replication,
+        );
+        (service, document_query, session)
     }
 
     #[test]
@@ -574,12 +594,21 @@ mod tests {
                     }],
                 },
             ),
-        )
-        .unwrap();
+        );
+        let conn = Arc::new(conn.unwrap());
+        let document_query = DocumentQuery::new(conn.schema_catalog());
+        let service = CollectionWritePath::new(
+            conn.schema_catalog(),
+            document_query,
+            StoreWritePath::new(
+                conn.table_cache(),
+                conn.durability_backend(),
+                conn.replication_coordinator(),
+            ),
+        );
         let mut session = conn.open_session();
 
-        let err = conn
-            .collection_write_path
+        let err = service
             .insert_one(&mut session, "items", json!({"_id": "k1", "value": "v1"}))
             .unwrap_err();
         match err {
@@ -591,7 +620,7 @@ mod tests {
     #[test]
     fn create_index_backfills_existing_documents() {
         let tmp = tempdir().unwrap();
-        let (service, mut session) =
+        let (service, _query, mut session) =
             test_services(tmp.path().to_path_buf(), DurabilityBackend::Disabled);
 
         service
@@ -603,5 +632,188 @@ mod tests {
         let mut cursor = wuow.open_cursor("index:users:name").unwrap();
         assert!(cursor.next().unwrap().is_some());
         wuow.commit().unwrap();
+    }
+
+    #[test]
+    fn crud_roundtrip() {
+        let tmp = tempdir().unwrap();
+        let (service, query, mut session) =
+            test_services(tmp.path().to_path_buf(), DurabilityBackend::Disabled);
+
+        let inserted = service
+            .insert_one(&mut session, "users", json!({"name": "alice", "age": 30}))
+            .unwrap();
+        let id = inserted.get("_id").unwrap().clone();
+
+        let fetched = query
+            .find(&mut session, "users", Some(json!({"_id": id.clone()})))
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(fetched.get("name"), Some(&json!("alice")));
+
+        let updated = service
+            .update_one(
+                &mut session,
+                "users",
+                Some(json!({"_id": id.clone()})),
+                json!({"$set": {"age": 31}}),
+            )
+            .unwrap();
+        assert_eq!(updated.matched, 1);
+        assert_eq!(updated.modified, 1);
+
+        let fetched = query
+            .find(&mut session, "users", Some(json!({"_id": id.clone()})))
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(fetched.get("age"), Some(&json!(31)));
+
+        let deleted = service
+            .delete_one(&mut session, "users", Some(json!({"_id": id})))
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(query
+            .find(&mut session, "users", Some(json!({"name": "alice"})))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn create_index_registers_index_name() {
+        let tmp = tempdir().unwrap();
+        let (service, query, mut session) =
+            test_services(tmp.path().to_path_buf(), DurabilityBackend::Disabled);
+
+        service
+            .insert_one(&mut session, "users", json!({"_id": 1, "name": "alice"}))
+            .unwrap();
+        service.create_index(&mut session, "users", "name").unwrap();
+
+        let indexes = query.list_indexes("users").unwrap();
+        assert!(indexes.iter().any(|index| index == "name"));
+    }
+
+    #[test]
+    fn deferred_mode_records_put_and_commit_markers() {
+        let (replication, recorded_ops) =
+            ReplicationCoordinator::test_backend(WritePathMode::DeferredReplication);
+        let tmp = tempdir().unwrap();
+        let (service, _query, mut session) = test_services_with_replication(
+            tmp.path().to_path_buf(),
+            DurabilityBackend::Disabled,
+            replication,
+        );
+        let mut txn = session.transaction().unwrap();
+        let txn_id = txn.txn_id();
+        let doc = json!({"_id": "k1", "value": "v1"});
+        let encoded_key = encode_id_value(&json!("k1")).unwrap();
+        let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
+
+        service
+            .insert_one_in_write_unit(&mut txn, "items", doc)
+            .unwrap();
+        txn.commit().unwrap();
+
+        assert_eq!(
+            *recorded_ops.lock(),
+            vec![
+                (
+                    DurableOp::Put {
+                        store_name: "items.main.wt".to_string(),
+                        key: encoded_key,
+                        value: encoded_doc,
+                        txn_id,
+                    },
+                    DurabilityGuarantee::Buffered,
+                ),
+                (
+                    DurableOp::TxnCommit {
+                        txn_id,
+                        commit_ts: txn_id,
+                    },
+                    DurabilityGuarantee::Sync,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn deferred_mode_records_put_and_abort_markers_for_explicit_and_drop() {
+        let (replication, recorded_ops) =
+            ReplicationCoordinator::test_backend(WritePathMode::DeferredReplication);
+        let tmp = tempdir().unwrap();
+        let (service, _query, mut session) = test_services_with_replication(
+            tmp.path().to_path_buf(),
+            DurabilityBackend::Disabled,
+            replication,
+        );
+
+        {
+            let mut txn = session.transaction().unwrap();
+            let txn_id = txn.txn_id();
+            let doc = json!({"_id": "abort-me", "value": "v1"});
+            let encoded_key = encode_id_value(&json!("abort-me")).unwrap();
+            let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
+            service
+                .insert_one_in_write_unit(&mut txn, "items", doc)
+                .unwrap();
+            txn.abort().unwrap();
+
+            assert_eq!(
+                *recorded_ops.lock(),
+                vec![
+                    (
+                        DurableOp::Put {
+                            store_name: "items.main.wt".to_string(),
+                            key: encoded_key,
+                            value: encoded_doc,
+                            txn_id,
+                        },
+                        DurabilityGuarantee::Buffered,
+                    ),
+                    (
+                        DurableOp::TxnAbort { txn_id },
+                        DurabilityGuarantee::Buffered
+                    ),
+                ]
+            );
+        }
+
+        recorded_ops.lock().clear();
+
+        {
+            let mut dropped = session.transaction().unwrap();
+            let txn_id = dropped.txn_id();
+            let doc = json!({"_id": "drop-me", "value": "v2"});
+            let encoded_key = encode_id_value(&json!("drop-me")).unwrap();
+            let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
+            service
+                .insert_one_in_write_unit(&mut dropped, "items", doc)
+                .unwrap();
+            drop(dropped);
+
+            assert_eq!(
+                *recorded_ops.lock(),
+                vec![
+                    (
+                        DurableOp::Put {
+                            store_name: "items.main.wt".to_string(),
+                            key: encoded_key,
+                            value: encoded_doc,
+                            txn_id,
+                        },
+                        DurabilityGuarantee::Buffered,
+                    ),
+                    (
+                        DurableOp::TxnAbort { txn_id },
+                        DurabilityGuarantee::Buffered
+                    ),
+                ]
+            );
+        }
     }
 }

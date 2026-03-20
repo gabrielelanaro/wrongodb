@@ -2,7 +2,8 @@ use std::sync::{Arc, Weak};
 
 use crate::api::cursor::{Cursor, CursorWriteAccess};
 use crate::core::errors::StorageError;
-use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp, WritePathMode};
+use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp};
+use crate::replication::{ReplicationCoordinator, WritePathMode};
 use crate::schema::SchemaCatalog;
 use crate::storage::table_cache::TableCache;
 use crate::txn::{ActiveWriteUnit, RecoveryUnit, TransactionManager, TxnId, TXN_NONE};
@@ -29,6 +30,7 @@ pub struct Session {
     schema_catalog: Arc<SchemaCatalog>,
     transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
+    replication_coordinator: Arc<ReplicationCoordinator>,
     recovery_unit: Arc<dyn RecoveryUnit>,
     active_txn: Option<ActiveWriteUnit>,
 }
@@ -39,6 +41,7 @@ impl Session {
         schema_catalog: Arc<SchemaCatalog>,
         transaction_manager: Arc<TransactionManager>,
         durability_backend: Arc<DurabilityBackend>,
+        replication_coordinator: Arc<ReplicationCoordinator>,
     ) -> Self {
         let recovery_unit = durability_backend.new_recovery_unit();
         Self {
@@ -47,6 +50,7 @@ impl Session {
             transaction_manager,
             recovery_unit,
             durability_backend,
+            replication_coordinator,
             active_txn: None,
         }
     }
@@ -126,18 +130,24 @@ impl Session {
         }
 
         if self.transaction_manager.has_active_transactions()
-            || !self.durability_backend.is_enabled()
+            || !self
+                .replication_coordinator
+                .is_enabled(self.durability_backend.as_ref())
         {
             return Ok(());
         }
 
-        self.durability_backend
-            .record(DurableOp::Checkpoint, DurabilityGuarantee::Sync)?;
-        self.durability_backend.truncate_to_checkpoint()
+        self.replication_coordinator.record(
+            self.durability_backend.as_ref(),
+            DurableOp::Checkpoint,
+            DurabilityGuarantee::Sync,
+        )?;
+        self.replication_coordinator
+            .truncate_to_checkpoint(self.durability_backend.as_ref())
     }
 
     fn write_path_mode(&self) -> WritePathMode {
-        self.durability_backend.write_path_mode()
+        self.replication_coordinator.write_path_mode()
     }
 
     fn cursor_write_access(&self) -> CursorWriteAccess {
@@ -148,7 +158,8 @@ impl Session {
     }
 
     fn record_commit(&self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        self.durability_backend.record(
+        self.replication_coordinator.record(
+            self.durability_backend.as_ref(),
             DurableOp::TxnCommit {
                 txn_id,
                 commit_ts: txn_id,
@@ -158,7 +169,8 @@ impl Session {
     }
 
     fn record_abort(&self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        self.durability_backend.record(
+        self.replication_coordinator.record(
+            self.durability_backend.as_ref(),
             DurableOp::TxnAbort { txn_id },
             DurabilityGuarantee::Buffered,
         )
@@ -359,45 +371,113 @@ impl<'a> Drop for WriteUnitOfWork<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use serde_json::json;
     use tempfile::tempdir;
 
     use super::*;
-    use crate::api::connection::{Connection, ConnectionConfig};
-    use crate::collection_write_path::{CollectionWritePath, UpdateResult};
-    use crate::core::bson::{encode_document, encode_id_value};
-    use crate::document_query::DocumentQuery;
-    use crate::durability::DurabilityBackend;
+    use crate::durability::{
+        DurabilityBackend, DurabilityGuarantee, DurableOp, StoreCommandApplier,
+    };
+    use crate::recovery::recover_from_wal;
+    use crate::replication::{ReplicationCoordinator, WritePathMode};
     use crate::schema::SchemaCatalog;
     use crate::storage::table_cache::TableCache;
-    use crate::storage::wal::{WalFileReader, WalReader, WalRecord};
-    use crate::store_write_path::StoreWritePath;
-    use crate::txn::GlobalTxnState;
+    use crate::storage::wal::{GlobalWal, WalFileReader, WalReader, WalRecord};
+    use crate::txn::{GlobalTxnState, TransactionManager};
 
-    fn new_session_with_backend(
-        backend: DurabilityBackend,
-    ) -> (Session, CollectionWritePath, DocumentQuery) {
-        let dir = tempdir().unwrap();
-        let base_path = dir.path().to_path_buf();
-        std::mem::forget(dir);
-        let transaction_manager =
-            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let table_cache = Arc::new(TableCache::new(
-            base_path.clone(),
-            transaction_manager.clone(),
-        ));
-        let schema_catalog = Arc::new(SchemaCatalog::new(base_path));
-        let backend = Arc::new(backend);
-        let query = DocumentQuery::new(schema_catalog.clone());
-        let write_path = CollectionWritePath::new(
-            schema_catalog.clone(),
-            query.clone(),
-            StoreWritePath::new(table_cache.clone(), backend.clone()),
-        );
-        let session = Session::new(table_cache, schema_catalog, transaction_manager, backend);
-        (session, write_path, query)
+    const TEST_URI: &str = "table:items";
+    const TEST_STORE: &str = "items.main.wt";
+    const TEST_KEY: &[u8] = b"k1";
+    const TEST_VALUE: &[u8] = b"v1";
+
+    struct SessionTestFixture {
+        session: Session,
+    }
+
+    impl SessionTestFixture {
+        fn with_backend(backend: DurabilityBackend) -> Self {
+            Self::with_components(backend, ReplicationCoordinator::standalone())
+        }
+
+        fn with_deferred_replication() -> (
+            Self,
+            Arc<parking_lot::Mutex<Vec<(DurableOp, DurabilityGuarantee)>>>,
+        ) {
+            let (replication, recorded_ops) =
+                ReplicationCoordinator::test_backend(WritePathMode::DeferredReplication);
+            (
+                Self::with_components(DurabilityBackend::Disabled, replication),
+                recorded_ops,
+            )
+        }
+
+        fn with_components(
+            backend: DurabilityBackend,
+            replication: ReplicationCoordinator,
+        ) -> Self {
+            let dir = tempdir().unwrap();
+            let base_path = dir.path().to_path_buf();
+            std::mem::forget(dir);
+            Self::build(base_path, Arc::new(backend), Arc::new(replication))
+        }
+
+        fn open_local_wal<P: AsRef<Path>>(path: P) -> Self {
+            let base_path = path.as_ref().to_path_buf();
+            std::fs::create_dir_all(&base_path).unwrap();
+            let transaction_manager =
+                Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+            let table_cache = Arc::new(TableCache::new(
+                base_path.clone(),
+                transaction_manager.clone(),
+            ));
+            let applier = Arc::new(StoreCommandApplier::new(
+                table_cache.clone(),
+                transaction_manager,
+            ));
+            recover_existing_wal_if_present(&base_path, applier.clone());
+            let backend = Arc::new(DurabilityBackend::open(&base_path, true).unwrap());
+            let replication = Arc::new(ReplicationCoordinator::standalone());
+            Self::build(base_path, backend, replication)
+        }
+
+        fn into_session(self) -> Session {
+            self.session
+        }
+
+        fn build(
+            base_path: PathBuf,
+            backend: Arc<DurabilityBackend>,
+            replication: Arc<ReplicationCoordinator>,
+        ) -> Self {
+            let transaction_manager =
+                Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+            let table_cache = Arc::new(TableCache::new(
+                base_path.clone(),
+                transaction_manager.clone(),
+            ));
+            let schema_catalog = Arc::new(SchemaCatalog::new(base_path));
+            let session = Session::new(
+                table_cache,
+                schema_catalog,
+                transaction_manager,
+                backend,
+                replication,
+            );
+
+            Self { session }
+        }
+    }
+
+    fn recover_existing_wal_if_present(base_path: &Path, applier: Arc<StoreCommandApplier>) {
+        let wal_path = GlobalWal::path_for_db(base_path);
+        if !wal_path.exists() {
+            return;
+        }
+
+        let reader = WalFileReader::open(&wal_path).unwrap();
+        recover_from_wal(applier, reader).unwrap();
     }
 
     fn read_wal_records(db_dir: &std::path::Path) -> Vec<WalRecord> {
@@ -410,81 +490,197 @@ mod tests {
         records
     }
 
-    fn insert_one(
-        write_path: &CollectionWritePath,
-        session: &mut Session,
-        collection: &str,
-        doc: serde_json::Value,
-    ) -> crate::Document {
-        write_path.insert_one(session, collection, doc).unwrap()
+    fn insert_in_write_unit(
+        write_unit: &mut WriteUnitOfWork<'_>,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), WrongoDBError> {
+        let mut cursor = write_unit.open_cursor(TEST_URI)?;
+        cursor.insert(key, value)
     }
 
-    fn find_one(
-        query: &DocumentQuery,
-        session: &mut Session,
-        collection: &str,
-        filter: serde_json::Value,
-    ) -> Option<crate::Document> {
-        query
-            .find(session, collection, Some(filter))
-            .unwrap()
-            .into_iter()
-            .next()
+    #[test]
+    fn create_table_allows_non_transactional_cursor_access() {
+        let mut session =
+            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+        session.create(TEST_URI).unwrap();
+
+        let mut cursor = session.open_cursor(TEST_URI).unwrap();
+        cursor.insert(TEST_KEY, TEST_VALUE).unwrap();
+
+        assert_eq!(cursor.get(TEST_KEY).unwrap(), Some(TEST_VALUE.to_vec()));
     }
 
-    fn create_index(
-        write_path: &CollectionWritePath,
-        session: &mut Session,
-        collection: &str,
-        field: &str,
-    ) {
-        write_path.create_index(session, collection, field).unwrap();
+    #[test]
+    fn create_rejects_index_uris() {
+        let mut session =
+            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+
+        let err = session.create("index:test:name").unwrap_err();
+        assert!(err.to_string().contains("only table:... is supported"));
     }
 
-    fn list_indexes(query: &DocumentQuery, collection: &str) -> Vec<String> {
-        query.list_indexes(collection).unwrap()
+    #[test]
+    fn transaction_cursor_reads_its_uncommitted_write() {
+        let mut session =
+            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+        session.create(TEST_URI).unwrap();
+
+        let mut txn = session.transaction().unwrap();
+        insert_in_write_unit(&mut txn, TEST_KEY, TEST_VALUE).unwrap();
+
+        let mut cursor = txn.open_cursor(TEST_URI).unwrap();
+        assert_eq!(cursor.get(TEST_KEY).unwrap(), Some(TEST_VALUE.to_vec()));
     }
 
-    fn update_one(
-        write_path: &CollectionWritePath,
-        session: &mut Session,
-        collection: &str,
-        filter: serde_json::Value,
-        update: serde_json::Value,
-    ) -> UpdateResult {
-        write_path
-            .update_one(session, collection, Some(filter), update)
-            .unwrap()
+    #[test]
+    fn local_mode_commit_makes_transactional_cursor_write_visible() {
+        let mut session =
+            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+        session.create(TEST_URI).unwrap();
+
+        let mut txn = session.transaction().unwrap();
+        insert_in_write_unit(&mut txn, TEST_KEY, TEST_VALUE).unwrap();
+        txn.commit().unwrap();
+
+        let mut cursor = session.open_cursor(TEST_URI).unwrap();
+        assert_eq!(cursor.get(TEST_KEY).unwrap(), Some(TEST_VALUE.to_vec()));
     }
 
-    fn delete_one(
-        write_path: &CollectionWritePath,
-        session: &mut Session,
-        collection: &str,
-        filter: serde_json::Value,
-    ) -> usize {
-        write_path
-            .delete_one(session, collection, Some(filter))
-            .unwrap()
+    #[test]
+    fn local_mode_abort_discards_transactional_cursor_write() {
+        let mut session =
+            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+        session.create(TEST_URI).unwrap();
+
+        let mut txn = session.transaction().unwrap();
+        insert_in_write_unit(&mut txn, TEST_KEY, TEST_VALUE).unwrap();
+        txn.abort().unwrap();
+
+        let mut cursor = session.open_cursor(TEST_URI).unwrap();
+        assert_eq!(cursor.get(TEST_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn dropped_write_unit_discards_transactional_cursor_write() {
+        let mut session =
+            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+        session.create(TEST_URI).unwrap();
+
+        {
+            let mut txn = session.transaction().unwrap();
+            insert_in_write_unit(&mut txn, TEST_KEY, TEST_VALUE).unwrap();
+        }
+
+        let mut cursor = session.open_cursor(TEST_URI).unwrap();
+        assert_eq!(cursor.get(TEST_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn deferred_mode_open_cursor_rejects_low_level_writes() {
+        let (fixture, _recorded_ops) = SessionTestFixture::with_deferred_replication();
+        let mut session = fixture.into_session();
+        session.create(TEST_URI).unwrap();
+
+        let mut cursor = session.open_cursor(TEST_URI).unwrap();
+        let err = cursor.insert(TEST_KEY, TEST_VALUE).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cursor writes are not available when replication defers apply"));
+    }
+
+    #[test]
+    fn deferred_mode_commit_records_transaction_commit_marker() {
+        let (fixture, recorded_ops) = SessionTestFixture::with_deferred_replication();
+        let mut session = fixture.into_session();
+
+        let txn = session.transaction().unwrap();
+        let txn_id = txn.txn_id();
+        txn.commit().unwrap();
+
+        assert_eq!(
+            *recorded_ops.lock(),
+            vec![(
+                DurableOp::TxnCommit {
+                    txn_id,
+                    commit_ts: txn_id,
+                },
+                DurabilityGuarantee::Sync,
+            )]
+        );
+    }
+
+    #[test]
+    fn deferred_mode_abort_records_transaction_abort_for_explicit_and_drop() {
+        let (fixture, recorded_ops) = SessionTestFixture::with_deferred_replication();
+        let mut session = fixture.into_session();
+
+        {
+            let txn = session.transaction().unwrap();
+            let txn_id = txn.txn_id();
+            txn.abort().unwrap();
+
+            assert_eq!(
+                *recorded_ops.lock(),
+                vec![(
+                    DurableOp::TxnAbort { txn_id },
+                    DurabilityGuarantee::Buffered
+                )]
+            );
+        }
+
+        recorded_ops.lock().clear();
+
+        {
+            let dropped = session.transaction().unwrap();
+            let txn_id = dropped.txn_id();
+            drop(dropped);
+
+            assert_eq!(
+                *recorded_ops.lock(),
+                vec![(
+                    DurableOp::TxnAbort { txn_id },
+                    DurabilityGuarantee::Buffered
+                )]
+            );
+        }
     }
 
     #[test]
     fn checkpoint_skips_truncate_when_transaction_active() {
         let dir = tempdir().unwrap();
-        let conn = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
-        let mut session = conn.open_session();
-        session.create("table:items").unwrap();
+        let base_path = dir.path().to_path_buf();
+        let transaction_manager =
+            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+        let table_cache = Arc::new(TableCache::new(
+            base_path.clone(),
+            transaction_manager.clone(),
+        ));
+        let backend = Arc::new(DurabilityBackend::open(&base_path, true).unwrap());
+        let replication = Arc::new(ReplicationCoordinator::standalone());
+        let schema_catalog = Arc::new(SchemaCatalog::new(base_path));
+        let mut session = Session::new(
+            table_cache.clone(),
+            schema_catalog.clone(),
+            transaction_manager.clone(),
+            backend.clone(),
+            replication.clone(),
+        );
+        let mut checkpoint_session = Session::new(
+            table_cache,
+            schema_catalog,
+            transaction_manager,
+            backend,
+            replication,
+        );
+        session.create(TEST_URI).unwrap();
 
-        {
-            let mut txn = session.transaction().unwrap();
-            conn.collection_write_path
-                .insert_one_in_write_unit(&mut txn, "items", json!({"_id": "k1", "value": "v1"}))
-                .unwrap();
-        }
+        let mut txn = session.transaction().unwrap();
+        insert_in_write_unit(&mut txn, TEST_KEY, TEST_VALUE).unwrap();
 
         let wal_path = dir.path().join("global.wal");
         let before = std::fs::metadata(&wal_path).unwrap().len();
-        session.checkpoint().unwrap();
+        checkpoint_session.checkpoint().unwrap();
         let after = std::fs::metadata(&wal_path).unwrap().len();
 
         assert!(after >= before);
@@ -497,17 +693,12 @@ mod tests {
     #[test]
     fn checkpoint_truncates_when_no_active_transactions() {
         let dir = tempdir().unwrap();
-        let conn = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
-        let mut session = conn.open_session();
-        session.create("table:items").unwrap();
+        let mut session = SessionTestFixture::open_local_wal(dir.path()).into_session();
+        session.create(TEST_URI).unwrap();
 
-        {
-            let mut txn = session.transaction().unwrap();
-            conn.collection_write_path
-                .insert_one_in_write_unit(&mut txn, "items", json!({"_id": "k1", "value": "v1"}))
-                .unwrap();
-            txn.commit().unwrap();
-        }
+        let mut txn = session.transaction().unwrap();
+        insert_in_write_unit(&mut txn, TEST_KEY, TEST_VALUE).unwrap();
+        txn.commit().unwrap();
 
         let wal_path = dir.path().join("global.wal");
         session.checkpoint().unwrap();
@@ -519,49 +710,14 @@ mod tests {
     }
 
     #[test]
-    fn local_mode_commit_applies_page_local_updates() {
-        let (mut session, write_path, query) =
-            new_session_with_backend(DurabilityBackend::Disabled);
-        let mut txn = session.transaction().unwrap();
-        write_path
-            .insert_one_in_write_unit(&mut txn, "items", json!({"_id": "k1", "value": "v1"}))
-            .unwrap();
-
-        txn.commit().unwrap();
-
-        let doc = find_one(&query, &mut session, "items", json!({"_id": "k1"})).unwrap();
-        assert_eq!(doc.get("value"), Some(&json!("v1")));
-    }
-
-    #[test]
-    fn local_mode_abort_discards_page_local_updates() {
-        let (mut session, write_path, query) =
-            new_session_with_backend(DurabilityBackend::Disabled);
-        let mut txn = session.transaction().unwrap();
-        write_path
-            .insert_one_in_write_unit(&mut txn, "items", json!({"_id": "k1", "value": "v1"}))
-            .unwrap();
-
-        txn.abort().unwrap();
-
-        assert!(find_one(&query, &mut session, "items", json!({"_id": "k1"})).is_none());
-    }
-
-    #[test]
-    fn local_wal_mode_records_write_and_commit_markers() {
+    fn local_wal_mode_records_transactional_cursor_write_and_commit_markers() {
         let dir = tempdir().unwrap();
-        let conn = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
-        let mut session = conn.open_session();
-        session.create("table:items").unwrap();
-        let expected_key = encode_id_value(&json!("k1")).unwrap();
-        let expected_value =
-            encode_document(json!({"_id": "k1", "value": "v1"}).as_object().unwrap()).unwrap();
+        let mut session = SessionTestFixture::open_local_wal(dir.path()).into_session();
+        session.create(TEST_URI).unwrap();
 
         let mut txn = session.transaction().unwrap();
         let txn_id = txn.txn_id();
-        conn.collection_write_path
-            .insert_one_in_write_unit(&mut txn, "items", json!({"_id": "k1", "value": "v1"}))
-            .unwrap();
+        insert_in_write_unit(&mut txn, TEST_KEY, TEST_VALUE).unwrap();
         txn.commit().unwrap();
 
         let records = read_wal_records(dir.path());
@@ -572,9 +728,9 @@ mod tests {
                 key,
                 value,
                 txn_id: record_txn_id,
-            } if store_name == "items.main.wt"
-                && key == &expected_key
-                && value == &expected_value
+            } if store_name == TEST_STORE
+                && key == TEST_KEY
+                && value == TEST_VALUE
                 && *record_txn_id == txn_id
         )));
         assert!(records.iter().any(|record| matches!(
@@ -584,257 +740,5 @@ mod tests {
                 commit_ts,
             } if *record_txn_id == txn_id && *commit_ts == txn_id
         )));
-    }
-
-    #[test]
-    fn local_wal_mode_does_not_recover_aborted_write() {
-        let dir = tempdir().unwrap();
-        {
-            let conn = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
-            let mut session = conn.open_session();
-            session.create("table:items").unwrap();
-
-            let mut txn = session.transaction().unwrap();
-            conn.collection_write_path
-                .insert_one_in_write_unit(
-                    &mut txn,
-                    "items",
-                    json!({"_id": "abort-me", "value": "v1"}),
-                )
-                .unwrap();
-            txn.abort().unwrap();
-        }
-
-        let reopened = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
-        let mut session = reopened.open_session();
-        assert!(find_one(
-            &reopened.document_query,
-            &mut session,
-            "items",
-            json!({"_id": "abort-me"})
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn deferred_mode_records_commit_after_write_ops() {
-        let (backend, recorded_ops) =
-            DurabilityBackend::test_backend(WritePathMode::DeferredReplication);
-        let (mut session, write_path, _query) = new_session_with_backend(backend);
-        let mut txn = session.transaction().unwrap();
-        let txn_id = txn.txn_id();
-        let doc = json!({"_id": "k1", "value": "v1"});
-        let encoded_key = encode_id_value(&json!("k1")).unwrap();
-        let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
-
-        write_path
-            .insert_one_in_write_unit(&mut txn, "items", doc)
-            .unwrap();
-        txn.commit().unwrap();
-
-        assert_eq!(
-            *recorded_ops.lock(),
-            vec![
-                (
-                    DurableOp::Put {
-                        store_name: "items.main.wt".to_string(),
-                        key: encoded_key,
-                        value: encoded_doc,
-                        txn_id,
-                    },
-                    DurabilityGuarantee::Buffered,
-                ),
-                (
-                    DurableOp::TxnCommit {
-                        txn_id,
-                        commit_ts: txn_id,
-                    },
-                    DurabilityGuarantee::Sync,
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn deferred_mode_records_abort_for_explicit_and_drop_abort() {
-        let (backend, recorded_ops) =
-            DurabilityBackend::test_backend(WritePathMode::DeferredReplication);
-        let (mut session, write_path, _query) = new_session_with_backend(backend);
-
-        {
-            let mut txn = session.transaction().unwrap();
-            let txn_id = txn.txn_id();
-            let doc = json!({"_id": "abort-me", "value": "v1"});
-            let encoded_key = encode_id_value(&json!("abort-me")).unwrap();
-            let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
-            write_path
-                .insert_one_in_write_unit(&mut txn, "items", doc)
-                .unwrap();
-            txn.abort().unwrap();
-
-            assert_eq!(
-                *recorded_ops.lock(),
-                vec![
-                    (
-                        DurableOp::Put {
-                            store_name: "items.main.wt".to_string(),
-                            key: encoded_key,
-                            value: encoded_doc,
-                            txn_id,
-                        },
-                        DurabilityGuarantee::Buffered,
-                    ),
-                    (
-                        DurableOp::TxnAbort { txn_id },
-                        DurabilityGuarantee::Buffered
-                    ),
-                ]
-            );
-        }
-
-        recorded_ops.lock().clear();
-
-        {
-            let mut dropped = session.transaction().unwrap();
-            let txn_id = dropped.txn_id();
-            let doc = json!({"_id": "drop-me", "value": "v2"});
-            let encoded_key = encode_id_value(&json!("drop-me")).unwrap();
-            let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
-            write_path
-                .insert_one_in_write_unit(&mut dropped, "items", doc)
-                .unwrap();
-            drop(dropped);
-
-            assert_eq!(
-                *recorded_ops.lock(),
-                vec![
-                    (
-                        DurableOp::Put {
-                            store_name: "items.main.wt".to_string(),
-                            key: encoded_key,
-                            value: encoded_doc,
-                            txn_id,
-                        },
-                        DurabilityGuarantee::Buffered,
-                    ),
-                    (
-                        DurableOp::TxnAbort { txn_id },
-                        DurabilityGuarantee::Buffered
-                    ),
-                ]
-            );
-        }
-    }
-
-    #[test]
-    fn session_crud_roundtrip() {
-        let tmp = tempdir().unwrap();
-        let conn = Connection::open(tmp.path().join("db"), ConnectionConfig::default()).unwrap();
-        let mut session = conn.open_session();
-
-        let inserted = insert_one(
-            &conn.collection_write_path,
-            &mut session,
-            "test",
-            json!({"name": "alice", "age": 30}),
-        );
-        let id = inserted.get("_id").unwrap().clone();
-
-        let fetched = find_one(
-            &conn.document_query,
-            &mut session,
-            "test",
-            json!({"_id": id.clone()}),
-        )
-        .unwrap();
-        assert_eq!(fetched.get("name").unwrap().as_str().unwrap(), "alice");
-
-        let updated = update_one(
-            &conn.collection_write_path,
-            &mut session,
-            "test",
-            json!({"_id": id.clone()}),
-            json!({"$set": {"age": 31}}),
-        );
-        assert_eq!(updated.matched, 1);
-        assert_eq!(updated.modified, 1);
-
-        let fetched = find_one(
-            &conn.document_query,
-            &mut session,
-            "test",
-            json!({"_id": id.clone()}),
-        )
-        .unwrap();
-        assert_eq!(fetched.get("age").unwrap().as_i64().unwrap(), 31);
-
-        let deleted = delete_one(
-            &conn.collection_write_path,
-            &mut session,
-            "test",
-            json!({"_id": id}),
-        );
-        assert_eq!(deleted, 1);
-        assert!(find_one(
-            &conn.document_query,
-            &mut session,
-            "test",
-            json!({"name": "alice"})
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn session_create_and_list_indexes() {
-        let tmp = tempdir().unwrap();
-        let conn = Connection::open(tmp.path().join("db"), ConnectionConfig::default()).unwrap();
-        let mut session = conn.open_session();
-
-        insert_one(
-            &conn.collection_write_path,
-            &mut session,
-            "test",
-            json!({"name": "alice"}),
-        );
-        create_index(&conn.collection_write_path, &mut session, "test", "name");
-
-        let indexes = list_indexes(&conn.document_query, "test");
-        assert!(indexes.iter().any(|idx| idx == "name"));
-    }
-
-    #[test]
-    fn session_create_rejects_index_uris() {
-        let tmp = tempdir().unwrap();
-        let conn = Connection::open(tmp.path().join("db"), ConnectionConfig::default()).unwrap();
-        let mut session = conn.open_session();
-
-        let err = session.create("index:test:name").unwrap_err();
-        assert!(err.to_string().contains("only table:... is supported"));
-    }
-
-    #[test]
-    fn checkpoint_preserves_indexed_lookup_after_reconciliation() {
-        let tmp = tempdir().unwrap();
-        let conn = Connection::open(tmp.path().join("db"), ConnectionConfig::default()).unwrap();
-        let mut session = conn.open_session();
-
-        create_index(&conn.collection_write_path, &mut session, "test", "name");
-        insert_one(
-            &conn.collection_write_path,
-            &mut session,
-            "test",
-            json!({"_id": 1, "name": "alice"}),
-        );
-
-        session.checkpoint().unwrap();
-
-        let doc = find_one(
-            &conn.document_query,
-            &mut session,
-            "test",
-            json!({"name": "alice"}),
-        )
-        .unwrap();
-        assert_eq!(doc.get("name"), Some(&json!("alice")));
     }
 }

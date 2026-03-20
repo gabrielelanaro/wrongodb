@@ -12,6 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use self::commands::handlers::crud::{bson_to_value, value_to_bson};
 use self::commands::CommandRegistry;
+use crate::database_context::DatabaseContext;
 use crate::{Connection, WrongoDBError};
 
 const OP_MSG: i32 = 2013;
@@ -51,15 +52,16 @@ pub async fn start_server(
     conn: Arc<Connection>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
+    let db = Arc::new(DatabaseContext::new(conn));
     let registry = Arc::new(CommandRegistry::new());
     println!("Server listening on {}", addr);
 
     loop {
         let (socket, _) = listener.accept().await?;
-        let conn_clone = Arc::clone(&conn);
+        let db_clone = Arc::clone(&db);
         let registry_clone = Arc::clone(&registry);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, conn_clone, registry_clone).await {
+            if let Err(e) = handle_connection(socket, db_clone, registry_clone).await {
                 eprintln!("Connection error: {}", e);
             }
         });
@@ -68,7 +70,7 @@ pub async fn start_server(
 
 async fn handle_connection(
     mut socket: TcpStream,
-    conn: Arc<Connection>,
+    db: Arc<DatabaseContext>,
     registry: Arc<CommandRegistry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
@@ -102,11 +104,11 @@ async fn handle_connection(
 
         match header.op_code {
             OP_MSG => {
-                let response = handle_op_msg(&body_buf, &conn, &registry).await?;
+                let response = handle_op_msg(&body_buf, &db, &registry).await?;
                 send_op_msg_response(&mut socket, header.request_id, &response).await?;
             }
             OP_QUERY => {
-                let response = handle_op_query(&body_buf, &conn, &registry).await?;
+                let response = handle_op_query(&body_buf, &db, &registry).await?;
                 send_reply(&mut socket, header.request_id, &response).await?;
             }
             _ => continue,
@@ -116,7 +118,7 @@ async fn handle_connection(
 
 async fn handle_op_msg(
     body_buf: &[u8],
-    conn: &Arc<Connection>,
+    db: &Arc<DatabaseContext>,
     registry: &CommandRegistry,
 ) -> Result<Document, WrongoDBError> {
     let mut cursor = Cursor::new(body_buf);
@@ -163,7 +165,7 @@ async fn handle_op_msg(
                 doc.insert("documents", Bson::Array(docs_bson));
             }
         }
-        return Ok(match registry.execute(&doc, conn.as_ref()) {
+        return Ok(match registry.execute(&doc, db.as_ref()) {
             Ok(response) => response,
             Err(err) => command_error_document(&err),
         });
@@ -174,7 +176,7 @@ async fn handle_op_msg(
 
 async fn handle_op_query(
     body_buf: &[u8],
-    conn: &Arc<Connection>,
+    db: &Arc<DatabaseContext>,
     registry: &CommandRegistry,
 ) -> Result<Document, WrongoDBError> {
     let mut cursor = Cursor::new(body_buf);
@@ -201,7 +203,7 @@ async fn handle_op_query(
     let query_doc: Document = bson::from_slice(&query_buf).map_err(WrongoDBError::BsonDe)?;
 
     if full_coll_name == "admin.$cmd" {
-        return Ok(match registry.execute(&query_doc, conn.as_ref()) {
+        return Ok(match registry.execute(&query_doc, db.as_ref()) {
             Ok(response) => response,
             Err(err) => command_error_document(&err),
         });
@@ -212,9 +214,9 @@ async fn handle_op_query(
         .split_once('.')
         .map(|(_, coll)| coll)
         .unwrap_or(full_coll_name.as_str());
-    let mut session = conn.open_session();
-    let results = match conn
-        .document_query
+    let mut session = db.connection().open_session();
+    let results = match db
+        .document_query()
         .find(&mut session, coll_name, Some(filter_json))
     {
         Ok(results) => results,
