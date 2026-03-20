@@ -33,6 +33,29 @@ impl StoreWritePath {
         Ok(())
     }
 
+    pub(crate) fn write_path_mode(&self) -> WritePathMode {
+        self.replication_coordinator.write_path_mode()
+    }
+
+    pub(crate) fn record_commit(&self, txn_id: TxnId) -> Result<(), WrongoDBError> {
+        self.replication_coordinator.record(
+            self.durability_backend.as_ref(),
+            DurableOp::TxnCommit {
+                txn_id,
+                commit_ts: txn_id,
+            },
+            DurabilityGuarantee::Sync,
+        )
+    }
+
+    pub(crate) fn record_abort(&self, txn_id: TxnId) -> Result<(), WrongoDBError> {
+        self.replication_coordinator.record(
+            self.durability_backend.as_ref(),
+            DurableOp::TxnAbort { txn_id },
+            DurabilityGuarantee::Buffered,
+        )
+    }
+
     pub(crate) fn insert(
         &self,
         write_unit: &mut WriteUnitOfWork<'_>,

@@ -1,5 +1,27 @@
 # Decisions
 
+## 2026-03-20: Keep `Session` WT-like and move replicated commit coordination above storage
+
+**Decision**
+- Remove replication coordination from `Session` and `WriteUnitOfWork`.
+- Keep `Session` responsible only for:
+  - opening cursors
+  - owning the local recovery unit
+  - local transaction begin/commit/abort
+  - local checkpoint/WAL coordination
+- Move deferred-replication commit/abort markers to `CollectionWritePath`.
+- Keep `StoreWritePath` as the helper that knows how to:
+  - locally apply store mutations
+  - or record replicated durable ops
+
+**Why**
+- `Session` is intended to stay close to a WT-style storage session.
+- Threading `ReplicationCoordinator` into `Session` made the storage API depend on
+  database-level replication policy.
+- The correct split is:
+  - storage transaction lifecycle in `Session`
+  - replicated write admission/commit policy in the upper write path
+
 ## 2026-03-20: Split RAFT coordination out of local durability
 
 **Decision**

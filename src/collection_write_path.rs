@@ -8,6 +8,7 @@ use crate::core::document::{normalize_document_in_place, validate_is_object};
 use crate::core::errors::DocumentValidationError;
 use crate::document_query::DocumentQuery;
 use crate::index::encode_index_key;
+use crate::replication::WritePathMode;
 use crate::schema::SchemaCatalog;
 use crate::store_write_path::StoreWritePath;
 use crate::{Document, WrongoDBError};
@@ -369,14 +370,26 @@ impl CollectionWritePath {
     where
         F: FnOnce(&Self, &mut WriteUnitOfWork<'_>) -> Result<R, WrongoDBError>,
     {
+        let write_path_mode = self.store_write_path.write_path_mode();
         let mut write_unit = session.transaction()?;
+        let txn_id = write_unit.txn_id();
         let result = f(self, &mut write_unit);
         match result {
             Ok(value) => {
+                if write_path_mode == WritePathMode::DeferredReplication {
+                    if let Err(err) = self.store_write_path.record_commit(txn_id) {
+                        let _ = self.store_write_path.record_abort(txn_id);
+                        let _ = write_unit.abort();
+                        return Err(err);
+                    }
+                }
                 write_unit.commit()?;
                 Ok(value)
             }
             Err(err) => {
+                if write_path_mode == WritePathMode::DeferredReplication {
+                    let _ = self.store_write_path.record_abort(txn_id);
+                }
                 let _ = write_unit.abort();
                 Err(err)
             }
@@ -511,13 +524,8 @@ mod tests {
             document_query.clone(),
             store_write_path,
         );
-        let session = crate::api::Session::new(
-            table_cache,
-            schema_catalog,
-            transaction_manager,
-            backend,
-            replication,
-        );
+        let session =
+            crate::api::Session::new(table_cache, schema_catalog, transaction_manager, backend);
         (service, document_query, session)
     }
 
@@ -707,16 +715,11 @@ mod tests {
             DurabilityBackend::Disabled,
             replication,
         );
-        let mut txn = session.transaction().unwrap();
-        let txn_id = txn.txn_id();
         let doc = json!({"_id": "k1", "value": "v1"});
         let encoded_key = encode_id_value(&json!("k1")).unwrap();
         let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
 
-        service
-            .insert_one_in_write_unit(&mut txn, "items", doc)
-            .unwrap();
-        txn.commit().unwrap();
+        service.insert_one(&mut session, "items", doc).unwrap();
 
         assert_eq!(
             *recorded_ops.lock(),
@@ -726,14 +729,14 @@ mod tests {
                         store_name: "items.main.wt".to_string(),
                         key: encoded_key,
                         value: encoded_doc,
-                        txn_id,
+                        txn_id: 1,
                     },
                     DurabilityGuarantee::Buffered,
                 ),
                 (
                     DurableOp::TxnCommit {
-                        txn_id,
-                        commit_ts: txn_id,
+                        txn_id: 1,
+                        commit_ts: 1,
                     },
                     DurabilityGuarantee::Sync,
                 ),
@@ -753,15 +756,18 @@ mod tests {
         );
 
         {
-            let mut txn = session.transaction().unwrap();
-            let txn_id = txn.txn_id();
             let doc = json!({"_id": "abort-me", "value": "v1"});
             let encoded_key = encode_id_value(&json!("abort-me")).unwrap();
             let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
-            service
-                .insert_one_in_write_unit(&mut txn, "items", doc)
-                .unwrap();
-            txn.abort().unwrap();
+            let err = service
+                .run_in_write_unit(&mut session, |this, write_unit| {
+                    this.insert_one_in_write_unit(write_unit, "items", doc)?;
+                    Err::<(), WrongoDBError>(WrongoDBError::Storage(crate::StorageError(
+                        "force abort".into(),
+                    )))
+                })
+                .unwrap_err();
+            assert!(err.to_string().contains("force abort"));
 
             assert_eq!(
                 *recorded_ops.lock(),
@@ -771,12 +777,12 @@ mod tests {
                             store_name: "items.main.wt".to_string(),
                             key: encoded_key,
                             value: encoded_doc,
-                            txn_id,
+                            txn_id: 1,
                         },
                         DurabilityGuarantee::Buffered,
                     ),
                     (
-                        DurableOp::TxnAbort { txn_id },
+                        DurableOp::TxnAbort { txn_id: 1 },
                         DurabilityGuarantee::Buffered
                     ),
                 ]
@@ -786,15 +792,18 @@ mod tests {
         recorded_ops.lock().clear();
 
         {
-            let mut dropped = session.transaction().unwrap();
-            let txn_id = dropped.txn_id();
             let doc = json!({"_id": "drop-me", "value": "v2"});
             let encoded_key = encode_id_value(&json!("drop-me")).unwrap();
             let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
-            service
-                .insert_one_in_write_unit(&mut dropped, "items", doc)
-                .unwrap();
-            drop(dropped);
+            let err = service
+                .run_in_write_unit(&mut session, |this, write_unit| {
+                    this.insert_one_in_write_unit(write_unit, "items", doc)?;
+                    Err::<(), WrongoDBError>(WrongoDBError::Storage(crate::StorageError(
+                        "force drop".into(),
+                    )))
+                })
+                .unwrap_err();
+            assert!(err.to_string().contains("force drop"));
 
             assert_eq!(
                 *recorded_ops.lock(),
@@ -804,12 +813,12 @@ mod tests {
                             store_name: "items.main.wt".to_string(),
                             key: encoded_key,
                             value: encoded_doc,
-                            txn_id,
+                            txn_id: 2,
                         },
                         DurabilityGuarantee::Buffered,
                     ),
                     (
-                        DurableOp::TxnAbort { txn_id },
+                        DurableOp::TxnAbort { txn_id: 2 },
                         DurabilityGuarantee::Buffered
                     ),
                 ]

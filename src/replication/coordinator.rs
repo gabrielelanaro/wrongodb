@@ -79,15 +79,6 @@ impl ReplicationCoordinator {
         Self::Standalone
     }
 
-    pub(crate) fn is_enabled(&self, durability_backend: &DurabilityBackend) -> bool {
-        match self {
-            Self::Standalone => durability_backend.is_enabled(),
-            Self::Raft(_) => true,
-            #[cfg(test)]
-            Self::Test(backend) => backend.write_path_mode == WritePathMode::DeferredReplication,
-        }
-    }
-
     pub(crate) fn hello_state(&self) -> HelloState {
         match self {
             Self::Standalone => HelloState {
@@ -123,18 +114,6 @@ impl ReplicationCoordinator {
                 backend.recorded_ops.lock().push((op, guarantee));
                 Ok(())
             }
-        }
-    }
-
-    pub(crate) fn truncate_to_checkpoint(
-        &self,
-        durability_backend: &DurabilityBackend,
-    ) -> Result<(), WrongoDBError> {
-        match self {
-            Self::Standalone => durability_backend.truncate_to_checkpoint(),
-            Self::Raft(backend) => backend.truncate_to_checkpoint(),
-            #[cfg(test)]
-            Self::Test(_) => Ok(()),
         }
     }
 
@@ -215,11 +194,6 @@ impl RaftReplicationCoordinator {
         }
         Ok(())
     }
-
-    fn truncate_to_checkpoint(&self) -> Result<(), WrongoDBError> {
-        self.raft_service.truncate_to_checkpoint()
-    }
-
     #[cfg(test)]
     fn raft_tick(&self) -> Result<(), WrongoDBError> {
         self.raft_service.force_tick()

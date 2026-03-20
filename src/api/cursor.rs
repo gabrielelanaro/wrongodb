@@ -18,6 +18,7 @@ pub type CursorEntry = (Vec<u8>, Vec<u8>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CursorWriteAccess {
+    #[cfg(test)]
     ReadOnly,
     ReadWrite,
 }
@@ -92,8 +93,7 @@ impl Cursor {
             return Ok(());
         }
         Err(WrongoDBError::Storage(StorageError(
-            "cursor writes are not available when replication defers apply; replicated writes do not go through the low-level cursor API"
-                .into(),
+            "cursor is read-only in this context".into(),
         )))
     }
 
@@ -183,13 +183,6 @@ impl Cursor {
     }
 
     /// Delete an existing key from the bound store.
-    ///
-    /// In deferred replication mode this method is intentionally unavailable:
-    /// low-level cursor writes are local-store operations, not the replicated
-    /// write API.
-    ///
-    /// That restriction exists to keep the cursor contract stable instead of
-    /// letting it silently switch between local apply and deferred apply.
     pub fn delete(&mut self, key: &[u8]) -> Result<(), WrongoDBError> {
         let txn_id = self.bound_txn_id;
         self.ensure_writable()?;
@@ -211,9 +204,6 @@ impl Cursor {
     }
 
     /// Fetch the visible value for `key` in the cursor's bound transaction.
-    ///
-    /// Reads stay on the low-level cursor API in every durability mode because
-    /// they do not participate in the replicated write path split.
     ///
     /// The method lives here because visibility is still a one-store,
     /// one-transaction question.
@@ -387,9 +377,7 @@ mod tests {
         );
 
         let err = cursor.insert(b"k1", b"v1").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("replicated writes do not go through the low-level cursor API"));
+        assert!(err.to_string().contains("cursor is read-only"));
     }
 
     #[test]

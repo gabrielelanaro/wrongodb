@@ -143,6 +143,7 @@ impl RaftServiceHandle {
             .map_err(|_| StorageError("raft service dropped sync response".into()))?
     }
 
+    #[cfg(test)]
     pub(crate) fn truncate_to_checkpoint(&self) -> Result<(), WrongoDBError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.cmd_tx
@@ -203,6 +204,7 @@ enum RaftServiceCommand {
     Sync {
         reply: Sender<Result<(), WrongoDBError>>,
     },
+    #[cfg(test)]
     TruncateToCheckpoint {
         reply: Sender<Result<(), WrongoDBError>>,
     },
@@ -381,6 +383,7 @@ fn process_proposal(
                         let _ = reply.send(runtime.sync_node());
                     }
                 }
+                #[cfg(test)]
                 RaftServiceCommand::TruncateToCheckpoint { reply } => {
                     if let Some(err) = current_fatal_error(state) {
                         let _ = reply.send(Err(err));
@@ -456,6 +459,7 @@ fn handle_non_proposal_command(
             }
             true
         }
+        #[cfg(test)]
         RaftServiceCommand::TruncateToCheckpoint { reply } => {
             if let Some(err) = current_fatal_error(state) {
                 let _ = reply.send(Err(err));

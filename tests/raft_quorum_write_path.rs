@@ -34,7 +34,7 @@ fn standalone_local_wal_mode_allows_public_cursor_writes() {
 }
 
 #[test]
-fn cluster_mode_rejects_public_cursor_writes() {
+fn cluster_mode_still_allows_low_level_storage_cursor_writes() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("db");
     let local_raft_addr = free_local_addr();
@@ -55,8 +55,10 @@ fn cluster_mode_rejects_public_cursor_writes() {
     )
     .unwrap();
 
-    let err = insert_kv(&conn, b"alice", b"value").unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("replicated writes do not go through the low-level cursor API"));
+    insert_kv(&conn, b"alice", b"value").unwrap();
+
+    let session = conn.open_session();
+    let mut cursor = session.open_cursor("table:test").unwrap();
+    let value = cursor.get(b"alice").unwrap().unwrap();
+    assert_eq!(value, b"value".to_vec());
 }

@@ -219,20 +219,17 @@ mod tests {
             ));
             let schema_catalog = Arc::new(SchemaCatalog::new(base_path));
             let backend = Arc::new(DurabilityBackend::Disabled);
-            let replication = Arc::new(ReplicationCoordinator::standalone());
             let query = DocumentQuery::new(schema_catalog.clone());
             let write_path = CollectionWritePath::new(
                 schema_catalog.clone(),
                 query.clone(),
-                StoreWritePath::new(table_cache.clone(), backend.clone(), replication.clone()),
+                StoreWritePath::new(
+                    table_cache.clone(),
+                    backend.clone(),
+                    Arc::new(ReplicationCoordinator::standalone()),
+                ),
             );
-            let session = Session::new(
-                table_cache,
-                schema_catalog,
-                transaction_manager,
-                backend,
-                replication,
-            );
+            let session = Session::new(table_cache, schema_catalog, transaction_manager, backend);
 
             Self {
                 query,

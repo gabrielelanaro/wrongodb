@@ -2,8 +2,7 @@ use std::sync::{Arc, Weak};
 
 use crate::api::cursor::{Cursor, CursorWriteAccess};
 use crate::core::errors::StorageError;
-use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp};
-use crate::replication::{ReplicationCoordinator, WritePathMode};
+use crate::durability::DurabilityBackend;
 use crate::schema::SchemaCatalog;
 use crate::storage::table_cache::TableCache;
 use crate::txn::{ActiveWriteUnit, RecoveryUnit, TransactionManager, TxnId, TXN_NONE};
@@ -30,7 +29,6 @@ pub struct Session {
     schema_catalog: Arc<SchemaCatalog>,
     transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
-    replication_coordinator: Arc<ReplicationCoordinator>,
     recovery_unit: Arc<dyn RecoveryUnit>,
     active_txn: Option<ActiveWriteUnit>,
 }
@@ -41,7 +39,6 @@ impl Session {
         schema_catalog: Arc<SchemaCatalog>,
         transaction_manager: Arc<TransactionManager>,
         durability_backend: Arc<DurabilityBackend>,
-        replication_coordinator: Arc<ReplicationCoordinator>,
     ) -> Self {
         let recovery_unit = durability_backend.new_recovery_unit();
         Self {
@@ -50,7 +47,6 @@ impl Session {
             transaction_manager,
             recovery_unit,
             durability_backend,
-            replication_coordinator,
             active_txn: None,
         }
     }
@@ -93,7 +89,7 @@ impl Session {
     /// boundary object just to read or perform local writes.
     pub fn open_cursor(&self, uri: &str) -> Result<Cursor, WrongoDBError> {
         let store_name = self.schema_catalog.resolve_uri(uri)?;
-        self.open_store_cursor_with_access(&store_name, TXN_NONE, self.cursor_write_access())
+        self.open_store_cursor_with_access(&store_name, TXN_NONE, CursorWriteAccess::ReadWrite)
     }
 
     /// Start a transactional write unit of work.
@@ -130,50 +126,16 @@ impl Session {
         }
 
         if self.transaction_manager.has_active_transactions()
-            || !self
-                .replication_coordinator
-                .is_enabled(self.durability_backend.as_ref())
+            || !self.durability_backend.is_enabled()
         {
             return Ok(());
         }
 
-        self.replication_coordinator.record(
-            self.durability_backend.as_ref(),
-            DurableOp::Checkpoint,
-            DurabilityGuarantee::Sync,
+        self.durability_backend.record(
+            crate::durability::DurableOp::Checkpoint,
+            crate::durability::DurabilityGuarantee::Sync,
         )?;
-        self.replication_coordinator
-            .truncate_to_checkpoint(self.durability_backend.as_ref())
-    }
-
-    fn write_path_mode(&self) -> WritePathMode {
-        self.replication_coordinator.write_path_mode()
-    }
-
-    fn cursor_write_access(&self) -> CursorWriteAccess {
-        match self.write_path_mode() {
-            WritePathMode::LocalApply => CursorWriteAccess::ReadWrite,
-            WritePathMode::DeferredReplication => CursorWriteAccess::ReadOnly,
-        }
-    }
-
-    fn record_commit(&self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        self.replication_coordinator.record(
-            self.durability_backend.as_ref(),
-            DurableOp::TxnCommit {
-                txn_id,
-                commit_ts: txn_id,
-            },
-            DurabilityGuarantee::Sync,
-        )
-    }
-
-    fn record_abort(&self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        self.replication_coordinator.record(
-            self.durability_backend.as_ref(),
-            DurableOp::TxnAbort { txn_id },
-            DurabilityGuarantee::Buffered,
-        )
+        self.durability_backend.truncate_to_checkpoint()
     }
 
     fn open_store_cursor_with_access(
@@ -227,7 +189,6 @@ impl Session {
 pub struct WriteUnitOfWork<'a> {
     session: &'a mut Session,
     committed: bool,
-    write_path_mode: WritePathMode,
 }
 
 impl<'a> WriteUnitOfWork<'a> {
@@ -245,7 +206,7 @@ impl<'a> WriteUnitOfWork<'a> {
         self.session.open_store_cursor_with_access(
             &store_name,
             self.txn_id(),
-            self.session.cursor_write_access(),
+            CursorWriteAccess::ReadWrite,
         )
     }
 
@@ -265,13 +226,9 @@ impl<'a> WriteUnitOfWork<'a> {
         let txn_id = active.txn_id();
         let txn_handle = active.txn_handle();
 
-        match self.write_path_mode {
-            WritePathMode::LocalApply => self
-                .session
-                .recovery_unit
-                .commit_unit_of_work(txn_id, txn_id)?,
-            WritePathMode::DeferredReplication => self.session.record_commit(txn_id)?,
-        }
+        self.session
+            .recovery_unit
+            .commit_unit_of_work(txn_id, txn_id)?;
 
         {
             let mut txn = txn_handle.lock();
@@ -302,10 +259,7 @@ impl<'a> WriteUnitOfWork<'a> {
         let txn_id = active.txn_id();
         let txn_handle = active.txn_handle();
 
-        match self.write_path_mode {
-            WritePathMode::LocalApply => self.session.recovery_unit.abort_unit_of_work(txn_id)?,
-            WritePathMode::DeferredReplication => self.session.record_abort(txn_id)?,
-        }
+        self.session.recovery_unit.abort_unit_of_work(txn_id)?;
 
         {
             let mut txn = txn_handle.lock();
@@ -318,11 +272,9 @@ impl<'a> WriteUnitOfWork<'a> {
     }
 
     fn new(session: &'a mut Session) -> Self {
-        let write_path_mode = session.write_path_mode();
         Self {
             session,
             committed: false,
-            write_path_mode,
         }
     }
 
@@ -341,7 +293,7 @@ impl<'a> WriteUnitOfWork<'a> {
         self.session.open_store_cursor_with_access(
             store_name,
             self.txn_id(),
-            self.session.cursor_write_access(),
+            CursorWriteAccess::ReadWrite,
         )
     }
 }
@@ -355,14 +307,7 @@ impl<'a> Drop for WriteUnitOfWork<'a> {
         if let Some(active) = self.session.active_txn.take() {
             let txn_id = active.txn_id();
             let txn_handle = active.txn_handle();
-            match self.write_path_mode {
-                WritePathMode::LocalApply => {
-                    let _ = self.session.recovery_unit.abort_unit_of_work(txn_id);
-                }
-                WritePathMode::DeferredReplication => {
-                    let _ = self.session.record_abort(txn_id);
-                }
-            }
+            let _ = self.session.recovery_unit.abort_unit_of_work(txn_id);
             let mut txn = txn_handle.lock();
             let _ = self.session.transaction_manager.abort_txn_state(&mut txn);
         }
@@ -377,11 +322,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::durability::{
-        DurabilityBackend, DurabilityGuarantee, DurableOp, StoreCommandApplier,
-    };
+    use crate::durability::{DurabilityBackend, StoreCommandApplier};
     use crate::recovery::recover_from_wal;
-    use crate::replication::{ReplicationCoordinator, WritePathMode};
     use crate::schema::SchemaCatalog;
     use crate::storage::table_cache::TableCache;
     use crate::storage::wal::{GlobalWal, WalFileReader, WalReader, WalRecord};
@@ -398,29 +340,10 @@ mod tests {
 
     impl SessionTestFixture {
         fn with_backend(backend: DurabilityBackend) -> Self {
-            Self::with_components(backend, ReplicationCoordinator::standalone())
-        }
-
-        fn with_deferred_replication() -> (
-            Self,
-            Arc<parking_lot::Mutex<Vec<(DurableOp, DurabilityGuarantee)>>>,
-        ) {
-            let (replication, recorded_ops) =
-                ReplicationCoordinator::test_backend(WritePathMode::DeferredReplication);
-            (
-                Self::with_components(DurabilityBackend::Disabled, replication),
-                recorded_ops,
-            )
-        }
-
-        fn with_components(
-            backend: DurabilityBackend,
-            replication: ReplicationCoordinator,
-        ) -> Self {
             let dir = tempdir().unwrap();
             let base_path = dir.path().to_path_buf();
             std::mem::forget(dir);
-            Self::build(base_path, Arc::new(backend), Arc::new(replication))
+            Self::build(base_path, Arc::new(backend))
         }
 
         fn open_local_wal<P: AsRef<Path>>(path: P) -> Self {
@@ -438,19 +361,14 @@ mod tests {
             ));
             recover_existing_wal_if_present(&base_path, applier.clone());
             let backend = Arc::new(DurabilityBackend::open(&base_path, true).unwrap());
-            let replication = Arc::new(ReplicationCoordinator::standalone());
-            Self::build(base_path, backend, replication)
+            Self::build(base_path, backend)
         }
 
         fn into_session(self) -> Session {
             self.session
         }
 
-        fn build(
-            base_path: PathBuf,
-            backend: Arc<DurabilityBackend>,
-            replication: Arc<ReplicationCoordinator>,
-        ) -> Self {
+        fn build(base_path: PathBuf, backend: Arc<DurabilityBackend>) -> Self {
             let transaction_manager =
                 Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
             let table_cache = Arc::new(TableCache::new(
@@ -458,13 +376,7 @@ mod tests {
                 transaction_manager.clone(),
             ));
             let schema_catalog = Arc::new(SchemaCatalog::new(base_path));
-            let session = Session::new(
-                table_cache,
-                schema_catalog,
-                transaction_manager,
-                backend,
-                replication,
-            );
+            let session = Session::new(table_cache, schema_catalog, transaction_manager, backend);
 
             Self { session }
         }
@@ -577,76 +489,6 @@ mod tests {
     }
 
     #[test]
-    fn deferred_mode_open_cursor_rejects_low_level_writes() {
-        let (fixture, _recorded_ops) = SessionTestFixture::with_deferred_replication();
-        let mut session = fixture.into_session();
-        session.create(TEST_URI).unwrap();
-
-        let mut cursor = session.open_cursor(TEST_URI).unwrap();
-        let err = cursor.insert(TEST_KEY, TEST_VALUE).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("cursor writes are not available when replication defers apply"));
-    }
-
-    #[test]
-    fn deferred_mode_commit_records_transaction_commit_marker() {
-        let (fixture, recorded_ops) = SessionTestFixture::with_deferred_replication();
-        let mut session = fixture.into_session();
-
-        let txn = session.transaction().unwrap();
-        let txn_id = txn.txn_id();
-        txn.commit().unwrap();
-
-        assert_eq!(
-            *recorded_ops.lock(),
-            vec![(
-                DurableOp::TxnCommit {
-                    txn_id,
-                    commit_ts: txn_id,
-                },
-                DurabilityGuarantee::Sync,
-            )]
-        );
-    }
-
-    #[test]
-    fn deferred_mode_abort_records_transaction_abort_for_explicit_and_drop() {
-        let (fixture, recorded_ops) = SessionTestFixture::with_deferred_replication();
-        let mut session = fixture.into_session();
-
-        {
-            let txn = session.transaction().unwrap();
-            let txn_id = txn.txn_id();
-            txn.abort().unwrap();
-
-            assert_eq!(
-                *recorded_ops.lock(),
-                vec![(
-                    DurableOp::TxnAbort { txn_id },
-                    DurabilityGuarantee::Buffered
-                )]
-            );
-        }
-
-        recorded_ops.lock().clear();
-
-        {
-            let dropped = session.transaction().unwrap();
-            let txn_id = dropped.txn_id();
-            drop(dropped);
-
-            assert_eq!(
-                *recorded_ops.lock(),
-                vec![(
-                    DurableOp::TxnAbort { txn_id },
-                    DurabilityGuarantee::Buffered
-                )]
-            );
-        }
-    }
-
-    #[test]
     fn checkpoint_skips_truncate_when_transaction_active() {
         let dir = tempdir().unwrap();
         let base_path = dir.path().to_path_buf();
@@ -657,22 +499,15 @@ mod tests {
             transaction_manager.clone(),
         ));
         let backend = Arc::new(DurabilityBackend::open(&base_path, true).unwrap());
-        let replication = Arc::new(ReplicationCoordinator::standalone());
         let schema_catalog = Arc::new(SchemaCatalog::new(base_path));
         let mut session = Session::new(
             table_cache.clone(),
             schema_catalog.clone(),
             transaction_manager.clone(),
             backend.clone(),
-            replication.clone(),
         );
-        let mut checkpoint_session = Session::new(
-            table_cache,
-            schema_catalog,
-            transaction_manager,
-            backend,
-            replication,
-        );
+        let mut checkpoint_session =
+            Session::new(table_cache, schema_catalog, transaction_manager, backend);
         session.create(TEST_URI).unwrap();
 
         let mut txn = session.transaction().unwrap();
