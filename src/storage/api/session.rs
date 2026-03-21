@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::core::errors::StorageError;
 use crate::storage::api::cursor::{TableCursor, TableCursorWriteAccess};
@@ -11,7 +11,7 @@ use crate::storage::handle_cache::HandleCache;
 use crate::storage::metadata_catalog::{MetadataCatalog, METADATA_STORE_NAME, METADATA_URI};
 use crate::storage::table::Table;
 use crate::storage::RecoveryUnit;
-use crate::txn::{ActiveWriteUnit, TransactionManager, TxnId, TXN_NONE};
+use crate::txn::{ActiveWriteUnit, TransactionManager, TxnId};
 use crate::WrongoDBError;
 
 /// A request-scoped execution context over shared connection infrastructure.
@@ -84,7 +84,7 @@ impl Session {
         ))))
     }
 
-    /// Open a non-transactional table cursor bound to `TXN_NONE`.
+    /// Open a non-transactional table cursor using the current session context.
     ///
     /// This method intentionally has the same name as
     /// [`WriteUnitOfWork::open_cursor`]. The duplication is deliberate:
@@ -92,8 +92,8 @@ impl Session {
     /// raw transaction ids in the public cursor API.
     ///
     /// `Session::open_cursor` means "open a table cursor outside any transaction".
-    /// [`WriteUnitOfWork::open_cursor`] means "open the same kind of table cursor,
-    /// but bound to the active transaction".
+    /// [`WriteUnitOfWork::open_cursor`] means "open the same kind of table cursor
+    /// while the transaction is active".
     ///
     /// The method lives on `Session` because non-transactional access is still
     /// a first-class storage API and should not require creating a transaction
@@ -103,7 +103,7 @@ impl Session {
         self.open_resolved_cursor_with_access(
             uri,
             &store_name,
-            TXN_NONE,
+            None,
             TableCursorWriteAccess::ReadWrite,
         )
     }
@@ -111,7 +111,7 @@ impl Session {
     /// Start a transactional write unit of work.
     ///
     /// This exists as a separate step so commit/abort ordering, local WAL
-    /// markers, and transaction-bound cursor opening all flow through a single
+    /// markers, and transaction-aware cursor opening all flow through a single
     /// RAII boundary instead of being spread across the public API.
     ///
     /// The public API deliberately makes transaction scope explicit here rather
@@ -169,7 +169,7 @@ impl Session {
         &self,
         uri: &str,
         store_name: &str,
-        bound_txn_id: TxnId,
+        txn_handle: Option<Weak<Mutex<crate::txn::Transaction>>>,
         write_access: TableCursorWriteAccess,
     ) -> Result<TableCursor, WrongoDBError> {
         let table =
@@ -181,31 +181,13 @@ impl Session {
                         self.transaction_manager.clone(),
                     )?))
                 })?;
-        let active_txn = self.bound_transaction_handle(bound_txn_id)?;
         Ok(TableCursor::new(
             table,
             uri.to_string(),
-            bound_txn_id,
-            active_txn,
+            txn_handle,
             self.recovery_unit.clone(),
             write_access,
         ))
-    }
-
-    fn bound_transaction_handle(
-        &self,
-        bound_txn_id: TxnId,
-    ) -> Result<Option<Weak<parking_lot::Mutex<crate::txn::Transaction>>>, WrongoDBError> {
-        if bound_txn_id == TXN_NONE {
-            return Ok(None);
-        }
-
-        let active = self.active_txn.as_ref().ok_or_else(|| {
-            StorageError(format!(
-                "transaction cursor requested for txn {bound_txn_id}, but no transaction is active"
-            ))
-        })?;
-        Ok(Some(Arc::downgrade(&active.txn_handle())))
     }
 
     fn resolve_uri(&self, uri: &str) -> Result<String, WrongoDBError> {
@@ -233,10 +215,10 @@ impl Session {
 ///
 /// This type exists so the public API has an explicit transaction scope:
 /// while a write unit of work is alive, callers open cursors from it and those
-/// cursors are automatically bound to the active transaction.
+/// cursors participate in the active transaction while it exists.
 ///
 /// That is why this type is separate from [`Session`]. It keeps commit/abort
-/// ownership and transaction-bound cursor opening behind a single object,
+/// ownership and transaction-aware cursor opening behind a single object,
 /// instead of exposing raw transaction ids or letting callers keep reaching
 /// back into `Session` during a transaction.
 ///
@@ -248,21 +230,27 @@ pub struct WriteUnitOfWork<'a> {
 }
 
 impl<'a> WriteUnitOfWork<'a> {
-    /// Open a table cursor bound to this transaction.
+    /// Open a table cursor using this transaction context.
     ///
     /// This duplicates [`Session::open_cursor`] by design. The reason is API
     /// clarity: a caller should choose transaction scope by opening the table cursor
     /// from the transaction boundary, not by reaching back into `Session` and
     /// not by threading transaction ids through every table cursor method.
     ///
-    /// The duplication is about binding, not behavior: both methods open the
-    /// same kind of table cursor, but they bind it to different transaction scopes.
+    /// The duplication is about transaction scope, not behavior: both methods
+    /// open the same kind of table cursor, but they do so under different
+    /// transaction scopes.
     pub fn open_cursor(&mut self, uri: &str) -> Result<TableCursor, WrongoDBError> {
         let store_name = self.session.resolve_uri_for_txn(uri, self.txn_id())?;
+        let txn_handle = self
+            .session
+            .active_txn
+            .as_ref()
+            .map(|active| Arc::downgrade(&active.txn_handle()));
         self.session.open_resolved_cursor_with_access(
             uri,
             &store_name,
-            self.txn_id(),
+            txn_handle,
             TableCursorWriteAccess::ReadWrite,
         )
     }

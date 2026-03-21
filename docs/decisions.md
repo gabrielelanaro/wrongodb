@@ -1,5 +1,27 @@
 # Decisions
 
+## 2026-03-21: Make `TableCursor` consult live session transaction context at call time
+
+**Decision**
+- Remove the stored transaction id from `TableCursor`.
+- Keep only a weak handle to the session transaction when the cursor is opened under an active
+  `WriteUnitOfWork`.
+- Derive the current transaction id from the live handle at call time.
+- If the transaction handle is gone, let the cursor fall back to autocommit behavior instead of
+  erroring on a stale transaction id.
+
+**Why**
+- This matches the WiredTiger model more closely: the session owns transaction state and the cursor
+  consults that state when it executes.
+- It removes the stale-cursor mismatch where a cursor could keep an old transaction id after the
+  transaction boundary had ended.
+- Keeping the weak handle lets the cursor participate in the active transaction when one exists,
+  while still allowing the same cursor object to keep working after the transaction scope has ended.
+
+**Notes**
+- This supersedes the earlier assumption that stale transaction-bound cursors should fail cleanly
+  after commit/abort.
+
 ## 2026-03-21: Rename the storage cursor type to `TableCursor`
 
 **Decision**
@@ -1997,8 +2019,8 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 **Why**
 - Transaction-owned operation bookkeeping is cleaner than a manager-side `txn_id -> updates` map:
   commit/abort already operate on the `Transaction`, so the write path should record ops there.
-- A weak transaction handle makes stale transaction-bound cursors fail cleanly after commit/abort
-  instead of continuing to write with a dead transaction id.
+- A weak transaction handle lets cursors participate in the active transaction when one exists,
+  while falling back to autocommit after the transaction ends.
 - The checkpoint sweep is the minimal bridge needed to keep the new session-bound MVCC write path
   compatible with the existing persisted base-page/checkpoint model while scans and full
   reconciliation are still being migrated.
