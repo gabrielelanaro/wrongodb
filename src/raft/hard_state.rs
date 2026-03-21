@@ -21,7 +21,6 @@ pub(crate) struct RaftHardState {
 
 #[derive(Debug)]
 pub(crate) struct RaftHardStateStore {
-    #[allow(dead_code)]
     path: PathBuf,
     state: RaftHardState,
 }
@@ -48,7 +47,6 @@ impl RaftHardStateStore {
         &self.state
     }
 
-    #[allow(dead_code)]
     pub(crate) fn set_current_term(&mut self, new_term: u64) -> Result<(), WrongoDBError> {
         if new_term < self.state.current_term {
             return Err(StorageError(format!(
@@ -67,7 +65,6 @@ impl RaftHardStateStore {
         persist_state(&self.path, &self.state)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn set_voted_for(&mut self, candidate: Option<&str>) -> Result<(), WrongoDBError> {
         if let Some(candidate) = candidate {
             if candidate.is_empty() {

@@ -143,14 +143,12 @@ impl PageHeader {
 /// The key is not materialized in the raw page image yet. Its update chain
 /// holds the visible versions for that inserted row until a later reconciliation
 /// writes it into the serialized page format.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RowInsert {
     key: Vec<u8>,
     updates: UpdateChain,
 }
 
-#[allow(dead_code)]
 impl RowInsert {
     // ------------------------------------------------------------------------
     // Constructors
@@ -193,14 +191,12 @@ impl RowInsert {
 /// A `HashMap` or skip list would add an unnecessary second lookup structure
 /// for existing rows. Ordered/search-oriented structures belong to
 /// `row_inserts`, where keys do not yet have an on-page slot.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct RowModify {
     row_updates: Vec<Option<UpdateChain>>,
     row_inserts: Vec<Vec<RowInsert>>,
 }
 
-#[allow(dead_code)]
 impl RowModify {
     // ------------------------------------------------------------------------
     // Constructors
@@ -411,7 +407,6 @@ impl Page {
         self.raw.data()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn row_modify(&self) -> Option<&RowModify> {
         self.row_modify.as_ref()
     }
@@ -424,7 +419,6 @@ impl Page {
         self.row_modify = None;
     }
 
-    #[allow(dead_code)]
     pub(crate) fn ensure_row_modify(&mut self) -> Result<&mut RowModify, PageError> {
         if self.header().page_type != PageType::Leaf {
             return Err(PageError::Corrupt(

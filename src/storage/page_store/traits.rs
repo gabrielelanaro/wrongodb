@@ -7,7 +7,6 @@ pub trait PageRead: std::fmt::Debug + Send + Sync {
     fn page_payload_len(&self) -> usize;
     fn pin_page(&mut self, page_id: u64) -> Result<ReadPin, WrongoDBError>;
     fn get_page(&self, pin: &ReadPin) -> &Page;
-    #[allow(dead_code)]
     fn get_page_mut(&mut self, pin: &ReadPin) -> &mut Page;
     fn unpin_page(&mut self, pin: ReadPin);
 }

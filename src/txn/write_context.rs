@@ -1,6 +1,5 @@
 use crate::txn::TxnId;
 
-#[allow(dead_code)]
 /// Write-time transaction context consumed by storage cursors.
 ///
 /// The B+tree layer should not depend on the transaction manager directly. It
@@ -11,7 +10,6 @@ pub struct WriteContext {
     txn_id: TxnId,
 }
 
-#[allow(dead_code)]
 impl WriteContext {
     // ------------------------------------------------------------------------
     // Constructors

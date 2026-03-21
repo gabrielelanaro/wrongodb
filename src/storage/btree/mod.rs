@@ -76,7 +76,6 @@ enum ReadStep {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 struct LeafPosition {
     page_id: u64,
     index: usize,
@@ -371,7 +370,6 @@ impl BTreeCursor {
         Ok(stats)
     }
 
-    #[allow(dead_code)]
     fn find_leaf_position(&mut self, key: &[u8]) -> Result<LeafPosition, WrongoDBError> {
         let mut node_id = self.page_store.root_page_id();
         if node_id == NONE_PAGE_ID {
@@ -732,7 +730,6 @@ fn find_visible_insert_value(
     None
 }
 
-#[allow(dead_code)]
 fn apply_leaf_update(
     page: &mut Page,
     key: &[u8],
@@ -758,7 +755,6 @@ fn apply_leaf_update(
     }
 }
 
-#[allow(dead_code)]
 fn prepend_update(chain: &mut UpdateChain, update: Update) -> UpdateRef {
     if let Some(head) = chain.head() {
         head.write().mark_stopped(update.txn_id);

@@ -117,7 +117,6 @@ impl PageCache {
         &entry.page
     }
 
-    #[allow(dead_code)]
     pub fn get_page_mut(&mut self, page_id: u64) -> &mut Page {
         let entry = self
             .get_mut(page_id)

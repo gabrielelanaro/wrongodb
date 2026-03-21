@@ -208,6 +208,7 @@ enum RaftServiceCommand {
     TruncateToCheckpoint {
         reply: Sender<Result<(), WrongoDBError>>,
     },
+    #[allow(dead_code)]
     Tick {
         reply: Sender<Result<(), WrongoDBError>>,
     },
