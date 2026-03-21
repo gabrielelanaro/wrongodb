@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::collection_write_path::CollectionWritePath;
 use crate::document_query::DocumentQuery;
 use crate::replication::ReplicationCoordinator;
+use crate::schema::SchemaCatalog;
 use crate::store_write_path::StoreWritePath;
 use crate::{Connection, WrongoDBError};
 
@@ -14,6 +15,7 @@ use crate::{Connection, WrongoDBError};
 /// and write orchestration through this crate-private container.
 pub(crate) struct DatabaseContext {
     connection: Arc<Connection>,
+    schema_catalog: Arc<SchemaCatalog>,
     document_query: DocumentQuery,
     collection_write_path: CollectionWritePath,
     replication_coordinator: Arc<ReplicationCoordinator>,
@@ -25,7 +27,10 @@ impl DatabaseContext {
         replication_coordinator: Arc<ReplicationCoordinator>,
     ) -> Self {
         let metadata_catalog = connection.metadata_catalog();
-        let schema_catalog = connection.schema_catalog();
+        let schema_catalog = Arc::new(SchemaCatalog::new(
+            connection.base_path().to_path_buf(),
+            metadata_catalog.clone(),
+        ));
         let table_handles = connection.table_handles();
         let durability_backend = connection.durability_backend();
         let document_query = DocumentQuery::new(schema_catalog.clone());
@@ -38,13 +43,14 @@ impl DatabaseContext {
         );
         let collection_write_path = CollectionWritePath::new(
             metadata_catalog,
-            schema_catalog,
+            schema_catalog.clone(),
             document_query.clone(),
             store_write_path,
         );
 
         Self {
             connection,
+            schema_catalog,
             document_query,
             collection_write_path,
             replication_coordinator,
@@ -69,6 +75,6 @@ impl DatabaseContext {
     }
 
     pub(crate) fn list_collections(&self) -> Result<Vec<String>, WrongoDBError> {
-        self.connection.schema_catalog().list_collections()
+        self.schema_catalog.list_collections()
     }
 }

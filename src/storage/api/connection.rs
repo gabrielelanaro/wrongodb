@@ -8,7 +8,6 @@ use parking_lot::RwLock;
 use crate::durability::{DurabilityBackend, StoreCommandApplier};
 use crate::recovery::recover_from_wal;
 use crate::replication::RaftMode;
-use crate::schema::SchemaCatalog;
 use crate::storage::api::session::Session;
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::metadata_catalog::MetadataCatalog;
@@ -77,7 +76,7 @@ impl ConnectionConfig {
 /// Top-level database handle that owns shared engine state.
 ///
 /// `Connection` exists so sessions can stay cheap and request-scoped. Long-lived
-/// components such as schema metadata, open store handles, MVCC state, and
+/// components such as storage metadata, open store handles, MVCC state, and
 /// local durability machinery live here once, and every [`Session`](crate::Session)
 /// borrows that shared infrastructure instead of rebuilding it.
 ///
@@ -86,7 +85,6 @@ impl ConnectionConfig {
 pub struct Connection {
     base_path: PathBuf,
     metadata_catalog: Arc<MetadataCatalog>,
-    schema_catalog: Arc<SchemaCatalog>,
     table_handles: Arc<HandleCache<String, RwLock<Table>>>,
     transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
@@ -126,10 +124,6 @@ impl Connection {
             table_handles.clone(),
             transaction_manager.clone(),
         ));
-        let schema_catalog = Arc::new(SchemaCatalog::new(
-            base_path.clone(),
-            metadata_catalog.clone(),
-        ));
         let applier = Arc::new(StoreCommandApplier::new(
             base_path.clone(),
             table_handles.clone(),
@@ -149,7 +143,6 @@ impl Connection {
         Ok(Self {
             base_path,
             metadata_catalog,
-            schema_catalog,
             table_handles,
             transaction_manager,
             durability_backend,
@@ -176,10 +169,6 @@ impl Connection {
 
     pub(crate) fn metadata_catalog(&self) -> Arc<MetadataCatalog> {
         self.metadata_catalog.clone()
-    }
-
-    pub(crate) fn schema_catalog(&self) -> Arc<SchemaCatalog> {
-        self.schema_catalog.clone()
     }
 
     pub(crate) fn base_path(&self) -> &Path {
