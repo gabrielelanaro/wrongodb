@@ -2071,3 +2071,28 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - With this change, explicit transactions, implicit autocommit writes, and replayed autocommit
   writes all converge on the same page-local update-chain model; only checkpoint/reconcile keeps
   the internal materialization path.
+
+## 2026-03-21: Storage owns WAL, replay, and durability plumbing end to end
+
+**Decision**
+- Move local durability and WAL replay under `storage/` as storage-internal modules:
+  `storage::durability`, `storage::recovery`, `storage::command`, and
+  `storage::recovery_unit`.
+- Make `Connection::open()` the only active entrypoint that performs global WAL recovery, using a
+  storage-local recovery executor.
+- Move `CatalogRecovery` under `server::recovery` so startup catalog reconciliation is no longer
+  mixed into storage crash recovery.
+- Remove the active crate wiring for `raft`, `replication`, top-level `durability`, top-level
+  `recovery`, and `store_write_path`.
+- Collapse `CollectionWritePath` onto the existing storage transaction and cursor API instead of
+  branching on replication/write-path mode.
+
+**Why**
+- The WT-style boundary needs one owner for physical durability: storage should own WAL recording,
+  replay classification, replay execution, and checkpoint truncation without upper layers knowing
+  about those internals.
+- Startup catalog reconciliation is a server/bootstrap concern, not part of storage crash
+  recovery.
+- The previous shared durability/replication machinery made the storage layer structurally depend
+  on a second world with different semantics. Removing it keeps the active architecture aligned
+  with a self-contained storage engine.

@@ -2,44 +2,34 @@ use std::sync::Arc;
 
 use crate::collection_write_path::CollectionWritePath;
 use crate::document_query::DocumentQuery;
-use crate::replication::ReplicationCoordinator;
 use crate::schema::SchemaCatalog;
-use crate::store_write_path::StoreWritePath;
 use crate::{Connection, WrongoDBError};
 
 /// Internal database-layer container above the WT-like storage connection.
 ///
 /// `DatabaseContext` groups the non-storage services used by the MongoDB wire
 /// protocol handlers. It intentionally sits above [`Connection`]: the storage
-/// API stays WT-like while upper layers own replication coordination, query,
-/// and write orchestration through this crate-private container.
+/// API stays WT-like while upper layers own query and document-level write
+/// orchestration through this crate-private container.
 pub(crate) struct DatabaseContext {
     connection: Arc<Connection>,
     schema_catalog: Arc<SchemaCatalog>,
     document_query: DocumentQuery,
     collection_write_path: CollectionWritePath,
-    replication_coordinator: Arc<ReplicationCoordinator>,
 }
 
 impl DatabaseContext {
-    pub(crate) fn new(
-        connection: Arc<Connection>,
-        replication_coordinator: Arc<ReplicationCoordinator>,
-    ) -> Self {
+    pub(crate) fn new(connection: Arc<Connection>) -> Self {
         let metadata_catalog = connection.metadata_catalog();
         let schema_catalog = Arc::new(SchemaCatalog::new(
             connection.base_path().to_path_buf(),
             metadata_catalog.clone(),
         ));
-        let durability_backend = connection.durability_backend();
         let document_query = DocumentQuery::new(schema_catalog.clone());
-        let store_write_path =
-            StoreWritePath::new(durability_backend, replication_coordinator.clone());
         let collection_write_path = CollectionWritePath::new(
             metadata_catalog,
             schema_catalog.clone(),
             document_query.clone(),
-            store_write_path,
         );
 
         Self {
@@ -47,7 +37,6 @@ impl DatabaseContext {
             schema_catalog,
             document_query,
             collection_write_path,
-            replication_coordinator,
         }
     }
 
@@ -64,8 +53,7 @@ impl DatabaseContext {
     }
 
     pub(crate) fn hello_state(&self) -> (bool, Option<String>) {
-        let state = self.replication_coordinator.hello_state();
-        (state.is_writable_primary, state.leader_hint)
+        (true, None)
     }
 
     pub(crate) fn list_collections(&self) -> Result<Vec<String>, WrongoDBError> {

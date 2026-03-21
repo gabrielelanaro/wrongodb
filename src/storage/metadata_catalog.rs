@@ -309,8 +309,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::durability::DurabilityBackend;
     use crate::storage::api::Session;
+    use crate::storage::durability::DurabilityBackend;
     use crate::txn::{GlobalTxnState, TransactionManager};
 
     struct MetadataFixture {

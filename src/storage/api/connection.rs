@@ -5,11 +5,11 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::durability::{DurabilityBackend, StoreCommandApplier};
-use crate::recovery::recover_from_wal;
 use crate::storage::api::session::Session;
+use crate::storage::durability::DurabilityBackend;
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::metadata_catalog::MetadataCatalog;
+use crate::storage::recovery::{recover_from_wal, RecoveryExecutor};
 use crate::storage::table::Table;
 use crate::storage::wal::{GlobalWal, WalFileReader};
 use crate::txn::{GlobalTxnState, TransactionManager};
@@ -106,7 +106,7 @@ impl Connection {
             table_handles.clone(),
             transaction_manager.clone(),
         ));
-        let applier = Arc::new(StoreCommandApplier::new(
+        let recovery_executor = Arc::new(RecoveryExecutor::new(
             base_path.clone(),
             metadata_catalog.clone(),
             table_handles.clone(),
@@ -114,7 +114,7 @@ impl Connection {
         ));
 
         if let Some(recovery_reader) = open_recovery_reader(&base_path) {
-            recover_from_wal(applier.clone(), recovery_reader)?;
+            recover_from_wal(recovery_executor, recovery_reader)?;
         }
 
         let durability_backend = Arc::new(DurabilityBackend::open(&base_path, local_wal_enabled)?);
@@ -152,19 +152,6 @@ impl Connection {
 
     pub(crate) fn base_path(&self) -> &Path {
         &self.base_path
-    }
-
-    pub(crate) fn new_store_command_applier(&self) -> Arc<StoreCommandApplier> {
-        Arc::new(StoreCommandApplier::new(
-            self.base_path.clone(),
-            self.metadata_catalog.clone(),
-            self.table_handles.clone(),
-            self.transaction_manager.clone(),
-        ))
-    }
-
-    pub(crate) fn durability_backend(&self) -> Arc<DurabilityBackend> {
-        self.durability_backend.clone()
     }
 }
 

@@ -11,7 +11,7 @@ fn insert_kv(conn: &Connection, key: &[u8], value: &[u8]) -> Result<(), WrongoDB
 }
 
 #[test]
-fn standalone_local_wal_mode_allows_public_cursor_writes() {
+fn wal_enabled_connection_allows_public_cursor_writes() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("db");
     let conn = Connection::open(&path, ConnectionConfig::new(true)).unwrap();
@@ -25,7 +25,7 @@ fn standalone_local_wal_mode_allows_public_cursor_writes() {
 }
 
 #[test]
-fn cluster_mode_still_allows_low_level_storage_cursor_writes() {
+fn wal_disabled_connection_allows_public_cursor_writes() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("db");
     let conn = Connection::open(&path, ConnectionConfig::new(false)).unwrap();

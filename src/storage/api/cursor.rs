@@ -4,7 +4,8 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::core::errors::{DocumentValidationError, StorageError};
 use crate::storage::table::Table;
-use crate::txn::{RecoveryUnit, Transaction, TxnId};
+use crate::storage::RecoveryUnit;
+use crate::txn::{Transaction, TxnId};
 use crate::WrongoDBError;
 
 /// A single key/value entry returned by [`Cursor::next`].
@@ -32,11 +33,10 @@ pub(crate) enum CursorWriteAccess {
 ///
 /// The reason this type exists publicly is to expose a small, explicit
 /// storage interface for one store at a time. It is intentionally not
-/// responsible for collection semantics, replication policy, or
-/// commit/abort orchestration.
+/// responsible for collection semantics or commit/abort orchestration.
 ///
-/// If a caller needs document-level writes or replicated write orchestration,
-/// they should go through the higher-level command path, not extend this type.
+/// If a caller needs document-level writes, they should go through the
+/// higher-level command path, not extend this type.
 pub struct Cursor {
     table: Arc<RwLock<Table>>,
     uri: String,
@@ -145,8 +145,8 @@ impl Cursor {
     /// application through the bound transaction context.
     ///
     /// It exists on `Cursor` because insert is a one-store mutation. Higher
-    /// layers remain responsible for multi-store work such as index maintenance
-    /// or replicated write orchestration.
+    /// layers remain responsible for multi-store work such as index
+    /// maintenance.
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
         let txn_id = self.bound_txn_id;
         self.ensure_writable()?;
@@ -308,7 +308,8 @@ mod tests {
     use tempfile::{tempdir, TempDir};
 
     use super::*;
-    use crate::txn::{GlobalTxnState, NoopRecoveryUnit, TransactionManager, TXN_NONE};
+    use crate::storage::NoopRecoveryUnit;
+    use crate::txn::{GlobalTxnState, TransactionManager, TXN_NONE};
 
     fn open_index_table() -> (TempDir, Arc<RwLock<Table>>, String) {
         let tmp = tempdir().unwrap();

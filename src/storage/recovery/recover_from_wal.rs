@@ -2,40 +2,38 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::core::errors::StorageError;
-use crate::durability::{CommandApplier, DurableOp};
+use crate::storage::command::StorageCommand;
+use crate::storage::recovery::RecoveryApplier;
 use crate::storage::wal::{RecoveryError, WalReader, WalRecord, WalRecordHeader};
 use crate::txn::{TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
-// ============================================================================
-// Recovery Planning
-// ============================================================================
-
 #[derive(Debug)]
 enum RecoveryAction {
-    ApplyChange(DurableOp),
+    ApplyChange(StorageCommand),
     StageTransactionChange {
         txn_id: TxnId,
         change: BufferedRecoveryChange,
     },
     ApplyBufferedTransaction {
         txn_id: TxnId,
-        commit: DurableOp,
+        commit: StorageCommand,
     },
     DiscardBufferedTransaction {
         txn_id: TxnId,
+        abort: StorageCommand,
     },
     Ignore,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BufferedRecoveryChange {
-    op: DurableOp,
+    command: StorageCommand,
 }
 
 impl BufferedRecoveryChange {
-    fn into_op(self) -> DurableOp {
-        self.op
+    fn into_command(self) -> StorageCommand {
+        self.command
     }
 }
 
@@ -66,47 +64,40 @@ impl StagedRecoveryChanges {
     }
 }
 
-// ============================================================================
-// Public API
-// ============================================================================
-
-/// Replays committed WAL operations into the storage command applier.
-///
-/// Recovery buffers transactional changes until a matching commit record is
-/// observed, discards incomplete transactions at the end of the log, and
-/// checkpoints any stores opened during replay.
+/// Replays committed WAL operations into the storage recovery executor.
 pub(crate) fn recover_from_wal(
-    applier: Arc<impl CommandApplier>,
+    applier: Arc<impl RecoveryApplier>,
     mut reader: impl WalReader,
 ) -> Result<(), WrongoDBError> {
     let mut staged_changes = StagedRecoveryChanges::default();
     while let Some(action) = read_next_recovery_action(&mut reader)? {
         match action {
-            RecoveryAction::ApplyChange(op) => {
-                apply_change(applier.as_ref(), op)?;
+            RecoveryAction::ApplyChange(command) => {
+                applier.apply(command)?;
             }
             RecoveryAction::StageTransactionChange { txn_id, change } => {
-                stage_transaction_change(&mut staged_changes, txn_id, change);
+                staged_changes.stage(txn_id, change);
             }
             RecoveryAction::ApplyBufferedTransaction { txn_id, commit } => {
-                apply_buffered_transaction(applier.as_ref(), &mut staged_changes, txn_id, commit)?;
+                for change in staged_changes.release(txn_id) {
+                    applier.apply(change.into_command())?;
+                }
+                applier.apply(commit)?;
             }
-            RecoveryAction::DiscardBufferedTransaction { txn_id } => {
-                discard_buffered_transaction(&mut staged_changes, txn_id);
+            RecoveryAction::DiscardBufferedTransaction { txn_id, abort } => {
+                staged_changes.discard(txn_id);
+                applier.apply(abort)?;
             }
             RecoveryAction::Ignore => {}
         }
     }
 
-    discard_incomplete_transactions(&mut staged_changes);
-    checkpoint_open_stores(applier.as_ref())?;
-
+    if !staged_changes.is_empty() {
+        staged_changes.discard_all();
+    }
+    applier.checkpoint_open_stores()?;
     Ok(())
 }
-
-// ============================================================================
-// Private Helpers
-// ============================================================================
 
 fn read_next_recovery_action(
     reader: &mut dyn WalReader,
@@ -116,45 +107,6 @@ fn read_next_recovery_action(
     };
 
     Ok(Some(classify_recovery_action(header, record)))
-}
-
-fn apply_change(applier: &impl CommandApplier, op: DurableOp) -> Result<(), WrongoDBError> {
-    applier.apply(op)
-}
-
-fn stage_transaction_change(
-    staged_changes: &mut StagedRecoveryChanges,
-    txn_id: TxnId,
-    change: BufferedRecoveryChange,
-) {
-    staged_changes.stage(txn_id, change);
-}
-
-fn apply_buffered_transaction(
-    applier: &impl CommandApplier,
-    staged_changes: &mut StagedRecoveryChanges,
-    txn_id: TxnId,
-    commit: DurableOp,
-) -> Result<(), WrongoDBError> {
-    for change in staged_changes.release(txn_id) {
-        apply_change(applier, change.into_op())?;
-    }
-    apply_change(applier, commit)
-}
-
-fn discard_buffered_transaction(staged_changes: &mut StagedRecoveryChanges, txn_id: TxnId) {
-    staged_changes.discard(txn_id);
-}
-
-fn discard_incomplete_transactions(staged_changes: &mut StagedRecoveryChanges) {
-    if staged_changes.is_empty() {
-        return;
-    }
-    staged_changes.discard_all();
-}
-
-fn checkpoint_open_stores(applier: &impl CommandApplier) -> Result<(), WrongoDBError> {
-    applier.checkpoint_open_stores()
 }
 
 fn next_recovery_record(
@@ -184,7 +136,7 @@ fn classify_recovery_action(_header: WalRecordHeader, record: WalRecord) -> Reco
             key,
             value,
             txn_id,
-        } if txn_id == TXN_NONE => RecoveryAction::ApplyChange(DurableOp::Put {
+        } if txn_id == TXN_NONE => RecoveryAction::ApplyChange(StorageCommand::Put {
             uri,
             key,
             value,
@@ -198,7 +150,7 @@ fn classify_recovery_action(_header: WalRecordHeader, record: WalRecord) -> Reco
         } => RecoveryAction::StageTransactionChange {
             txn_id,
             change: BufferedRecoveryChange {
-                op: DurableOp::Put {
+                command: StorageCommand::Put {
                     uri,
                     key,
                     value,
@@ -207,26 +159,25 @@ fn classify_recovery_action(_header: WalRecordHeader, record: WalRecord) -> Reco
             },
         },
         WalRecord::Delete { uri, key, txn_id } if txn_id == TXN_NONE => {
-            RecoveryAction::ApplyChange(DurableOp::Delete { uri, key, txn_id })
+            RecoveryAction::ApplyChange(StorageCommand::Delete { uri, key, txn_id })
         }
         WalRecord::Delete { uri, key, txn_id } => RecoveryAction::StageTransactionChange {
             txn_id,
             change: BufferedRecoveryChange {
-                op: DurableOp::Delete { uri, key, txn_id },
+                command: StorageCommand::Delete { uri, key, txn_id },
             },
         },
         WalRecord::TxnCommit { txn_id, commit_ts } => RecoveryAction::ApplyBufferedTransaction {
             txn_id,
-            commit: DurableOp::TxnCommit { txn_id, commit_ts },
+            commit: StorageCommand::TxnCommit { txn_id, commit_ts },
         },
-        WalRecord::TxnAbort { txn_id } => RecoveryAction::DiscardBufferedTransaction { txn_id },
+        WalRecord::TxnAbort { txn_id } => RecoveryAction::DiscardBufferedTransaction {
+            txn_id,
+            abort: StorageCommand::TxnAbort { txn_id },
+        },
         WalRecord::Checkpoint => RecoveryAction::Ignore,
     }
 }
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -238,11 +189,11 @@ mod tests {
     use serde::Serialize;
     use tempfile::tempdir;
 
-    use crate::durability::{CommandApplier, DurableOp, StoreCommandApplier};
-    use crate::recovery::recover_from_wal;
     use crate::storage::api::{Connection, ConnectionConfig};
+    use crate::storage::command::StorageCommand;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::metadata_catalog::{MetadataCatalog, METADATA_URI};
+    use crate::storage::recovery::{recover_from_wal, RecoveryApplier, RecoveryExecutor};
     use crate::storage::table::Table;
     use crate::storage::wal::{
         GlobalWal, Lsn, RecoveryError, WalFileReader, WalReader, WalRecord, WalRecordHeader,
@@ -253,12 +204,12 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct RecordingCommandApplier {
-        applied: Mutex<Vec<DurableOp>>,
+        applied: Mutex<Vec<StorageCommand>>,
         checkpoint_count: Mutex<usize>,
     }
 
     impl RecordingCommandApplier {
-        fn applied(&self) -> Vec<DurableOp> {
+        fn applied(&self) -> Vec<StorageCommand> {
             self.applied.lock().clone()
         }
 
@@ -267,9 +218,9 @@ mod tests {
         }
     }
 
-    impl CommandApplier for RecordingCommandApplier {
-        fn apply(&self, op: DurableOp) -> Result<(), crate::WrongoDBError> {
-            self.applied.lock().push(op);
+    impl RecoveryApplier for RecordingCommandApplier {
+        fn apply(&self, command: StorageCommand) -> Result<(), crate::WrongoDBError> {
+            self.applied.lock().push(command);
             Ok(())
         }
 
@@ -341,7 +292,7 @@ mod tests {
             table_handles.clone(),
             transaction_manager.clone(),
         ));
-        let applier = Arc::new(StoreCommandApplier::new(
+        let applier = Arc::new(RecoveryExecutor::new(
             base_path.to_path_buf(),
             metadata_catalog,
             table_handles.clone(),
@@ -351,8 +302,8 @@ mod tests {
         recover_from_wal(applier, reader).unwrap();
 
         let table = table_handles
-            .get_or_try_insert_with(store_name.to_string(), |store_name| {
-                let path = base_path.join(store_name);
+            .get_or_try_insert_with(store_name.to_string(), |source| {
+                let path = base_path.join(source);
                 Ok(parking_lot::RwLock::new(Table::open_or_create_store(
                     path,
                     transaction_manager.clone(),
@@ -380,7 +331,7 @@ mod tests {
 
         assert_eq!(
             applier.applied(),
-            vec![DurableOp::Put {
+            vec![StorageCommand::Put {
                 uri: TEST_URI.to_string(),
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
@@ -436,16 +387,17 @@ mod tests {
         assert_eq!(
             applier.applied(),
             vec![
-                DurableOp::Put {
+                StorageCommand::Put {
                     uri: TEST_URI.to_string(),
                     key: b"committed".to_vec(),
                     value: b"v1".to_vec(),
                     txn_id: 7,
                 },
-                DurableOp::TxnCommit {
+                StorageCommand::TxnCommit {
                     txn_id: 7,
                     commit_ts: 7,
                 },
+                StorageCommand::TxnAbort { txn_id: 8 },
             ]
         );
         assert_eq!(applier.checkpoint_count(), 1);

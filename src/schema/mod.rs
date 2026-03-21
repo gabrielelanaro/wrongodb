@@ -178,8 +178,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::durability::DurabilityBackend;
     use crate::storage::api::Session;
+    use crate::storage::durability::DurabilityBackend;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::metadata_catalog::MetadataCatalog;
     use crate::storage::table::Table;

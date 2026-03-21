@@ -1,8 +1,8 @@
 mod commands;
+mod recovery;
 
 use std::collections::HashMap;
 use std::io::{self, Cursor};
-use std::path::Path;
 use std::sync::Arc;
 
 use bson::{doc, Bson, Document};
@@ -14,8 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use self::commands::handlers::crud::{bson_to_value, value_to_bson};
 use self::commands::CommandRegistry;
 use crate::api::DatabaseContext;
-use crate::recovery::CatalogRecovery;
-use crate::replication::{RaftMode, ReplicationCoordinator};
+use crate::server::recovery::CatalogRecovery;
 use crate::{Connection, WrongoDBError};
 
 const OP_MSG: i32 = 2013;
@@ -52,20 +51,14 @@ impl MsgHeader {
 
 pub async fn start_server(
     addr: &str,
-    db_path: &Path,
     conn: Arc<Connection>,
-    raft_mode: RaftMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     let catalog_report = CatalogRecovery::reconcile(conn.as_ref())?;
     for source in &catalog_report.unreferenced_sources {
         eprintln!("Catalog recovery found unreferenced source file: {source}");
     }
-    let applier = conn.new_store_command_applier();
-    let replication_coordinator = Arc::new(ReplicationCoordinator::open(
-        db_path, true, applier, raft_mode,
-    )?);
-    let db = Arc::new(DatabaseContext::new(conn, replication_coordinator));
+    let db = Arc::new(DatabaseContext::new(conn));
     let registry = Arc::new(CommandRegistry::new());
     println!("Server listening on {}", addr);
 

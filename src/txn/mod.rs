@@ -2,7 +2,6 @@ pub(crate) mod active_write_unit;
 pub mod global_txn;
 pub(crate) mod manager;
 pub mod read_visibility;
-pub(crate) mod recovery_unit;
 pub mod snapshot;
 pub mod transaction;
 pub mod update;
@@ -13,8 +12,6 @@ pub use global_txn::GlobalTxnState;
 #[allow(unused_imports)]
 pub(crate) use manager::TransactionManager;
 pub use read_visibility::ReadVisibility;
-#[allow(unused_imports)]
-pub(crate) use recovery_unit::{NoopRecoveryUnit, RecoveryUnit, WalRecoveryUnit};
 #[allow(unused_imports)]
 pub use transaction::{Transaction, TxnOp, TxnState};
 pub use update::{Update, UpdateChain, UpdateRef, UpdateType};

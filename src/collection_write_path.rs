@@ -7,11 +7,9 @@ use crate::core::document::{normalize_document_in_place, validate_is_object};
 use crate::core::errors::DocumentValidationError;
 use crate::document_query::DocumentQuery;
 use crate::index::encode_index_key;
-use crate::replication::WritePathMode;
 use crate::schema::SchemaCatalog;
 use crate::storage::api::{Session, WriteUnitOfWork};
 use crate::storage::metadata_catalog::{table_uri, MetadataCatalog};
-use crate::store_write_path::StoreWritePath;
 use crate::{Document, WrongoDBError};
 
 #[derive(Debug, Clone, Copy)]
@@ -25,7 +23,6 @@ pub(crate) struct CollectionWritePath {
     metadata_catalog: Arc<MetadataCatalog>,
     schema_catalog: Arc<SchemaCatalog>,
     document_query: DocumentQuery,
-    store_write_path: StoreWritePath,
 }
 
 impl CollectionWritePath {
@@ -33,13 +30,11 @@ impl CollectionWritePath {
         metadata_catalog: Arc<MetadataCatalog>,
         schema_catalog: Arc<SchemaCatalog>,
         document_query: DocumentQuery,
-        store_write_path: StoreWritePath,
     ) -> Self {
         Self {
             metadata_catalog,
             schema_catalog,
             document_query,
-            store_write_path,
         }
     }
 
@@ -131,8 +126,7 @@ impl CollectionWritePath {
         let key = encode_id_value(id)?;
         let value = encode_document(&obj)?;
         let primary_uri = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
-        self.store_write_path
-            .insert(write_unit, &primary_uri, &key, &value)?;
+        self.insert_record(write_unit, &primary_uri, &key, &value)?;
         self.apply_index_add(write_unit, collection, &obj)?;
         Ok(obj)
     }
@@ -162,8 +156,7 @@ impl CollectionWritePath {
         let key = encode_id_value(id)?;
         let value = encode_document(&updated_doc)?;
         let primary_uri = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
-        self.store_write_path
-            .update(write_unit, &primary_uri, &key, &value)?;
+        self.update_record(write_unit, &primary_uri, &key, &value)?;
 
         self.apply_index_remove(write_unit, collection, doc)?;
         self.apply_index_add(write_unit, collection, &updated_doc)?;
@@ -200,8 +193,7 @@ impl CollectionWritePath {
                 .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
             let key = encode_id_value(id)?;
             let value = encode_document(&updated_doc)?;
-            self.store_write_path
-                .update(write_unit, &primary_uri, &key, &value)?;
+            self.update_record(write_unit, &primary_uri, &key, &value)?;
 
             self.apply_index_remove(write_unit, collection, &doc)?;
             self.apply_index_add(write_unit, collection, &updated_doc)?;
@@ -233,8 +225,7 @@ impl CollectionWritePath {
         };
         let key = encode_id_value(id)?;
         let primary_uri = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
-        self.store_write_path
-            .delete(write_unit, &primary_uri, &key)?;
+        self.delete_record(write_unit, &primary_uri, &key)?;
         self.apply_index_remove(write_unit, collection, doc)?;
         Ok(1)
     }
@@ -259,8 +250,7 @@ impl CollectionWritePath {
                 continue;
             };
             let key = encode_id_value(id)?;
-            self.store_write_path
-                .delete(write_unit, &primary_uri, &key)?;
+            self.delete_record(write_unit, &primary_uri, &key)?;
             self.apply_index_remove(write_unit, collection, &doc)?;
             deleted += 1;
         }
@@ -296,8 +286,7 @@ impl CollectionWritePath {
             let Some(key) = encode_index_key(value, id)? else {
                 continue;
             };
-            self.store_write_path
-                .insert(write_unit, &index_uri, &key, &[])?;
+            self.insert_record(write_unit, &index_uri, &key, &[])?;
         }
 
         Ok(())
@@ -342,13 +331,44 @@ impl CollectionWritePath {
                 continue;
             };
             if is_add {
-                self.store_write_path
-                    .insert(write_unit, &def.uri, &key, &[])?;
+                self.insert_record(write_unit, &def.uri, &key, &[])?;
             } else {
-                self.store_write_path.delete(write_unit, &def.uri, &key)?;
+                self.delete_record(write_unit, &def.uri, &key)?;
             }
         }
         Ok(())
+    }
+
+    fn insert_record(
+        &self,
+        write_unit: &mut WriteUnitOfWork<'_>,
+        uri: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), WrongoDBError> {
+        let mut cursor = write_unit.open_cursor(uri)?;
+        cursor.insert(key, value)
+    }
+
+    fn update_record(
+        &self,
+        write_unit: &mut WriteUnitOfWork<'_>,
+        uri: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), WrongoDBError> {
+        let mut cursor = write_unit.open_cursor(uri)?;
+        cursor.update(key, value)
+    }
+
+    fn delete_record(
+        &self,
+        write_unit: &mut WriteUnitOfWork<'_>,
+        uri: &str,
+        key: &[u8],
+    ) -> Result<(), WrongoDBError> {
+        let mut cursor = write_unit.open_cursor(uri)?;
+        cursor.delete(key)
     }
 
     fn ensure_table_registered_in_write_unit(
@@ -364,26 +384,14 @@ impl CollectionWritePath {
     where
         F: FnOnce(&Self, &mut WriteUnitOfWork<'_>) -> Result<R, WrongoDBError>,
     {
-        let write_path_mode = self.store_write_path.write_path_mode();
         let mut write_unit = session.transaction()?;
-        let txn_id = write_unit.txn_id();
         let result = f(self, &mut write_unit);
         match result {
             Ok(value) => {
-                if write_path_mode == WritePathMode::DeferredReplication {
-                    if let Err(err) = self.store_write_path.record_commit(txn_id) {
-                        let _ = self.store_write_path.record_abort(txn_id);
-                        let _ = write_unit.abort();
-                        return Err(err);
-                    }
-                }
                 write_unit.commit()?;
                 Ok(value)
             }
             Err(err) => {
-                if write_path_mode == WritePathMode::DeferredReplication {
-                    let _ = self.store_write_path.record_abort(txn_id);
-                }
                 let _ = write_unit.abort();
                 Err(err)
             }
@@ -463,46 +471,26 @@ fn apply_update(doc: &Document, update: &Value) -> Result<Document, WrongoDBErro
 
 #[cfg(test)]
 mod tests {
-    use std::net::TcpListener;
     use std::sync::Arc;
 
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::apply_update;
-    use crate::api::DatabaseContext;
     use crate::collection_write_path::CollectionWritePath;
-    use crate::core::bson::{encode_document, encode_id_value};
     use crate::document_query::DocumentQuery;
-    use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp};
-    use crate::replication::{RaftMode, RaftPeerConfig, ReplicationCoordinator, WritePathMode};
     use crate::schema::SchemaCatalog;
-    use crate::storage::api::{Connection, ConnectionConfig, Session};
+    use crate::storage::api::Session;
+    use crate::storage::durability::DurabilityBackend;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::metadata_catalog::MetadataCatalog;
     use crate::storage::table::Table;
-    use crate::store_write_path::StoreWritePath;
     use crate::txn::{GlobalTxnState, TransactionManager};
     use crate::WrongoDBError;
-
-    fn free_local_addr() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        addr.to_string()
-    }
 
     fn test_services(
         base_path: std::path::PathBuf,
         backend: DurabilityBackend,
-    ) -> (CollectionWritePath, DocumentQuery, Session) {
-        test_services_with_replication(base_path, backend, ReplicationCoordinator::standalone())
-    }
-
-    fn test_services_with_replication(
-        base_path: std::path::PathBuf,
-        backend: DurabilityBackend,
-        replication: ReplicationCoordinator,
     ) -> (CollectionWritePath, DocumentQuery, Session) {
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
@@ -517,14 +505,11 @@ mod tests {
             metadata_catalog.clone(),
         ));
         let backend = Arc::new(backend);
-        let replication = Arc::new(replication);
         let document_query = DocumentQuery::new(schema_catalog.clone());
-        let store_write_path = StoreWritePath::new(backend.clone(), replication.clone());
         let service = CollectionWritePath::new(
             metadata_catalog.clone(),
             schema_catalog.clone(),
             document_query.clone(),
-            store_write_path,
         );
         let session = Session::new(
             base_path,
@@ -591,41 +576,6 @@ mod tests {
         assert_eq!(result.get("status").unwrap().as_str().unwrap(), "active");
         assert!(!result.contains_key("age"));
         assert!(result.contains_key("_id"));
-    }
-
-    #[test]
-    fn clustered_collection_write_path_rejects_writes_when_not_leader() {
-        let dir = tempdir().unwrap();
-        let raft_mode = RaftMode::Cluster {
-            local_node_id: "n1".to_string(),
-            local_raft_addr: free_local_addr(),
-            peers: vec![RaftPeerConfig {
-                node_id: "n2".to_string(),
-                raft_addr: free_local_addr(),
-            }],
-        };
-        let conn = Connection::open(dir.path(), ConnectionConfig::new(false));
-        let conn = Arc::new(conn.unwrap());
-        let replication_coordinator = Arc::new(
-            ReplicationCoordinator::open(
-                dir.path(),
-                true,
-                conn.new_store_command_applier(),
-                raft_mode,
-            )
-            .unwrap(),
-        );
-        let db = DatabaseContext::new(conn, replication_coordinator);
-        let service = db.collection_write_path();
-        let mut session = db.connection().open_session();
-
-        let err = service
-            .insert_one(&mut session, "items", json!({"_id": "k1", "value": "v1"}))
-            .unwrap_err();
-        match err {
-            WrongoDBError::NotLeader { leader_hint } => assert_eq!(leader_hint, None),
-            other => panic!("unexpected error: {other}"),
-        }
     }
 
     #[test]
@@ -709,123 +659,27 @@ mod tests {
     }
 
     #[test]
-    fn deferred_mode_records_put_and_commit_markers() {
-        let (replication, recorded_ops) =
-            ReplicationCoordinator::test_backend(WritePathMode::DeferredReplication);
+    fn failing_write_unit_aborts_changes() {
         let tmp = tempdir().unwrap();
-        let (service, _query, mut session) = test_services_with_replication(
-            tmp.path().to_path_buf(),
-            DurabilityBackend::Disabled,
-            replication,
-        );
-        let doc = json!({"_id": "k1", "value": "v1"});
-        let encoded_key = encode_id_value(&json!("k1")).unwrap();
-        let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
+        let (service, query, mut session) =
+            test_services(tmp.path().to_path_buf(), DurabilityBackend::Disabled);
 
-        service.insert_one(&mut session, "items", doc).unwrap();
-
-        assert_eq!(
-            *recorded_ops.lock(),
-            vec![
-                (
-                    DurableOp::Put {
-                        uri: "table:items".to_string(),
-                        key: encoded_key,
-                        value: encoded_doc,
-                        txn_id: 1,
-                    },
-                    DurabilityGuarantee::Buffered,
-                ),
-                (
-                    DurableOp::TxnCommit {
-                        txn_id: 1,
-                        commit_ts: 1,
-                    },
-                    DurabilityGuarantee::Sync,
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn deferred_mode_records_put_and_abort_markers_for_explicit_and_drop() {
-        let (replication, recorded_ops) =
-            ReplicationCoordinator::test_backend(WritePathMode::DeferredReplication);
-        let tmp = tempdir().unwrap();
-        let (service, _query, mut session) = test_services_with_replication(
-            tmp.path().to_path_buf(),
-            DurabilityBackend::Disabled,
-            replication,
-        );
-
-        {
-            let doc = json!({"_id": "abort-me", "value": "v1"});
-            let encoded_key = encode_id_value(&json!("abort-me")).unwrap();
-            let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
-            let err = service
-                .run_in_write_unit(&mut session, |this, write_unit| {
-                    this.insert_one_in_write_unit(write_unit, "items", doc)?;
-                    Err::<(), WrongoDBError>(WrongoDBError::Storage(crate::StorageError(
-                        "force abort".into(),
-                    )))
-                })
-                .unwrap_err();
-            assert!(err.to_string().contains("force abort"));
-
-            assert_eq!(
-                *recorded_ops.lock(),
-                vec![
-                    (
-                        DurableOp::Put {
-                            uri: "table:items".to_string(),
-                            key: encoded_key,
-                            value: encoded_doc,
-                            txn_id: 1,
-                        },
-                        DurabilityGuarantee::Buffered,
-                    ),
-                    (
-                        DurableOp::TxnAbort { txn_id: 1 },
-                        DurabilityGuarantee::Buffered
-                    ),
-                ]
-            );
-        }
-
-        recorded_ops.lock().clear();
-
-        {
-            let doc = json!({"_id": "drop-me", "value": "v2"});
-            let encoded_key = encode_id_value(&json!("drop-me")).unwrap();
-            let encoded_doc = encode_document(doc.as_object().unwrap()).unwrap();
-            let err = service
-                .run_in_write_unit(&mut session, |this, write_unit| {
-                    this.insert_one_in_write_unit(write_unit, "items", doc)?;
-                    Err::<(), WrongoDBError>(WrongoDBError::Storage(crate::StorageError(
-                        "force drop".into(),
-                    )))
-                })
-                .unwrap_err();
-            assert!(err.to_string().contains("force drop"));
-
-            assert_eq!(
-                *recorded_ops.lock(),
-                vec![
-                    (
-                        DurableOp::Put {
-                            uri: "table:items".to_string(),
-                            key: encoded_key,
-                            value: encoded_doc,
-                            txn_id: 2,
-                        },
-                        DurabilityGuarantee::Buffered,
-                    ),
-                    (
-                        DurableOp::TxnAbort { txn_id: 2 },
-                        DurabilityGuarantee::Buffered
-                    ),
-                ]
-            );
-        }
+        let err = service
+            .run_in_write_unit(&mut session, |this, write_unit| {
+                this.insert_one_in_write_unit(
+                    write_unit,
+                    "items",
+                    json!({"_id": "abort-me", "value": "v1"}),
+                )?;
+                Err::<(), WrongoDBError>(WrongoDBError::Storage(crate::StorageError(
+                    "force abort".into(),
+                )))
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("force abort"));
+        assert!(query
+            .find(&mut session, "items", Some(json!({"_id": "abort-me"})))
+            .unwrap()
+            .is_empty());
     }
 }

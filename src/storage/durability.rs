@@ -3,21 +3,19 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::durability::DurableOp;
+use crate::storage::command::StorageCommand;
+use crate::storage::recovery_unit::{NoopRecoveryUnit, RecoveryUnit, WalRecoveryUnit};
 use crate::storage::wal::GlobalWal;
-use crate::txn::{NoopRecoveryUnit, RecoveryUnit, WalRecoveryUnit};
 use crate::WrongoDBError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DurabilityGuarantee {
+pub(crate) enum StorageSyncPolicy {
+    #[cfg(test)]
     Buffered,
     Sync,
 }
 
-/// Local durability backend for standalone storage recovery and WAL markers.
-///
-/// RAFT replication is handled in [`crate::replication::ReplicationCoordinator`].
-/// This backend intentionally stays focused on local durability only.
+/// Local storage durability backend for WAL markers and checkpoint truncation.
 #[derive(Debug)]
 pub(crate) enum DurabilityBackend {
     Disabled,
@@ -40,12 +38,12 @@ impl DurabilityBackend {
 
     pub(crate) fn record(
         &self,
-        op: DurableOp,
-        guarantee: DurabilityGuarantee,
+        command: StorageCommand,
+        sync_policy: StorageSyncPolicy,
     ) -> Result<(), WrongoDBError> {
         match self {
             Self::Disabled => Ok(()),
-            Self::LocalWal(backend) => backend.record(op, guarantee),
+            Self::LocalWal(backend) => backend.record(command, sync_policy),
         }
     }
 
@@ -78,10 +76,14 @@ impl LocalWalDurabilityBackend {
         })
     }
 
-    fn record(&self, op: DurableOp, guarantee: DurabilityGuarantee) -> Result<(), WrongoDBError> {
+    fn record(
+        &self,
+        command: StorageCommand,
+        sync_policy: StorageSyncPolicy,
+    ) -> Result<(), WrongoDBError> {
         let mut wal = self.wal.lock();
-        match op {
-            DurableOp::Put {
+        match command {
+            StorageCommand::Put {
                 uri,
                 key,
                 value,
@@ -89,20 +91,20 @@ impl LocalWalDurabilityBackend {
             } => {
                 wal.log_put(&uri, &key, &value, txn_id)?;
             }
-            DurableOp::Delete { uri, key, txn_id } => {
+            StorageCommand::Delete { uri, key, txn_id } => {
                 wal.log_delete(&uri, &key, txn_id)?;
             }
-            DurableOp::TxnCommit { txn_id, commit_ts } => {
+            StorageCommand::TxnCommit { txn_id, commit_ts } => {
                 wal.log_txn_commit(txn_id, commit_ts)?;
             }
-            DurableOp::TxnAbort { txn_id } => {
+            StorageCommand::TxnAbort { txn_id } => {
                 wal.log_txn_abort(txn_id)?;
             }
-            DurableOp::Checkpoint => {
+            StorageCommand::Checkpoint => {
                 wal.log_checkpoint()?;
             }
         }
-        if guarantee == DurabilityGuarantee::Sync {
+        if sync_policy == StorageSyncPolicy::Sync {
             wal.sync()?;
         }
         Ok(())
@@ -132,13 +134,13 @@ mod tests {
         assert!(!backend.is_enabled());
         backend
             .record(
-                DurableOp::Put {
+                StorageCommand::Put {
                     uri: "table:users".to_string(),
                     key: b"k1".to_vec(),
                     value: b"v1".to_vec(),
                     txn_id: crate::txn::TXN_NONE,
                 },
-                DurabilityGuarantee::Buffered,
+                StorageSyncPolicy::Buffered,
             )
             .unwrap();
     }
@@ -150,11 +152,11 @@ mod tests {
 
         backend
             .record(
-                DurableOp::TxnCommit {
+                StorageCommand::TxnCommit {
                     txn_id: 7,
                     commit_ts: 7,
                 },
-                DurabilityGuarantee::Sync,
+                StorageSyncPolicy::Sync,
             )
             .unwrap();
 
@@ -182,11 +184,11 @@ mod tests {
 
         backend
             .record(
-                DurableOp::TxnCommit {
+                StorageCommand::TxnCommit {
                     txn_id: 1,
                     commit_ts: 1,
                 },
-                DurabilityGuarantee::Sync,
+                StorageSyncPolicy::Sync,
             )
             .unwrap();
 
@@ -195,7 +197,7 @@ mod tests {
         assert!(before > 512);
 
         backend
-            .record(DurableOp::Checkpoint, DurabilityGuarantee::Sync)
+            .record(StorageCommand::Checkpoint, StorageSyncPolicy::Sync)
             .unwrap();
         backend.truncate_to_checkpoint().unwrap();
 

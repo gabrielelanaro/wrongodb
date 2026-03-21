@@ -201,13 +201,11 @@ mod tests {
 
     use super::*;
     use crate::collection_write_path::CollectionWritePath;
-    use crate::durability::DurabilityBackend;
-    use crate::replication::ReplicationCoordinator;
     use crate::schema::SchemaCatalog;
+    use crate::storage::durability::DurabilityBackend;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::metadata_catalog::MetadataCatalog;
     use crate::storage::table::Table;
-    use crate::store_write_path::StoreWritePath;
     use crate::txn::{GlobalTxnState, TransactionManager};
 
     struct QueryTestFixture {
@@ -240,10 +238,6 @@ mod tests {
                 metadata_catalog.clone(),
                 schema_catalog.clone(),
                 query.clone(),
-                StoreWritePath::new(
-                    backend.clone(),
-                    Arc::new(ReplicationCoordinator::standalone()),
-                ),
             );
             let session = Session::new(
                 base_path,

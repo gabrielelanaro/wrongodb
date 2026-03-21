@@ -5,26 +5,20 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 
 use crate::core::errors::StorageError;
-use crate::durability::DurableOp;
-use crate::raft::command::CommittedCommand;
-use crate::raft::service::CommittedCommandExecutor;
+use crate::storage::command::StorageCommand;
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::metadata_catalog::MetadataCatalog;
 use crate::storage::table::Table;
 use crate::txn::{Transaction, TransactionManager, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
-/// Applies committed durable commands and finalizes recovery state.
-///
-/// Recovery depends on this narrow interface so replay logic can be tested
-/// independently from the concrete store implementation.
-pub(crate) trait CommandApplier: Send + Sync {
-    fn apply(&self, op: DurableOp) -> Result<(), WrongoDBError>;
+pub(crate) trait RecoveryApplier: Send + Sync {
+    fn apply(&self, command: StorageCommand) -> Result<(), WrongoDBError>;
     fn checkpoint_open_stores(&self) -> Result<(), WrongoDBError>;
 }
 
 #[derive(Debug)]
-pub(crate) struct StoreCommandApplier {
+pub(crate) struct RecoveryExecutor {
     base_path: PathBuf,
     metadata_catalog: Arc<MetadataCatalog>,
     table_handles: Arc<HandleCache<String, RwLock<Table>>>,
@@ -32,7 +26,7 @@ pub(crate) struct StoreCommandApplier {
     in_flight_txns: Mutex<HashMap<TxnId, Transaction>>,
 }
 
-impl StoreCommandApplier {
+impl RecoveryExecutor {
     pub(crate) fn new(
         base_path: PathBuf,
         metadata_catalog: Arc<MetadataCatalog>,
@@ -65,10 +59,12 @@ impl StoreCommandApplier {
             )?))
         })
     }
+}
 
-    fn apply_op(&self, op: DurableOp) -> Result<(), WrongoDBError> {
-        match op {
-            DurableOp::Put {
+impl RecoveryApplier for RecoveryExecutor {
+    fn apply(&self, command: StorageCommand) -> Result<(), WrongoDBError> {
+        match command {
+            StorageCommand::Put {
                 uri,
                 key,
                 value,
@@ -85,7 +81,7 @@ impl StoreCommandApplier {
                     table.write().local_apply_put_in_txn(&key, &value, txn)?;
                 }
             }
-            DurableOp::Delete { uri, key, txn_id } => {
+            StorageCommand::Delete { uri, key, txn_id } => {
                 let table = self.open_table_for_uri(&uri, txn_id)?;
                 if txn_id == TXN_NONE {
                     let _ = table.write().local_apply_delete_autocommit(&key)?;
@@ -97,31 +93,23 @@ impl StoreCommandApplier {
                     let _ = table.write().local_apply_delete_in_txn(&key, txn)?;
                 }
             }
-            DurableOp::TxnCommit { txn_id, .. } => {
-                if txn_id == TXN_NONE {
-                    return Ok(());
-                }
-                if let Some(mut txn) = self.in_flight_txns.lock().remove(&txn_id) {
-                    self.transaction_manager.commit_txn_state(&mut txn)?;
-                }
-            }
-            DurableOp::TxnAbort { txn_id } => {
-                if txn_id == TXN_NONE {
-                    return Ok(());
-                }
-                if let Some(mut txn) = self.in_flight_txns.lock().remove(&txn_id) {
-                    self.transaction_manager.abort_txn_state(&mut txn)?;
+            StorageCommand::TxnCommit { txn_id, .. } => {
+                if txn_id != TXN_NONE {
+                    if let Some(mut txn) = self.in_flight_txns.lock().remove(&txn_id) {
+                        self.transaction_manager.commit_txn_state(&mut txn)?;
+                    }
                 }
             }
-            DurableOp::Checkpoint => {}
+            StorageCommand::TxnAbort { txn_id } => {
+                if txn_id != TXN_NONE {
+                    if let Some(mut txn) = self.in_flight_txns.lock().remove(&txn_id) {
+                        self.transaction_manager.abort_txn_state(&mut txn)?;
+                    }
+                }
+            }
+            StorageCommand::Checkpoint => {}
         }
         Ok(())
-    }
-}
-
-impl CommandApplier for StoreCommandApplier {
-    fn apply(&self, op: DurableOp) -> Result<(), WrongoDBError> {
-        self.apply_op(op)
     }
 
     fn checkpoint_open_stores(&self) -> Result<(), WrongoDBError> {
@@ -129,11 +117,5 @@ impl CommandApplier for StoreCommandApplier {
             table.write().checkpoint_store()?;
         }
         Ok(())
-    }
-}
-
-impl CommittedCommandExecutor for StoreCommandApplier {
-    fn execute(&self, cmd: CommittedCommand) -> Result<(), WrongoDBError> {
-        self.apply(cmd.command.into())
     }
 }

@@ -593,6 +593,7 @@ impl GlobalWal {
     // Checkpoint Operations
     // ------------------------------------------------------------------------
 
+    #[cfg(test)]
     pub fn set_checkpoint_lsn(&mut self, lsn: Lsn) -> Result<(), WrongoDBError> {
         self.file.set_checkpoint_lsn(lsn)
     }
@@ -821,6 +822,7 @@ impl WalFile {
     // Checkpoint Operations
     // ------------------------------------------------------------------------
 
+    #[cfg(test)]
     fn set_checkpoint_lsn(&mut self, lsn: Lsn) -> Result<(), WrongoDBError> {
         self.header.checkpoint_lsn = lsn;
         self.header.crc32 = self.header.compute_crc32();

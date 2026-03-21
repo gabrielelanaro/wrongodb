@@ -4,12 +4,14 @@ use std::sync::{Arc, Weak};
 use parking_lot::RwLock;
 
 use crate::core::errors::StorageError;
-use crate::durability::DurabilityBackend;
 use crate::storage::api::cursor::{Cursor, CursorWriteAccess};
+use crate::storage::command::StorageCommand;
+use crate::storage::durability::{DurabilityBackend, StorageSyncPolicy};
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::metadata_catalog::{MetadataCatalog, METADATA_STORE_NAME, METADATA_URI};
 use crate::storage::table::Table;
-use crate::txn::{ActiveWriteUnit, RecoveryUnit, TransactionManager, TxnId, TXN_NONE};
+use crate::storage::RecoveryUnit;
+use crate::txn::{ActiveWriteUnit, TransactionManager, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
 /// A request-scoped execution context over shared connection infrastructure.
@@ -23,8 +25,8 @@ use crate::WrongoDBError;
 /// - start transactions
 /// - trigger checkpoint
 ///
-/// It intentionally does not own document write orchestration or the replicated
-/// write path. Those live in higher internal layers.
+/// It intentionally does not own document write orchestration. That lives in
+/// higher internal layers.
 ///
 /// In practice this means `Session` answers "what can this request do right
 /// now?" while `Connection` answers "what engine are we attached to?".
@@ -158,10 +160,8 @@ impl Session {
             return Ok(());
         }
 
-        self.durability_backend.record(
-            crate::durability::DurableOp::Checkpoint,
-            crate::durability::DurabilityGuarantee::Sync,
-        )?;
+        self.durability_backend
+            .record(StorageCommand::Checkpoint, StorageSyncPolicy::Sync)?;
         self.durability_backend.truncate_to_checkpoint()
     }
 
@@ -368,10 +368,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::durability::{DurabilityBackend, StoreCommandApplier};
-    use crate::recovery::recover_from_wal;
+    use crate::storage::durability::DurabilityBackend;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::metadata_catalog::MetadataCatalog;
+    use crate::storage::recovery::{recover_from_wal, RecoveryExecutor};
     use crate::storage::table::Table;
     use crate::storage::wal::{GlobalWal, WalFileReader, WalReader, WalRecord};
     use crate::txn::{GlobalTxnState, TransactionManager};
@@ -403,7 +403,7 @@ mod tests {
                 table_handles.clone(),
                 transaction_manager.clone(),
             ));
-            let applier = Arc::new(StoreCommandApplier::new(
+            let applier = Arc::new(RecoveryExecutor::new(
                 base_path.clone(),
                 metadata_catalog,
                 table_handles.clone(),
@@ -439,7 +439,7 @@ mod tests {
         }
     }
 
-    fn recover_existing_wal_if_present(base_path: &Path, applier: Arc<StoreCommandApplier>) {
+    fn recover_existing_wal_if_present(base_path: &Path, applier: Arc<RecoveryExecutor>) {
         let wal_path = GlobalWal::path_for_db(base_path);
         if !wal_path.exists() {
             return;
