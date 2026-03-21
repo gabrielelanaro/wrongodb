@@ -22,19 +22,17 @@ use crate::WrongoDBError;
 /// the internal storage and recovery wiring.
 #[derive(Clone)]
 pub struct ConnectionConfig {
-    /// Enables runtime local WAL recording for storage writes.
+    /// Enables WAL recording for storage writes.
     ///
     /// WAL replay on startup is always attempted if `global.wal` exists. This
     /// flag only controls whether new local writes append to the WAL after the
     /// connection is opened.
-    pub local_wal_enabled: bool,
+    pub wal_enabled: bool,
 }
 
 impl Default for ConnectionConfig {
     fn default() -> Self {
-        Self {
-            local_wal_enabled: true,
-        }
+        Self { wal_enabled: true }
     }
 }
 
@@ -44,16 +42,16 @@ impl ConnectionConfig {
     /// Callers provide the storage-affecting inputs at the construction site so
     /// the local durability mode stays visible instead of being implied by a
     /// hidden default.
-    pub fn new(local_wal_enabled: bool) -> Self {
-        Self { local_wal_enabled }
+    pub fn new(wal_enabled: bool) -> Self {
+        Self { wal_enabled }
     }
 
-    /// Override whether runtime local WAL recording is enabled.
+    /// Override whether WAL recording is enabled.
     ///
     /// This stays on the config builder so durability mode is chosen before the
     /// engine is opened, not mutated later at runtime.
-    pub fn local_wal_enabled(mut self, enabled: bool) -> Self {
-        self.local_wal_enabled = enabled;
+    pub fn wal_enabled(mut self, enabled: bool) -> Self {
+        self.wal_enabled = enabled;
         self
     }
 }
@@ -94,7 +92,7 @@ impl Connection {
     where
         P: AsRef<Path>,
     {
-        let ConnectionConfig { local_wal_enabled } = config;
+        let ConnectionConfig { wal_enabled } = config;
         let base_path = path.as_ref().to_path_buf();
         fs::create_dir_all(&base_path)?;
 
@@ -117,7 +115,7 @@ impl Connection {
             recover_from_wal(recovery_executor, recovery_reader)?;
         }
 
-        let durability_backend = Arc::new(DurabilityBackend::open(&base_path, local_wal_enabled)?);
+        let durability_backend = Arc::new(DurabilityBackend::open(&base_path, wal_enabled)?);
 
         Ok(Self {
             base_path,

@@ -5,7 +5,7 @@
 **Decision**
 - Remove `RaftMode` from [`ConnectionConfig`].
 - Make `ConnectionConfig` carry only storage policy:
-  - `local_wal_enabled`
+  - `wal_enabled`
 - Make `Connection::open()` always attempt WAL replay if `global.wal` exists.
 - Keep `RaftMode` at server/bootstrap and replication-coordinator boundaries, not in the WT-like storage connection.
 
