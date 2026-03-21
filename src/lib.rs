@@ -11,7 +11,7 @@ mod txn;
 pub use crate::core::errors::{DocumentValidationError, StorageError, WrongoDBError};
 pub use crate::server::start_server;
 pub use crate::storage::api::{
-    Connection, ConnectionConfig, Cursor, CursorEntry, Session, WriteUnitOfWork,
+    Connection, ConnectionConfig, CursorEntry, Session, TableCursor, WriteUnitOfWork,
 };
 
 pub(crate) type Document = serde_json::Map<String, serde_json::Value>;

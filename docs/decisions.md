@@ -1,5 +1,18 @@
 # Decisions
 
+## 2026-03-21: Rename the storage cursor type to `TableCursor`
+
+**Decision**
+- Rename the public storage cursor type from `Cursor` to `TableCursor`.
+- Rename the internal access enum from `CursorWriteAccess` to `TableCursorWriteAccess`.
+- Keep the method names `open_cursor` on `Session` and `WriteUnitOfWork` for now, since they describe
+  the operation rather than the returned type.
+
+**Why**
+- The type operates on one table/store at a time, so `TableCursor` is more specific than `Cursor`.
+- The old name overlapped with `std::io::Cursor` and made storage-level discussion harder to read.
+- Keeping the open methods unchanged avoids a wider API churn while still making the returned type explicit.
+
 ## 2026-03-21: Make `ConnectionConfig` storage-only and move `RaftMode` out of the storage API
 
 **Decision**

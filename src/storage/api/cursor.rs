@@ -8,9 +8,9 @@ use crate::storage::RecoveryUnit;
 use crate::txn::{Transaction, TxnId};
 use crate::WrongoDBError;
 
-/// A single key/value entry returned by [`Cursor::next`].
+/// A single key/value entry returned by [`TableCursor::next`].
 ///
-/// The public cursor surface is deliberately key/value-shaped because it is the
+/// The public table cursor surface is deliberately key/value-shaped because it is the
 /// low-level storage API, not the document/query API.
 ///
 /// This type alias exists to keep that low-level API readable without
@@ -18,18 +18,18 @@ use crate::WrongoDBError;
 pub type CursorEntry = (Vec<u8>, Vec<u8>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CursorWriteAccess {
+pub(crate) enum TableCursorWriteAccess {
     #[cfg(test)]
     ReadOnly,
     ReadWrite,
 }
 
-/// Cursor over a single physical store.
+/// Table cursor over a single physical store.
 ///
-/// A cursor is always bound to one store and one transaction context. Cursors
-/// opened from [`Session`](crate::Session) are non-transactional; cursors
-/// opened from [`WriteUnitOfWork`](crate::WriteUnitOfWork) are bound to the
-/// active transaction.
+/// A table cursor is always bound to one store and one transaction context.
+/// Table cursors opened from [`Session`](crate::Session) are non-transactional;
+/// table cursors opened from [`WriteUnitOfWork`](crate::WriteUnitOfWork) are
+/// bound to the active transaction.
 ///
 /// The reason this type exists publicly is to expose a small, explicit
 /// storage interface for one store at a time. It is intentionally not
@@ -37,13 +37,13 @@ pub(crate) enum CursorWriteAccess {
 ///
 /// If a caller needs document-level writes, they should go through the
 /// higher-level command path, not extend this type.
-pub struct Cursor {
+pub struct TableCursor {
     table: Arc<RwLock<Table>>,
     uri: String,
     bound_txn_id: TxnId,
     active_txn: Option<Weak<Mutex<Transaction>>>,
     recovery_unit: Arc<dyn RecoveryUnit>,
-    write_access: CursorWriteAccess,
+    write_access: TableCursorWriteAccess,
     buffered_entries: Vec<CursorEntry>,
     buffer_pos: usize,
     exhausted: bool,
@@ -51,14 +51,14 @@ pub struct Cursor {
     range_end: Option<Vec<u8>>,
 }
 
-impl Cursor {
+impl TableCursor {
     pub(crate) fn new(
         table: Arc<RwLock<Table>>,
         uri: String,
         bound_txn_id: TxnId,
         active_txn: Option<Weak<Mutex<Transaction>>>,
         recovery_unit: Arc<dyn RecoveryUnit>,
-        write_access: CursorWriteAccess,
+        write_access: TableCursorWriteAccess,
     ) -> Self {
         Self {
             table,
@@ -80,7 +80,7 @@ impl Cursor {
     /// Range state lives on the cursor so scans can be resumed incrementally
     /// without pushing iterator state into `Session`.
     ///
-    /// The method exists on `Cursor` because scan position is cursor-local
+    /// The method exists on `TableCursor` because scan position is cursor-local
     /// state, not session state.
     pub fn set_range(&mut self, start: Option<Vec<u8>>, end: Option<Vec<u8>>) {
         self.range_start = start;
@@ -89,7 +89,7 @@ impl Cursor {
     }
 
     fn ensure_writable(&self) -> Result<(), WrongoDBError> {
-        if self.write_access == CursorWriteAccess::ReadWrite {
+        if self.write_access == TableCursorWriteAccess::ReadWrite {
             return Ok(());
         }
         Err(WrongoDBError::Storage(StorageError(
@@ -144,7 +144,7 @@ impl Cursor {
     /// validation, local durability recording for local write modes, and MVCC
     /// application through the bound transaction context.
     ///
-    /// It exists on `Cursor` because insert is a one-store mutation. Higher
+    /// It exists on `TableCursor` because insert is a one-store mutation. Higher
     /// layers remain responsible for multi-store work such as index
     /// maintenance.
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
@@ -166,7 +166,7 @@ impl Cursor {
     /// operation. Higher-level document/index orchestration lives elsewhere.
     ///
     /// This separation keeps update semantics local to one store and prevents
-    /// `Cursor` from turning into a document write controller.
+    /// `TableCursor` from turning into a document write controller.
     pub fn update(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
         let txn_id = self.bound_txn_id;
         self.ensure_writable()?;
@@ -326,13 +326,13 @@ mod tests {
     #[test]
     fn insert_applies_locally() {
         let (_tmp, table, store_name) = open_index_table();
-        let mut cursor = Cursor::new(
+        let mut cursor = TableCursor::new(
             table.clone(),
             store_name,
             TXN_NONE,
             None,
             Arc::new(NoopRecoveryUnit),
-            CursorWriteAccess::ReadWrite,
+            TableCursorWriteAccess::ReadWrite,
         );
 
         cursor.insert(b"k1", b"v1").unwrap();
@@ -350,13 +350,13 @@ mod tests {
             .write()
             .local_apply_put_autocommit(b"k1", b"v1")
             .unwrap();
-        let mut cursor = Cursor::new(
+        let mut cursor = TableCursor::new(
             table.clone(),
             store_name,
             TXN_NONE,
             None,
             Arc::new(NoopRecoveryUnit),
-            CursorWriteAccess::ReadWrite,
+            TableCursorWriteAccess::ReadWrite,
         );
 
         cursor.delete(b"k1").unwrap();
@@ -367,13 +367,13 @@ mod tests {
     #[test]
     fn read_only_cursor_rejects_writes() {
         let (_tmp, table, store_name) = open_index_table();
-        let mut cursor = Cursor::new(
+        let mut cursor = TableCursor::new(
             table,
             store_name,
             TXN_NONE,
             None,
             Arc::new(NoopRecoveryUnit),
-            CursorWriteAccess::ReadOnly,
+            TableCursorWriteAccess::ReadOnly,
         );
 
         let err = cursor.insert(b"k1", b"v1").unwrap_err();
@@ -386,13 +386,13 @@ mod tests {
         let txn_manager = Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
         let txn_handle = Arc::new(Mutex::new(txn_manager.begin_snapshot_txn()));
         let txn_id = txn_handle.lock().id();
-        let mut cursor = Cursor::new(
+        let mut cursor = TableCursor::new(
             table,
             store_name,
             txn_id,
             Some(Arc::downgrade(&txn_handle)),
             Arc::new(NoopRecoveryUnit),
-            CursorWriteAccess::ReadWrite,
+            TableCursorWriteAccess::ReadWrite,
         );
 
         drop(txn_handle);

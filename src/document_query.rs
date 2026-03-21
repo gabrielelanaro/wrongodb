@@ -7,7 +7,7 @@ use crate::core::bson::{decode_document, encode_id_value};
 use crate::core::document::validate_is_object;
 use crate::index::{decode_index_id, encode_range_bounds};
 use crate::schema::SchemaCatalog;
-use crate::storage::api::{Cursor, Session, WriteUnitOfWork};
+use crate::storage::api::{Session, TableCursor, WriteUnitOfWork};
 use crate::{Document, WrongoDBError};
 
 #[derive(Clone)]
@@ -176,7 +176,7 @@ impl DocumentQuery {
 }
 
 fn scan_with_cursor<F>(
-    cursor: &mut Cursor,
+    cursor: &mut TableCursor,
     matches_filter: F,
 ) -> Result<Vec<Document>, WrongoDBError>
 where

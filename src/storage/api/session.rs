@@ -4,7 +4,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::RwLock;
 
 use crate::core::errors::StorageError;
-use crate::storage::api::cursor::{Cursor, CursorWriteAccess};
+use crate::storage::api::cursor::{TableCursor, TableCursorWriteAccess};
 use crate::storage::command::StorageCommand;
 use crate::storage::durability::{DurabilityBackend, StorageSyncPolicy};
 use crate::storage::handle_cache::HandleCache;
@@ -84,27 +84,27 @@ impl Session {
         ))))
     }
 
-    /// Open a non-transactional cursor bound to `TXN_NONE`.
+    /// Open a non-transactional table cursor bound to `TXN_NONE`.
     ///
     /// This method intentionally has the same name as
     /// [`WriteUnitOfWork::open_cursor`]. The duplication is deliberate:
     /// transaction scope is expressed by the receiver instead of by exposing
     /// raw transaction ids in the public cursor API.
     ///
-    /// `Session::open_cursor` means "open a cursor outside any transaction".
-    /// [`WriteUnitOfWork::open_cursor`] means "open the same kind of cursor,
+    /// `Session::open_cursor` means "open a table cursor outside any transaction".
+    /// [`WriteUnitOfWork::open_cursor`] means "open the same kind of table cursor,
     /// but bound to the active transaction".
     ///
     /// The method lives on `Session` because non-transactional access is still
     /// a first-class storage API and should not require creating a transaction
     /// boundary object just to read or perform local writes.
-    pub fn open_cursor(&self, uri: &str) -> Result<Cursor, WrongoDBError> {
+    pub fn open_cursor(&self, uri: &str) -> Result<TableCursor, WrongoDBError> {
         let store_name = self.resolve_uri(uri)?;
         self.open_resolved_cursor_with_access(
             uri,
             &store_name,
             TXN_NONE,
-            CursorWriteAccess::ReadWrite,
+            TableCursorWriteAccess::ReadWrite,
         )
     }
 
@@ -133,7 +133,7 @@ impl Session {
     /// durability is enabled, emits the matching durability marker only after
     /// the storage-level reconciliation pass has finished.
     ///
-    /// It lives on `Session` instead of `Cursor` or `Table` because checkpoint
+    /// It lives on `Session` instead of `TableCursor` or `Table` because checkpoint
     /// is not a one-store concern.
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         let mut store_names = self.metadata_catalog.all_sources()?;
@@ -170,8 +170,8 @@ impl Session {
         uri: &str,
         store_name: &str,
         bound_txn_id: TxnId,
-        write_access: CursorWriteAccess,
-    ) -> Result<Cursor, WrongoDBError> {
+        write_access: TableCursorWriteAccess,
+    ) -> Result<TableCursor, WrongoDBError> {
         let table =
             self.table_handles
                 .get_or_try_insert_with(store_name.to_string(), |store_name| {
@@ -182,7 +182,7 @@ impl Session {
                     )?))
                 })?;
         let active_txn = self.bound_transaction_handle(bound_txn_id)?;
-        Ok(Cursor::new(
+        Ok(TableCursor::new(
             table,
             uri.to_string(),
             bound_txn_id,
@@ -248,22 +248,22 @@ pub struct WriteUnitOfWork<'a> {
 }
 
 impl<'a> WriteUnitOfWork<'a> {
-    /// Open a cursor bound to this transaction.
+    /// Open a table cursor bound to this transaction.
     ///
     /// This duplicates [`Session::open_cursor`] by design. The reason is API
-    /// clarity: a caller should choose transaction scope by opening the cursor
+    /// clarity: a caller should choose transaction scope by opening the table cursor
     /// from the transaction boundary, not by reaching back into `Session` and
-    /// not by threading transaction ids through every cursor method.
+    /// not by threading transaction ids through every table cursor method.
     ///
     /// The duplication is about binding, not behavior: both methods open the
-    /// same kind of cursor, but they bind it to different transaction scopes.
-    pub fn open_cursor(&mut self, uri: &str) -> Result<Cursor, WrongoDBError> {
+    /// same kind of table cursor, but they bind it to different transaction scopes.
+    pub fn open_cursor(&mut self, uri: &str) -> Result<TableCursor, WrongoDBError> {
         let store_name = self.session.resolve_uri_for_txn(uri, self.txn_id())?;
         self.session.open_resolved_cursor_with_access(
             uri,
             &store_name,
             self.txn_id(),
-            CursorWriteAccess::ReadWrite,
+            TableCursorWriteAccess::ReadWrite,
         )
     }
 
