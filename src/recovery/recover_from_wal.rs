@@ -276,7 +276,6 @@ mod tests {
 
     use crate::durability::{CommandApplier, CommittedDurableOp, DurableOp, StoreCommandApplier};
     use crate::recovery::recover_from_wal;
-    use crate::schema::SchemaCatalog;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::table::Table;
     use crate::storage::wal::{
@@ -353,7 +352,6 @@ mod tests {
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
         let table_handles = Arc::new(HandleCache::<String, parking_lot::RwLock<Table>>::new());
-        let _schema_catalog = Arc::new(SchemaCatalog::new(base_path.to_path_buf()));
         let applier = Arc::new(StoreCommandApplier::new(
             base_path.to_path_buf(),
             table_handles.clone(),

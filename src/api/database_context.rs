@@ -24,6 +24,7 @@ impl DatabaseContext {
         connection: Arc<Connection>,
         replication_coordinator: Arc<ReplicationCoordinator>,
     ) -> Self {
+        let metadata_catalog = connection.metadata_catalog();
         let schema_catalog = connection.schema_catalog();
         let table_handles = connection.table_handles();
         let durability_backend = connection.durability_backend();
@@ -35,8 +36,12 @@ impl DatabaseContext {
             durability_backend,
             replication_coordinator.clone(),
         );
-        let collection_write_path =
-            CollectionWritePath::new(schema_catalog, document_query.clone(), store_write_path);
+        let collection_write_path = CollectionWritePath::new(
+            metadata_catalog,
+            schema_catalog,
+            document_query.clone(),
+            store_write_path,
+        );
 
         Self {
             connection,

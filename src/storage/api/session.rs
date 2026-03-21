@@ -5,9 +5,11 @@ use parking_lot::RwLock;
 
 use crate::core::errors::StorageError;
 use crate::durability::DurabilityBackend;
-use crate::schema::SchemaCatalog;
 use crate::storage::api::cursor::{Cursor, CursorWriteAccess};
 use crate::storage::handle_cache::HandleCache;
+use crate::storage::metadata_catalog::{
+    MetadataCatalog, MetadataEntry, MetadataKind, METADATA_STORE_NAME,
+};
 use crate::storage::table::Table;
 use crate::txn::{ActiveWriteUnit, RecoveryUnit, TransactionManager, TxnId, TXN_NONE};
 use crate::WrongoDBError;
@@ -31,7 +33,7 @@ use crate::WrongoDBError;
 pub struct Session {
     base_path: PathBuf,
     table_handles: Arc<HandleCache<String, RwLock<Table>>>,
-    schema_catalog: Arc<SchemaCatalog>,
+    metadata_catalog: Arc<MetadataCatalog>,
     transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
     recovery_unit: Arc<dyn RecoveryUnit>,
@@ -42,7 +44,7 @@ impl Session {
     pub(crate) fn new(
         base_path: PathBuf,
         table_handles: Arc<HandleCache<String, RwLock<Table>>>,
-        schema_catalog: Arc<SchemaCatalog>,
+        metadata_catalog: Arc<MetadataCatalog>,
         transaction_manager: Arc<TransactionManager>,
         durability_backend: Arc<DurabilityBackend>,
     ) -> Self {
@@ -50,7 +52,7 @@ impl Session {
         Self {
             base_path,
             table_handles,
-            schema_catalog,
+            metadata_catalog,
             transaction_manager,
             recovery_unit,
             durability_backend,
@@ -71,15 +73,24 @@ impl Session {
     pub fn create(&mut self, uri: &str) -> Result<(), WrongoDBError> {
         if let Some(collection) = uri.strip_prefix("table:") {
             let store_name = Self::primary_store_name(collection);
-            let _ = self
-                .table_handles
-                .get_or_try_insert_with(store_name, |store_name| {
-                    let path = self.base_path.join(store_name);
-                    Ok(RwLock::new(Table::open_or_create_store(
-                        path,
-                        self.transaction_manager.clone(),
-                    )?))
-                })?;
+            let _ =
+                self.table_handles
+                    .get_or_try_insert_with(store_name.clone(), |store_name| {
+                        let path = self.base_path.join(store_name);
+                        Ok(RwLock::new(Table::open_or_create_store(
+                            path,
+                            self.transaction_manager.clone(),
+                        )?))
+                    })?;
+            let entry = MetadataEntry {
+                uri: uri.to_string(),
+                kind: MetadataKind::Table,
+                source: store_name,
+            };
+            let metadata_catalog = self.metadata_catalog.clone();
+            let mut write_unit = self.transaction()?;
+            metadata_catalog.put_if_absent_in_write_unit(&mut write_unit, entry)?;
+            write_unit.commit()?;
             return Ok(());
         }
 
@@ -135,7 +146,12 @@ impl Session {
     /// It lives on `Session` instead of `Cursor` or `Table` because checkpoint
     /// is not a one-store concern.
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
-        for store_name in self.schema_catalog.all_store_names()? {
+        let mut store_names = self.metadata_catalog.all_sources()?;
+        store_names.push(METADATA_STORE_NAME.to_string());
+        store_names.sort();
+        store_names.dedup();
+
+        for store_name in store_names {
             let table = self
                 .table_handles
                 .get_or_try_insert_with(store_name, |store_name| {
@@ -204,26 +220,23 @@ impl Session {
     }
 
     fn resolve_uri(&self, uri: &str) -> Result<String, WrongoDBError> {
-        if let Some(collection) = uri.strip_prefix("table:") {
-            return Ok(Self::primary_store_name(collection));
+        if !uri.starts_with("table:") && !uri.starts_with("index:") {
+            return Err(StorageError(format!("unsupported URI: {uri}")).into());
         }
 
-        if let Some(rest) = uri.strip_prefix("index:") {
-            let mut parts = rest.splitn(2, ':');
-            let collection = parts.next().unwrap_or("");
-            let index_name = parts.next().unwrap_or("");
-            if collection.is_empty() || index_name.is_empty() {
-                return Err(StorageError(format!("invalid index URI: {uri}")).into());
-            }
-            return self
-                .schema_catalog
-                .collection_schema(collection)?
-                .index_store(index_name)
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| StorageError(format!("unknown index: {uri}")).into());
+        self.metadata_catalog
+            .lookup_source(uri)?
+            .ok_or_else(|| StorageError(format!("unknown URI: {uri}")).into())
+    }
+
+    fn resolve_uri_for_txn(&self, uri: &str, txn_id: TxnId) -> Result<String, WrongoDBError> {
+        if !uri.starts_with("table:") && !uri.starts_with("index:") {
+            return Err(StorageError(format!("unsupported URI: {uri}")).into());
         }
 
-        Err(StorageError(format!("unsupported URI: {uri}")).into())
+        self.metadata_catalog
+            .lookup_source_for_txn(uri, txn_id)?
+            .ok_or_else(|| StorageError(format!("unknown URI: {uri}")).into())
     }
 
     fn primary_store_name(collection: &str) -> String {
@@ -260,7 +273,7 @@ impl<'a> WriteUnitOfWork<'a> {
     /// The duplication is about binding, not behavior: both methods open the
     /// same kind of cursor, but they bind it to different transaction scopes.
     pub fn open_cursor(&mut self, uri: &str) -> Result<Cursor, WrongoDBError> {
-        let store_name = self.session.resolve_uri(uri)?;
+        let store_name = self.session.resolve_uri_for_txn(uri, self.txn_id())?;
         self.session.open_store_cursor_with_access(
             &store_name,
             self.txn_id(),
@@ -382,8 +395,8 @@ mod tests {
     use super::*;
     use crate::durability::{DurabilityBackend, StoreCommandApplier};
     use crate::recovery::recover_from_wal;
-    use crate::schema::SchemaCatalog;
     use crate::storage::handle_cache::HandleCache;
+    use crate::storage::metadata_catalog::MetadataCatalog;
     use crate::storage::table::Table;
     use crate::storage::wal::{GlobalWal, WalFileReader, WalReader, WalRecord};
     use crate::txn::{GlobalTxnState, TransactionManager};
@@ -429,11 +442,15 @@ mod tests {
             let transaction_manager =
                 Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
             let table_handles = Arc::new(HandleCache::<String, RwLock<Table>>::new());
-            let schema_catalog = Arc::new(SchemaCatalog::new(base_path.clone()));
+            let metadata_catalog = Arc::new(MetadataCatalog::new(
+                base_path.clone(),
+                table_handles.clone(),
+                transaction_manager.clone(),
+            ));
             let session = Session::new(
                 base_path,
                 table_handles,
-                schema_catalog,
+                metadata_catalog,
                 transaction_manager,
                 backend,
             );
@@ -556,18 +573,22 @@ mod tests {
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
         let table_handles = Arc::new(HandleCache::<String, RwLock<Table>>::new());
         let backend = Arc::new(DurabilityBackend::open(&base_path, true).unwrap());
-        let schema_catalog = Arc::new(SchemaCatalog::new(base_path.clone()));
+        let metadata_catalog = Arc::new(MetadataCatalog::new(
+            base_path.clone(),
+            table_handles.clone(),
+            transaction_manager.clone(),
+        ));
         let mut session = Session::new(
             base_path.clone(),
             table_handles.clone(),
-            schema_catalog.clone(),
+            metadata_catalog.clone(),
             transaction_manager.clone(),
             backend.clone(),
         );
         let mut checkpoint_session = Session::new(
             base_path,
             table_handles,
-            schema_catalog,
+            metadata_catalog,
             transaction_manager,
             backend,
         );

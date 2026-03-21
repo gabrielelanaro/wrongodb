@@ -73,6 +73,13 @@ impl DocumentQuery {
         collection: &str,
         filter: Option<Value>,
     ) -> Result<Vec<Document>, WrongoDBError> {
+        if !self
+            .schema_catalog
+            .collection_exists_in_txn(collection, write_unit.txn_id())?
+        {
+            return Ok(Vec::new());
+        }
+
         let filter_doc = match filter {
             None => Document::new(),
             Some(value) => {
@@ -117,7 +124,9 @@ impl DocumentQuery {
             });
         }
 
-        let schema = self.schema_catalog.collection_schema(collection)?;
+        let schema = self
+            .schema_catalog
+            .collection_schema_for_txn(collection, write_unit.txn_id())?;
         let indexed_field = filter_doc.keys().find(|key| schema.has_index(key)).cloned();
         if let Some(field) = indexed_field {
             let value = filter_doc.get(&field).expect("field selected from filter");
@@ -196,6 +205,7 @@ mod tests {
     use crate::replication::ReplicationCoordinator;
     use crate::schema::SchemaCatalog;
     use crate::storage::handle_cache::HandleCache;
+    use crate::storage::metadata_catalog::MetadataCatalog;
     use crate::storage::table::Table;
     use crate::store_write_path::StoreWritePath;
     use crate::txn::{GlobalTxnState, TransactionManager};
@@ -215,10 +225,19 @@ mod tests {
             let transaction_manager =
                 Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
             let table_handles = Arc::new(HandleCache::<String, parking_lot::RwLock<Table>>::new());
-            let schema_catalog = Arc::new(SchemaCatalog::new(base_path.clone()));
+            let metadata_catalog = Arc::new(MetadataCatalog::new(
+                base_path.clone(),
+                table_handles.clone(),
+                transaction_manager.clone(),
+            ));
+            let schema_catalog = Arc::new(SchemaCatalog::new(
+                base_path.clone(),
+                metadata_catalog.clone(),
+            ));
             let backend = Arc::new(DurabilityBackend::Disabled);
             let query = DocumentQuery::new(schema_catalog.clone());
             let write_path = CollectionWritePath::new(
+                metadata_catalog.clone(),
                 schema_catalog.clone(),
                 query.clone(),
                 StoreWritePath::new(
@@ -232,7 +251,7 @@ mod tests {
             let session = Session::new(
                 base_path,
                 table_handles,
-                schema_catalog,
+                metadata_catalog,
                 transaction_manager,
                 backend,
             );

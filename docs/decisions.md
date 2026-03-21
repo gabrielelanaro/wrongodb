@@ -1,5 +1,33 @@
 # Decisions
 
+## 2026-03-21: Make `metadata.wt` the storage metadata source of truth while keeping collection semantics in `SchemaCatalog`
+
+**Decision**
+- Add a storage-facing `MetadataCatalog` backed by the reserved
+  `metadata.wt` store.
+- Store one metadata row per logical storage URI:
+  - `table:<collection>`
+  - `index:<collection>:<name>`
+- Make `Session` resolve URIs and enumerate checkpoint stores through
+  `metadata.wt`, not through `SchemaCatalog` or filesystem scans.
+- Keep `SchemaCatalog` collection-shaped and above storage:
+  - collection existence and listing come from `table:` metadata rows
+  - index definitions remain mirrored in the existing file-backed schema format
+    for now
+- Accept the temporary split that metadata rows are committed transactionally in
+  storage, while the file-backed index-definition mirror is written after the
+  storage transaction commits.
+
+**Why**
+- URI-to-store mapping is storage metadata, not collection schema.
+- Moving URI resolution into `metadata.wt` lets the WT-like storage API stop
+  depending on collection semantics.
+- Keeping collection semantics in `SchemaCatalog` preserves the architectural
+  direction that "collection" stays above `Session`.
+- Deferring the file-backed schema mirror to a post-commit step is the smallest
+  incremental path that makes `metadata.wt` authoritative for storage without
+  redesigning higher collection/index APIs in the same patch.
+
 ## 2026-03-21: Make `Connection` own a generic storage handle cache directly
 
 **Decision**

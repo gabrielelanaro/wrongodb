@@ -2,6 +2,7 @@ pub(crate) mod api;
 pub mod block;
 pub mod btree;
 pub(crate) mod handle_cache;
+pub(crate) mod metadata_catalog;
 pub mod mvcc;
 pub mod page_store;
 pub mod table;

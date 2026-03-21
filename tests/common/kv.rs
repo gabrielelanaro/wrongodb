@@ -11,6 +11,7 @@ pub fn insert_kv(
     value: &[u8],
 ) -> Result<(), WrongoDBError> {
     let mut session = conn.open_session();
+    session.create(&table_uri(collection))?;
     let mut write_unit = session.transaction()?;
     insert_kv_in_write_unit(&mut write_unit, collection, key, value)?;
     write_unit.commit()

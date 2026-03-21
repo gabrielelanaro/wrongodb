@@ -11,6 +11,7 @@ use crate::replication::RaftMode;
 use crate::schema::SchemaCatalog;
 use crate::storage::api::session::Session;
 use crate::storage::handle_cache::HandleCache;
+use crate::storage::metadata_catalog::MetadataCatalog;
 use crate::storage::table::Table;
 use crate::storage::wal::{GlobalWal, WalFileReader};
 use crate::txn::{GlobalTxnState, TransactionManager};
@@ -84,6 +85,7 @@ impl ConnectionConfig {
 /// owns request-local state.
 pub struct Connection {
     base_path: PathBuf,
+    metadata_catalog: Arc<MetadataCatalog>,
     schema_catalog: Arc<SchemaCatalog>,
     table_handles: Arc<HandleCache<String, RwLock<Table>>>,
     transaction_manager: Arc<TransactionManager>,
@@ -118,8 +120,16 @@ impl Connection {
 
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let schema_catalog = Arc::new(SchemaCatalog::new(base_path.clone()));
         let table_handles = Arc::new(HandleCache::new());
+        let metadata_catalog = Arc::new(MetadataCatalog::new(
+            base_path.clone(),
+            table_handles.clone(),
+            transaction_manager.clone(),
+        ));
+        let schema_catalog = Arc::new(SchemaCatalog::new(
+            base_path.clone(),
+            metadata_catalog.clone(),
+        ));
         let applier = Arc::new(StoreCommandApplier::new(
             base_path.clone(),
             table_handles.clone(),
@@ -138,6 +148,7 @@ impl Connection {
 
         Ok(Self {
             base_path,
+            metadata_catalog,
             schema_catalog,
             table_handles,
             transaction_manager,
@@ -157,10 +168,14 @@ impl Connection {
         Session::new(
             self.base_path.clone(),
             self.table_handles.clone(),
-            self.schema_catalog.clone(),
+            self.metadata_catalog.clone(),
             self.transaction_manager.clone(),
             self.durability_backend.clone(),
         )
+    }
+
+    pub(crate) fn metadata_catalog(&self) -> Arc<MetadataCatalog> {
+        self.metadata_catalog.clone()
     }
 
     pub(crate) fn schema_catalog(&self) -> Arc<SchemaCatalog> {

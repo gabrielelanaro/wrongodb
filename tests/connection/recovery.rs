@@ -14,6 +14,7 @@ fn global_wal_path(db_dir: &std::path::Path) -> std::path::PathBuf {
 
 fn insert_kv(conn: &Connection, table: &str, key: &[u8], value: &[u8]) {
     let mut session = conn.open_session();
+    session.create(&format!("table:{table}")).unwrap();
     let mut txn = session.transaction().unwrap();
     insert_kv_in_write_unit(&mut txn, table, key, value).unwrap();
     txn.commit().unwrap();
@@ -79,6 +80,7 @@ fn recovery_skips_uncommitted_transaction_writes() {
     {
         let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
         let mut session = conn.open_session();
+        session.create("table:test").unwrap();
 
         let mut txn = session.transaction().unwrap();
         insert_kv_in_write_unit(&mut txn, "test", b"k1", b"a").unwrap();
@@ -102,6 +104,7 @@ fn recovery_skips_explicitly_aborted_transaction_writes() {
     {
         let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
         let mut session = conn.open_session();
+        session.create("table:test").unwrap();
 
         let mut txn = session.transaction().unwrap();
         insert_kv_in_write_unit(&mut txn, "test", b"k1", b"a").unwrap();

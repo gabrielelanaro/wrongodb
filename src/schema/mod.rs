@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::core::errors::StorageError;
+use crate::storage::metadata_catalog::{MetadataCatalog, TABLE_URI_PREFIX};
+use crate::txn::TxnId;
 use crate::WrongoDBError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,30 +21,12 @@ pub(crate) struct IndexDefinition {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CollectionSchema {
-    collection: String,
-    primary_store: String,
     indexes: BTreeMap<String, IndexDefinition>,
 }
 
 impl CollectionSchema {
-    pub(crate) fn primary_store(&self) -> &str {
-        &self.primary_store
-    }
-
-    pub(crate) fn index_names(&self) -> Vec<String> {
-        self.indexes.keys().cloned().collect()
-    }
-
     pub(crate) fn has_index(&self, name: &str) -> bool {
         self.indexes.contains_key(name)
-    }
-
-    pub(crate) fn index_store(&self, name: &str) -> Option<&str> {
-        self.indexes.get(name).map(|def| def.source.as_str())
-    }
-
-    pub(crate) fn index_definitions(&self) -> Vec<IndexDefinition> {
-        self.indexes.values().cloned().collect()
     }
 }
 
@@ -54,61 +39,70 @@ struct CollectionSchemaFile {
 #[derive(Debug, Clone)]
 pub(crate) struct SchemaCatalog {
     base_path: PathBuf,
+    metadata_catalog: Arc<MetadataCatalog>,
 }
 
 impl SchemaCatalog {
-    pub(crate) fn new(base_path: PathBuf) -> Self {
-        Self { base_path }
+    pub(crate) fn new(base_path: PathBuf, metadata_catalog: Arc<MetadataCatalog>) -> Self {
+        Self {
+            base_path,
+            metadata_catalog,
+        }
     }
 
-    pub(crate) fn collection_schema(
+    pub(crate) fn collection_schema_for_txn(
         &self,
         collection: &str,
+        txn_id: TxnId,
     ) -> Result<CollectionSchema, WrongoDBError> {
+        let uri = table_uri(collection);
+        let _primary_store = self
+            .metadata_catalog
+            .lookup_source_for_txn(&uri, txn_id)?
+            .ok_or_else(|| StorageError(format!("unknown collection: {uri}")))?;
         let indexes = self.load_index_definitions(collection)?;
-        Ok(CollectionSchema {
-            collection: collection.to_string(),
-            primary_store: format!("{collection}.main.wt"),
-            indexes,
-        })
+        Ok(CollectionSchema { indexes })
     }
 
     pub(crate) fn list_indexes(&self, collection: &str) -> Result<Vec<String>, WrongoDBError> {
-        Ok(self.collection_schema(collection)?.index_names())
+        Ok(self
+            .load_index_definitions(collection)?
+            .into_keys()
+            .collect::<Vec<_>>())
     }
 
     pub(crate) fn list_collections(&self) -> Result<Vec<String>, WrongoDBError> {
-        let mut names = Vec::new();
-        for entry in fs::read_dir(&self.base_path)? {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let Some(file_name) = file_name.to_str() else {
-                continue;
-            };
-            if let Some(name) = file_name.strip_suffix(".main.wt") {
-                names.push(name.to_string());
-            }
-        }
+        let mut names = self
+            .metadata_catalog
+            .scan_prefix(TABLE_URI_PREFIX)?
+            .into_iter()
+            .filter_map(|entry| entry.uri.strip_prefix(TABLE_URI_PREFIX).map(str::to_string))
+            .collect::<Vec<_>>();
         names.sort();
         names.dedup();
         Ok(names)
     }
 
-    pub(crate) fn all_store_names(&self) -> Result<Vec<String>, WrongoDBError> {
-        let mut names = Vec::new();
-        for entry in fs::read_dir(&self.base_path)? {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let Some(file_name) = file_name.to_str() else {
-                continue;
-            };
-            if file_name.ends_with(".wt") {
-                names.push(file_name.to_string());
-            }
-        }
-        names.sort();
-        names.dedup();
-        Ok(names)
+    pub(crate) fn collection_exists_in_txn(
+        &self,
+        collection: &str,
+        txn_id: TxnId,
+    ) -> Result<bool, WrongoDBError> {
+        let uri = table_uri(collection);
+        Ok(self
+            .metadata_catalog
+            .lookup_source_for_txn(&uri, txn_id)?
+            .is_some())
+    }
+
+    pub(crate) fn index_definitions(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<IndexDefinition>, WrongoDBError> {
+        Ok(self
+            .load_index_definitions(collection)?
+            .into_values()
+            .collect())
     }
 
     pub(crate) fn add_index(
@@ -212,16 +206,46 @@ impl SchemaCatalog {
     }
 }
 
+fn table_uri(collection: &str) -> String {
+    format!("{TABLE_URI_PREFIX}{collection}")
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use parking_lot::RwLock;
     use tempfile::tempdir;
 
     use super::*;
+    use crate::durability::DurabilityBackend;
+    use crate::storage::api::Session;
+    use crate::storage::handle_cache::HandleCache;
+    use crate::storage::metadata_catalog::MetadataCatalog;
+    use crate::storage::table::Table;
+    use crate::txn::{GlobalTxnState, TransactionManager};
 
     #[test]
     fn add_index_persists_and_resolves_store_name() {
         let tmp = tempdir().unwrap();
-        let catalog = SchemaCatalog::new(tmp.path().to_path_buf());
+        let base_path = tmp.path().to_path_buf();
+        let transaction_manager =
+            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+        let table_handles = Arc::new(HandleCache::<String, RwLock<Table>>::new());
+        let metadata_catalog = Arc::new(MetadataCatalog::new(
+            base_path.clone(),
+            table_handles.clone(),
+            transaction_manager.clone(),
+        ));
+        let catalog = SchemaCatalog::new(base_path.clone(), metadata_catalog.clone());
+        let mut session = Session::new(
+            base_path,
+            table_handles,
+            metadata_catalog,
+            transaction_manager,
+            Arc::new(DurabilityBackend::Disabled),
+        );
+        session.create("table:users").unwrap();
 
         assert_eq!(
             catalog
@@ -230,11 +254,7 @@ mod tests {
             Some("users.name.idx.wt".to_string())
         );
         assert_eq!(
-            catalog
-                .collection_schema("users")
-                .unwrap()
-                .index_store("name")
-                .unwrap(),
+            catalog.index_definitions("users").unwrap()[0].source,
             "users.name.idx.wt"
         );
         assert_eq!(
