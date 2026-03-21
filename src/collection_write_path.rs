@@ -479,8 +479,11 @@ mod tests {
     use crate::api::connection::{Connection, ConnectionConfig};
     use crate::collection_write_path::CollectionWritePath;
     use crate::core::bson::{encode_document, encode_id_value};
+    use crate::database_context::DatabaseContext;
     use crate::document_query::DocumentQuery;
-    use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp};
+    use crate::durability::{
+        DurabilityBackend, DurabilityGuarantee, DurableOp, StoreCommandApplier,
+    };
     use crate::replication::{RaftMode, RaftPeerConfig, ReplicationCoordinator, WritePathMode};
     use crate::schema::SchemaCatalog;
     use crate::storage::table_cache::TableCache;
@@ -589,32 +592,31 @@ mod tests {
     #[test]
     fn clustered_collection_write_path_rejects_writes_when_not_leader() {
         let dir = tempdir().unwrap();
-        let conn = Connection::open(
-            dir.path(),
-            ConnectionConfig::new(
-                true,
-                RaftMode::Cluster {
-                    local_node_id: "n1".to_string(),
-                    local_raft_addr: free_local_addr(),
-                    peers: vec![RaftPeerConfig {
-                        node_id: "n2".to_string(),
-                        raft_addr: free_local_addr(),
-                    }],
-                },
-            ),
-        );
+        let raft_mode = RaftMode::Cluster {
+            local_node_id: "n1".to_string(),
+            local_raft_addr: free_local_addr(),
+            peers: vec![RaftPeerConfig {
+                node_id: "n2".to_string(),
+                raft_addr: free_local_addr(),
+            }],
+        };
+        let conn = Connection::open(dir.path(), ConnectionConfig::new(true, raft_mode.clone()));
         let conn = Arc::new(conn.unwrap());
-        let document_query = DocumentQuery::new(conn.schema_catalog());
-        let service = CollectionWritePath::new(
-            conn.schema_catalog(),
-            document_query,
-            StoreWritePath::new(
-                conn.table_cache(),
-                conn.durability_backend(),
-                conn.replication_coordinator(),
-            ),
+        let replication_coordinator = Arc::new(
+            ReplicationCoordinator::open(
+                dir.path(),
+                true,
+                Arc::new(StoreCommandApplier::new(
+                    conn.table_cache(),
+                    conn.transaction_manager(),
+                )),
+                raft_mode,
+            )
+            .unwrap(),
         );
-        let mut session = conn.open_session();
+        let db = DatabaseContext::new(conn, replication_coordinator);
+        let service = db.collection_write_path();
+        let mut session = db.connection().open_session();
 
         let err = service
             .insert_one(&mut session, "items", json!({"_id": "k1", "value": "v1"}))

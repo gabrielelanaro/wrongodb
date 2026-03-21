@@ -17,12 +17,17 @@ async fn test_mongo_client_connection() {
     // Start server in background
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("test_server.db");
-    let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+    let config = ConnectionConfig::default();
+    let conn = Connection::open(&db_path, config.clone()).unwrap();
     let conn = Arc::new(conn);
 
+    let db_path_clone = db_path.clone();
+    let config_clone = config.clone();
     let conn_clone = Arc::clone(&conn);
     tokio::spawn(async move {
-        start_server("127.0.0.1:27018", conn_clone).await.unwrap();
+        start_server("127.0.0.1:27018", &db_path_clone, conn_clone, config_clone)
+            .await
+            .unwrap();
     });
 
     // Wait a bit
@@ -95,12 +100,17 @@ async fn test_mongo_client_connection() {
 async fn test_supported_mongosh_commands() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("test_shell.db");
-    let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+    let config = ConnectionConfig::default();
+    let conn = Connection::open(&db_path, config.clone()).unwrap();
     let conn = Arc::new(conn);
 
+    let db_path_clone = db_path.clone();
+    let config_clone = config.clone();
     let conn_clone = Arc::clone(&conn);
     tokio::spawn(async move {
-        start_server("127.0.0.1:27019", conn_clone).await.unwrap();
+        start_server("127.0.0.1:27019", &db_path_clone, conn_clone, config_clone)
+            .await
+            .unwrap();
     });
 
     crate::common::wait_for_server().await;
@@ -213,12 +223,16 @@ async fn test_non_leader_mode_rejects_writes_but_keeps_connection_alive() {
             }],
         },
     );
-    let conn = Connection::open(&db_path, cfg).unwrap();
+    let conn = Connection::open(&db_path, cfg.clone()).unwrap();
     let conn = Arc::new(conn);
 
+    let db_path_clone = db_path.clone();
+    let cfg_clone = cfg.clone();
     let conn_clone = Arc::clone(&conn);
     tokio::spawn(async move {
-        start_server("127.0.0.1:27020", conn_clone).await.unwrap();
+        start_server("127.0.0.1:27020", &db_path_clone, conn_clone, cfg_clone)
+            .await
+            .unwrap();
     });
 
     crate::common::wait_for_server().await;

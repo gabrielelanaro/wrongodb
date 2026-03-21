@@ -2,6 +2,7 @@ mod commands;
 
 use std::collections::HashMap;
 use std::io::{self, Cursor};
+use std::path::Path;
 use std::sync::Arc;
 
 use bson::{doc, Bson, Document};
@@ -13,7 +14,9 @@ use tokio::net::{TcpListener, TcpStream};
 use self::commands::handlers::crud::{bson_to_value, value_to_bson};
 use self::commands::CommandRegistry;
 use crate::database_context::DatabaseContext;
-use crate::{Connection, WrongoDBError};
+use crate::durability::StoreCommandApplier;
+use crate::replication::ReplicationCoordinator;
+use crate::{Connection, ConnectionConfig, WrongoDBError};
 
 const OP_MSG: i32 = 2013;
 const OP_QUERY: i32 = 2004;
@@ -49,10 +52,22 @@ impl MsgHeader {
 
 pub async fn start_server(
     addr: &str,
+    db_path: &Path,
     conn: Arc<Connection>,
+    config: ConnectionConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
-    let db = Arc::new(DatabaseContext::new(conn));
+    let applier = Arc::new(StoreCommandApplier::new(
+        conn.table_cache(),
+        conn.transaction_manager(),
+    ));
+    let replication_coordinator = Arc::new(ReplicationCoordinator::open(
+        db_path,
+        config.wal_enabled,
+        applier,
+        config.raft_mode,
+    )?);
+    let db = Arc::new(DatabaseContext::new(conn, replication_coordinator));
     let registry = Arc::new(CommandRegistry::new());
     println!("Server listening on {}", addr);
 

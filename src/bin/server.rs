@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use wrongodb::{start_server, Connection, ConnectionConfig, RaftMode, RaftPeerConfig};
@@ -205,9 +206,11 @@ fn raft_mode(parsed: &ParsedArgs) -> Result<RaftMode, Box<dyn std::error::Error>
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parsed = parse_args();
     let mode = raft_mode(&parsed)?;
-    let conn = Connection::open(db_path(&parsed), ConnectionConfig::new(true, mode))?;
+    let path = db_path(&parsed);
+    let config = ConnectionConfig::new(true, mode);
+    let conn = Connection::open(&path, config.clone())?;
     let conn = Arc::new(conn);
     let addr = server_addr(&parsed);
-    start_server(&addr, conn).await?;
+    start_server(&addr, Path::new(&path), conn, config).await?;
     Ok(())
 }

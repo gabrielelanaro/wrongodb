@@ -1,5 +1,29 @@
 # Decisions
 
+## 2026-03-21: Move replication runtime ownership out of `Connection` and into `DatabaseContext`
+
+**Decision**
+- Remove the live `ReplicationCoordinator` from `Connection`.
+- Keep `Connection` responsible for shared storage-engine state:
+  - `SchemaCatalog`
+  - `TableCache`
+  - `TransactionManager`
+  - local `DurabilityBackend`
+  - `Session` creation
+- Make `DatabaseContext` own the replication runtime it needs for:
+  - hello/isWritablePrimary state
+  - deferred replicated write-path coordination
+- Build the `ReplicationCoordinator` at the server/bootstrap layer and inject it
+  into `DatabaseContext`.
+
+**Why**
+- A WT-like `Connection` should not own request-path replication policy or
+  protocol-facing topology state.
+- `ReplicationCoordinator` is part of the database/server layer, not the storage
+  session layer.
+- Building replication from startup inputs at the composition root removes the
+  need for `Connection` to leak base path or replication mode back upward.
+
 ## 2026-03-20: Keep `Session` WT-like and move replicated commit coordination above storage
 
 **Decision**
