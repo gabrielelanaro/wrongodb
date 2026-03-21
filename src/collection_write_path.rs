@@ -8,7 +8,7 @@ use crate::core::errors::DocumentValidationError;
 use crate::document_query::DocumentQuery;
 use crate::index::encode_index_key;
 use crate::schema::SchemaCatalog;
-use crate::storage::api::{Session, WriteUnitOfWork};
+use crate::storage::api::Session;
 use crate::storage::metadata_catalog::{table_uri, MetadataCatalog};
 use crate::{Document, WrongoDBError};
 
@@ -44,8 +44,8 @@ impl CollectionWritePath {
         collection: &str,
         doc: Value,
     ) -> Result<Document, WrongoDBError> {
-        self.run_in_write_unit(session, |this, write_unit| {
-            this.insert_one_in_write_unit(write_unit, collection, doc)
+        self.run_in_transaction(session, |this, session| {
+            this.insert_one_in_transaction(session, collection, doc)
         })
     }
 
@@ -56,8 +56,8 @@ impl CollectionWritePath {
         filter: Option<Value>,
         update: Value,
     ) -> Result<UpdateResult, WrongoDBError> {
-        self.run_in_write_unit(session, |this, write_unit| {
-            this.update_one_in_write_unit(write_unit, collection, filter, update)
+        self.run_in_transaction(session, |this, session| {
+            this.update_one_in_transaction(session, collection, filter, update)
         })
     }
 
@@ -68,8 +68,8 @@ impl CollectionWritePath {
         filter: Option<Value>,
         update: Value,
     ) -> Result<UpdateResult, WrongoDBError> {
-        self.run_in_write_unit(session, |this, write_unit| {
-            this.update_many_in_write_unit(write_unit, collection, filter, update)
+        self.run_in_transaction(session, |this, session| {
+            this.update_many_in_transaction(session, collection, filter, update)
         })
     }
 
@@ -79,8 +79,8 @@ impl CollectionWritePath {
         collection: &str,
         filter: Option<Value>,
     ) -> Result<usize, WrongoDBError> {
-        self.run_in_write_unit(session, |this, write_unit| {
-            this.delete_one_in_write_unit(write_unit, collection, filter)
+        self.run_in_transaction(session, |this, session| {
+            this.delete_one_in_transaction(session, collection, filter)
         })
     }
 
@@ -90,8 +90,8 @@ impl CollectionWritePath {
         collection: &str,
         filter: Option<Value>,
     ) -> Result<usize, WrongoDBError> {
-        self.run_in_write_unit(session, |this, write_unit| {
-            this.delete_many_in_write_unit(write_unit, collection, filter)
+        self.run_in_transaction(session, |this, session| {
+            this.delete_many_in_transaction(session, collection, filter)
         })
     }
 
@@ -101,8 +101,8 @@ impl CollectionWritePath {
         collection: &str,
         field: &str,
     ) -> Result<(), WrongoDBError> {
-        self.run_in_write_unit(session, |this, write_unit| {
-            this.create_index_in_write_unit(write_unit, collection, field)
+        self.run_in_transaction(session, |this, session| {
+            this.create_index_in_transaction(session, collection, field)
         })?;
         let _ = self
             .schema_catalog
@@ -110,9 +110,9 @@ impl CollectionWritePath {
         Ok(())
     }
 
-    pub(crate) fn insert_one_in_write_unit(
+    pub(crate) fn insert_one_in_transaction(
         &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
+        session: &mut Session,
         collection: &str,
         doc: Value,
     ) -> Result<Document, WrongoDBError> {
@@ -125,21 +125,21 @@ impl CollectionWritePath {
             .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
         let key = encode_id_value(id)?;
         let value = encode_document(&obj)?;
-        let primary_uri = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
-        self.insert_record(write_unit, &primary_uri, &key, &value)?;
+        let primary_uri = self.ensure_table_registered_in_transaction(session, collection)?;
+        self.insert_record(session, &primary_uri, &key, &value)?;
         Ok(obj)
     }
 
-    pub(crate) fn update_one_in_write_unit(
+    pub(crate) fn update_one_in_transaction(
         &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
+        session: &mut Session,
         collection: &str,
         filter: Option<Value>,
         update: Value,
     ) -> Result<UpdateResult, WrongoDBError> {
         let docs = self
             .document_query
-            .find_in_write_unit(write_unit, collection, filter)?;
+            .find_in_transaction(session, collection, filter)?;
         if docs.is_empty() {
             return Ok(UpdateResult {
                 matched: 0,
@@ -154,8 +154,8 @@ impl CollectionWritePath {
             .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
         let key = encode_id_value(id)?;
         let value = encode_document(&updated_doc)?;
-        let primary_uri = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
-        self.update_record(write_unit, &primary_uri, &key, &value)?;
+        let primary_uri = self.ensure_table_registered_in_transaction(session, collection)?;
+        self.update_record(session, &primary_uri, &key, &value)?;
 
         Ok(UpdateResult {
             matched: 1,
@@ -163,16 +163,16 @@ impl CollectionWritePath {
         })
     }
 
-    pub(crate) fn update_many_in_write_unit(
+    pub(crate) fn update_many_in_transaction(
         &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
+        session: &mut Session,
         collection: &str,
         filter: Option<Value>,
         update: Value,
     ) -> Result<UpdateResult, WrongoDBError> {
         let docs = self
             .document_query
-            .find_in_write_unit(write_unit, collection, filter)?;
+            .find_in_transaction(session, collection, filter)?;
         if docs.is_empty() {
             return Ok(UpdateResult {
                 matched: 0,
@@ -180,7 +180,7 @@ impl CollectionWritePath {
             });
         }
 
-        let primary_uri = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
+        let primary_uri = self.ensure_table_registered_in_transaction(session, collection)?;
         let mut modified = 0;
         for doc in docs {
             let updated_doc = apply_update(&doc, &update)?;
@@ -189,7 +189,7 @@ impl CollectionWritePath {
                 .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
             let key = encode_id_value(id)?;
             let value = encode_document(&updated_doc)?;
-            self.update_record(write_unit, &primary_uri, &key, &value)?;
+            self.update_record(session, &primary_uri, &key, &value)?;
             modified += 1;
         }
 
@@ -199,15 +199,15 @@ impl CollectionWritePath {
         })
     }
 
-    pub(crate) fn delete_one_in_write_unit(
+    pub(crate) fn delete_one_in_transaction(
         &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
+        session: &mut Session,
         collection: &str,
         filter: Option<Value>,
     ) -> Result<usize, WrongoDBError> {
         let docs = self
             .document_query
-            .find_in_write_unit(write_unit, collection, filter)?;
+            .find_in_transaction(session, collection, filter)?;
         if docs.is_empty() {
             return Ok(0);
         }
@@ -217,48 +217,48 @@ impl CollectionWritePath {
             return Ok(0);
         };
         let key = encode_id_value(id)?;
-        let primary_uri = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
-        self.delete_record(write_unit, &primary_uri, &key)?;
+        let primary_uri = self.ensure_table_registered_in_transaction(session, collection)?;
+        self.delete_record(session, &primary_uri, &key)?;
         Ok(1)
     }
 
-    pub(crate) fn delete_many_in_write_unit(
+    pub(crate) fn delete_many_in_transaction(
         &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
+        session: &mut Session,
         collection: &str,
         filter: Option<Value>,
     ) -> Result<usize, WrongoDBError> {
         let docs = self
             .document_query
-            .find_in_write_unit(write_unit, collection, filter)?;
+            .find_in_transaction(session, collection, filter)?;
         if docs.is_empty() {
             return Ok(0);
         }
 
-        let primary_uri = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
+        let primary_uri = self.ensure_table_registered_in_transaction(session, collection)?;
         let mut deleted = 0;
         for doc in docs {
             let Some(id) = doc.get("_id") else {
                 continue;
             };
             let key = encode_id_value(id)?;
-            self.delete_record(write_unit, &primary_uri, &key)?;
+            self.delete_record(session, &primary_uri, &key)?;
             deleted += 1;
         }
 
         Ok(deleted)
     }
 
-    pub(crate) fn create_index_in_write_unit(
+    pub(crate) fn create_index_in_transaction(
         &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
+        session: &mut Session,
         collection: &str,
         field: &str,
     ) -> Result<(), WrongoDBError> {
-        self.ensure_table_registered_in_write_unit(write_unit, collection)?;
+        self.ensure_table_registered_in_transaction(session, collection)?;
 
-        let (index_uri, inserted) = self.metadata_catalog.ensure_index_uri_in_write_unit(
-            write_unit,
+        let (index_uri, inserted) = self.metadata_catalog.ensure_index_uri_in_transaction(
+            session,
             collection,
             field,
             vec![field.to_string()],
@@ -267,7 +267,7 @@ impl CollectionWritePath {
             return Ok(());
         }
 
-        let mut primary_cursor = write_unit.open_cursor(&table_uri(collection))?;
+        let mut primary_cursor = session.open_cursor(&table_uri(collection))?;
 
         while let Some((_, bytes)) = primary_cursor.next()? {
             let doc = decode_document(&bytes)?;
@@ -280,7 +280,7 @@ impl CollectionWritePath {
             let Some(key) = encode_index_key(value, id)? else {
                 continue;
             };
-            write_unit.raw_insert(&index_uri, &key, &[])?;
+            session.raw_insert(&index_uri, &key, &[])?;
         }
 
         Ok(())
@@ -288,61 +288,50 @@ impl CollectionWritePath {
 
     fn insert_record(
         &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
+        session: &mut Session,
         uri: &str,
         key: &[u8],
         value: &[u8],
     ) -> Result<(), WrongoDBError> {
-        let mut cursor = write_unit.open_cursor(uri)?;
+        let mut cursor = session.open_cursor(uri)?;
         cursor.insert(key, value)
     }
 
     fn update_record(
         &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
+        session: &mut Session,
         uri: &str,
         key: &[u8],
         value: &[u8],
     ) -> Result<(), WrongoDBError> {
-        let mut cursor = write_unit.open_cursor(uri)?;
+        let mut cursor = session.open_cursor(uri)?;
         cursor.update(key, value)
     }
 
     fn delete_record(
         &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
+        session: &mut Session,
         uri: &str,
         key: &[u8],
     ) -> Result<(), WrongoDBError> {
-        let mut cursor = write_unit.open_cursor(uri)?;
+        let mut cursor = session.open_cursor(uri)?;
         cursor.delete(key)
     }
 
-    fn ensure_table_registered_in_write_unit(
+    fn ensure_table_registered_in_transaction(
         &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
+        session: &mut Session,
         collection: &str,
     ) -> Result<String, WrongoDBError> {
         self.metadata_catalog
-            .ensure_table_uri_in_write_unit(write_unit, collection)
+            .ensure_table_uri_in_transaction(session, collection)
     }
 
-    fn run_in_write_unit<R, F>(&self, session: &mut Session, f: F) -> Result<R, WrongoDBError>
+    fn run_in_transaction<R, F>(&self, session: &mut Session, f: F) -> Result<R, WrongoDBError>
     where
-        F: FnOnce(&Self, &mut WriteUnitOfWork<'_>) -> Result<R, WrongoDBError>,
+        F: FnOnce(&Self, &mut Session) -> Result<R, WrongoDBError>,
     {
-        let mut write_unit = session.transaction()?;
-        let result = f(self, &mut write_unit);
-        match result {
-            Ok(value) => {
-                write_unit.commit()?;
-                Ok(value)
-            }
-            Err(err) => {
-                let _ = write_unit.abort();
-                Err(err)
-            }
-        }
+        session.with_transaction(|session| f(self, session))
     }
 }
 
@@ -536,10 +525,13 @@ mod tests {
             .unwrap();
         service.create_index(&mut session, "users", "name").unwrap();
 
-        let mut wuow = session.transaction().unwrap();
-        let rows = wuow.raw_scan_range("index:users:name", None, None).unwrap();
-        assert!(!rows.is_empty());
-        wuow.commit().unwrap();
+        session
+            .with_transaction(|session| {
+                let rows = session.raw_scan_range("index:users:name", None, None)?;
+                assert!(!rows.is_empty());
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
@@ -606,15 +598,15 @@ mod tests {
     }
 
     #[test]
-    fn failing_write_unit_aborts_changes() {
+    fn failing_transaction_aborts_changes() {
         let tmp = tempdir().unwrap();
         let (service, query, mut session) =
             test_services(tmp.path().to_path_buf(), DurabilityBackend::Disabled);
 
         let err = service
-            .run_in_write_unit(&mut session, |this, write_unit| {
-                this.insert_one_in_write_unit(
-                    write_unit,
+            .run_in_transaction(&mut session, |this, session| {
+                this.insert_one_in_transaction(
+                    session,
                     "items",
                     json!({"_id": "abort-me", "value": "v1"}),
                 )?;

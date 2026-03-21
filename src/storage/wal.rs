@@ -4,7 +4,7 @@
 
 const GLOBAL_WAL_FILE_NAME: &str = "global.wal";
 const WAL_MAGIC: &[u8; 8] = b"WALG001\0";
-const WAL_VERSION: u16 = 4;
+const WAL_VERSION: u16 = 5;
 const WAL_HEADER_SIZE: usize = 512;
 const RECORD_HEADER_SIZE: usize = 26;
 
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use crc32fast::Hasher;
 
 use crate::core::errors::{StorageError, WrongoDBError};
-use crate::txn::{Timestamp, TxnId};
+use crate::txn::{Timestamp, TxnId, TxnLogOp};
 
 /// Log Sequence Number - uniquely identifies a position in the WAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -32,35 +32,19 @@ pub struct Lsn {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WalRecordType {
-    Put = 1,
-    Delete = 2,
-    Checkpoint = 3,
-    TxnCommit = 4,
-    TxnAbort = 5,
+    TxnCommit = 1,
+    Checkpoint = 2,
 }
 
 /// Global WAL record containing logical operation data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalRecord {
-    Put {
-        uri: String,
-        key: Vec<u8>,
-        value: Vec<u8>,
-        txn_id: TxnId,
-    },
-    Delete {
-        uri: String,
-        key: Vec<u8>,
-        txn_id: TxnId,
-    },
-    Checkpoint,
     TxnCommit {
         txn_id: TxnId,
         commit_ts: Timestamp,
+        ops: Vec<TxnLogOp>,
     },
-    TxnAbort {
-        txn_id: TxnId,
-    },
+    Checkpoint,
 }
 
 /// WAL record header - precedes each record in the WAL.
@@ -165,11 +149,8 @@ impl TryFrom<u8> for WalRecordType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            1 => Ok(Self::Put),
-            2 => Ok(Self::Delete),
-            3 => Ok(Self::Checkpoint),
-            4 => Ok(Self::TxnCommit),
-            5 => Ok(Self::TxnAbort),
+            1 => Ok(Self::TxnCommit),
+            2 => Ok(Self::Checkpoint),
             _ => Err(StorageError(format!("invalid WAL record type: {value}")).into()),
         }
     }
@@ -182,11 +163,8 @@ impl TryFrom<u8> for WalRecordType {
 impl WalRecord {
     pub fn record_type(&self) -> WalRecordType {
         match self {
-            WalRecord::Put { .. } => WalRecordType::Put,
-            WalRecord::Delete { .. } => WalRecordType::Delete,
-            WalRecord::Checkpoint => WalRecordType::Checkpoint,
             WalRecord::TxnCommit { .. } => WalRecordType::TxnCommit,
-            WalRecord::TxnAbort { .. } => WalRecordType::TxnAbort,
+            WalRecord::Checkpoint => WalRecordType::Checkpoint,
         }
     }
 
@@ -194,30 +172,19 @@ impl WalRecord {
         let mut buf = Vec::new();
 
         match self {
-            WalRecord::Put {
-                uri,
-                key,
-                value,
+            WalRecord::TxnCommit {
                 txn_id,
+                commit_ts,
+                ops,
             } => {
                 buf.extend_from_slice(&txn_id.to_le_bytes());
-                serialize_string(&mut buf, uri);
-                serialize_bytes(&mut buf, key);
-                serialize_bytes(&mut buf, value);
-            }
-            WalRecord::Delete { uri, key, txn_id } => {
-                buf.extend_from_slice(&txn_id.to_le_bytes());
-                serialize_string(&mut buf, uri);
-                serialize_bytes(&mut buf, key);
+                buf.extend_from_slice(&commit_ts.to_le_bytes());
+                buf.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+                for op in ops {
+                    serialize_log_op(&mut buf, op);
+                }
             }
             WalRecord::Checkpoint => {}
-            WalRecord::TxnCommit { txn_id, commit_ts } => {
-                buf.extend_from_slice(&txn_id.to_le_bytes());
-                buf.extend_from_slice(&commit_ts.to_le_bytes());
-            }
-            WalRecord::TxnAbort { txn_id } => {
-                buf.extend_from_slice(&txn_id.to_le_bytes());
-            }
         }
 
         buf
@@ -240,34 +207,21 @@ impl WalRecord {
         };
 
         match record_type {
-            WalRecordType::Put => {
-                let txn_id = read_u64(data, &mut cursor)?;
-                let uri = deserialize_string(data, &mut cursor)?;
-                let key = deserialize_bytes(data, &mut cursor)?;
-                let value = deserialize_bytes(data, &mut cursor)?;
-                Ok(WalRecord::Put {
-                    uri,
-                    key,
-                    value,
-                    txn_id,
-                })
-            }
-            WalRecordType::Delete => {
-                let txn_id = read_u64(data, &mut cursor)?;
-                let uri = deserialize_string(data, &mut cursor)?;
-                let key = deserialize_bytes(data, &mut cursor)?;
-                Ok(WalRecord::Delete { uri, key, txn_id })
-            }
-            WalRecordType::Checkpoint => Ok(WalRecord::Checkpoint),
             WalRecordType::TxnCommit => {
                 let txn_id = read_u64(data, &mut cursor)?;
                 let commit_ts = read_u64(data, &mut cursor)?;
-                Ok(WalRecord::TxnCommit { txn_id, commit_ts })
+                let ops_len = read_u32(data, &mut cursor)? as usize;
+                let mut ops = Vec::with_capacity(ops_len);
+                for _ in 0..ops_len {
+                    ops.push(deserialize_log_op(data, &mut cursor)?);
+                }
+                Ok(WalRecord::TxnCommit {
+                    txn_id,
+                    commit_ts,
+                    ops,
+                })
             }
-            WalRecordType::TxnAbort => {
-                let txn_id = read_u64(data, &mut cursor)?;
-                Ok(WalRecord::TxnAbort { txn_id })
-            }
+            WalRecordType::Checkpoint => Ok(WalRecord::Checkpoint),
         }
     }
 }
@@ -554,35 +508,13 @@ impl GlobalWal {
     // Logging Operations
     // ------------------------------------------------------------------------
 
-    pub fn log_put(
-        &mut self,
-        uri: &str,
-        key: &[u8],
-        value: &[u8],
-        txn_id: TxnId,
-    ) -> Result<Lsn, WrongoDBError> {
-        self.file.log_put(uri, key, value, txn_id)
-    }
-
-    pub fn log_delete(
-        &mut self,
-        uri: &str,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<Lsn, WrongoDBError> {
-        self.file.log_delete(uri, key, txn_id)
-    }
-
     pub fn log_txn_commit(
         &mut self,
         txn_id: TxnId,
         commit_ts: Timestamp,
+        ops: &[TxnLogOp],
     ) -> Result<Lsn, WrongoDBError> {
-        self.file.log_txn_commit(txn_id, commit_ts)
-    }
-
-    pub fn log_txn_abort(&mut self, txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
-        self.file.log_txn_abort(txn_id)
+        self.file.log_txn_commit(txn_id, commit_ts, ops)
     }
 
     pub fn log_checkpoint(&mut self) -> Result<Lsn, WrongoDBError> {
@@ -867,39 +799,17 @@ impl WalFile {
     // Logging Operations
     // ------------------------------------------------------------------------
 
-    fn log_put(
-        &mut self,
-        uri: &str,
-        key: &[u8],
-        value: &[u8],
-        txn_id: TxnId,
-    ) -> Result<Lsn, WrongoDBError> {
-        self.append_record(WalRecord::Put {
-            uri: uri.to_string(),
-            key: key.to_vec(),
-            value: value.to_vec(),
-            txn_id,
-        })
-    }
-
-    fn log_delete(&mut self, uri: &str, key: &[u8], txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
-        self.append_record(WalRecord::Delete {
-            uri: uri.to_string(),
-            key: key.to_vec(),
-            txn_id,
-        })
-    }
-
     fn log_txn_commit(
         &mut self,
         txn_id: TxnId,
         commit_ts: Timestamp,
+        ops: &[TxnLogOp],
     ) -> Result<Lsn, WrongoDBError> {
-        self.append_record(WalRecord::TxnCommit { txn_id, commit_ts })
-    }
-
-    fn log_txn_abort(&mut self, txn_id: TxnId) -> Result<Lsn, WrongoDBError> {
-        self.append_record(WalRecord::TxnAbort { txn_id })
+        self.append_record(WalRecord::TxnCommit {
+            txn_id,
+            commit_ts,
+            ops: ops.to_vec(),
+        })
     }
 
     fn log_checkpoint(&mut self) -> Result<Lsn, WrongoDBError> {
@@ -985,6 +895,22 @@ fn serialize_string(buf: &mut Vec<u8>, value: &str) {
     buf.extend_from_slice(bytes);
 }
 
+fn serialize_log_op(buf: &mut Vec<u8>, op: &TxnLogOp) {
+    match op {
+        TxnLogOp::Put { uri, key, value } => {
+            buf.push(1);
+            serialize_string(buf, uri);
+            serialize_bytes(buf, key);
+            serialize_bytes(buf, value);
+        }
+        TxnLogOp::Delete { uri, key } => {
+            buf.push(2);
+            serialize_string(buf, uri);
+            serialize_bytes(buf, key);
+        }
+    }
+}
+
 fn deserialize_string(data: &[u8], cursor: &mut usize) -> Result<String, WrongoDBError> {
     let bytes = deserialize_bytes(data, cursor)?;
     String::from_utf8(bytes)
@@ -994,6 +920,19 @@ fn deserialize_string(data: &[u8], cursor: &mut usize) -> Result<String, WrongoD
 fn serialize_bytes(buf: &mut Vec<u8>, value: &[u8]) {
     buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
     buf.extend_from_slice(value);
+}
+
+fn read_u32(data: &[u8], cursor: &mut usize) -> Result<u32, WrongoDBError> {
+    if *cursor + 4 > data.len() {
+        return Err(StorageError("unexpected EOF reading u32".into()).into());
+    }
+    let out = u32::from_le_bytes(
+        data[*cursor..*cursor + 4]
+            .try_into()
+            .map_err(|_| StorageError("invalid u32 encoding".into()))?,
+    );
+    *cursor += 4;
+    Ok(out)
 }
 
 fn deserialize_bytes(data: &[u8], cursor: &mut usize) -> Result<Vec<u8>, WrongoDBError> {
@@ -1012,6 +951,30 @@ fn deserialize_bytes(data: &[u8], cursor: &mut usize) -> Result<Vec<u8>, WrongoD
     let out = data[*cursor..*cursor + len].to_vec();
     *cursor += len;
     Ok(out)
+}
+
+fn deserialize_log_op(data: &[u8], cursor: &mut usize) -> Result<TxnLogOp, WrongoDBError> {
+    if *cursor >= data.len() {
+        return Err(StorageError("unexpected EOF reading txn log op type".into()).into());
+    }
+
+    let op_type = data[*cursor];
+    *cursor += 1;
+
+    match op_type {
+        1 => {
+            let uri = deserialize_string(data, cursor)?;
+            let key = deserialize_bytes(data, cursor)?;
+            let value = deserialize_bytes(data, cursor)?;
+            Ok(TxnLogOp::Put { uri, key, value })
+        }
+        2 => {
+            let uri = deserialize_string(data, cursor)?;
+            let key = deserialize_bytes(data, cursor)?;
+            Ok(TxnLogOp::Delete { uri, key })
+        }
+        _ => Err(StorageError(format!("invalid txn log op type: {op_type}")).into()),
+    }
 }
 
 fn scan_wal_tail(path: &Path) -> Result<(Lsn, u64, Option<String>), WrongoDBError> {
@@ -1069,30 +1032,36 @@ mod tests {
 
     #[test]
     fn wal_record_round_trip() {
-        let input = WalRecord::Put {
-            uri: "table:users".to_string(),
-            key: b"k".to_vec(),
-            value: b"v".to_vec(),
+        let input = WalRecord::TxnCommit {
             txn_id: 42,
+            commit_ts: 42,
+            ops: vec![TxnLogOp::Put {
+                uri: "table:users".to_string(),
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }],
         };
 
         let payload = input.serialize_payload();
-        let out = WalRecord::deserialize_payload(WalRecordType::Put, &payload).unwrap();
+        let out = WalRecord::deserialize_payload(WalRecordType::TxnCommit, &payload).unwrap();
 
         assert_eq!(input, out);
     }
 
     #[test]
     fn wal_record_round_trip_reserved_metadata_uri() {
-        let input = WalRecord::Put {
-            uri: "metadata:".to_string(),
-            key: b"table:users".to_vec(),
-            value: b"metadata-row".to_vec(),
+        let input = WalRecord::TxnCommit {
             txn_id: 42,
+            commit_ts: 42,
+            ops: vec![TxnLogOp::Put {
+                uri: "metadata:".to_string(),
+                key: b"table:users".to_vec(),
+                value: b"metadata-row".to_vec(),
+            }],
         };
 
         let payload = input.serialize_payload();
-        let out = WalRecord::deserialize_payload(WalRecordType::Put, &payload).unwrap();
+        let out = WalRecord::deserialize_payload(WalRecordType::TxnCommit, &payload).unwrap();
 
         assert_eq!(input, out);
     }
@@ -1100,7 +1069,7 @@ mod tests {
     #[test]
     fn wal_record_header_round_trip_preserves_lsn_chain() {
         let input = WalRecordHeader {
-            record_type: WalRecordType::Put as u8,
+            record_type: WalRecordType::TxnCommit as u8,
             flags: 1,
             payload_len: 77,
             lsn: Lsn::new(0, 4096),
@@ -1119,8 +1088,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
 
-        wal.log_put("table:users", b"k1", b"v1", 1).unwrap();
-        wal.log_txn_commit(1, 1).unwrap();
+        wal.log_txn_commit(
+            1,
+            1,
+            &[TxnLogOp::Put {
+                uri: "table:users".to_string(),
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+            }],
+        )
+        .unwrap();
         wal.sync().unwrap();
 
         let mut reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
@@ -1129,16 +1106,21 @@ mod tests {
         assert_eq!(header.prev_lsn, Lsn::new(0, 0));
 
         match record {
-            WalRecord::Put {
-                uri,
-                key,
-                value,
+            WalRecord::TxnCommit {
                 txn_id,
+                commit_ts,
+                ops,
             } => {
-                assert_eq!(uri, "table:users");
-                assert_eq!(key, b"k1");
-                assert_eq!(value, b"v1");
                 assert_eq!(txn_id, 1);
+                assert_eq!(commit_ts, 1);
+                assert_eq!(
+                    ops,
+                    vec![TxnLogOp::Put {
+                        uri: "table:users".to_string(),
+                        key: b"k1".to_vec(),
+                        value: b"v1".to_vec(),
+                    }]
+                );
             }
             other => panic!("unexpected record: {other:?}"),
         }
@@ -1149,7 +1131,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let wal_path = GlobalWal::path_for_db(dir.path());
         let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
-        wal.log_put("table:users", b"k1", b"v1", 1).unwrap();
+        wal.log_txn_commit(
+            1,
+            1,
+            &[TxnLogOp::Put {
+                uri: "table:users".to_string(),
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+            }],
+        )
+        .unwrap();
         wal.sync().unwrap();
 
         let mut file = OpenOptions::new()
@@ -1172,9 +1163,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
 
-        wal.log_put("table:users", b"k1", b"v1", 1).unwrap();
-        wal.log_delete("table:users", b"k1", 1).unwrap();
-        wal.log_txn_commit(1, 1).unwrap();
+        wal.log_txn_commit(
+            1,
+            1,
+            &[
+                TxnLogOp::Put {
+                    uri: "table:users".to_string(),
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                },
+                TxnLogOp::Delete {
+                    uri: "table:users".to_string(),
+                    key: b"k1".to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+        wal.log_checkpoint().unwrap();
         wal.sync().unwrap();
 
         let mut reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
@@ -1183,11 +1188,9 @@ mod tests {
             headers.push(header);
         }
 
-        assert_eq!(headers.len(), 3);
+        assert_eq!(headers.len(), 2);
         assert!(headers[1].lsn.offset > headers[0].lsn.offset);
-        assert!(headers[2].lsn.offset > headers[1].lsn.offset);
         assert_eq!(headers[1].prev_lsn, headers[0].lsn);
-        assert_eq!(headers[2].prev_lsn, headers[1].lsn);
     }
 
     #[test]
@@ -1195,14 +1198,31 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
 
-        wal.log_put("table:users", b"k1", b"v1", 1).unwrap();
-        wal.log_txn_commit(1, 1).unwrap();
+        wal.log_txn_commit(
+            1,
+            1,
+            &[TxnLogOp::Put {
+                uri: "table:users".to_string(),
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+            }],
+        )
+        .unwrap();
         let checkpoint_lsn = wal.log_checkpoint().unwrap();
         wal.set_checkpoint_lsn(checkpoint_lsn).unwrap();
         wal.sync().unwrap();
         wal.truncate_to_checkpoint().unwrap();
 
-        wal.log_put("table:users", b"k2", b"v2", 2).unwrap();
+        wal.log_txn_commit(
+            2,
+            2,
+            &[TxnLogOp::Put {
+                uri: "table:users".to_string(),
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+            }],
+        )
+        .unwrap();
         wal.sync().unwrap();
 
         let mut reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
@@ -1217,8 +1237,16 @@ mod tests {
         let wal_path = GlobalWal::path_for_db(dir.path());
         let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
 
-        wal.log_put("table:users", b"k1", b"v1", 1).unwrap();
-        wal.log_txn_commit(1, 1).unwrap();
+        wal.log_txn_commit(
+            1,
+            1,
+            &[TxnLogOp::Put {
+                uri: "table:users".to_string(),
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+            }],
+        )
+        .unwrap();
         let checkpoint_lsn = wal.log_checkpoint().unwrap();
         wal.set_checkpoint_lsn(checkpoint_lsn).unwrap();
         wal.sync().unwrap();

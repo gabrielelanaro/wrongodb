@@ -5,7 +5,7 @@ use crate::storage::block::file::NONE_BLOCK_ID;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::mvcc::ReconcileStats;
 use crate::storage::page_store::{BlockFilePageStore, Page, PageStore};
-use crate::txn::{ReadVisibility, Transaction, TransactionManager, TxnId, TxnOp, WriteContext};
+use crate::txn::{ReadVisibility, Transaction, TransactionManager, TxnId, TxnPageOp, WriteContext};
 use crate::WrongoDBError;
 
 type StoreEntry = (Vec<u8>, Vec<u8>);
@@ -154,6 +154,7 @@ pub(crate) fn scan_range(
 // Write Operations
 // ============================================================================
 
+#[cfg(test)]
 pub(crate) fn apply_put_autocommit(
     btree: &mut BTreeCursor,
     transaction_manager: &TransactionManager,
@@ -169,6 +170,7 @@ pub(crate) fn apply_put_autocommit(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn apply_delete_autocommit(
     btree: &mut BTreeCursor,
     transaction_manager: &TransactionManager,
@@ -194,7 +196,7 @@ pub(crate) fn apply_put_in_txn(
 ) -> Result<(), WrongoDBError> {
     let write_context = WriteContext::from_txn_id(txn.id());
     let update_ref = btree.put_with_update_ref(key, value, &write_context)?;
-    txn.record_op(TxnOp::PageUpdate(update_ref));
+    txn.record_page_op(TxnPageOp::PageUpdate(update_ref));
     Ok(())
 }
 
@@ -205,7 +207,7 @@ pub(crate) fn apply_delete_in_txn(
 ) -> Result<bool, WrongoDBError> {
     let write_context = WriteContext::from_txn_id(txn.id());
     let update_ref = btree.delete_with_update_ref(key, &write_context)?;
-    txn.record_op(TxnOp::PageUpdate(update_ref));
+    txn.record_page_op(TxnPageOp::PageUpdate(update_ref));
     Ok(true)
 }
 

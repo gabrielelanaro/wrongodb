@@ -1,23 +1,24 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 
 use crate::core::errors::StorageError;
 use crate::storage::btree::BTreeCursor;
-use crate::storage::command::StorageCommand;
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::metadata_catalog::MetadataCatalog;
 use crate::storage::table::{
-    apply_delete_autocommit, apply_delete_in_txn, apply_put_autocommit, apply_put_in_txn,
-    checkpoint_store, open_or_create_btree,
+    apply_delete_in_txn, apply_put_in_txn, checkpoint_store, open_or_create_btree,
 };
-use crate::txn::{Transaction, TransactionManager, TxnId, TXN_NONE};
+use crate::txn::{TransactionManager, TxnId, TxnLogOp};
 use crate::WrongoDBError;
 
 pub(crate) trait RecoveryApplier: Send + Sync {
-    fn apply(&self, command: StorageCommand) -> Result<(), WrongoDBError>;
+    fn apply_committed_transaction(
+        &self,
+        txn_id: TxnId,
+        ops: &[TxnLogOp],
+    ) -> Result<(), WrongoDBError>;
     fn checkpoint_open_stores(&self) -> Result<(), WrongoDBError>;
 }
 
@@ -27,7 +28,6 @@ pub(crate) struct RecoveryExecutor {
     metadata_catalog: Arc<MetadataCatalog>,
     store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
     transaction_manager: Arc<TransactionManager>,
-    in_flight_txns: Mutex<HashMap<TxnId, Transaction>>,
 }
 
 impl RecoveryExecutor {
@@ -42,7 +42,6 @@ impl RecoveryExecutor {
             metadata_catalog,
             store_handles,
             transaction_manager,
-            in_flight_txns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -63,62 +62,27 @@ impl RecoveryExecutor {
 }
 
 impl RecoveryApplier for RecoveryExecutor {
-    fn apply(&self, command: StorageCommand) -> Result<(), WrongoDBError> {
-        match command {
-            StorageCommand::Put {
-                uri,
-                key,
-                value,
-                txn_id,
-            } => {
-                let store = self.open_store_for_uri(&uri, txn_id)?;
-                if txn_id == TXN_NONE {
-                    apply_put_autocommit(
-                        &mut store.write(),
-                        self.transaction_manager.as_ref(),
-                        &key,
-                        &value,
-                    )?;
-                } else {
-                    let mut txns = self.in_flight_txns.lock();
-                    let txn = txns
-                        .entry(txn_id)
-                        .or_insert_with(|| self.transaction_manager.begin_replay_txn(txn_id));
-                    apply_put_in_txn(&mut store.write(), &key, &value, txn)?;
+    fn apply_committed_transaction(
+        &self,
+        txn_id: TxnId,
+        ops: &[TxnLogOp],
+    ) -> Result<(), WrongoDBError> {
+        let mut txn = self.transaction_manager.begin_replay_txn(txn_id);
+
+        for op in ops {
+            match op {
+                TxnLogOp::Put { uri, key, value } => {
+                    let store = self.open_store_for_uri(uri, txn_id)?;
+                    apply_put_in_txn(&mut store.write(), key, value, &mut txn)?;
+                }
+                TxnLogOp::Delete { uri, key } => {
+                    let store = self.open_store_for_uri(uri, txn_id)?;
+                    let _ = apply_delete_in_txn(&mut store.write(), key, &mut txn)?;
                 }
             }
-            StorageCommand::Delete { uri, key, txn_id } => {
-                let store = self.open_store_for_uri(&uri, txn_id)?;
-                if txn_id == TXN_NONE {
-                    let _ = apply_delete_autocommit(
-                        &mut store.write(),
-                        self.transaction_manager.as_ref(),
-                        &key,
-                    )?;
-                } else {
-                    let mut txns = self.in_flight_txns.lock();
-                    let txn = txns
-                        .entry(txn_id)
-                        .or_insert_with(|| self.transaction_manager.begin_replay_txn(txn_id));
-                    let _ = apply_delete_in_txn(&mut store.write(), &key, txn)?;
-                }
-            }
-            StorageCommand::TxnCommit { txn_id, .. } => {
-                if txn_id != TXN_NONE {
-                    if let Some(mut txn) = self.in_flight_txns.lock().remove(&txn_id) {
-                        self.transaction_manager.commit_txn_state(&mut txn)?;
-                    }
-                }
-            }
-            StorageCommand::TxnAbort { txn_id } => {
-                if txn_id != TXN_NONE {
-                    if let Some(mut txn) = self.in_flight_txns.lock().remove(&txn_id) {
-                        self.transaction_manager.abort_txn_state(&mut txn)?;
-                    }
-                }
-            }
-            StorageCommand::Checkpoint => {}
         }
+
+        self.transaction_manager.commit_txn_state(&mut txn)?;
         Ok(())
     }
 

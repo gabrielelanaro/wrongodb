@@ -1,6 +1,6 @@
 use crate::common::kv::{
-    delete_kv_in_session, delete_kv_in_write_unit, get_kv, get_kv_in_write_unit,
-    insert_kv_in_session, insert_kv_in_write_unit,
+    delete_kv_in_session, delete_kv_in_transaction, get_kv, get_kv_in_transaction,
+    insert_kv_in_session, insert_kv_in_transaction,
 };
 use wrongodb::{Connection, ConnectionConfig};
 
@@ -13,15 +13,14 @@ fn test_connection_basic() {
     session.create("table:test").unwrap();
 
     {
-        let mut txn = session.transaction().unwrap();
-        insert_kv_in_write_unit(&mut txn, "test", b"key1", b"value1").unwrap();
-
-        let value = get_kv_in_write_unit(&mut txn, "test", b"key1")
-            .unwrap()
+        session
+            .with_transaction(|session| {
+                insert_kv_in_transaction(session, "test", b"key1", b"value1")?;
+                let value = get_kv_in_transaction(session, "test", b"key1")?.unwrap();
+                assert_eq!(value, b"value1".to_vec());
+                Ok(())
+            })
             .unwrap();
-        assert_eq!(value, b"value1".to_vec());
-
-        txn.commit().unwrap();
     }
 }
 
@@ -35,21 +34,19 @@ fn test_connection_with_config() {
     session.create("table:users").unwrap();
 
     {
-        let mut txn = session.transaction().unwrap();
-        insert_kv_in_write_unit(&mut txn, "users", b"user1", b"alice").unwrap();
-        insert_kv_in_write_unit(&mut txn, "users", b"user2", b"bob").unwrap();
+        session
+            .with_transaction(|session| {
+                insert_kv_in_transaction(session, "users", b"user1", b"alice")?;
+                insert_kv_in_transaction(session, "users", b"user2", b"bob")?;
 
-        let value = get_kv_in_write_unit(&mut txn, "users", b"user1")
-            .unwrap()
+                let value = get_kv_in_transaction(session, "users", b"user1")?.unwrap();
+                assert_eq!(value, b"alice".to_vec());
+
+                let value = get_kv_in_transaction(session, "users", b"user2")?.unwrap();
+                assert_eq!(value, b"bob".to_vec());
+                Ok(())
+            })
             .unwrap();
-        assert_eq!(value, b"alice".to_vec());
-
-        let value = get_kv_in_write_unit(&mut txn, "users", b"user2")
-            .unwrap()
-            .unwrap();
-        assert_eq!(value, b"bob".to_vec());
-
-        txn.commit().unwrap();
     }
 }
 
@@ -62,27 +59,23 @@ fn test_session_delete() {
     session.create("table:items").unwrap();
 
     {
-        let mut txn = session.transaction().unwrap();
-        insert_kv_in_write_unit(&mut txn, "items", b"item1", b"apple").unwrap();
-        insert_kv_in_write_unit(&mut txn, "items", b"item2", b"banana").unwrap();
+        session
+            .with_transaction(|session| {
+                insert_kv_in_transaction(session, "items", b"item1", b"apple")?;
+                insert_kv_in_transaction(session, "items", b"item2", b"banana")?;
 
-        let value = get_kv_in_write_unit(&mut txn, "items", b"item1")
-            .unwrap()
+                let value = get_kv_in_transaction(session, "items", b"item1")?.unwrap();
+                assert_eq!(value, b"apple".to_vec());
+
+                delete_kv_in_transaction(session, "items", b"item1")?;
+
+                assert!(get_kv_in_transaction(session, "items", b"item1")?.is_none());
+
+                let value = get_kv_in_transaction(session, "items", b"item2")?.unwrap();
+                assert_eq!(value, b"banana".to_vec());
+                Ok(())
+            })
             .unwrap();
-        assert_eq!(value, b"apple".to_vec());
-
-        delete_kv_in_write_unit(&mut txn, "items", b"item1").unwrap();
-
-        assert!(get_kv_in_write_unit(&mut txn, "items", b"item1")
-            .unwrap()
-            .is_none());
-
-        let value = get_kv_in_write_unit(&mut txn, "items", b"item2")
-            .unwrap()
-            .unwrap();
-        assert_eq!(value, b"banana".to_vec());
-
-        txn.commit().unwrap();
     }
 }
 

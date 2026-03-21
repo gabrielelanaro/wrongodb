@@ -1,4 +1,4 @@
-use wrongodb::{Connection, Session, WriteUnitOfWork, WrongoDBError};
+use wrongodb::{Connection, Session, WrongoDBError};
 
 fn table_uri(collection: &str) -> String {
     format!("table:{collection}")
@@ -12,9 +12,7 @@ pub fn insert_kv(
 ) -> Result<(), WrongoDBError> {
     let mut session = conn.open_session();
     session.create(&table_uri(collection))?;
-    let mut write_unit = session.transaction()?;
-    insert_kv_in_write_unit(&mut write_unit, collection, key, value)?;
-    write_unit.commit()
+    session.with_transaction(|session| insert_kv_in_transaction(session, collection, key, value))
 }
 
 pub fn insert_kv_in_session(
@@ -28,13 +26,13 @@ pub fn insert_kv_in_session(
     cursor.insert(key, value)
 }
 
-pub fn insert_kv_in_write_unit(
-    write_unit: &mut WriteUnitOfWork<'_>,
+pub fn insert_kv_in_transaction(
+    session: &mut Session,
     collection: &str,
     key: &[u8],
     value: &[u8],
 ) -> Result<(), WrongoDBError> {
-    let mut cursor = write_unit.open_cursor(&table_uri(collection))?;
+    let mut cursor = session.open_cursor(&table_uri(collection))?;
     cursor.insert(key, value)
 }
 
@@ -49,13 +47,13 @@ pub fn update_kv_in_session(
     cursor.update(key, value)
 }
 
-pub fn update_kv_in_write_unit(
-    write_unit: &mut WriteUnitOfWork<'_>,
+pub fn update_kv_in_transaction(
+    session: &mut Session,
     collection: &str,
     key: &[u8],
     value: &[u8],
 ) -> Result<(), WrongoDBError> {
-    let mut cursor = write_unit.open_cursor(&table_uri(collection))?;
+    let mut cursor = session.open_cursor(&table_uri(collection))?;
     cursor.update(key, value)
 }
 
@@ -69,12 +67,12 @@ pub fn delete_kv_in_session(
     cursor.delete(key)
 }
 
-pub fn delete_kv_in_write_unit(
-    write_unit: &mut WriteUnitOfWork<'_>,
+pub fn delete_kv_in_transaction(
+    session: &mut Session,
     collection: &str,
     key: &[u8],
 ) -> Result<(), WrongoDBError> {
-    let mut cursor = write_unit.open_cursor(&table_uri(collection))?;
+    let mut cursor = session.open_cursor(&table_uri(collection))?;
     cursor.delete(key)
 }
 
@@ -97,12 +95,12 @@ pub fn get_kv_in_session(
     cursor.get(key)
 }
 
-pub fn get_kv_in_write_unit(
-    write_unit: &mut WriteUnitOfWork<'_>,
+pub fn get_kv_in_transaction(
+    session: &mut Session,
     collection: &str,
     key: &[u8],
 ) -> Result<Option<Vec<u8>>, WrongoDBError> {
-    let mut cursor = write_unit.open_cursor(&table_uri(collection))?;
+    let mut cursor = session.open_cursor(&table_uri(collection))?;
     cursor.get(key)
 }
 

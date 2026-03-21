@@ -12,12 +12,14 @@ fn main() {
         let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
         let mut session = conn.open_session();
         session.create("table:test").unwrap();
-        let mut txn = session.transaction().unwrap();
-
-        println!("Inserting key0");
-        let mut cursor = txn.open_cursor("table:test").unwrap();
-        cursor.insert(b"key0", b"value0").unwrap();
-        txn.commit().unwrap();
+        session
+            .with_transaction(|session| {
+                println!("Inserting key0");
+                let mut cursor = session.open_cursor("table:test")?;
+                cursor.insert(b"key0", b"value0")?;
+                Ok(())
+            })
+            .unwrap();
     }
 
     println!("\n=== Reopening database (recovery) ===");

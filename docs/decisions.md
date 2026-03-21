@@ -1,5 +1,45 @@
 # Decisions
 
+## 2026-03-21: Make `TableCursor` session-bound and reset open cursors directly on rollback
+
+**Decision**
+- Make `TableCursor` borrow `Session` so a cursor cannot outlive its session.
+- Remove the cursor-side rollback generation polling mechanism.
+- Track open cursors directly on `Session` as weak references to private cursor runtime state.
+- Make rollback and failed implicit write transactions reset open cursor state directly by walking that session-owned cursor list.
+- Keep public session mutation APIs unchanged:
+  - `with_transaction(&mut self, ...)`
+  - `create(&mut self, ...)`
+  - `checkpoint(&mut self, ...)`
+
+**Why**
+- WiredTiger keeps transaction state and open cursor tracking on the session and resets those cursors directly on rollback.
+- The old `rollback_epoch` polling scheme was a workaround for detached cursors, not a WT-like ownership model.
+- Borrowing the session gives Rust the same fundamental safety property WT has structurally:
+  a cursor cannot survive its session.
+
+**Notes**
+- This intentionally keeps the Rust restriction that a cursor cannot remain live across a later `&mut Session` call.
+- Internal helpers such as raw index backfill writes are allowed to use `&self` so they can coexist with a borrowed table cursor during index creation.
+
+## 2026-03-21: Keep session transaction runtime as direct `Session` state instead of adding a coordinator wrapper
+
+**Decision**
+- Keep the shared transaction runtime needed by detached cursors as direct fields on `Session`:
+  - `active_txn_slot`
+  - `rollback_epoch`
+- Keep explicit/implicit write-transaction helpers in the `storage/api/session.rs` module as plain functions over those fields.
+- Pass the concrete shared pieces cursors need directly into `TableCursor` instead of introducing a `SessionTxnCoordinator` or `SessionInner` wrapper type.
+
+**Why**
+- WiredTiger keeps transaction state on the session itself, not in a separate coordinator object.
+- Adding a wrapper just to ferry a mutex slot, rollback generation, transaction manager, and durability backend made the code harder to read without clarifying ownership.
+- Keeping the state on `Session` preserves the intended WT shape while still letting detached Rust cursor objects consult live session transaction state through shared primitives.
+
+**Notes**
+- The rollback epoch remains for now because cursors are still detached objects and `Session` does not yet own/reset them directly.
+- This keeps the current API stable while deferring the larger cursor-ownership change.
+
 ## 2026-03-21: Make `TableCursor` own secondary index maintenance and limit public cursor opens to `table:` URIs
 
 **Decision**
@@ -2183,3 +2223,61 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - The previous shared durability/replication machinery made the storage layer structurally depend
   on a second world with different semantics. Removing it keeps the active architecture aligned
   with a self-contained storage engine.
+
+## 2026-03-21: Remove `WriteUnitOfWork` and `RecoveryUnit` from the storage API
+
+**Decision**
+- Remove the public `WriteUnitOfWork` API and the internal `RecoveryUnit` abstraction from the
+  storage layer.
+- Make `Session` the owner of live transaction state again, with a single public transactional
+  entrypoint:
+  - `Session::with_transaction(...)`
+- Keep explicit transaction lifecycle methods only as crate-private session internals used by the
+  public helper and by internal tests:
+  - `begin_transaction_internal`
+  - `commit_transaction_internal`
+  - `rollback_transaction_internal`
+- Make open cursors consult shared session transaction state at use time rather than carrying a
+  bound transaction handle directly.
+- On rollback, bump a session rollback epoch so open cursors reset buffered scan state; on commit,
+  cursor position remains usable.
+- Add `Drop` cleanup on `Session` so an abandoned active transaction rolls back when the session is
+  dropped.
+
+**Why**
+- `WriteUnitOfWork` and `RecoveryUnit` are MongoDB-shaped boundaries, not WiredTiger-shaped ones.
+  WT sessions own transaction state, and cursors operate against that live session state.
+- In Rust, a closure-based `with_transaction` API keeps the public surface small and safe without
+  reintroducing a second transaction facade object.
+- Sharing live session transaction state with cursors removes the old split where table cursors
+  owned transaction handles while the session owned higher-level context.
+
+## 2026-03-21: Make WAL commit-record-based and transaction-owned
+
+**Decision**
+- Rename low-level MVCC bookkeeping from `TxnOp` / `ops` to:
+  - `TxnPageOp`
+  - `page_ops`
+- Add `TxnLogOp` and make each live `Transaction` own:
+  - page-level MVCC update refs
+  - logical WAL log ops
+- Replace standalone WAL records for `Put`, `Delete`, and `TxnAbort` with a commit-record-only
+  format:
+  - `WalRecord::TxnCommit { txn_id, commit_ts, ops }`
+  - `WalRecord::Checkpoint`
+- Bump the WAL version and accept the format break with no compatibility shim.
+- Make durability flush happen at transaction commit, before MVCC state is finalized:
+  - serialize the transaction's `TxnLogOp`s into one commit record
+  - append and sync that record
+  - only then mark MVCC page updates committed
+- Aborted transactions discard in-memory `TxnLogOp`s and emit no replayable WAL record.
+- Recovery replays committed transaction records directly; it no longer stages loose WAL changes by
+  transaction id.
+
+**Why**
+- WT does not log free-standing `Put/Delete/Abort` records from cursor code. It buffers logical log
+  ops on the transaction and writes them at commit.
+- Moving WAL ownership onto the transaction keeps durability aligned with transaction semantics:
+  one transaction produces one replayable data record.
+- Replay becomes simpler and more robust once the WAL already contains committed transaction
+  boundaries instead of requiring recovery-time reconstruction.

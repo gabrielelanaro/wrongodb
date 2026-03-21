@@ -13,17 +13,18 @@ fn main() {
         let mut session = conn.open_session();
         session.create("table:test").unwrap();
 
-        let mut txn = session.transaction().unwrap();
-        let mut cursor = txn.open_cursor("table:test").unwrap();
-
-        for i in 0..5 {
-            println!("Inserting: key{}", i);
-            let key = format!("key{i}");
-            let value = format!("value{i}");
-            cursor.insert(key.as_bytes(), value.as_bytes()).unwrap();
-        }
-
-        txn.commit().unwrap();
+        session
+            .with_transaction(|session| {
+                let mut cursor = session.open_cursor("table:test")?;
+                for i in 0..5 {
+                    println!("Inserting: key{}", i);
+                    let key = format!("key{i}");
+                    let value = format!("value{i}");
+                    cursor.insert(key.as_bytes(), value.as_bytes())?;
+                }
+                Ok(())
+            })
+            .unwrap();
     }
 
     // Phase 2: Open and insert more data
@@ -31,17 +32,18 @@ fn main() {
     {
         let mut session = conn.open_session();
 
-        let mut txn = session.transaction().unwrap();
-        let mut cursor = txn.open_cursor("table:test").unwrap();
-
-        for i in 5..10 {
-            println!("Inserting: key{}", i);
-            let key = format!("key{i}");
-            let value = format!("value{i}");
-            cursor.insert(key.as_bytes(), value.as_bytes()).unwrap();
-        }
-
-        txn.commit().unwrap();
+        session
+            .with_transaction(|session| {
+                let mut cursor = session.open_cursor("table:test")?;
+                for i in 5..10 {
+                    println!("Inserting: key{}", i);
+                    let key = format!("key{i}");
+                    let value = format!("value{i}");
+                    cursor.insert(key.as_bytes(), value.as_bytes())?;
+                }
+                Ok(())
+            })
+            .unwrap();
         // Don't checkpoint - simulate crash
     }
 

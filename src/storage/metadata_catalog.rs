@@ -5,7 +5,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::core::errors::StorageError;
-use crate::storage::api::WriteUnitOfWork;
+use crate::storage::api::Session;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::table::{
@@ -133,14 +133,14 @@ impl MetadataCatalog {
             .map(|entry| entry.source))
     }
 
-    pub(crate) fn ensure_table_uri_in_write_unit(
+    pub(crate) fn ensure_table_uri_in_transaction(
         &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
+        session: &mut Session,
         collection: &str,
     ) -> Result<String, WrongoDBError> {
         let uri = table_uri(collection);
         if self
-            .lookup_source_for_txn(&uri, write_unit.txn_id())?
+            .lookup_source_for_txn(&uri, session.txn_id())?
             .is_some()
         {
             return Ok(uri);
@@ -148,21 +148,21 @@ impl MetadataCatalog {
 
         let source = table_source_name(collection);
         self.ensure_source_exists(&source)?;
-        let _inserted = self
-            .put_if_absent_in_write_unit(write_unit, MetadataEntry::table(uri.clone(), source))?;
+        let _inserted =
+            self.put_if_absent_in_transaction(session, MetadataEntry::table(uri.clone(), source))?;
         Ok(uri)
     }
 
-    pub(crate) fn ensure_index_uri_in_write_unit(
+    pub(crate) fn ensure_index_uri_in_transaction(
         &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
+        session: &mut Session,
         collection: &str,
         name: &str,
         columns: Vec<String>,
     ) -> Result<(String, bool), WrongoDBError> {
         let uri = index_uri(collection, name);
         if self
-            .lookup_source_for_txn(&uri, write_unit.txn_id())?
+            .lookup_source_for_txn(&uri, session.txn_id())?
             .is_some()
         {
             return Ok((uri, false));
@@ -170,20 +170,20 @@ impl MetadataCatalog {
 
         let source = index_source_name(collection, name);
         self.ensure_source_exists(&source)?;
-        let inserted = self.put_if_absent_in_write_unit(
-            write_unit,
+        let inserted = self.put_if_absent_in_transaction(
+            session,
             MetadataEntry::index(uri.clone(), source, name, columns),
         )?;
         Ok((uri, inserted))
     }
 
-    pub(crate) fn put_if_absent_in_write_unit(
+    pub(crate) fn put_if_absent_in_transaction(
         &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
+        session: &mut Session,
         entry: MetadataEntry,
     ) -> Result<bool, WrongoDBError> {
         if self
-            .lookup_source_for_txn(&entry.uri, write_unit.txn_id())?
+            .lookup_source_for_txn(&entry.uri, session.txn_id())?
             .is_some()
         {
             return Ok(false);
@@ -191,7 +191,7 @@ impl MetadataCatalog {
 
         let key = encode_metadata_key(&entry.uri);
         let value = encode_metadata_value(&entry)?;
-        write_unit.raw_insert(METADATA_URI, &key, &value)?;
+        session.raw_insert(METADATA_URI, &key, &value)?;
         Ok(true)
     }
 
@@ -432,15 +432,16 @@ mod tests {
     #[test]
     fn metadata_catalog_writes_and_reads_table_row() {
         let mut fixture = MetadataFixture::new();
-        let mut write_unit = fixture.session.transaction().unwrap();
         fixture
-            .catalog
-            .put_if_absent_in_write_unit(
-                &mut write_unit,
-                MetadataEntry::table("table:users", "users.main.wt"),
-            )
+            .session
+            .with_transaction(|session| {
+                fixture.catalog.put_if_absent_in_transaction(
+                    session,
+                    MetadataEntry::table("table:users", "users.main.wt"),
+                )?;
+                Ok(())
+            })
             .unwrap();
-        write_unit.commit().unwrap();
 
         assert_eq!(
             fixture.catalog.lookup_source("table:users").unwrap(),
@@ -451,20 +452,21 @@ mod tests {
     #[test]
     fn metadata_catalog_writes_and_reads_index_row() {
         let mut fixture = MetadataFixture::new();
-        let mut write_unit = fixture.session.transaction().unwrap();
         fixture
-            .catalog
-            .put_if_absent_in_write_unit(
-                &mut write_unit,
-                MetadataEntry::index(
-                    "index:users:name",
-                    "users.name.idx.wt",
-                    "name",
-                    vec!["name".to_string()],
-                ),
-            )
+            .session
+            .with_transaction(|session| {
+                fixture.catalog.put_if_absent_in_transaction(
+                    session,
+                    MetadataEntry::index(
+                        "index:users:name",
+                        "users.name.idx.wt",
+                        "name",
+                        vec!["name".to_string()],
+                    ),
+                )?;
+                Ok(())
+            })
             .unwrap();
-        write_unit.commit().unwrap();
 
         assert_eq!(
             fixture.catalog.lookup_source("index:users:name").unwrap(),
@@ -475,28 +477,31 @@ mod tests {
     #[test]
     fn metadata_catalog_scans_table_and_index_prefixes() {
         let mut fixture = MetadataFixture::new();
-        let mut write_unit = fixture.session.transaction().unwrap();
-        for entry in [
-            MetadataEntry::table("table:users", "users.main.wt"),
-            MetadataEntry::index(
-                "index:users:name",
-                "users.name.idx.wt",
-                "name",
-                vec!["name".to_string()],
-            ),
-            MetadataEntry::index(
-                "index:users:email",
-                "users.email.idx.wt",
-                "email",
-                vec!["email".to_string()],
-            ),
-        ] {
-            fixture
-                .catalog
-                .put_if_absent_in_write_unit(&mut write_unit, entry)
-                .unwrap();
-        }
-        write_unit.commit().unwrap();
+        fixture
+            .session
+            .with_transaction(|session| {
+                for entry in [
+                    MetadataEntry::table("table:users", "users.main.wt"),
+                    MetadataEntry::index(
+                        "index:users:name",
+                        "users.name.idx.wt",
+                        "name",
+                        vec!["name".to_string()],
+                    ),
+                    MetadataEntry::index(
+                        "index:users:email",
+                        "users.email.idx.wt",
+                        "email",
+                        vec!["email".to_string()],
+                    ),
+                ] {
+                    fixture
+                        .catalog
+                        .put_if_absent_in_transaction(session, entry)?;
+                }
+                Ok(())
+            })
+            .unwrap();
 
         let tables = fixture.catalog.scan_prefix(TABLE_URI_PREFIX).unwrap();
         let indexes = fixture.catalog.scan_prefix("index:users:").unwrap();
@@ -509,22 +514,25 @@ mod tests {
     #[test]
     fn metadata_catalog_all_sources_includes_table_and_index_stores() {
         let mut fixture = MetadataFixture::new();
-        let mut write_unit = fixture.session.transaction().unwrap();
-        for entry in [
-            MetadataEntry::table("table:users", "users.main.wt"),
-            MetadataEntry::index(
-                "index:users:name",
-                "users.name.idx.wt",
-                "name",
-                vec!["name".to_string()],
-            ),
-        ] {
-            fixture
-                .catalog
-                .put_if_absent_in_write_unit(&mut write_unit, entry)
-                .unwrap();
-        }
-        write_unit.commit().unwrap();
+        fixture
+            .session
+            .with_transaction(|session| {
+                for entry in [
+                    MetadataEntry::table("table:users", "users.main.wt"),
+                    MetadataEntry::index(
+                        "index:users:name",
+                        "users.name.idx.wt",
+                        "name",
+                        vec!["name".to_string()],
+                    ),
+                ] {
+                    fixture
+                        .catalog
+                        .put_if_absent_in_transaction(session, entry)?;
+                }
+                Ok(())
+            })
+            .unwrap();
 
         assert_eq!(
             fixture.catalog.all_sources().unwrap(),
@@ -535,35 +543,38 @@ mod tests {
     #[test]
     fn table_metadata_for_txn_loads_index_definitions_in_stable_order() {
         let mut fixture = MetadataFixture::new();
-        let mut write_unit = fixture.session.transaction().unwrap();
-        for entry in [
-            MetadataEntry::table("table:users", "users.main.wt"),
-            MetadataEntry::index(
-                "index:users:z_last",
-                "users.z_last.idx.wt",
-                "z_last",
-                vec!["z_last".to_string()],
-            ),
-            MetadataEntry::index(
-                "index:users:a_first",
-                "users.a_first.idx.wt",
-                "a_first",
-                vec!["a_first".to_string()],
-            ),
-        ] {
-            fixture
-                .catalog
-                .put_if_absent_in_write_unit(&mut write_unit, entry)
-                .unwrap();
-        }
-        let txn_id = write_unit.txn_id();
+        let mut table = None;
+        fixture
+            .session
+            .with_transaction(|session| {
+                for entry in [
+                    MetadataEntry::table("table:users", "users.main.wt"),
+                    MetadataEntry::index(
+                        "index:users:z_last",
+                        "users.z_last.idx.wt",
+                        "z_last",
+                        vec!["z_last".to_string()],
+                    ),
+                    MetadataEntry::index(
+                        "index:users:a_first",
+                        "users.a_first.idx.wt",
+                        "a_first",
+                        vec!["a_first".to_string()],
+                    ),
+                ] {
+                    fixture
+                        .catalog
+                        .put_if_absent_in_transaction(session, entry)?;
+                }
 
-        let table = fixture
-            .catalog
-            .table_metadata_for_txn("table:users", txn_id)
-            .unwrap()
+                table = fixture
+                    .catalog
+                    .table_metadata_for_txn("table:users", session.txn_id())?;
+                Ok(())
+            })
             .unwrap();
-        write_unit.commit().unwrap();
+
+        let table = table.unwrap();
 
         assert_eq!(table.uri(), "table:users");
         assert_eq!(

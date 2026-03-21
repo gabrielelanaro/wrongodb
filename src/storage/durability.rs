@@ -3,9 +3,8 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::storage::command::StorageCommand;
-use crate::storage::recovery_unit::{NoopRecoveryUnit, RecoveryUnit, WalRecoveryUnit};
 use crate::storage::wal::GlobalWal;
+use crate::txn::{Timestamp, TxnId, TxnLogOp};
 use crate::WrongoDBError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,14 +35,18 @@ impl DurabilityBackend {
         Ok(Self::LocalWal(LocalWalDurabilityBackend::open(base_path)?))
     }
 
-    pub(crate) fn record(
+    pub(crate) fn log_transaction_commit(
         &self,
-        command: StorageCommand,
+        txn_id: TxnId,
+        commit_ts: Timestamp,
+        ops: &[TxnLogOp],
         sync_policy: StorageSyncPolicy,
     ) -> Result<(), WrongoDBError> {
         match self {
             Self::Disabled => Ok(()),
-            Self::LocalWal(backend) => backend.record(command, sync_policy),
+            Self::LocalWal(backend) => {
+                backend.log_transaction_commit(txn_id, commit_ts, ops, sync_policy)
+            }
         }
     }
 
@@ -54,10 +57,13 @@ impl DurabilityBackend {
         }
     }
 
-    pub(crate) fn new_recovery_unit(&self) -> Arc<dyn RecoveryUnit> {
+    pub(crate) fn record_checkpoint(
+        &self,
+        sync_policy: StorageSyncPolicy,
+    ) -> Result<(), WrongoDBError> {
         match self {
-            Self::Disabled => Arc::new(NoopRecoveryUnit),
-            Self::LocalWal(backend) => backend.new_recovery_unit(),
+            Self::Disabled => Ok(()),
+            Self::LocalWal(backend) => backend.record_checkpoint(sync_policy),
         }
     }
 
@@ -76,34 +82,24 @@ impl LocalWalDurabilityBackend {
         })
     }
 
-    fn record(
+    fn log_transaction_commit(
         &self,
-        command: StorageCommand,
+        txn_id: TxnId,
+        commit_ts: Timestamp,
+        ops: &[TxnLogOp],
         sync_policy: StorageSyncPolicy,
     ) -> Result<(), WrongoDBError> {
         let mut wal = self.wal.lock();
-        match command {
-            StorageCommand::Put {
-                uri,
-                key,
-                value,
-                txn_id,
-            } => {
-                wal.log_put(&uri, &key, &value, txn_id)?;
-            }
-            StorageCommand::Delete { uri, key, txn_id } => {
-                wal.log_delete(&uri, &key, txn_id)?;
-            }
-            StorageCommand::TxnCommit { txn_id, commit_ts } => {
-                wal.log_txn_commit(txn_id, commit_ts)?;
-            }
-            StorageCommand::TxnAbort { txn_id } => {
-                wal.log_txn_abort(txn_id)?;
-            }
-            StorageCommand::Checkpoint => {
-                wal.log_checkpoint()?;
-            }
+        wal.log_txn_commit(txn_id, commit_ts, ops)?;
+        if sync_policy == StorageSyncPolicy::Sync {
+            wal.sync()?;
         }
+        Ok(())
+    }
+
+    fn record_checkpoint(&self, sync_policy: StorageSyncPolicy) -> Result<(), WrongoDBError> {
+        let mut wal = self.wal.lock();
+        wal.log_checkpoint()?;
         if sync_policy == StorageSyncPolicy::Sync {
             wal.sync()?;
         }
@@ -112,10 +108,6 @@ impl LocalWalDurabilityBackend {
 
     fn truncate_to_checkpoint(&self) -> Result<(), WrongoDBError> {
         self.wal.lock().truncate_to_checkpoint()
-    }
-
-    fn new_recovery_unit(&self) -> Arc<dyn RecoveryUnit> {
-        Arc::new(WalRecoveryUnit::new(self.wal.clone()))
     }
 }
 
@@ -133,13 +125,14 @@ mod tests {
 
         assert!(!backend.is_enabled());
         backend
-            .record(
-                StorageCommand::Put {
+            .log_transaction_commit(
+                7,
+                7,
+                &[TxnLogOp::Put {
                     uri: "table:users".to_string(),
                     key: b"k1".to_vec(),
                     value: b"v1".to_vec(),
-                    txn_id: crate::txn::TXN_NONE,
-                },
+                }],
                 StorageSyncPolicy::Buffered,
             )
             .unwrap();
@@ -151,11 +144,14 @@ mod tests {
         let backend = DurabilityBackend::open(dir.path(), true).unwrap();
 
         backend
-            .record(
-                StorageCommand::TxnCommit {
-                    txn_id: 7,
-                    commit_ts: 7,
-                },
+            .log_transaction_commit(
+                7,
+                7,
+                &[TxnLogOp::Put {
+                    uri: "table:users".to_string(),
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                }],
                 StorageSyncPolicy::Sync,
             )
             .unwrap();
@@ -168,7 +164,8 @@ mod tests {
                 record,
                 WalRecord::TxnCommit {
                     txn_id: 7,
-                    commit_ts: 7
+                    commit_ts: 7,
+                    ..
                 }
             ) {
                 found_commit = true;
@@ -183,11 +180,14 @@ mod tests {
         let backend = DurabilityBackend::open(dir.path(), true).unwrap();
 
         backend
-            .record(
-                StorageCommand::TxnCommit {
-                    txn_id: 1,
-                    commit_ts: 1,
-                },
+            .log_transaction_commit(
+                1,
+                1,
+                &[TxnLogOp::Put {
+                    uri: "table:users".to_string(),
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                }],
                 StorageSyncPolicy::Sync,
             )
             .unwrap();
@@ -196,9 +196,7 @@ mod tests {
         let before = std::fs::metadata(&wal_path).unwrap().len();
         assert!(before > 512);
 
-        backend
-            .record(StorageCommand::Checkpoint, StorageSyncPolicy::Sync)
-            .unwrap();
+        backend.record_checkpoint(StorageSyncPolicy::Sync).unwrap();
         backend.truncate_to_checkpoint().unwrap();
 
         let after_truncate = std::fs::metadata(&wal_path).unwrap().len();

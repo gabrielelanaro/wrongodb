@@ -19,8 +19,21 @@ pub enum TxnState {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(not(test), allow(dead_code))]
-pub enum TxnOp {
+pub enum TxnPageOp {
     PageUpdate(UpdateRef),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TxnLogOp {
+    Put {
+        uri: String,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Delete {
+        uri: String,
+        key: Vec<u8>,
+    },
 }
 
 #[derive(Debug)]
@@ -32,7 +45,8 @@ pub struct Transaction {
     read_ts: Option<Timestamp>,
     kind: TransactionKind,
     state: TxnState,
-    ops: Vec<TxnOp>,
+    page_ops: Vec<TxnPageOp>,
+    log_ops: Vec<TxnLogOp>,
 }
 
 impl Transaction {
@@ -43,7 +57,8 @@ impl Transaction {
             read_ts: None,
             kind: TransactionKind::Snapshot,
             state: TxnState::Active,
-            ops: Vec::new(),
+            page_ops: Vec::new(),
+            log_ops: Vec::new(),
         }
     }
 
@@ -54,7 +69,8 @@ impl Transaction {
             read_ts: None,
             kind: TransactionKind::Replay,
             state: TxnState::Active,
-            ops: Vec::new(),
+            page_ops: Vec::new(),
+            log_ops: Vec::new(),
         }
     }
 
@@ -119,8 +135,16 @@ impl Transaction {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn record_op(&mut self, op: TxnOp) {
-        self.ops.push(op);
+    pub fn record_page_op(&mut self, op: TxnPageOp) {
+        self.page_ops.push(op);
+    }
+
+    pub fn record_log_op(&mut self, op: TxnLogOp) {
+        self.log_ops.push(op);
+    }
+
+    pub fn log_ops(&self) -> &[TxnLogOp] {
+        &self.log_ops
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -140,19 +164,21 @@ impl Transaction {
     }
 
     fn mark_ops_committed(&mut self, commit_ts: Timestamp) {
-        for op in self.ops.drain(..) {
+        for op in self.page_ops.drain(..) {
             match op {
-                TxnOp::PageUpdate(update_ref) => update_ref.write().mark_committed(commit_ts),
+                TxnPageOp::PageUpdate(update_ref) => update_ref.write().mark_committed(commit_ts),
             }
         }
+        self.log_ops.clear();
     }
 
     fn mark_ops_aborted(&mut self) {
-        for op in self.ops.drain(..).rev() {
+        for op in self.page_ops.drain(..).rev() {
             match op {
-                TxnOp::PageUpdate(update_ref) => abort_update_ref(&update_ref),
+                TxnPageOp::PageUpdate(update_ref) => abort_update_ref(&update_ref),
             }
         }
+        self.log_ops.clear();
     }
 }
 

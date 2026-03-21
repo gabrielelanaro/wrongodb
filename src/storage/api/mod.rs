@@ -4,4 +4,4 @@ pub(crate) mod session;
 
 pub use connection::{Connection, ConnectionConfig};
 pub use cursor::{CursorEntry, TableCursor};
-pub use session::{Session, WriteUnitOfWork};
+pub use session::Session;

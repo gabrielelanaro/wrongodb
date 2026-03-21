@@ -3,7 +3,7 @@
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 
-use crate::common::kv::{get_kv, insert_kv_in_write_unit, update_kv_in_write_unit};
+use crate::common::kv::{get_kv, insert_kv_in_transaction, update_kv_in_transaction};
 use tempfile::tempdir;
 
 use wrongodb::{Connection, ConnectionConfig};
@@ -15,9 +15,9 @@ fn global_wal_path(db_dir: &std::path::Path) -> std::path::PathBuf {
 fn insert_kv(conn: &Connection, table: &str, key: &[u8], value: &[u8]) {
     let mut session = conn.open_session();
     session.create(&format!("table:{table}")).unwrap();
-    let mut txn = session.transaction().unwrap();
-    insert_kv_in_write_unit(&mut txn, table, key, value).unwrap();
-    txn.commit().unwrap();
+    session
+        .with_transaction(|session| insert_kv_in_transaction(session, table, key, value))
+        .unwrap();
 }
 
 fn insert_kv_non_transactional(conn: &Connection, table: &str, key: &[u8], value: &[u8]) {
@@ -73,25 +73,28 @@ fn recovery_replays_records_appended_after_restart() {
 }
 
 #[test]
-fn recovery_skips_uncommitted_transaction_writes() {
+fn recovery_skips_incomplete_transaction_commit_record() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("db");
 
     {
         let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
-        let mut session = conn.open_session();
-        session.create("table:test").unwrap();
-
-        let mut txn = session.transaction().unwrap();
-        insert_kv_in_write_unit(&mut txn, "test", b"k1", b"a").unwrap();
-        insert_kv_in_write_unit(&mut txn, "test", b"k2", b"b").unwrap();
-
-        std::mem::forget(txn);
+        insert_kv(&conn, "test", b"k1", b"a");
+        insert_kv(&conn, "test", b"k2", b"b");
     }
+
+    let wal_path = global_wal_path(&db_path);
+    let len = std::fs::metadata(&wal_path).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&wal_path)
+        .unwrap()
+        .set_len(len.saturating_sub(8))
+        .unwrap();
 
     {
         let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
-        assert!(!exists(&conn, "test", b"k1"));
+        assert!(exists(&conn, "test", b"k1"));
         assert!(!exists(&conn, "test", b"k2"));
     }
 }
@@ -106,9 +109,10 @@ fn recovery_skips_explicitly_aborted_transaction_writes() {
         let mut session = conn.open_session();
         session.create("table:test").unwrap();
 
-        let mut txn = session.transaction().unwrap();
-        insert_kv_in_write_unit(&mut txn, "test", b"k1", b"a").unwrap();
-        txn.abort().unwrap();
+        let _ = session.with_transaction(|session| {
+            insert_kv_in_transaction(session, "test", b"k1", b"a")?;
+            Err::<(), wrongodb::WrongoDBError>(wrongodb::StorageError("abort".into()).into())
+        });
     }
 
     {
@@ -128,9 +132,11 @@ fn recovery_replays_transactional_writes_at_commit_time() {
 
         let mut session = conn.open_session();
 
-        let mut txn = session.transaction().unwrap();
-        update_kv_in_write_unit(&mut txn, "test", b"shared", b"txn").unwrap();
-        txn.commit().unwrap();
+        session
+            .with_transaction(|session| {
+                update_kv_in_transaction(session, "test", b"shared", b"txn")
+            })
+            .unwrap();
     }
 
     {
@@ -192,8 +198,7 @@ fn recovery_handles_empty_committed_transaction() {
     {
         let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
         let mut session = conn.open_session();
-        let txn = session.transaction().unwrap();
-        txn.commit().unwrap();
+        session.with_transaction(|_| Ok(())).unwrap();
     }
 
     let _reopened = Connection::open(&db_path, ConnectionConfig::default()).unwrap();

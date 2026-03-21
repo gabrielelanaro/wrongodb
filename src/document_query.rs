@@ -7,7 +7,7 @@ use crate::core::bson::{decode_document, encode_id_value};
 use crate::core::document::validate_is_object;
 use crate::index::{decode_index_id, encode_range_bounds};
 use crate::schema::SchemaCatalog;
-use crate::storage::api::{Session, TableCursor, WriteUnitOfWork};
+use crate::storage::api::{Session, TableCursor};
 use crate::{Document, WrongoDBError};
 
 #[derive(Clone)]
@@ -26,8 +26,8 @@ impl DocumentQuery {
         collection: &str,
         filter: Option<Value>,
     ) -> Result<Vec<Document>, WrongoDBError> {
-        self.run_in_write_unit(session, |this, write_unit| {
-            this.find_in_write_unit(write_unit, collection, filter)
+        self.run_in_transaction(session, |this, session| {
+            this.find_in_transaction(session, collection, filter)
         })
     }
 
@@ -67,15 +67,15 @@ impl DocumentQuery {
         self.schema_catalog.list_indexes(collection)
     }
 
-    pub(crate) fn find_in_write_unit(
+    pub(crate) fn find_in_transaction(
         &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
+        session: &mut Session,
         collection: &str,
         filter: Option<Value>,
     ) -> Result<Vec<Document>, WrongoDBError> {
         if !self
             .schema_catalog
-            .collection_exists_in_txn(collection, write_unit.txn_id())?
+            .collection_exists_in_txn(collection, session.txn_id())?
         {
             return Ok(Vec::new());
         }
@@ -88,7 +88,7 @@ impl DocumentQuery {
             }
         };
 
-        let mut table_cursor = write_unit.open_cursor(&format!("table:{collection}"))?;
+        let mut table_cursor = session.open_cursor(&format!("table:{collection}"))?;
 
         if filter_doc.is_empty() {
             return scan_with_cursor(&mut table_cursor, |doc| {
@@ -126,14 +126,14 @@ impl DocumentQuery {
 
         let schema = self
             .schema_catalog
-            .collection_schema_for_txn(collection, write_unit.txn_id())?;
+            .collection_schema_for_txn(collection, session.txn_id())?;
         let indexed_field = filter_doc.keys().find(|key| schema.has_index(key)).cloned();
         if let Some(field) = indexed_field {
             let value = filter_doc.get(&field).expect("field selected from filter");
             let Some((start_key, end_key)) = encode_range_bounds(value) else {
                 return Ok(Vec::new());
             };
-            let index_entries = write_unit.raw_scan_range(
+            let index_entries = session.raw_scan_range(
                 &format!("index:{collection}:{field}"),
                 Some(&start_key),
                 Some(&end_key),
@@ -158,27 +158,16 @@ impl DocumentQuery {
         scan_with_cursor(&mut table_cursor, matches_filter)
     }
 
-    fn run_in_write_unit<R, F>(&self, session: &mut Session, f: F) -> Result<R, WrongoDBError>
+    fn run_in_transaction<R, F>(&self, session: &mut Session, f: F) -> Result<R, WrongoDBError>
     where
-        F: FnOnce(&Self, &mut WriteUnitOfWork<'_>) -> Result<R, WrongoDBError>,
+        F: FnOnce(&Self, &mut Session) -> Result<R, WrongoDBError>,
     {
-        let mut write_unit = session.transaction()?;
-        let result = f(self, &mut write_unit);
-        match result {
-            Ok(value) => {
-                write_unit.commit()?;
-                Ok(value)
-            }
-            Err(err) => {
-                let _ = write_unit.abort();
-                Err(err)
-            }
-        }
+        session.with_transaction(|session| f(self, session))
     }
 }
 
 fn scan_with_cursor<F>(
-    cursor: &mut TableCursor,
+    cursor: &mut TableCursor<'_>,
     matches_filter: F,
 ) -> Result<Vec<Document>, WrongoDBError>
 where
