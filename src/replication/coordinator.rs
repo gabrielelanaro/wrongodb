@@ -501,11 +501,7 @@ mod tests {
     #[test]
     fn sync_persists_applied_through_index_in_consistency_file() {
         let dir = tempdir().unwrap();
-        let conn = Connection::open(
-            dir.path(),
-            ConnectionConfig::new(false, RaftMode::Standalone),
-        )
-        .unwrap();
+        let conn = Connection::open(dir.path(), ConnectionConfig::new(false)).unwrap();
         let mut session = conn.open_session();
         session.create("table:users").unwrap();
         session.checkpoint().unwrap();

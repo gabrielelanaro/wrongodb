@@ -2,7 +2,7 @@ use crate::common::kv::{
     delete_kv_in_session, delete_kv_in_write_unit, get_kv, get_kv_in_write_unit,
     insert_kv_in_session, insert_kv_in_write_unit,
 };
-use wrongodb::{Connection, ConnectionConfig, RaftMode};
+use wrongodb::{Connection, ConnectionConfig};
 
 #[test]
 fn test_connection_basic() {
@@ -28,7 +28,7 @@ fn test_connection_basic() {
 #[test]
 fn test_connection_with_config() {
     let tmp = tempfile::tempdir().unwrap();
-    let config = ConnectionConfig::new(false, RaftMode::Standalone);
+    let config = ConnectionConfig::new(false);
     let conn = Connection::open(tmp.path().join("test"), config).unwrap();
 
     let mut session = conn.open_session();

@@ -240,7 +240,6 @@ mod tests {
 
     use crate::durability::{CommandApplier, DurableOp, StoreCommandApplier};
     use crate::recovery::recover_from_wal;
-    use crate::replication::RaftMode;
     use crate::storage::api::{Connection, ConnectionConfig};
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::metadata_catalog::{MetadataCatalog, METADATA_URI};
@@ -480,11 +479,7 @@ mod tests {
         wal.log_txn_commit(7, 7).unwrap();
         wal.sync().unwrap();
 
-        let conn = Connection::open(
-            dir.path(),
-            ConnectionConfig::new(true, RaftMode::Standalone),
-        )
-        .unwrap();
+        let conn = Connection::open(dir.path(), ConnectionConfig::new(true)).unwrap();
 
         assert_eq!(
             conn.metadata_catalog()

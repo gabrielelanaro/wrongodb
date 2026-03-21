@@ -207,10 +207,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parsed = parse_args();
     let mode = raft_mode(&parsed)?;
     let path = db_path(&parsed);
-    let config = ConnectionConfig::new(true, mode);
+    let config = ConnectionConfig::new(matches!(&mode, RaftMode::Standalone));
     let conn = Connection::open(&path, config.clone())?;
     let conn = Arc::new(conn);
     let addr = server_addr(&parsed);
-    start_server(&addr, Path::new(&path), conn, config).await?;
+    start_server(&addr, Path::new(&path), conn, mode).await?;
     Ok(())
 }

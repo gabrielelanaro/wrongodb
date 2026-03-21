@@ -15,8 +15,8 @@ use self::commands::handlers::crud::{bson_to_value, value_to_bson};
 use self::commands::CommandRegistry;
 use crate::api::DatabaseContext;
 use crate::recovery::CatalogRecovery;
-use crate::replication::ReplicationCoordinator;
-use crate::{Connection, ConnectionConfig, WrongoDBError};
+use crate::replication::{RaftMode, ReplicationCoordinator};
+use crate::{Connection, WrongoDBError};
 
 const OP_MSG: i32 = 2013;
 const OP_QUERY: i32 = 2004;
@@ -54,7 +54,7 @@ pub async fn start_server(
     addr: &str,
     db_path: &Path,
     conn: Arc<Connection>,
-    config: ConnectionConfig,
+    raft_mode: RaftMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     let catalog_report = CatalogRecovery::reconcile(conn.as_ref())?;
@@ -63,10 +63,7 @@ pub async fn start_server(
     }
     let applier = conn.new_store_command_applier();
     let replication_coordinator = Arc::new(ReplicationCoordinator::open(
-        db_path,
-        config.wal_enabled,
-        applier,
-        config.raft_mode,
+        db_path, true, applier, raft_mode,
     )?);
     let db = Arc::new(DatabaseContext::new(conn, replication_coordinator));
     let registry = Arc::new(CommandRegistry::new());

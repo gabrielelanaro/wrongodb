@@ -604,7 +604,7 @@ mod tests {
                 raft_addr: free_local_addr(),
             }],
         };
-        let conn = Connection::open(dir.path(), ConnectionConfig::new(true, raft_mode.clone()));
+        let conn = Connection::open(dir.path(), ConnectionConfig::new(false));
         let conn = Arc::new(conn.unwrap());
         let replication_coordinator = Arc::new(
             ReplicationCoordinator::open(

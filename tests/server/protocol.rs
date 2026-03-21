@@ -22,12 +22,16 @@ async fn test_mongo_client_connection() {
     let conn = Arc::new(conn);
 
     let db_path_clone = db_path.clone();
-    let config_clone = config.clone();
     let conn_clone = Arc::clone(&conn);
     tokio::spawn(async move {
-        start_server("127.0.0.1:27018", &db_path_clone, conn_clone, config_clone)
-            .await
-            .unwrap();
+        start_server(
+            "127.0.0.1:27018",
+            &db_path_clone,
+            conn_clone,
+            RaftMode::Standalone,
+        )
+        .await
+        .unwrap();
     });
 
     // Wait a bit
@@ -105,12 +109,16 @@ async fn test_supported_mongosh_commands() {
     let conn = Arc::new(conn);
 
     let db_path_clone = db_path.clone();
-    let config_clone = config.clone();
     let conn_clone = Arc::clone(&conn);
     tokio::spawn(async move {
-        start_server("127.0.0.1:27019", &db_path_clone, conn_clone, config_clone)
-            .await
-            .unwrap();
+        start_server(
+            "127.0.0.1:27019",
+            &db_path_clone,
+            conn_clone,
+            RaftMode::Standalone,
+        )
+        .await
+        .unwrap();
     });
 
     crate::common::wait_for_server().await;
@@ -212,27 +220,29 @@ async fn test_non_leader_mode_rejects_writes_but_keeps_connection_alive() {
     let db_path = tmp.path().join("test_cluster_non_leader.db");
     let local_raft_addr = free_local_addr();
     let peer_raft_addr = free_local_addr();
-    let cfg = ConnectionConfig::new(
-        true,
-        RaftMode::Cluster {
-            local_node_id: "n1".to_string(),
-            local_raft_addr,
-            peers: vec![RaftPeerConfig {
-                node_id: "n2".to_string(),
-                raft_addr: peer_raft_addr,
-            }],
-        },
-    );
-    let conn = Connection::open(&db_path, cfg.clone()).unwrap();
+    let raft_mode = RaftMode::Cluster {
+        local_node_id: "n1".to_string(),
+        local_raft_addr,
+        peers: vec![RaftPeerConfig {
+            node_id: "n2".to_string(),
+            raft_addr: peer_raft_addr,
+        }],
+    };
+    let conn = Connection::open(&db_path, ConnectionConfig::new(false)).unwrap();
     let conn = Arc::new(conn);
 
     let db_path_clone = db_path.clone();
-    let cfg_clone = cfg.clone();
+    let raft_mode_clone = raft_mode.clone();
     let conn_clone = Arc::clone(&conn);
     tokio::spawn(async move {
-        start_server("127.0.0.1:27020", &db_path_clone, conn_clone, cfg_clone)
-            .await
-            .unwrap();
+        start_server(
+            "127.0.0.1:27020",
+            &db_path_clone,
+            conn_clone,
+            raft_mode_clone,
+        )
+        .await
+        .unwrap();
     });
 
     crate::common::wait_for_server().await;

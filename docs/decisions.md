@@ -1,5 +1,21 @@
 # Decisions
 
+## 2026-03-21: Make `ConnectionConfig` storage-only and move `RaftMode` out of the storage API
+
+**Decision**
+- Remove `RaftMode` from [`ConnectionConfig`].
+- Make `ConnectionConfig` carry only storage policy:
+  - `local_wal_enabled`
+- Make `Connection::open()` always attempt WAL replay if `global.wal` exists.
+- Keep `RaftMode` at server/bootstrap and replication-coordinator boundaries, not in the WT-like storage connection.
+
+**Why**
+- `RaftMode` is a replication concept and should not leak into the storage-layer open API.
+- Storage recovery and runtime local WAL recording are different concerns:
+  - WAL replay on open is a storage safety step
+  - runtime local WAL recording is a storage durability policy
+- Using replication mode as a proxy for storage behavior was the last direct RAFT coupling in `Connection`.
+
 ## 2026-03-21: Remove RAFT identity from the storage WAL and persist logical restart markers in replication-owned state
 
 **Decision**

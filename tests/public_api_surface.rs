@@ -33,7 +33,7 @@ fn api_mod_only_exposes_database_context_internally() {
 fn storage_api_mod_reexports_storage_surface() {
     let storage_api_mod = read("src/storage/api/mod.rs");
 
-    assert!(storage_api_mod.contains("pub use crate::replication::{RaftMode, RaftPeerConfig};"));
+    assert!(!storage_api_mod.contains("pub use crate::replication::{RaftMode, RaftPeerConfig};"));
     assert!(storage_api_mod.contains("pub use connection::{Connection, ConnectionConfig};"));
     assert!(storage_api_mod.contains("pub use cursor::{Cursor, CursorEntry};"));
     assert!(storage_api_mod.contains("pub use session::{Session, WriteUnitOfWork};"));

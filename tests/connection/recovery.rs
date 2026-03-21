@@ -6,7 +6,7 @@ use std::io::{Seek, SeekFrom, Write};
 use crate::common::kv::{get_kv, insert_kv_in_write_unit, update_kv_in_write_unit};
 use tempfile::tempdir;
 
-use wrongodb::{Connection, ConnectionConfig, RaftMode};
+use wrongodb::{Connection, ConnectionConfig};
 
 fn global_wal_path(db_dir: &std::path::Path) -> std::path::PathBuf {
     db_dir.join("global.wal")
@@ -203,14 +203,13 @@ fn recovery_handles_empty_committed_transaction() {
 fn wal_disabled_mode_opens_without_global_wal() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("db");
-    let cfg = ConnectionConfig::new(false, RaftMode::Standalone);
+    let cfg = ConnectionConfig::new(false);
 
     {
         let conn = Connection::open(&db_path, cfg).unwrap();
         insert_kv(&conn, "test", b"k1", b"a");
     }
 
-    let _reopened =
-        Connection::open(&db_path, ConnectionConfig::new(false, RaftMode::Standalone)).unwrap();
+    let _reopened = Connection::open(&db_path, ConnectionConfig::new(false)).unwrap();
     assert!(!global_wal_path(&db_path).exists());
 }
