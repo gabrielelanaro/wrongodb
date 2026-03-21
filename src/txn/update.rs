@@ -35,12 +35,12 @@ impl TimeWindow {
 pub struct Update {
     pub txn_id: TxnId,
     pub time_window: TimeWindow,
-    pub next: Option<UpdateRef>,
+    pub next: Option<UpdateHandle>,
     pub type_: UpdateType,
     pub data: Vec<u8>,
 }
 
-pub type UpdateRef = Arc<RwLock<Update>>;
+pub type UpdateHandle = Arc<RwLock<Update>>;
 
 impl Update {
     pub fn new(txn_id: TxnId, update_type: UpdateType, data: Vec<u8>) -> Self {
@@ -104,18 +104,18 @@ impl Update {
 
 #[derive(Debug, Default, Clone)]
 pub struct UpdateChain {
-    head: Option<UpdateRef>,
+    head: Option<UpdateHandle>,
 }
 
 impl UpdateChain {
-    pub fn prepend(&mut self, mut update: Update) -> UpdateRef {
+    pub fn prepend(&mut self, mut update: Update) -> UpdateHandle {
         update.next = self.head.take();
-        let update_ref = Arc::new(RwLock::new(update));
-        self.head = Some(update_ref.clone());
-        update_ref
+        let update_handle = Arc::new(RwLock::new(update));
+        self.head = Some(update_handle.clone());
+        update_handle
     }
 
-    pub fn head(&self) -> Option<UpdateRef> {
+    pub fn head(&self) -> Option<UpdateHandle> {
         self.head.clone()
     }
 
@@ -215,11 +215,11 @@ impl UpdateChain {
 
 /// Iterator over updates in an UpdateChain.
 pub struct UpdateChainIter {
-    current: Option<UpdateRef>,
+    current: Option<UpdateHandle>,
 }
 
 impl Iterator for UpdateChainIter {
-    type Item = UpdateRef;
+    type Item = UpdateHandle;
 
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.current.clone()?;

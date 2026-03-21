@@ -1,5 +1,33 @@
 # Decisions
 
+## 2026-03-21: Make `BTreeCursor` the transactional store-write boundary and keep explicit base-row helpers for reconciliation
+
+**Decision**
+- Move normal runtime store writes into `BTreeCursor`:
+  - `put(uri, key, value, txn)`
+  - `delete(uri, key, txn)`
+- Make those methods own the full low-level write step:
+  - attach the `Update`
+  - track the resulting `UpdateHandle` on the transaction
+  - buffer the matching `TxnLogOp`
+- Remove `txn::WriteContext` as redundant plumbing.
+- Rename the tracked update handle and transaction bookkeeping to match what the code actually stores:
+  - `UpdateRef` -> `UpdateHandle`
+  - `page_ops` -> `tracked_updates`
+  - `record_page_op` -> `track_update`
+- Keep direct base-image writes as explicit internal helpers only:
+  - `write_base_row`
+  - `delete_base_row`
+
+**Why**
+- WiredTiger does not route normal writes through a separate "put in txn" wrapper. The file/btree write path performs the modify and registers the resulting update with the transaction.
+- Our previous split across `BTreeCursor`, `storage/table.rs`, and `WriteContext` leaked implementation plumbing into the API and made the normal write path harder to read than the actual semantics.
+- Keeping `write_base_row` / `delete_base_row` as explicit internal helpers preserves the reconciliation/checkpoint use case without confusing it with the runtime transactional write path.
+
+**Notes**
+- Recovery replay still uses the same transactional `BTreeCursor::put/delete` path and suppresses WAL capture through replay transaction mode.
+- `storage/table.rs` now stays focused on metadata, reads, and checkpoint coordination instead of raw store mutation orchestration.
+
 ## 2026-03-21: Buffer WAL log ops at the low-level store write boundary and suppress capture for replay transactions
 
 **Decision**

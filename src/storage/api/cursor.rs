@@ -7,10 +7,7 @@ use crate::core::errors::{DocumentValidationError, StorageError};
 use crate::index::encode_index_key;
 use crate::storage::api::session::Session;
 use crate::storage::btree::BTreeCursor;
-use crate::storage::table::{
-    apply_delete_in_txn, apply_put_in_txn, contains_key, get_version, scan_range, IndexMetadata,
-    TableMetadata,
-};
+use crate::storage::table::{contains_key, get_version, scan_range, IndexMetadata, TableMetadata};
 use crate::txn::{Transaction, TxnId};
 use crate::{Document, WrongoDBError};
 
@@ -126,7 +123,7 @@ impl<'session> TableCursor<'session> {
                 if contains_key(&mut primary, key, txn_id)? {
                     return Err(DocumentValidationError("duplicate key error".into()).into());
                 }
-                apply_put_in_txn(self.table.uri(), &mut primary, key, value, txn)?;
+                primary.put(self.table.uri(), key, value, txn)?;
             }
 
             self.insert_secondary_indexes(&index_entries, txn_id, txn)
@@ -151,7 +148,7 @@ impl<'session> TableCursor<'session> {
 
             {
                 let mut primary = self.primary.write();
-                apply_put_in_txn(self.table.uri(), &mut primary, key, value, txn)?;
+                primary.put(self.table.uri(), key, value, txn)?;
             }
 
             self.insert_secondary_indexes(&new_index_entries, txn_id, txn)
@@ -174,7 +171,7 @@ impl<'session> TableCursor<'session> {
             self.delete_secondary_indexes(&old_index_entries, txn_id, txn)?;
 
             let mut primary = self.primary.write();
-            apply_delete_in_txn(self.table.uri(), &mut primary, key, txn).map(|_| ())
+            primary.delete(self.table.uri(), key, txn).map(|_| ())
         })?;
 
         self.reset();
@@ -379,7 +376,7 @@ impl<'session> TableCursor<'session> {
         for (index_pos, key) in entries {
             let metadata = &self.table.indexes()[*index_pos];
             let mut btree = self.indexes[*index_pos].write();
-            apply_put_in_txn(metadata.uri(), &mut btree, key, &[], txn)?;
+            btree.put(metadata.uri(), key, &[], txn)?;
         }
         Ok(())
     }
@@ -396,7 +393,7 @@ impl<'session> TableCursor<'session> {
             if !contains_key(&mut btree, key, txn_id)? {
                 continue;
             }
-            apply_delete_in_txn(metadata.uri(), &mut btree, key, txn)?;
+            btree.delete(metadata.uri(), key, txn)?;
         }
         Ok(())
     }
@@ -425,7 +422,7 @@ mod tests {
     use crate::storage::durability::DurabilityBackend;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::metadata_catalog::MetadataCatalog;
-    use crate::storage::table::{apply_put_in_txn, open_or_create_btree};
+    use crate::storage::table::open_or_create_btree;
     use crate::txn::{GlobalTxnState, TransactionManager, TXN_NONE};
 
     fn build_test_session(
@@ -536,7 +533,10 @@ mod tests {
     fn delete_applies_locally() {
         let (_tmp, btree, session, transaction_manager, table) = open_indexless_table();
         let mut seed_txn = transaction_manager.begin_snapshot_txn();
-        apply_put_in_txn(table.uri(), &mut btree.write(), b"k1", b"v1", &mut seed_txn).unwrap();
+        btree
+            .write()
+            .put(table.uri(), b"k1", b"v1", &mut seed_txn)
+            .unwrap();
         transaction_manager.commit_txn_state(&mut seed_txn).unwrap();
 
         let mut cursor = TableCursor::new(
@@ -597,22 +597,19 @@ mod tests {
         let new_value = make_document_bytes(1, "bob");
 
         let mut seed_txn = transaction_manager.begin_snapshot_txn();
-        apply_put_in_txn(
-            table.uri(),
-            &mut primary.write(),
-            &key,
-            &old_value,
-            &mut seed_txn,
-        )
-        .unwrap();
-        apply_put_in_txn(
-            table.indexes()[0].uri(),
-            &mut index.write(),
-            &index_key_for_name(1, "alice"),
-            &[],
-            &mut seed_txn,
-        )
-        .unwrap();
+        primary
+            .write()
+            .put(table.uri(), &key, &old_value, &mut seed_txn)
+            .unwrap();
+        index
+            .write()
+            .put(
+                table.indexes()[0].uri(),
+                &index_key_for_name(1, "alice"),
+                &[],
+                &mut seed_txn,
+            )
+            .unwrap();
         transaction_manager.commit_txn_state(&mut seed_txn).unwrap();
 
         let mut cursor = TableCursor::new(
@@ -653,22 +650,19 @@ mod tests {
         let value = make_document_bytes(1, "alice");
 
         let mut seed_txn = transaction_manager.begin_snapshot_txn();
-        apply_put_in_txn(
-            table.uri(),
-            &mut primary.write(),
-            &key,
-            &value,
-            &mut seed_txn,
-        )
-        .unwrap();
-        apply_put_in_txn(
-            table.indexes()[0].uri(),
-            &mut index.write(),
-            &index_key_for_name(1, "alice"),
-            &[],
-            &mut seed_txn,
-        )
-        .unwrap();
+        primary
+            .write()
+            .put(table.uri(), &key, &value, &mut seed_txn)
+            .unwrap();
+        index
+            .write()
+            .put(
+                table.indexes()[0].uri(),
+                &index_key_for_name(1, "alice"),
+                &[],
+                &mut seed_txn,
+            )
+            .unwrap();
         transaction_manager.commit_txn_state(&mut seed_txn).unwrap();
 
         let mut cursor = TableCursor::new(

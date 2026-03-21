@@ -4,16 +4,14 @@ pub mod read_visibility;
 pub mod snapshot;
 pub mod transaction;
 pub mod update;
-pub mod write_context;
 
 pub use global_txn::GlobalTxnState;
 #[allow(unused_imports)]
 pub(crate) use manager::TransactionManager;
 pub use read_visibility::ReadVisibility;
 #[allow(unused_imports)]
-pub use transaction::{Transaction, TxnLogOp, TxnPageOp, TxnState};
-pub use update::{Update, UpdateChain, UpdateRef, UpdateType};
-pub use write_context::WriteContext;
+pub use transaction::{Transaction, TxnLogOp, TxnState};
+pub use update::{Update, UpdateChain, UpdateHandle, UpdateType};
 
 pub type TxnId = u64;
 pub const TXN_NONE: TxnId = 0;

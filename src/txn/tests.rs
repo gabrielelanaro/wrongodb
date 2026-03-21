@@ -1,4 +1,4 @@
-use super::{GlobalTxnState, Transaction, TxnPageOp, Update, UpdateChain, UpdateType, TXN_NONE};
+use super::{GlobalTxnState, Transaction, Update, UpdateChain, UpdateHandle, UpdateType, TXN_NONE};
 
 #[test]
 fn snapshot_visibility_basic() {
@@ -37,7 +37,7 @@ fn update_chain_visibility() {
     assert!(find_visible(&chain, &t3).is_none());
 }
 
-fn find_visible(chain: &UpdateChain, txn: &Transaction) -> Option<super::UpdateRef> {
+fn find_visible(chain: &UpdateChain, txn: &Transaction) -> Option<UpdateHandle> {
     let mut current = chain.iter().next();
     while let Some(update_ref) = current {
         let update = update_ref.read();
@@ -69,7 +69,7 @@ fn transaction_commit_marks_recorded_ops_committed() {
 
     let mut chain = UpdateChain::default();
     let update_ref = chain.prepend(Update::new(txn.id(), UpdateType::Standard, b"v1".to_vec()));
-    txn.record_page_op(TxnPageOp::PageUpdate(update_ref.clone()));
+    txn.track_update(update_ref.clone());
 
     txn.commit(&global).unwrap();
 
@@ -85,7 +85,7 @@ fn transaction_abort_marks_recorded_ops_aborted() {
 
     let mut chain = UpdateChain::default();
     let update_ref = chain.prepend(Update::new(txn.id(), UpdateType::Standard, b"v1".to_vec()));
-    txn.record_page_op(TxnPageOp::PageUpdate(update_ref.clone()));
+    txn.track_update(update_ref.clone());
 
     txn.abort(&global).unwrap();
 
@@ -104,7 +104,7 @@ fn transaction_abort_restores_previous_current_update() {
 
     let update_ref = chain.prepend(Update::new(txn.id(), UpdateType::Standard, b"v2".to_vec()));
     base_ref.write().mark_stopped(txn.id());
-    txn.record_page_op(TxnPageOp::PageUpdate(update_ref.clone()));
+    txn.track_update(update_ref.clone());
 
     txn.abort(&global).unwrap();
 
@@ -123,7 +123,7 @@ fn transaction_commit_preserves_stop_metadata_on_overwritten_updates() {
 
     let update_ref = chain.prepend(Update::new(txn.id(), UpdateType::Standard, b"v2".to_vec()));
     base_ref.write().mark_stopped(txn.id());
-    txn.record_page_op(TxnPageOp::PageUpdate(update_ref.clone()));
+    txn.track_update(update_ref.clone());
 
     txn.commit(&global).unwrap();
 

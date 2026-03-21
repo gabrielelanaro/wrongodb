@@ -1,7 +1,7 @@
 use crate::core::errors::WrongoDBError;
 use crate::txn::global_txn::GlobalTxnState;
 use crate::txn::snapshot::Snapshot;
-use crate::txn::update::{Update, UpdateRef};
+use crate::txn::update::{Update, UpdateHandle};
 use crate::txn::{Timestamp, TxnId, TXN_NONE};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -21,12 +21,6 @@ pub enum TxnState {
     Active,
     Committed { commit_ts: Timestamp },
     Aborted,
-}
-
-#[derive(Debug, Clone)]
-#[cfg_attr(not(test), allow(dead_code))]
-pub enum TxnPageOp {
-    PageUpdate(UpdateRef),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +46,7 @@ pub struct Transaction {
     kind: TransactionKind,
     log_mode: TransactionLogMode,
     state: TxnState,
-    page_ops: Vec<TxnPageOp>,
+    tracked_updates: Vec<UpdateHandle>,
     log_ops: Vec<TxnLogOp>,
 }
 
@@ -65,7 +59,7 @@ impl Transaction {
             kind: TransactionKind::Snapshot,
             log_mode: TransactionLogMode::Capture,
             state: TxnState::Active,
-            page_ops: Vec::new(),
+            tracked_updates: Vec::new(),
             log_ops: Vec::new(),
         }
     }
@@ -78,7 +72,7 @@ impl Transaction {
             kind: TransactionKind::Replay,
             log_mode: TransactionLogMode::Skip,
             state: TxnState::Active,
-            page_ops: Vec::new(),
+            tracked_updates: Vec::new(),
             log_ops: Vec::new(),
         }
     }
@@ -144,8 +138,8 @@ impl Transaction {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub fn record_page_op(&mut self, op: TxnPageOp) {
-        self.page_ops.push(op);
+    pub fn track_update(&mut self, update_handle: UpdateHandle) {
+        self.tracked_updates.push(update_handle);
     }
 
     pub(crate) fn record_put_log(&mut self, uri: &str, key: &[u8], value: &[u8]) {
@@ -184,19 +178,15 @@ impl Transaction {
     }
 
     fn mark_ops_committed(&mut self, commit_ts: Timestamp) {
-        for op in self.page_ops.drain(..) {
-            match op {
-                TxnPageOp::PageUpdate(update_ref) => update_ref.write().mark_committed(commit_ts),
-            }
+        for update_handle in self.tracked_updates.drain(..) {
+            update_handle.write().mark_committed(commit_ts);
         }
         self.log_ops.clear();
     }
 
     fn mark_ops_aborted(&mut self) {
-        for op in self.page_ops.drain(..).rev() {
-            match op {
-                TxnPageOp::PageUpdate(update_ref) => abort_update_ref(&update_ref),
-            }
+        for update_handle in self.tracked_updates.drain(..).rev() {
+            abort_update_handle(&update_handle);
         }
         self.log_ops.clear();
     }
@@ -208,9 +198,9 @@ impl Transaction {
     }
 }
 
-fn abort_update_ref(update_ref: &UpdateRef) {
+fn abort_update_handle(update_handle: &UpdateHandle) {
     let (txn_id, next) = {
-        let mut update = update_ref.write();
+        let mut update = update_handle.write();
         update.mark_aborted();
         (update.txn_id, update.next.clone())
     };

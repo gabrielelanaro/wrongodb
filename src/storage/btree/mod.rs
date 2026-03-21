@@ -10,7 +10,9 @@ pub use iter::BTreeRangeIter;
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::mvcc::ReconcileStats;
 use crate::storage::page_store::{Page, PageEdit, PageRead, PageStore, PageType, RowInsert};
-use crate::txn::{ReadVisibility, TxnId, Update, UpdateChain, UpdateRef, UpdateType, WriteContext};
+use crate::txn::{
+    ReadVisibility, Transaction, TxnId, Update, UpdateChain, UpdateHandle, UpdateType,
+};
 use internal_ops::put_separator as put_internal_separator;
 use layout::{
     build_internal_page, internal_entries, leaf_entries, map_leaf_err, split_internal_entries,
@@ -86,13 +88,16 @@ struct LeafPosition {
 // BTreeCursor (Public API)
 // ============================================================================
 
-/// B+tree cursor providing read, write, and checkpoint operations.
+/// B+tree cursor providing read, transactional write, and checkpoint operations.
 ///
 /// `BTreeCursor` is the main interface for B+tree operations, managing:
 ///
 /// - **Point queries**: `get` retrieves a single key-value pair
 /// - **Range scans**: `range` returns an iterator over key ranges
-/// - **Mutations**: `put` and `delete` attach page-local MVCC updates
+/// - **Transactional writes**: crate-private `put` and `delete` attach page-local MVCC updates
+///   and register them with the active transaction
+/// - **Base-row writes**: internal `write_base_row` and `delete_base_row` update the reconciled
+///   page image without creating a new transactional update
 /// - **Checkpointing**: `checkpoint` flushes dirty pages and creates a consistent recovery point
 ///
 /// The cursor owns a [`PageStore`] which handles page caching, copy-on-write,
@@ -181,32 +186,30 @@ impl BTreeCursor {
     // Public API: Write Operations
     // ------------------------------------------------------------------------
 
-    #[allow(dead_code)]
-    pub fn put(
+    pub(crate) fn put(
         &mut self,
+        uri: &str,
         key: &[u8],
         value: &[u8],
-        write_context: &WriteContext,
+        txn: &mut Transaction,
     ) -> Result<(), WrongoDBError> {
-        if write_context.txn_id() == crate::txn::TXN_NONE {
-            return self.materialize_put(key, value);
-        }
-
-        let _ = self.put_with_update_ref(key, value, write_context)?;
+        let update_handle = self.attach_update(
+            key,
+            Update::new(txn.id(), UpdateType::Standard, value.to_vec()),
+            "leaf update failed",
+        )?;
+        txn.track_update(update_handle);
+        txn.record_put_log(uri, key, value);
         Ok(())
     }
 
-    pub(crate) fn materialize_put(
-        &mut self,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<(), WrongoDBError> {
+    pub(crate) fn write_base_row(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
         let root = self.page_store.root_page_id();
         if root == NONE_PAGE_ID {
             return Err(StorageError("btree missing root".into()).into());
         }
 
-        let result = self.materialize_insert_recursive(root, key, value, InsertMode::Upsert)?;
+        let result = self.write_base_row_recursive(root, key, value, InsertMode::Upsert)?;
         if let Some(split) = result.split {
             let payload_len = self.page_store.page_payload_len();
             let mut root_page = Page::new_internal(payload_len, result.new_node_id)
@@ -223,27 +226,29 @@ impl BTreeCursor {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn delete(
+    pub(crate) fn delete(
         &mut self,
+        uri: &str,
         key: &[u8],
-        write_context: &WriteContext,
+        txn: &mut Transaction,
     ) -> Result<bool, WrongoDBError> {
-        if write_context.txn_id() == crate::txn::TXN_NONE {
-            return self.materialize_delete(key);
-        }
-
-        let _ = self.delete_with_update_ref(key, write_context)?;
+        let update_handle = self.attach_update(
+            key,
+            Update::new(txn.id(), UpdateType::Tombstone, Vec::new()),
+            "leaf tombstone failed",
+        )?;
+        txn.track_update(update_handle);
+        txn.record_delete_log(uri, key);
         Ok(true)
     }
 
-    pub(crate) fn materialize_delete(&mut self, key: &[u8]) -> Result<bool, WrongoDBError> {
+    pub(crate) fn delete_base_row(&mut self, key: &[u8]) -> Result<bool, WrongoDBError> {
         let root = self.page_store.root_page_id();
         if root == NONE_PAGE_ID {
             return Ok(false);
         }
 
-        let result = self.materialize_delete_recursive(root, key)?;
+        let result = self.delete_base_row_recursive(root, key)?;
         self.page_store.set_root_page_id(result.new_node_id)?;
         Ok(result.deleted)
     }
@@ -297,44 +302,22 @@ impl BTreeCursor {
         Ok(Some(leaf.value_at(position.index)?.to_vec()))
     }
 
-    pub(crate) fn put_with_update_ref(
+    fn attach_update(
         &mut self,
         key: &[u8],
-        value: &[u8],
-        write_context: &WriteContext,
-    ) -> Result<UpdateRef, WrongoDBError> {
+        update: Update,
+        error_context: &str,
+    ) -> Result<UpdateHandle, WrongoDBError> {
         let position = self.find_leaf_position(key)?;
         let pin = self.page_store.pin_page(position.page_id)?;
-        let update_ref = {
+        let update_handle = {
             let page = self.page_store.get_page_mut(&pin);
-            let update = Update::new(write_context.txn_id(), UpdateType::Standard, value.to_vec());
-            apply_leaf_update(page, key, position, update).map_err(|e| {
-                StorageError(format!("leaf update failed at {}: {e}", position.page_id))
+            attach_leaf_update(page, key, position, update).map_err(|e| {
+                StorageError(format!("{error_context} at {}: {e}", position.page_id))
             })?
         };
         self.page_store.unpin_page(pin);
-        Ok(update_ref)
-    }
-
-    pub(crate) fn delete_with_update_ref(
-        &mut self,
-        key: &[u8],
-        write_context: &WriteContext,
-    ) -> Result<UpdateRef, WrongoDBError> {
-        let position = self.find_leaf_position(key)?;
-        let pin = self.page_store.pin_page(position.page_id)?;
-        let update_ref = {
-            let page = self.page_store.get_page_mut(&pin);
-            let update = Update::new(write_context.txn_id(), UpdateType::Tombstone, Vec::new());
-            apply_leaf_update(page, key, position, update).map_err(|e| {
-                StorageError(format!(
-                    "leaf tombstone failed at {}: {e}",
-                    position.page_id
-                ))
-            })?
-        };
-        self.page_store.unpin_page(pin);
-        Ok(update_ref)
+        Ok(update_handle)
     }
 
     pub(crate) fn reconcile_page_local_updates(
@@ -359,9 +342,9 @@ impl BTreeCursor {
 
         for (key, update_type, data) in entries {
             match update_type {
-                UpdateType::Standard => self.materialize_put(&key, &data)?,
+                UpdateType::Standard => self.write_base_row(&key, &data)?,
                 UpdateType::Tombstone => {
-                    let _ = self.materialize_delete(&key)?;
+                    let _ = self.delete_base_row(&key)?;
                 }
                 UpdateType::Reserve => {}
             }
@@ -466,7 +449,7 @@ impl BTreeCursor {
         Ok(())
     }
 
-    fn materialize_delete_recursive(
+    fn delete_base_row_recursive(
         &mut self,
         node_id: u64,
         key: &[u8],
@@ -520,7 +503,7 @@ impl BTreeCursor {
             entries[child_idx - 1].1
         };
 
-        let child_result = self.materialize_delete_recursive(child_id, key)?;
+        let child_result = self.delete_base_row_recursive(child_id, key)?;
         if child_idx == 0 {
             first_child = child_result.new_node_id;
         } else {
@@ -540,7 +523,7 @@ impl BTreeCursor {
     // Private Helpers: Insert Operations
     // ------------------------------------------------------------------------
 
-    fn materialize_insert_recursive(
+    fn write_base_row_recursive(
         &mut self,
         node_id: u64,
         key: &[u8],
@@ -637,7 +620,7 @@ impl BTreeCursor {
             entries[child_idx - 1].1
         };
 
-        let child_result = self.materialize_insert_recursive(child_id, key, value, mode)?;
+        let child_result = self.write_base_row_recursive(child_id, key, value, mode)?;
         if !child_result.inserted {
             return Ok(InsertResult {
                 new_node_id: page_id,
@@ -730,12 +713,12 @@ fn find_visible_insert_value(
     None
 }
 
-fn apply_leaf_update(
+fn attach_leaf_update(
     page: &mut Page,
     key: &[u8],
     position: LeafPosition,
     update: Update,
-) -> Result<UpdateRef, crate::storage::page_store::PageError> {
+) -> Result<UpdateHandle, crate::storage::page_store::PageError> {
     let row_modify = page.ensure_row_modify()?;
     if position.found {
         let chain =
@@ -755,7 +738,7 @@ fn apply_leaf_update(
     }
 }
 
-fn prepend_update(chain: &mut UpdateChain, update: Update) -> UpdateRef {
+fn prepend_update(chain: &mut UpdateChain, update: Update) -> UpdateHandle {
     if let Some(head) = chain.head() {
         head.write().mark_stopped(update.txn_id);
     }
@@ -876,12 +859,13 @@ fn child_index_for_key(entries: &[(Vec<u8>, u64)], key: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Arc;
 
     use tempfile::tempdir;
 
     use super::*;
     use crate::storage::page_store::{BlockFilePageStore, PageWrite, RootStore};
-    use crate::txn::{WriteContext, TXN_NONE};
+    use crate::txn::{GlobalTxnState, TransactionManager, TXN_NONE};
 
     fn create_tree(path: &Path) -> BTreeCursor {
         let mut store = BlockFilePageStore::create(path, 512).unwrap();
@@ -897,10 +881,11 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("btree_put_existing.wt");
         let mut tree = create_tree(&path);
-        let writer = WriteContext::from_txn_id(7);
+        let transaction_manager = TransactionManager::new(Arc::new(GlobalTxnState::new()));
+        let mut txn = transaction_manager.begin_snapshot_txn();
 
-        tree.materialize_put(b"k1", b"base").unwrap();
-        tree.put(b"k1", b"txn", &writer).unwrap();
+        tree.write_base_row(b"k1", b"base").unwrap();
+        tree.put("table:test", b"k1", b"txn", &mut txn).unwrap();
 
         assert_eq!(
             tree.get(b"k1", &ReadVisibility::from_txn_id(7)).unwrap(),
@@ -918,9 +903,10 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("btree_put_insert.wt");
         let mut tree = create_tree(&path);
-        let writer = WriteContext::from_txn_id(9);
+        let transaction_manager = TransactionManager::new(Arc::new(GlobalTxnState::new()));
+        let mut txn = transaction_manager.begin_snapshot_txn();
 
-        tree.put(b"k1", b"txn", &writer).unwrap();
+        tree.put("table:test", b"k1", b"txn", &mut txn).unwrap();
 
         assert_eq!(
             tree.get(b"k1", &ReadVisibility::from_txn_id(9)).unwrap(),
@@ -938,10 +924,11 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("btree_delete_existing.wt");
         let mut tree = create_tree(&path);
-        let writer = WriteContext::from_txn_id(11);
+        let transaction_manager = TransactionManager::new(Arc::new(GlobalTxnState::new()));
+        let mut txn = transaction_manager.begin_snapshot_txn();
 
-        tree.materialize_put(b"k1", b"base").unwrap();
-        tree.delete(b"k1", &writer).unwrap();
+        tree.write_base_row(b"k1", b"base").unwrap();
+        tree.delete("table:test", b"k1", &mut txn).unwrap();
 
         assert_eq!(
             tree.get(b"k1", &ReadVisibility::from_txn_id(11)).unwrap(),

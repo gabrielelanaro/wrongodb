@@ -10,8 +10,7 @@ use crate::storage::durability::{DurabilityBackend, StorageSyncPolicy};
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::metadata_catalog::{MetadataCatalog, METADATA_STORE_NAME, METADATA_URI};
 use crate::storage::table::{
-    apply_put_in_txn, checkpoint_store, contains_key, open_or_create_btree, scan_range,
-    TableMetadata,
+    checkpoint_store, contains_key, open_or_create_btree, scan_range, TableMetadata,
 };
 use crate::txn::{Transaction, TransactionManager, TxnId, TXN_NONE};
 use crate::WrongoDBError;
@@ -304,7 +303,7 @@ impl Session {
         }
 
         let mut txn = txn_handle.lock();
-        apply_put_in_txn(uri, &mut btree, key, value, &mut txn)?;
+        btree.put(uri, key, value, &mut txn)?;
         Ok(())
     }
 

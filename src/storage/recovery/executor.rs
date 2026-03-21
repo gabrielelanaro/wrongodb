@@ -7,9 +7,7 @@ use crate::core::errors::StorageError;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::metadata_catalog::MetadataCatalog;
-use crate::storage::table::{
-    apply_delete_in_txn, apply_put_in_txn, checkpoint_store, open_or_create_btree,
-};
+use crate::storage::table::{checkpoint_store, open_or_create_btree};
 use crate::txn::{TransactionManager, TxnId, TxnLogOp};
 use crate::WrongoDBError;
 
@@ -73,11 +71,11 @@ impl RecoveryApplier for RecoveryExecutor {
             match op {
                 TxnLogOp::Put { uri, key, value } => {
                     let store = self.open_store_for_uri(uri, txn_id)?;
-                    apply_put_in_txn(uri, &mut store.write(), key, value, &mut txn)?;
+                    store.write().put(uri, key, value, &mut txn)?;
                 }
                 TxnLogOp::Delete { uri, key } => {
                     let store = self.open_store_for_uri(uri, txn_id)?;
-                    let _ = apply_delete_in_txn(uri, &mut store.write(), key, &mut txn)?;
+                    let _ = store.write().delete(uri, key, &mut txn)?;
                 }
             }
         }
