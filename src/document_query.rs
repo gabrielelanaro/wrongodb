@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::api::{Cursor, Session, WriteUnitOfWork};
 use crate::core::bson::{decode_document, encode_id_value};
 use crate::core::document::validate_is_object;
 use crate::index::{decode_index_id, encode_range_bounds};
 use crate::schema::SchemaCatalog;
+use crate::storage::api::{Cursor, Session, WriteUnitOfWork};
 use crate::{Document, WrongoDBError};
 
 #[derive(Clone)]

@@ -1,3 +1,4 @@
+pub(crate) mod api;
 pub mod block;
 pub mod btree;
 pub mod mvcc;

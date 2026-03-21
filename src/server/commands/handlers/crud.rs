@@ -1,4 +1,4 @@
-use crate::database_context::DatabaseContext;
+use crate::api::DatabaseContext;
 use crate::server::commands::Command;
 use crate::WrongoDBError;
 use bson::{doc, oid::ObjectId, Bson, Document};

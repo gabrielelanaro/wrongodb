@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use crate::api::WriteUnitOfWork;
 use crate::core::errors::{DocumentValidationError, StorageError};
 use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp};
 use crate::replication::{ReplicationCoordinator, WritePathMode};
+use crate::storage::api::WriteUnitOfWork;
 use crate::storage::table_cache::TableCache;
 use crate::txn::TxnId;
 use crate::WrongoDBError;

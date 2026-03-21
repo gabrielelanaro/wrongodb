@@ -13,7 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use self::commands::handlers::crud::{bson_to_value, value_to_bson};
 use self::commands::CommandRegistry;
-use crate::database_context::DatabaseContext;
+use crate::api::DatabaseContext;
 use crate::durability::StoreCommandApplier;
 use crate::replication::ReplicationCoordinator;
 use crate::{Connection, ConnectionConfig, WrongoDBError};

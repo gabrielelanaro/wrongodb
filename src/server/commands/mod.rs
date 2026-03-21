@@ -1,6 +1,6 @@
 use bson::Document;
 
-use crate::database_context::DatabaseContext;
+use crate::api::DatabaseContext;
 use crate::WrongoDBError;
 
 pub(crate) mod handlers;

@@ -1,9 +1,9 @@
 use std::sync::{Arc, Weak};
 
-use crate::api::cursor::{Cursor, CursorWriteAccess};
 use crate::core::errors::StorageError;
 use crate::durability::DurabilityBackend;
 use crate::schema::SchemaCatalog;
+use crate::storage::api::cursor::{Cursor, CursorWriteAccess};
 use crate::storage::table_cache::TableCache;
 use crate::txn::{ActiveWriteUnit, RecoveryUnit, TransactionManager, TxnId, TXN_NONE};
 use crate::WrongoDBError;

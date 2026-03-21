@@ -1,5 +1,5 @@
 use super::crud::{bson_to_value, value_to_bson_value};
-use crate::database_context::DatabaseContext;
+use crate::api::DatabaseContext;
 use crate::server::commands::Command;
 use crate::WrongoDBError;
 use bson::{doc, Bson, Document};

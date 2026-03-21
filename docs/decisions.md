@@ -1,5 +1,30 @@
 # Decisions
 
+## 2026-03-21: Move the WT-like storage API under `storage/api` and reserve top-level `api` for database-layer context
+
+**Decision**
+- Move the storage-engine-facing handles into `src/storage/api/`:
+  - `Connection`
+  - `ConnectionConfig`
+  - `Session`
+  - `WriteUnitOfWork`
+  - `Cursor`
+  - `CursorEntry`
+- Keep the crate-root public API stable by re-exporting those types from
+  `crate::storage::api`.
+- Move `DatabaseContext` into `src/api/database_context.rs`.
+- Make `src/api/` the database-layer API area and keep `DatabaseContext`
+  crate-private.
+
+**Why**
+- The previous `src/api/` mixed two different boundaries:
+  the WT-like storage API and the higher database/server-layer context.
+- Moving storage handles under `storage/api` makes the ownership direction
+  explicit: storage internals and their public handles live together.
+- Reusing top-level `api` for `DatabaseContext` keeps upper-layer wiring
+  separate from the storage engine without changing the supported crate-root
+  surface.
+
 ## 2026-03-21: Move replication runtime ownership out of `Connection` and into `DatabaseContext`
 
 **Decision**

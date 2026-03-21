@@ -3,11 +3,11 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::api::session::Session;
 use crate::durability::{DurabilityBackend, StoreCommandApplier};
 use crate::recovery::recover_from_wal;
 use crate::replication::RaftMode;
 use crate::schema::SchemaCatalog;
+use crate::storage::api::session::Session;
 use crate::storage::table_cache::TableCache;
 use crate::storage::wal::{GlobalWal, WalFileReader};
 use crate::txn::{GlobalTxnState, TransactionManager};

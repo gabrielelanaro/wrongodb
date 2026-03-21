@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::api::{Session, WriteUnitOfWork};
 use crate::core::bson::{decode_document, encode_document, encode_id_value};
 use crate::core::document::{normalize_document_in_place, validate_is_object};
 use crate::core::errors::DocumentValidationError;
@@ -10,6 +9,7 @@ use crate::document_query::DocumentQuery;
 use crate::index::encode_index_key;
 use crate::replication::WritePathMode;
 use crate::schema::SchemaCatalog;
+use crate::storage::api::{Session, WriteUnitOfWork};
 use crate::store_write_path::StoreWritePath;
 use crate::{Document, WrongoDBError};
 
@@ -476,16 +476,16 @@ mod tests {
     use tempfile::tempdir;
 
     use super::apply_update;
-    use crate::api::connection::{Connection, ConnectionConfig};
+    use crate::api::DatabaseContext;
     use crate::collection_write_path::CollectionWritePath;
     use crate::core::bson::{encode_document, encode_id_value};
-    use crate::database_context::DatabaseContext;
     use crate::document_query::DocumentQuery;
     use crate::durability::{
         DurabilityBackend, DurabilityGuarantee, DurableOp, StoreCommandApplier,
     };
     use crate::replication::{RaftMode, RaftPeerConfig, ReplicationCoordinator, WritePathMode};
     use crate::schema::SchemaCatalog;
+    use crate::storage::api::{Connection, ConnectionConfig, Session};
     use crate::storage::table_cache::TableCache;
     use crate::store_write_path::StoreWritePath;
     use crate::txn::{GlobalTxnState, TransactionManager};
@@ -501,7 +501,7 @@ mod tests {
     fn test_services(
         base_path: std::path::PathBuf,
         backend: DurabilityBackend,
-    ) -> (CollectionWritePath, DocumentQuery, crate::api::Session) {
+    ) -> (CollectionWritePath, DocumentQuery, Session) {
         test_services_with_replication(base_path, backend, ReplicationCoordinator::standalone())
     }
 
@@ -509,7 +509,7 @@ mod tests {
         base_path: std::path::PathBuf,
         backend: DurabilityBackend,
         replication: ReplicationCoordinator,
-    ) -> (CollectionWritePath, DocumentQuery, crate::api::Session) {
+    ) -> (CollectionWritePath, DocumentQuery, Session) {
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
         let table_cache = Arc::new(TableCache::new(
@@ -527,8 +527,7 @@ mod tests {
             document_query.clone(),
             store_write_path,
         );
-        let session =
-            crate::api::Session::new(table_cache, schema_catalog, transaction_manager, backend);
+        let session = Session::new(table_cache, schema_catalog, transaction_manager, backend);
         (service, document_query, session)
     }
 

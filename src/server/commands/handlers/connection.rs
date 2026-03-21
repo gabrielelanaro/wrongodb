@@ -1,7 +1,8 @@
-use crate::database_context::DatabaseContext;
+use bson::{doc, Bson, Document};
+
+use crate::api::DatabaseContext;
 use crate::server::commands::Command;
 use crate::WrongoDBError;
-use bson::{doc, Bson, Document};
 
 /// Handles: hello, isMaster, ismaster
 pub struct HelloCommand;

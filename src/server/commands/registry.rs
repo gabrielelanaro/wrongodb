@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use bson::{doc, Bson, Document};
 
 use super::{handlers, Command};
-use crate::database_context::DatabaseContext;
+use crate::api::DatabaseContext;
 use crate::WrongoDBError;
 
 /// Registry that maps command names to their handlers.
