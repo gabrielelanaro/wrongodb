@@ -1,19 +1,19 @@
 ---
 name: sw-design-review
-description: Review software design boundaries and apply refactorings that improve coupling, cohesion, and test scope.
+description: Review software design for violations, must be called explicitly.
 ---
 
-The objective of software design review is to reorganize the code so that future changes are easier. Things that make the code easier are:
+The objective of software design review is to evaluate the code so that future changes are easier. Things that make the code easier are:
 - reducing coupling
 - improving understandability
 - remove unneeded abstraction
 - simplify complexity when it doesn't serve a purpose
 
-Refactoring is one of the main tools used to address these issues.
+Refactoring is one of the main tools used to address these issues. But this skill is only about review.
 
 All these activities contribute to make the codebase easier to change.
 
-Violations:
+Evaluate the following violations individually
 
 <violation>
   <id>R-0001</id>
