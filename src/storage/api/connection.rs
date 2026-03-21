@@ -12,7 +12,7 @@ use crate::storage::handle_cache::HandleCache;
 use crate::storage::metadata_catalog::MetadataCatalog;
 use crate::storage::recovery::{recover_from_wal, RecoveryExecutor};
 use crate::storage::wal::{GlobalWal, WalFileReader};
-use crate::txn::{GlobalTxnState, TransactionManager};
+use crate::txn::GlobalTxnState;
 use crate::WrongoDBError;
 
 /// Configuration used when opening a [`Connection`].
@@ -69,7 +69,7 @@ pub struct Connection {
     base_path: PathBuf,
     metadata_catalog: Arc<MetadataCatalog>,
     store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
-    transaction_manager: Arc<TransactionManager>,
+    global_txn: Arc<GlobalTxnState>,
     durability_backend: Arc<DurabilityBackend>,
 }
 
@@ -96,8 +96,7 @@ impl Connection {
         let base_path = path.as_ref().to_path_buf();
         fs::create_dir_all(&base_path)?;
 
-        let transaction_manager =
-            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+        let global_txn = Arc::new(GlobalTxnState::new());
         let store_handles = Arc::new(HandleCache::new());
         let metadata_catalog = Arc::new(MetadataCatalog::new(
             base_path.clone(),
@@ -107,7 +106,7 @@ impl Connection {
             base_path.clone(),
             metadata_catalog.clone(),
             store_handles.clone(),
-            transaction_manager.clone(),
+            global_txn.clone(),
         ));
 
         if let Some(recovery_reader) = open_recovery_reader(&base_path) {
@@ -120,7 +119,7 @@ impl Connection {
             base_path,
             metadata_catalog,
             store_handles,
-            transaction_manager,
+            global_txn,
             durability_backend,
         })
     }
@@ -138,7 +137,7 @@ impl Connection {
             self.base_path.clone(),
             self.store_handles.clone(),
             self.metadata_catalog.clone(),
-            self.transaction_manager.clone(),
+            self.global_txn.clone(),
             self.durability_backend.clone(),
         )
     }

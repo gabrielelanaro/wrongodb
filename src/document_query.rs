@@ -197,7 +197,7 @@ mod tests {
     use crate::storage::durability::DurabilityBackend;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::metadata_catalog::MetadataCatalog;
-    use crate::txn::{GlobalTxnState, TransactionManager};
+    use crate::txn::GlobalTxnState;
 
     struct QueryTestFixture {
         query: DocumentQuery,
@@ -211,8 +211,7 @@ mod tests {
             let base_path = dir.path().to_path_buf();
             std::mem::forget(dir);
 
-            let transaction_manager =
-                Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+            let global_txn = Arc::new(GlobalTxnState::new());
             let store_handles =
                 Arc::new(HandleCache::<String, parking_lot::RwLock<BTreeCursor>>::new());
             let metadata_catalog = Arc::new(MetadataCatalog::new(
@@ -234,7 +233,7 @@ mod tests {
                 base_path,
                 store_handles,
                 metadata_catalog,
-                transaction_manager,
+                global_txn,
                 backend,
             );
 

@@ -397,7 +397,7 @@ mod tests {
     use crate::storage::api::Session;
     use crate::storage::btree::BTreeCursor;
     use crate::storage::durability::DurabilityBackend;
-    use crate::txn::{GlobalTxnState, TransactionManager};
+    use crate::txn::GlobalTxnState;
 
     struct MetadataFixture {
         catalog: Arc<MetadataCatalog>,
@@ -411,8 +411,7 @@ mod tests {
             std::mem::forget(dir);
 
             let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
-            let transaction_manager =
-                Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+            let global_txn = Arc::new(GlobalTxnState::new());
             let catalog = Arc::new(MetadataCatalog::new(
                 base_path.clone(),
                 store_handles.clone(),
@@ -421,7 +420,7 @@ mod tests {
                 base_path,
                 store_handles,
                 catalog.clone(),
-                transaction_manager,
+                global_txn,
                 Arc::new(DurabilityBackend::Disabled),
             );
 

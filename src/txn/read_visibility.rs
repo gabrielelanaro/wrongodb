@@ -2,9 +2,9 @@ use crate::txn::{TxnId, Update, TXN_ABORTED};
 
 /// Read-time visibility context consumed by storage cursors.
 ///
-/// The B+tree layer should not depend on [`TransactionManager`](crate::txn::manager::TransactionManager)
-/// directly. It only needs enough context to decide whether a version on an
-/// update chain is visible to the current reader.
+/// The B+tree layer should not depend on global transaction state directly. It
+/// only needs enough context to decide whether a version on an update chain is
+/// visible to the current reader.
 ///
 /// This type intentionally starts small. Today it carries only the bound
 /// transaction id and reproduces the existing visibility rule used by the

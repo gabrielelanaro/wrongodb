@@ -865,7 +865,7 @@ mod tests {
 
     use super::*;
     use crate::storage::page_store::{BlockFilePageStore, PageWrite, RootStore};
-    use crate::txn::{GlobalTxnState, TransactionManager, TXN_NONE};
+    use crate::txn::{GlobalTxnState, TXN_NONE};
 
     fn create_tree(path: &Path) -> BTreeCursor {
         let mut store = BlockFilePageStore::create(path, 512).unwrap();
@@ -881,8 +881,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("btree_put_existing.wt");
         let mut tree = create_tree(&path);
-        let transaction_manager = TransactionManager::new(Arc::new(GlobalTxnState::new()));
-        let mut txn = transaction_manager.begin_snapshot_txn();
+        let global_txn = Arc::new(GlobalTxnState::new());
+        let mut txn = global_txn.begin_snapshot_txn();
 
         tree.write_base_row(b"k1", b"base").unwrap();
         tree.put("table:test", b"k1", b"txn", &mut txn).unwrap();
@@ -903,8 +903,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("btree_put_insert.wt");
         let mut tree = create_tree(&path);
-        let transaction_manager = TransactionManager::new(Arc::new(GlobalTxnState::new()));
-        let mut txn = transaction_manager.begin_snapshot_txn();
+        let global_txn = Arc::new(GlobalTxnState::new());
+        let mut txn = global_txn.begin_snapshot_txn();
 
         tree.put("table:test", b"k1", b"txn", &mut txn).unwrap();
 
@@ -924,8 +924,8 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("btree_delete_existing.wt");
         let mut tree = create_tree(&path);
-        let transaction_manager = TransactionManager::new(Arc::new(GlobalTxnState::new()));
-        let mut txn = transaction_manager.begin_snapshot_txn();
+        let global_txn = Arc::new(GlobalTxnState::new());
+        let mut txn = global_txn.begin_snapshot_txn();
 
         tree.write_base_row(b"k1", b"base").unwrap();
         tree.delete("table:test", b"k1", &mut txn).unwrap();

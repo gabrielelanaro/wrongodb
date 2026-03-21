@@ -90,7 +90,7 @@ mod tests {
     use crate::storage::wal::{
         GlobalWal, Lsn, RecoveryError, WalFileReader, WalReader, WalRecord, WalRecordHeader,
     };
-    use crate::txn::{GlobalTxnState, TransactionManager, TxnLogOp, TXN_NONE};
+    use crate::txn::{GlobalTxnState, TxnLogOp, TXN_NONE};
 
     const TEST_URI: &str = "table:test";
 
@@ -180,8 +180,7 @@ mod tests {
     }
 
     fn recover_store_from_wal(base_path: &Path, store_name: &str, key: &[u8]) -> Option<Vec<u8>> {
-        let transaction_manager =
-            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+        let global_txn = Arc::new(GlobalTxnState::new());
         let store_handles =
             Arc::new(HandleCache::<String, parking_lot::RwLock<BTreeCursor>>::new());
         let metadata_catalog = Arc::new(MetadataCatalog::new(
@@ -192,7 +191,7 @@ mod tests {
             base_path.to_path_buf(),
             metadata_catalog,
             store_handles.clone(),
-            transaction_manager.clone(),
+            global_txn,
         ));
         let reader = WalFileReader::open(GlobalWal::path_for_db(base_path)).unwrap();
         recover_from_wal(applier, reader).unwrap();

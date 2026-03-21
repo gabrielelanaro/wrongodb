@@ -1,5 +1,33 @@
 # Decisions
 
+## 2026-03-21: Remove `TransactionManager` and wire shared transaction state directly
+
+**Decision**
+- Remove `src/txn/manager.rs` and stop carrying a `TransactionManager` wrapper through the storage
+  and recovery layers.
+- Make shared engine components that need transaction coordination own `Arc<GlobalTxnState>`
+  directly:
+  - `Connection`
+  - `Session`
+  - `RecoveryExecutor`
+- Call transaction lifecycle methods on the real primitives instead of forwarding through a facade:
+  - `GlobalTxnState::begin_snapshot_txn()`
+  - `Transaction::replay(...)`
+  - `Transaction::commit(&GlobalTxnState)`
+  - `Transaction::abort(&GlobalTxnState)`
+- Keep checkpoint/reconciliation helpers driven by `GlobalTxnState` rather than a separate manager
+  object.
+- Fix `Session::begin_transaction_internal()` to reject nested begins before allocating/registering
+  a new snapshot transaction.
+
+**Why**
+- The old `TransactionManager` had been reduced to a pass-through wrapper over `GlobalTxnState`
+  and `Transaction`, so keeping it added indirection without owning real policy.
+- This keeps ownership clearer: `GlobalTxnState` is the shared MVCC state, `Transaction` owns the
+  live unit of work, and `Session`/recovery own orchestration.
+- Removing the wrapper matches the recent direction of shrinking transaction-layer abstractions down
+  to narrow, explicit contexts instead of broad manager dependencies.
+
 ## 2026-03-21: Make `BTreeCursor` the transactional store-write boundary and keep explicit base-row helpers for reconciliation
 
 **Decision**

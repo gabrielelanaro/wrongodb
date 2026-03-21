@@ -12,7 +12,7 @@ use crate::storage::metadata_catalog::{MetadataCatalog, METADATA_STORE_NAME, MET
 use crate::storage::table::{
     checkpoint_store, contains_key, open_or_create_btree, scan_range, TableMetadata,
 };
-use crate::txn::{Transaction, TransactionManager, TxnId, TXN_NONE};
+use crate::txn::{GlobalTxnState, Transaction, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
 pub(crate) type ActiveTxnHandle = Arc<Mutex<Transaction>>;
@@ -39,7 +39,7 @@ pub struct Session {
     base_path: PathBuf,
     store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
     metadata_catalog: Arc<MetadataCatalog>,
-    transaction_manager: Arc<TransactionManager>,
+    global_txn: Arc<GlobalTxnState>,
     durability_backend: Arc<DurabilityBackend>,
     active_txn: Mutex<Option<ActiveTxnHandle>>,
     open_cursors: Mutex<Vec<Weak<Mutex<TableCursorState>>>>,
@@ -50,7 +50,7 @@ impl Session {
         base_path: PathBuf,
         store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
         metadata_catalog: Arc<MetadataCatalog>,
-        transaction_manager: Arc<TransactionManager>,
+        global_txn: Arc<GlobalTxnState>,
         durability_backend: Arc<DurabilityBackend>,
     ) -> Self {
         Self {
@@ -58,7 +58,7 @@ impl Session {
             store_handles,
             metadata_catalog,
             durability_backend,
-            transaction_manager,
+            global_txn,
             active_txn: Mutex::new(None),
             open_cursors: Mutex::new(Vec::new()),
         }
@@ -133,12 +133,10 @@ impl Session {
                     let path = self.base_path.join(store_name);
                     Ok(RwLock::new(open_or_create_btree(path)?))
                 })?;
-            checkpoint_store(&mut store.write(), self.transaction_manager.as_ref())?;
+            checkpoint_store(&mut store.write(), self.global_txn.as_ref())?;
         }
 
-        if self.transaction_manager.has_active_transactions()
-            || !self.durability_backend.is_enabled()
-        {
+        if self.global_txn.has_active_transactions() || !self.durability_backend.is_enabled() {
             return Ok(());
         }
 
@@ -214,11 +212,11 @@ impl Session {
     }
 
     pub(crate) fn begin_transaction_internal(&mut self) -> Result<(), WrongoDBError> {
-        let txn = self.transaction_manager.begin_snapshot_txn();
         let mut active_txn = self.active_txn.lock();
         if active_txn.is_some() {
             return Err(WrongoDBError::TransactionAlreadyActive);
         }
+        let txn = self.global_txn.begin_snapshot_txn();
         *active_txn = Some(Arc::new(Mutex::new(txn)));
         Ok(())
     }
@@ -236,7 +234,7 @@ impl Session {
         if result.is_err() {
             self.reset_open_cursors();
             let mut txn = txn_handle.lock();
-            let _ = self.transaction_manager.abort_txn_state(&mut txn);
+            let _ = txn.abort(self.global_txn.as_ref());
         }
 
         result
@@ -249,7 +247,7 @@ impl Session {
 
         self.reset_open_cursors();
         let mut txn = txn_handle.lock();
-        self.transaction_manager.abort_txn_state(&mut txn)
+        txn.abort(self.global_txn.as_ref())
     }
 
     pub(crate) fn run_cursor_write_operation<R, F>(&self, f: F) -> Result<R, WrongoDBError>
@@ -261,7 +259,7 @@ impl Session {
             return f(txn.id(), &mut txn);
         }
 
-        let mut txn = self.transaction_manager.begin_snapshot_txn();
+        let mut txn = self.global_txn.begin_snapshot_txn();
         let txn_id = txn.id();
 
         let result = f(txn_id, &mut txn);
@@ -269,14 +267,14 @@ impl Session {
             Ok(value) => {
                 if let Err(err) = self.commit_txn_with_durability(&mut txn) {
                     self.reset_open_cursors();
-                    let _ = self.transaction_manager.abort_txn_state(&mut txn);
+                    let _ = txn.abort(self.global_txn.as_ref());
                     return Err(err);
                 }
                 Ok(value)
             }
             Err(err) => {
                 self.reset_open_cursors();
-                let _ = self.transaction_manager.abort_txn_state(&mut txn);
+                let _ = txn.abort(self.global_txn.as_ref());
                 Err(err)
             }
         }
@@ -350,7 +348,7 @@ impl Session {
             txn.log_ops(),
             StorageSyncPolicy::Sync,
         )?;
-        self.transaction_manager.commit_txn_state(txn)?;
+        txn.commit(self.global_txn.as_ref())?;
         Ok(())
     }
 }
@@ -415,7 +413,7 @@ mod tests {
     use crate::storage::metadata_catalog::MetadataCatalog;
     use crate::storage::recovery::{recover_from_wal, RecoveryExecutor};
     use crate::storage::wal::{GlobalWal, WalFileReader, WalReader, WalRecord};
-    use crate::txn::{GlobalTxnState, TransactionManager};
+    use crate::txn::GlobalTxnState;
 
     const TEST_URI: &str = "table:items";
     const TEST_KEY: &[u8] = b"k1";
@@ -436,8 +434,7 @@ mod tests {
         fn open_local_wal<P: AsRef<Path>>(path: P) -> Self {
             let base_path = path.as_ref().to_path_buf();
             std::fs::create_dir_all(&base_path).unwrap();
-            let transaction_manager =
-                Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+            let global_txn = Arc::new(GlobalTxnState::new());
             let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
             let metadata_catalog = Arc::new(MetadataCatalog::new(
                 base_path.clone(),
@@ -447,7 +444,7 @@ mod tests {
                 base_path.clone(),
                 metadata_catalog,
                 store_handles.clone(),
-                transaction_manager,
+                global_txn,
             ));
             recover_existing_wal_if_present(&base_path, applier.clone());
             let backend = Arc::new(DurabilityBackend::open(&base_path, true).unwrap());
@@ -459,8 +456,7 @@ mod tests {
         }
 
         fn build(base_path: PathBuf, backend: Arc<DurabilityBackend>) -> Self {
-            let transaction_manager =
-                Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+            let global_txn = Arc::new(GlobalTxnState::new());
             let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
             let metadata_catalog = Arc::new(MetadataCatalog::new(
                 base_path.clone(),
@@ -470,7 +466,7 @@ mod tests {
                 base_path,
                 store_handles,
                 metadata_catalog,
-                transaction_manager,
+                global_txn,
                 backend,
             );
 
@@ -658,8 +654,7 @@ mod tests {
     fn checkpoint_skips_truncate_when_transaction_active() {
         let dir = tempdir().unwrap();
         let base_path = dir.path().to_path_buf();
-        let transaction_manager =
-            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+        let global_txn = Arc::new(GlobalTxnState::new());
         let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
         let backend = Arc::new(DurabilityBackend::open(&base_path, true).unwrap());
         let metadata_catalog = Arc::new(MetadataCatalog::new(
@@ -670,14 +665,14 @@ mod tests {
             base_path.clone(),
             store_handles.clone(),
             metadata_catalog.clone(),
-            transaction_manager.clone(),
+            global_txn.clone(),
             backend.clone(),
         );
         let mut checkpoint_session = Session::new(
             base_path,
             store_handles,
             metadata_catalog,
-            transaction_manager,
+            global_txn,
             backend,
         );
         session.create(TEST_URI).unwrap();

@@ -173,14 +173,13 @@ mod tests {
     use crate::storage::durability::DurabilityBackend;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::metadata_catalog::MetadataCatalog;
-    use crate::txn::{GlobalTxnState, TransactionManager};
+    use crate::txn::GlobalTxnState;
 
     #[test]
     fn add_index_persists_logical_index_uri() {
         let tmp = tempdir().unwrap();
         let base_path = tmp.path().to_path_buf();
-        let transaction_manager =
-            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+        let global_txn = Arc::new(GlobalTxnState::new());
         let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
         let metadata_catalog = Arc::new(MetadataCatalog::new(
             base_path.clone(),
@@ -191,7 +190,7 @@ mod tests {
             base_path,
             store_handles,
             metadata_catalog,
-            transaction_manager,
+            global_txn,
             Arc::new(DurabilityBackend::Disabled),
         );
         session.create("table:users").unwrap();

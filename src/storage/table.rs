@@ -5,7 +5,7 @@ use crate::storage::block::file::NONE_BLOCK_ID;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::mvcc::ReconcileStats;
 use crate::storage::page_store::{BlockFilePageStore, Page, PageStore};
-use crate::txn::{ReadVisibility, TransactionManager, TxnId};
+use crate::txn::{GlobalTxnState, ReadVisibility, TxnId};
 use crate::WrongoDBError;
 
 type StoreEntry = (Vec<u8>, Vec<u8>);
@@ -158,16 +158,16 @@ pub(crate) fn scan_range(
 pub(crate) fn apply_put_autocommit(
     uri: &str,
     btree: &mut BTreeCursor,
-    transaction_manager: &TransactionManager,
+    global_txn: &GlobalTxnState,
     key: &[u8],
     value: &[u8],
 ) -> Result<(), WrongoDBError> {
-    let mut txn = transaction_manager.begin_snapshot_txn();
+    let mut txn = global_txn.begin_snapshot_txn();
     if let Err(err) = btree.put(uri, key, value, &mut txn) {
-        let _ = transaction_manager.abort_txn_state(&mut txn);
+        let _ = txn.abort(global_txn);
         return Err(err);
     }
-    transaction_manager.commit_txn_state(&mut txn)?;
+    txn.commit(global_txn)?;
     Ok(())
 }
 
@@ -175,18 +175,18 @@ pub(crate) fn apply_put_autocommit(
 pub(crate) fn apply_delete_autocommit(
     uri: &str,
     btree: &mut BTreeCursor,
-    transaction_manager: &TransactionManager,
+    global_txn: &GlobalTxnState,
     key: &[u8],
 ) -> Result<bool, WrongoDBError> {
-    let mut txn = transaction_manager.begin_snapshot_txn();
+    let mut txn = global_txn.begin_snapshot_txn();
     let deleted = match btree.delete(uri, key, &mut txn) {
         Ok(deleted) => deleted,
         Err(err) => {
-            let _ = transaction_manager.abort_txn_state(&mut txn);
+            let _ = txn.abort(global_txn);
             return Err(err);
         }
     };
-    transaction_manager.commit_txn_state(&mut txn)?;
+    txn.commit(global_txn)?;
     Ok(deleted)
 }
 
@@ -196,19 +196,19 @@ pub(crate) fn apply_delete_autocommit(
 
 pub(crate) fn checkpoint_store(
     btree: &mut BTreeCursor,
-    transaction_manager: &TransactionManager,
+    global_txn: &GlobalTxnState,
 ) -> Result<(), WrongoDBError> {
-    let _ = reconcile_for_checkpoint(btree, transaction_manager)?;
+    let _ = reconcile_for_checkpoint(btree, global_txn)?;
     btree.checkpoint()
 }
 
 pub(crate) fn reconcile_for_checkpoint(
     btree: &mut BTreeCursor,
-    transaction_manager: &TransactionManager,
+    global_txn: &GlobalTxnState,
 ) -> Result<ReconcileStats, WrongoDBError> {
     btree.reconcile_page_local_updates(
-        transaction_manager.oldest_active_txn_id(),
-        !transaction_manager.has_active_transactions(),
+        global_txn.oldest_active_txn_id(),
+        !global_txn.has_active_transactions(),
     )
 }
 
@@ -237,56 +237,47 @@ mod tests {
 
     use super::*;
     use crate::storage::mvcc::ReconcileStats;
-    use crate::txn::{GlobalTxnState, TxnLogOp, TXN_NONE};
+    use crate::txn::{GlobalTxnState, Transaction, TxnLogOp, TXN_NONE};
 
     const TEST_URI: &str = "table:test";
 
-    fn open_store(store_name: &str) -> (tempfile::TempDir, Arc<TransactionManager>, BTreeCursor) {
+    fn open_store(store_name: &str) -> (tempfile::TempDir, Arc<GlobalTxnState>, BTreeCursor) {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join(store_name);
-        let transaction_manager =
-            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+        let global_txn = Arc::new(GlobalTxnState::new());
         let btree = open_or_create_btree(&path).unwrap();
-        (tmp, transaction_manager, btree)
+        (tmp, global_txn, btree)
     }
 
     #[test]
     fn local_apply_writes_do_not_depend_on_hooks() {
-        let (_tmp, transaction_manager, mut btree) = open_store("table.idx.wt");
+        let (_tmp, global_txn, mut btree) = open_store("table.idx.wt");
 
-        apply_put_autocommit(
-            TEST_URI,
-            &mut btree,
-            transaction_manager.as_ref(),
-            b"k1",
-            b"v1",
-        )
-        .unwrap();
+        apply_put_autocommit(TEST_URI, &mut btree, global_txn.as_ref(), b"k1", b"v1").unwrap();
         assert_eq!(
             get_version(&mut btree, b"k1", TXN_NONE).unwrap(),
             Some(b"v1".to_vec())
         );
         let deleted =
-            apply_delete_autocommit(TEST_URI, &mut btree, transaction_manager.as_ref(), b"k1")
-                .unwrap();
+            apply_delete_autocommit(TEST_URI, &mut btree, global_txn.as_ref(), b"k1").unwrap();
         assert!(deleted);
         assert_eq!(get_version(&mut btree, b"k1", TXN_NONE).unwrap(), None);
     }
 
     #[test]
     fn reconcile_materializes_and_drops_current_committed_chain_without_active_transactions() {
-        let (_tmp, transaction_manager, mut btree) = open_store("table.idx.wt");
+        let (_tmp, global_txn, mut btree) = open_store("table.idx.wt");
 
-        let mut txn = transaction_manager.begin_snapshot_txn();
+        let mut txn = global_txn.begin_snapshot_txn();
         btree.put(TEST_URI, b"k1", b"v1", &mut txn).unwrap();
-        transaction_manager.commit_txn_state(&mut txn).unwrap();
+        txn.commit(global_txn.as_ref()).unwrap();
 
         assert_eq!(
             get_version(&mut btree, b"k1", TXN_NONE).unwrap(),
             Some(b"v1".to_vec())
         );
 
-        let stats = reconcile_for_checkpoint(&mut btree, transaction_manager.as_ref()).unwrap();
+        let stats = reconcile_for_checkpoint(&mut btree, global_txn.as_ref()).unwrap();
         assert_eq!(
             stats,
             ReconcileStats {
@@ -300,35 +291,30 @@ mod tests {
             Some(b"v1".to_vec())
         );
 
-        let second_pass =
-            reconcile_for_checkpoint(&mut btree, transaction_manager.as_ref()).unwrap();
+        let second_pass = reconcile_for_checkpoint(&mut btree, global_txn.as_ref()).unwrap();
         assert_eq!(second_pass, ReconcileStats::default());
     }
 
     #[test]
     fn reconcile_keeps_old_versions_needed_by_active_transactions() {
-        let (_tmp, transaction_manager, mut btree) = open_store("table.idx.wt");
+        let (_tmp, global_txn, mut btree) = open_store("table.idx.wt");
 
-        let mut first_writer = transaction_manager.begin_snapshot_txn();
+        let mut first_writer = global_txn.begin_snapshot_txn();
         btree
             .put(TEST_URI, b"k1", b"v1", &mut first_writer)
             .unwrap();
-        transaction_manager
-            .commit_txn_state(&mut first_writer)
-            .unwrap();
+        first_writer.commit(global_txn.as_ref()).unwrap();
 
-        let mut reader = transaction_manager.begin_snapshot_txn();
+        let mut reader = global_txn.begin_snapshot_txn();
         let reader_id = reader.id();
 
-        let mut second_writer = transaction_manager.begin_snapshot_txn();
+        let mut second_writer = global_txn.begin_snapshot_txn();
         btree
             .put(TEST_URI, b"k1", b"v2", &mut second_writer)
             .unwrap();
-        transaction_manager
-            .commit_txn_state(&mut second_writer)
-            .unwrap();
+        second_writer.commit(global_txn.as_ref()).unwrap();
 
-        let stats = reconcile_for_checkpoint(&mut btree, transaction_manager.as_ref()).unwrap();
+        let stats = reconcile_for_checkpoint(&mut btree, global_txn.as_ref()).unwrap();
         assert_eq!(
             stats,
             ReconcileStats {
@@ -346,10 +332,9 @@ mod tests {
             Some(b"v2".to_vec())
         );
 
-        transaction_manager.commit_txn_state(&mut reader).unwrap();
+        reader.commit(global_txn.as_ref()).unwrap();
 
-        let second_pass =
-            reconcile_for_checkpoint(&mut btree, transaction_manager.as_ref()).unwrap();
+        let second_pass = reconcile_for_checkpoint(&mut btree, global_txn.as_ref()).unwrap();
         assert_eq!(
             second_pass,
             ReconcileStats {
@@ -366,23 +351,16 @@ mod tests {
 
     #[test]
     fn reconcile_materializes_deletes_and_drops_tombstone_chains() {
-        let (_tmp, transaction_manager, mut btree) = open_store("table.idx.wt");
+        let (_tmp, global_txn, mut btree) = open_store("table.idx.wt");
 
-        apply_put_autocommit(
-            TEST_URI,
-            &mut btree,
-            transaction_manager.as_ref(),
-            b"k1",
-            b"v1",
-        )
-        .unwrap();
+        apply_put_autocommit(TEST_URI, &mut btree, global_txn.as_ref(), b"k1", b"v1").unwrap();
 
-        let mut txn = transaction_manager.begin_snapshot_txn();
+        let mut txn = global_txn.begin_snapshot_txn();
         let deleted = btree.delete(TEST_URI, b"k1", &mut txn).unwrap();
         assert!(deleted);
-        transaction_manager.commit_txn_state(&mut txn).unwrap();
+        txn.commit(global_txn.as_ref()).unwrap();
 
-        let stats = reconcile_for_checkpoint(&mut btree, transaction_manager.as_ref()).unwrap();
+        let stats = reconcile_for_checkpoint(&mut btree, global_txn.as_ref()).unwrap();
         assert_eq!(
             stats,
             ReconcileStats {
@@ -396,26 +374,12 @@ mod tests {
 
     #[test]
     fn scan_range_merges_page_local_inserts_and_slot_updates() {
-        let (_tmp, transaction_manager, mut btree) = open_store("table.idx.wt");
+        let (_tmp, global_txn, mut btree) = open_store("table.idx.wt");
 
-        apply_put_autocommit(
-            TEST_URI,
-            &mut btree,
-            transaction_manager.as_ref(),
-            b"k1",
-            b"v1",
-        )
-        .unwrap();
-        apply_put_autocommit(
-            TEST_URI,
-            &mut btree,
-            transaction_manager.as_ref(),
-            b"k3",
-            b"v3",
-        )
-        .unwrap();
+        apply_put_autocommit(TEST_URI, &mut btree, global_txn.as_ref(), b"k1", b"v1").unwrap();
+        apply_put_autocommit(TEST_URI, &mut btree, global_txn.as_ref(), b"k3", b"v3").unwrap();
 
-        let mut txn = transaction_manager.begin_snapshot_txn();
+        let mut txn = global_txn.begin_snapshot_txn();
         btree.put(TEST_URI, b"k2", b"v2", &mut txn).unwrap();
         btree.put(TEST_URI, b"k3", b"v3x", &mut txn).unwrap();
 
@@ -432,26 +396,12 @@ mod tests {
 
     #[test]
     fn scan_range_skips_page_local_tombstones() {
-        let (_tmp, transaction_manager, mut btree) = open_store("table.idx.wt");
+        let (_tmp, global_txn, mut btree) = open_store("table.idx.wt");
 
-        apply_put_autocommit(
-            TEST_URI,
-            &mut btree,
-            transaction_manager.as_ref(),
-            b"k1",
-            b"v1",
-        )
-        .unwrap();
-        apply_put_autocommit(
-            TEST_URI,
-            &mut btree,
-            transaction_manager.as_ref(),
-            b"k2",
-            b"v2",
-        )
-        .unwrap();
+        apply_put_autocommit(TEST_URI, &mut btree, global_txn.as_ref(), b"k1", b"v1").unwrap();
+        apply_put_autocommit(TEST_URI, &mut btree, global_txn.as_ref(), b"k2", b"v2").unwrap();
 
-        let mut txn = transaction_manager.begin_snapshot_txn();
+        let mut txn = global_txn.begin_snapshot_txn();
         let deleted = btree.delete(TEST_URI, b"k1", &mut txn).unwrap();
         assert!(deleted);
 
@@ -461,8 +411,8 @@ mod tests {
 
     #[test]
     fn snapshot_write_records_put_log_op() {
-        let (_tmp, transaction_manager, mut btree) = open_store("table.idx.wt");
-        let mut txn = transaction_manager.begin_snapshot_txn();
+        let (_tmp, global_txn, mut btree) = open_store("table.idx.wt");
+        let mut txn = global_txn.begin_snapshot_txn();
 
         btree.put(TEST_URI, b"k1", b"v1", &mut txn).unwrap();
 
@@ -478,16 +428,9 @@ mod tests {
 
     #[test]
     fn snapshot_write_records_delete_log_op() {
-        let (_tmp, transaction_manager, mut btree) = open_store("table.idx.wt");
-        apply_put_autocommit(
-            TEST_URI,
-            &mut btree,
-            transaction_manager.as_ref(),
-            b"k1",
-            b"v1",
-        )
-        .unwrap();
-        let mut txn = transaction_manager.begin_snapshot_txn();
+        let (_tmp, global_txn, mut btree) = open_store("table.idx.wt");
+        apply_put_autocommit(TEST_URI, &mut btree, global_txn.as_ref(), b"k1", b"v1").unwrap();
+        let mut txn = global_txn.begin_snapshot_txn();
 
         let deleted = btree.delete(TEST_URI, b"k1", &mut txn).unwrap();
 
@@ -503,8 +446,8 @@ mod tests {
 
     #[test]
     fn replay_write_skips_log_capture() {
-        let (_tmp, transaction_manager, mut btree) = open_store("table.idx.wt");
-        let mut txn = transaction_manager.begin_replay_txn(42);
+        let (_tmp, _global_txn, mut btree) = open_store("table.idx.wt");
+        let mut txn = Transaction::replay(42);
 
         btree.put(TEST_URI, b"k1", b"v1", &mut txn).unwrap();
 

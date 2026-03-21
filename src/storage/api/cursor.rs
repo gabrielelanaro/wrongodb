@@ -423,11 +423,11 @@ mod tests {
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::metadata_catalog::MetadataCatalog;
     use crate::storage::table::open_or_create_btree;
-    use crate::txn::{GlobalTxnState, TransactionManager, TXN_NONE};
+    use crate::txn::{GlobalTxnState, TXN_NONE};
 
     fn build_test_session(
         base_path: &Path,
-        transaction_manager: Arc<TransactionManager>,
+        global_txn: Arc<GlobalTxnState>,
         backend: Arc<DurabilityBackend>,
     ) -> Session {
         let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
@@ -439,7 +439,7 @@ mod tests {
             base_path.to_path_buf(),
             store_handles,
             metadata_catalog,
-            transaction_manager,
+            global_txn,
             backend,
         )
     }
@@ -448,25 +448,17 @@ mod tests {
         TempDir,
         Arc<RwLock<BTreeCursor>>,
         Session,
-        Arc<TransactionManager>,
+        Arc<GlobalTxnState>,
         TableMetadata,
     ) {
         let tmp = tempdir().unwrap();
         let uri = "table:test".to_string();
         let store_name = "cursor.main.wt".to_string();
         let path = tmp.path().join(&store_name);
-        let transaction_manager =
-            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+        let global_txn = Arc::new(GlobalTxnState::new());
         let btree = Arc::new(RwLock::new(open_or_create_btree(path).unwrap()));
-        let session =
-            build_test_session(tmp.path(), transaction_manager.clone(), disabled_backend());
-        (
-            tmp,
-            btree,
-            session,
-            transaction_manager,
-            TableMetadata::new(uri),
-        )
+        let session = build_test_session(tmp.path(), global_txn.clone(), disabled_backend());
+        (tmp, btree, session, global_txn, TableMetadata::new(uri))
     }
 
     fn open_table_with_secondary_index() -> (
@@ -474,14 +466,13 @@ mod tests {
         Arc<RwLock<BTreeCursor>>,
         Arc<RwLock<BTreeCursor>>,
         Session,
-        Arc<TransactionManager>,
+        Arc<GlobalTxnState>,
         TableMetadata,
     ) {
         let tmp = tempdir().unwrap();
         let primary_path = tmp.path().join("users.main.wt");
         let index_path = tmp.path().join("users.name.idx.wt");
-        let transaction_manager =
-            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+        let global_txn = Arc::new(GlobalTxnState::new());
         let primary = Arc::new(RwLock::new(open_or_create_btree(primary_path).unwrap()));
         let index = Arc::new(RwLock::new(open_or_create_btree(index_path).unwrap()));
         let table = TableMetadata::with_indexes(
@@ -492,9 +483,8 @@ mod tests {
                 vec!["name".to_string()],
             )],
         );
-        let session =
-            build_test_session(tmp.path(), transaction_manager.clone(), disabled_backend());
-        (tmp, primary, index, session, transaction_manager, table)
+        let session = build_test_session(tmp.path(), global_txn.clone(), disabled_backend());
+        (tmp, primary, index, session, global_txn, table)
     }
 
     fn make_document_bytes(id: i64, name: &str) -> Vec<u8> {
@@ -511,7 +501,7 @@ mod tests {
 
     #[test]
     fn insert_applies_locally() {
-        let (_tmp, btree, session, _transaction_manager, table) = open_indexless_table();
+        let (_tmp, btree, session, _global_txn, table) = open_indexless_table();
         let mut cursor = TableCursor::new(
             &session,
             table,
@@ -531,13 +521,13 @@ mod tests {
 
     #[test]
     fn delete_applies_locally() {
-        let (_tmp, btree, session, transaction_manager, table) = open_indexless_table();
-        let mut seed_txn = transaction_manager.begin_snapshot_txn();
+        let (_tmp, btree, session, global_txn, table) = open_indexless_table();
+        let mut seed_txn = global_txn.begin_snapshot_txn();
         btree
             .write()
             .put(table.uri(), b"k1", b"v1", &mut seed_txn)
             .unwrap();
-        transaction_manager.commit_txn_state(&mut seed_txn).unwrap();
+        seed_txn.commit(global_txn.as_ref()).unwrap();
 
         let mut cursor = TableCursor::new(
             &session,
@@ -558,8 +548,7 @@ mod tests {
 
     #[test]
     fn insert_writes_primary_and_secondary_index() {
-        let (_tmp, primary, index, session, _transaction_manager, table) =
-            open_table_with_secondary_index();
+        let (_tmp, primary, index, session, _global_txn, table) = open_table_with_secondary_index();
         let mut cursor = TableCursor::new(
             &session,
             table,
@@ -590,13 +579,12 @@ mod tests {
 
     #[test]
     fn update_rewrites_secondary_index() {
-        let (_tmp, primary, index, session, transaction_manager, table) =
-            open_table_with_secondary_index();
+        let (_tmp, primary, index, session, global_txn, table) = open_table_with_secondary_index();
         let key = encode_id_value(&json!(1)).unwrap();
         let old_value = make_document_bytes(1, "alice");
         let new_value = make_document_bytes(1, "bob");
 
-        let mut seed_txn = transaction_manager.begin_snapshot_txn();
+        let mut seed_txn = global_txn.begin_snapshot_txn();
         primary
             .write()
             .put(table.uri(), &key, &old_value, &mut seed_txn)
@@ -610,7 +598,7 @@ mod tests {
                 &mut seed_txn,
             )
             .unwrap();
-        transaction_manager.commit_txn_state(&mut seed_txn).unwrap();
+        seed_txn.commit(global_txn.as_ref()).unwrap();
 
         let mut cursor = TableCursor::new(
             &session,
@@ -644,12 +632,11 @@ mod tests {
 
     #[test]
     fn delete_removes_secondary_index() {
-        let (_tmp, primary, index, session, transaction_manager, table) =
-            open_table_with_secondary_index();
+        let (_tmp, primary, index, session, global_txn, table) = open_table_with_secondary_index();
         let key = encode_id_value(&json!(1)).unwrap();
         let value = make_document_bytes(1, "alice");
 
-        let mut seed_txn = transaction_manager.begin_snapshot_txn();
+        let mut seed_txn = global_txn.begin_snapshot_txn();
         primary
             .write()
             .put(table.uri(), &key, &value, &mut seed_txn)
@@ -663,7 +650,7 @@ mod tests {
                 &mut seed_txn,
             )
             .unwrap();
-        transaction_manager.commit_txn_state(&mut seed_txn).unwrap();
+        seed_txn.commit(global_txn.as_ref()).unwrap();
 
         let mut cursor = TableCursor::new(
             &session,
@@ -693,7 +680,7 @@ mod tests {
 
     #[test]
     fn read_only_cursor_rejects_writes() {
-        let (_tmp, btree, session, _transaction_manager, table) = open_indexless_table();
+        let (_tmp, btree, session, _global_txn, table) = open_indexless_table();
         let mut cursor = TableCursor::new(
             &session,
             table,
@@ -709,7 +696,7 @@ mod tests {
 
     #[test]
     fn transaction_bound_cursor_commit_persists_primary_and_secondary() {
-        let (_tmp, primary, index, mut session, _transaction_manager, table) =
+        let (_tmp, primary, index, mut session, _global_txn, table) =
             open_table_with_secondary_index();
         session.begin_transaction_internal().unwrap();
         let txn_id = session.txn_id();
@@ -756,7 +743,7 @@ mod tests {
 
     #[test]
     fn transaction_bound_cursor_abort_discards_primary_and_secondary() {
-        let (_tmp, primary, index, mut session, _transaction_manager, table) =
+        let (_tmp, primary, index, mut session, _global_txn, table) =
             open_table_with_secondary_index();
         session.begin_transaction_internal().unwrap();
         let txn_id = session.txn_id();
@@ -799,7 +786,7 @@ mod tests {
 
     #[test]
     fn cursor_uses_autocommit_without_active_transaction() {
-        let (_tmp, btree, session, _transaction_manager, table) = open_indexless_table();
+        let (_tmp, btree, session, _global_txn, table) = open_indexless_table();
         let mut cursor = TableCursor::new(
             &session,
             table,

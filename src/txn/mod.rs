@@ -1,13 +1,10 @@
 pub mod global_txn;
-pub(crate) mod manager;
 pub mod read_visibility;
 pub mod snapshot;
 pub mod transaction;
 pub mod update;
 
 pub use global_txn::GlobalTxnState;
-#[allow(unused_imports)]
-pub(crate) use manager::TransactionManager;
 pub use read_visibility::ReadVisibility;
 #[allow(unused_imports)]
 pub use transaction::{Transaction, TxnLogOp, TxnState};

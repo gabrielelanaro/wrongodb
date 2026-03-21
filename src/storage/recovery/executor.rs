@@ -8,7 +8,7 @@ use crate::storage::btree::BTreeCursor;
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::metadata_catalog::MetadataCatalog;
 use crate::storage::table::{checkpoint_store, open_or_create_btree};
-use crate::txn::{TransactionManager, TxnId, TxnLogOp};
+use crate::txn::{GlobalTxnState, Transaction, TxnId, TxnLogOp};
 use crate::WrongoDBError;
 
 pub(crate) trait RecoveryApplier: Send + Sync {
@@ -25,7 +25,7 @@ pub(crate) struct RecoveryExecutor {
     base_path: PathBuf,
     metadata_catalog: Arc<MetadataCatalog>,
     store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
-    transaction_manager: Arc<TransactionManager>,
+    global_txn: Arc<GlobalTxnState>,
 }
 
 impl RecoveryExecutor {
@@ -33,13 +33,13 @@ impl RecoveryExecutor {
         base_path: PathBuf,
         metadata_catalog: Arc<MetadataCatalog>,
         store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
-        transaction_manager: Arc<TransactionManager>,
+        global_txn: Arc<GlobalTxnState>,
     ) -> Self {
         Self {
             base_path,
             metadata_catalog,
             store_handles,
-            transaction_manager,
+            global_txn,
         }
     }
 
@@ -65,7 +65,7 @@ impl RecoveryApplier for RecoveryExecutor {
         txn_id: TxnId,
         ops: &[TxnLogOp],
     ) -> Result<(), WrongoDBError> {
-        let mut txn = self.transaction_manager.begin_replay_txn(txn_id);
+        let mut txn = Transaction::replay(txn_id);
 
         for op in ops {
             match op {
@@ -80,13 +80,13 @@ impl RecoveryApplier for RecoveryExecutor {
             }
         }
 
-        self.transaction_manager.commit_txn_state(&mut txn)?;
+        txn.commit(self.global_txn.as_ref())?;
         Ok(())
     }
 
     fn checkpoint_open_stores(&self) -> Result<(), WrongoDBError> {
         for store in self.store_handles.all_handles() {
-            checkpoint_store(&mut store.write(), self.transaction_manager.as_ref())?;
+            checkpoint_store(&mut store.write(), self.global_txn.as_ref())?;
         }
         Ok(())
     }

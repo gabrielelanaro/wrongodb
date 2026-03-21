@@ -421,15 +421,14 @@ mod tests {
     use crate::storage::durability::DurabilityBackend;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::metadata_catalog::MetadataCatalog;
-    use crate::txn::{GlobalTxnState, TransactionManager};
+    use crate::txn::GlobalTxnState;
     use crate::WrongoDBError;
 
     fn test_services(
         base_path: std::path::PathBuf,
         backend: DurabilityBackend,
     ) -> (CollectionWritePath, DocumentQuery, Session) {
-        let transaction_manager =
-            Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
+        let global_txn = Arc::new(GlobalTxnState::new());
         let store_handles =
             Arc::new(HandleCache::<String, parking_lot::RwLock<BTreeCursor>>::new());
         let metadata_catalog = Arc::new(MetadataCatalog::new(
@@ -451,7 +450,7 @@ mod tests {
             base_path,
             store_handles,
             metadata_catalog,
-            transaction_manager,
+            global_txn,
             backend,
         );
         (service, document_query, session)
