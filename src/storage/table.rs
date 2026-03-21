@@ -11,14 +11,58 @@ use crate::WrongoDBError;
 type StoreEntry = (Vec<u8>, Vec<u8>);
 type ScanEntries = Vec<StoreEntry>;
 
+/// Logical metadata for one secondary index attached to a table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexMetadata {
+    name: String,
+    uri: String,
+    columns: Vec<String>,
+}
+
+impl IndexMetadata {
+    // ------------------------------------------------------------------------
+    // Constructors
+    // ------------------------------------------------------------------------
+
+    pub(crate) fn new(
+        name: impl Into<String>,
+        uri: impl Into<String>,
+        columns: Vec<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            uri: uri.into(),
+            columns,
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Public API
+    // ------------------------------------------------------------------------
+
+    #[allow(dead_code)]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+}
+
 /// Logical metadata for one storage table URI.
 ///
 /// `TableMetadata` is intentionally cheap. It identifies a logical storage
-/// table such as `table:users` or `index:users:name_1`, but it does not own the
-/// opened physical store handle or transaction machinery.
+/// table such as `table:users`, along with the logical secondary indexes that
+/// should be maintained when rows are written through a table cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableMetadata {
     uri: String,
+    indexes: Vec<IndexMetadata>,
 }
 
 impl TableMetadata {
@@ -26,8 +70,19 @@ impl TableMetadata {
     // Constructors
     // ------------------------------------------------------------------------
 
+    #[cfg(test)]
     pub(crate) fn new(uri: impl Into<String>) -> Self {
-        Self { uri: uri.into() }
+        Self {
+            uri: uri.into(),
+            indexes: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_indexes(uri: impl Into<String>, indexes: Vec<IndexMetadata>) -> Self {
+        Self {
+            uri: uri.into(),
+            indexes,
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -36,6 +91,10 @@ impl TableMetadata {
 
     pub fn uri(&self) -> &str {
         &self.uri
+    }
+
+    pub fn indexes(&self) -> &[IndexMetadata] {
+        &self.indexes
     }
 }
 

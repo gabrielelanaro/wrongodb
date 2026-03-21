@@ -8,7 +8,9 @@ use crate::core::errors::StorageError;
 use crate::storage::api::WriteUnitOfWork;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::handle_cache::HandleCache;
-use crate::storage::table::{get_version, open_or_create_btree, scan_range};
+use crate::storage::table::{
+    get_version, open_or_create_btree, scan_range, IndexMetadata, TableMetadata,
+};
 use crate::txn::{TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
@@ -37,12 +39,45 @@ pub(crate) struct MetadataEntry {
     pub(crate) uri: String,
     pub(crate) kind: MetadataKind,
     pub(crate) source: String,
+    pub(crate) name: Option<String>,
+    pub(crate) columns: Vec<String>,
+}
+
+impl MetadataEntry {
+    fn table(uri: impl Into<String>, source: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            kind: MetadataKind::Table,
+            source: source.into(),
+            name: None,
+            columns: Vec::new(),
+        }
+    }
+
+    fn index(
+        uri: impl Into<String>,
+        source: impl Into<String>,
+        name: impl Into<String>,
+        columns: Vec<String>,
+    ) -> Self {
+        Self {
+            uri: uri.into(),
+            kind: MetadataKind::Index,
+            source: source.into(),
+            name: Some(name.into()),
+            columns,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MetadataRecord {
     kind: MetadataKind,
     source: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    columns: Vec<String>,
 }
 
 // ============================================================================
@@ -79,6 +114,7 @@ impl MetadataCatalog {
     // Public API
     // ------------------------------------------------------------------------
 
+    #[cfg(test)]
     pub(crate) fn lookup_source(&self, uri: &str) -> Result<Option<String>, WrongoDBError> {
         self.lookup_source_for_txn(uri, TXN_NONE)
     }
@@ -112,14 +148,8 @@ impl MetadataCatalog {
 
         let source = table_source_name(collection);
         self.ensure_source_exists(&source)?;
-        let _inserted = self.put_if_absent_in_write_unit(
-            write_unit,
-            MetadataEntry {
-                uri: uri.clone(),
-                kind: MetadataKind::Table,
-                source,
-            },
-        )?;
+        let _inserted = self
+            .put_if_absent_in_write_unit(write_unit, MetadataEntry::table(uri.clone(), source))?;
         Ok(uri)
     }
 
@@ -128,6 +158,7 @@ impl MetadataCatalog {
         write_unit: &mut WriteUnitOfWork<'_>,
         collection: &str,
         name: &str,
+        columns: Vec<String>,
     ) -> Result<(String, bool), WrongoDBError> {
         let uri = index_uri(collection, name);
         if self
@@ -141,11 +172,7 @@ impl MetadataCatalog {
         self.ensure_source_exists(&source)?;
         let inserted = self.put_if_absent_in_write_unit(
             write_unit,
-            MetadataEntry {
-                uri: uri.clone(),
-                kind: MetadataKind::Index,
-                source,
-            },
+            MetadataEntry::index(uri.clone(), source, name, columns),
         )?;
         Ok((uri, inserted))
     }
@@ -162,28 +189,58 @@ impl MetadataCatalog {
             return Ok(false);
         }
 
-        let mut cursor = write_unit.open_cursor(METADATA_URI)?;
         let key = encode_metadata_key(&entry.uri);
         let value = encode_metadata_value(&entry)?;
-        cursor.insert(&key, &value)?;
+        write_unit.raw_insert(METADATA_URI, &key, &value)?;
         Ok(true)
     }
 
     pub(crate) fn scan_prefix(&self, prefix: &str) -> Result<Vec<MetadataEntry>, WrongoDBError> {
+        self.scan_prefix_for_txn(prefix, TXN_NONE)
+    }
+
+    pub(crate) fn scan_prefix_for_txn(
+        &self,
+        prefix: &str,
+        txn_id: TxnId,
+    ) -> Result<Vec<MetadataEntry>, WrongoDBError> {
         let btree = self.open_metadata_table()?;
         let start = prefix_start(prefix);
         let end = prefix_end(prefix);
-        let entries = scan_range(
-            &mut btree.write(),
-            start.as_deref(),
-            end.as_deref(),
-            TXN_NONE,
-        )?;
+        let entries = scan_range(&mut btree.write(), start.as_deref(), end.as_deref(), txn_id)?;
 
         entries
             .into_iter()
             .map(|(key, value)| decode_metadata_entry(key, value))
             .collect()
+    }
+
+    pub(crate) fn table_metadata_for_txn(
+        &self,
+        uri: &str,
+        txn_id: TxnId,
+    ) -> Result<Option<TableMetadata>, WrongoDBError> {
+        let Some(entry) = self.lookup_entry_for_txn(uri, txn_id)? else {
+            return Ok(None);
+        };
+
+        if entry.kind != MetadataKind::Table {
+            return Err(StorageError(format!("URI is not a table: {uri}")).into());
+        }
+
+        let collection = uri.strip_prefix(TABLE_URI_PREFIX).ok_or_else(|| {
+            StorageError(format!(
+                "table metadata lookup requires table: URI, got: {uri}"
+            ))
+        })?;
+        let prefix = format!("{INDEX_URI_PREFIX}{collection}:");
+        let mut indexes = self
+            .scan_prefix_for_txn(&prefix, txn_id)?
+            .into_iter()
+            .map(index_metadata_from_entry)
+            .collect::<Result<Vec<_>, _>>()?;
+        indexes.sort_by(|left, right| left.uri().cmp(right.uri()));
+        Ok(Some(TableMetadata::with_indexes(uri, indexes)))
     }
 
     pub(crate) fn all_sources(&self) -> Result<Vec<String>, WrongoDBError> {
@@ -244,6 +301,8 @@ fn encode_metadata_value(entry: &MetadataEntry) -> Result<Vec<u8>, WrongoDBError
     let record = MetadataRecord {
         kind: entry.kind,
         source: entry.source.clone(),
+        name: entry.name.clone(),
+        columns: entry.columns.clone(),
     };
     Ok(bson::to_vec(&record)?)
 }
@@ -256,7 +315,31 @@ fn decode_metadata_entry(key: Vec<u8>, value: Vec<u8>) -> Result<MetadataEntry, 
         uri,
         kind: record.kind,
         source: record.source,
+        name: record.name,
+        columns: record.columns,
     })
+}
+
+fn index_metadata_from_entry(entry: MetadataEntry) -> Result<IndexMetadata, WrongoDBError> {
+    if entry.kind != MetadataKind::Index {
+        return Err(StorageError(format!("metadata row is not an index: {}", entry.uri)).into());
+    }
+
+    let name = entry.name.ok_or_else(|| {
+        StorageError(format!(
+            "legacy index metadata row is unsupported without name: {}",
+            entry.uri
+        ))
+    })?;
+    if entry.columns.is_empty() {
+        return Err(StorageError(format!(
+            "legacy index metadata row is unsupported without columns: {}",
+            entry.uri
+        ))
+        .into());
+    }
+
+    Ok(IndexMetadata::new(name, entry.uri, entry.columns))
 }
 
 fn prefix_start(prefix: &str) -> Option<Vec<u8>> {
@@ -354,11 +437,7 @@ mod tests {
             .catalog
             .put_if_absent_in_write_unit(
                 &mut write_unit,
-                MetadataEntry {
-                    uri: "table:users".to_string(),
-                    kind: MetadataKind::Table,
-                    source: "users.main.wt".to_string(),
-                },
+                MetadataEntry::table("table:users", "users.main.wt"),
             )
             .unwrap();
         write_unit.commit().unwrap();
@@ -377,11 +456,12 @@ mod tests {
             .catalog
             .put_if_absent_in_write_unit(
                 &mut write_unit,
-                MetadataEntry {
-                    uri: "index:users:name".to_string(),
-                    kind: MetadataKind::Index,
-                    source: "users.name.idx.wt".to_string(),
-                },
+                MetadataEntry::index(
+                    "index:users:name",
+                    "users.name.idx.wt",
+                    "name",
+                    vec!["name".to_string()],
+                ),
             )
             .unwrap();
         write_unit.commit().unwrap();
@@ -397,21 +477,19 @@ mod tests {
         let mut fixture = MetadataFixture::new();
         let mut write_unit = fixture.session.transaction().unwrap();
         for entry in [
-            MetadataEntry {
-                uri: "table:users".to_string(),
-                kind: MetadataKind::Table,
-                source: "users.main.wt".to_string(),
-            },
-            MetadataEntry {
-                uri: "index:users:name".to_string(),
-                kind: MetadataKind::Index,
-                source: "users.name.idx.wt".to_string(),
-            },
-            MetadataEntry {
-                uri: "index:users:email".to_string(),
-                kind: MetadataKind::Index,
-                source: "users.email.idx.wt".to_string(),
-            },
+            MetadataEntry::table("table:users", "users.main.wt"),
+            MetadataEntry::index(
+                "index:users:name",
+                "users.name.idx.wt",
+                "name",
+                vec!["name".to_string()],
+            ),
+            MetadataEntry::index(
+                "index:users:email",
+                "users.email.idx.wt",
+                "email",
+                vec!["email".to_string()],
+            ),
         ] {
             fixture
                 .catalog
@@ -433,16 +511,13 @@ mod tests {
         let mut fixture = MetadataFixture::new();
         let mut write_unit = fixture.session.transaction().unwrap();
         for entry in [
-            MetadataEntry {
-                uri: "table:users".to_string(),
-                kind: MetadataKind::Table,
-                source: "users.main.wt".to_string(),
-            },
-            MetadataEntry {
-                uri: "index:users:name".to_string(),
-                kind: MetadataKind::Index,
-                source: "users.name.idx.wt".to_string(),
-            },
+            MetadataEntry::table("table:users", "users.main.wt"),
+            MetadataEntry::index(
+                "index:users:name",
+                "users.name.idx.wt",
+                "name",
+                vec!["name".to_string()],
+            ),
         ] {
             fixture
                 .catalog
@@ -455,5 +530,54 @@ mod tests {
             fixture.catalog.all_sources().unwrap(),
             vec!["users.main.wt".to_string(), "users.name.idx.wt".to_string()]
         );
+    }
+
+    #[test]
+    fn table_metadata_for_txn_loads_index_definitions_in_stable_order() {
+        let mut fixture = MetadataFixture::new();
+        let mut write_unit = fixture.session.transaction().unwrap();
+        for entry in [
+            MetadataEntry::table("table:users", "users.main.wt"),
+            MetadataEntry::index(
+                "index:users:z_last",
+                "users.z_last.idx.wt",
+                "z_last",
+                vec!["z_last".to_string()],
+            ),
+            MetadataEntry::index(
+                "index:users:a_first",
+                "users.a_first.idx.wt",
+                "a_first",
+                vec!["a_first".to_string()],
+            ),
+        ] {
+            fixture
+                .catalog
+                .put_if_absent_in_write_unit(&mut write_unit, entry)
+                .unwrap();
+        }
+        let txn_id = write_unit.txn_id();
+
+        let table = fixture
+            .catalog
+            .table_metadata_for_txn("table:users", txn_id)
+            .unwrap()
+            .unwrap();
+        write_unit.commit().unwrap();
+
+        assert_eq!(table.uri(), "table:users");
+        assert_eq!(
+            table
+                .indexes()
+                .iter()
+                .map(|index| index.uri().to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "index:users:a_first".to_string(),
+                "index:users:z_last".to_string(),
+            ]
+        );
+        assert_eq!(table.indexes()[0].columns(), &["a_first".to_string()]);
+        assert_eq!(table.indexes()[1].columns(), &["z_last".to_string()]);
     }
 }

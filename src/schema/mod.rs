@@ -95,16 +95,6 @@ impl SchemaCatalog {
             .is_some())
     }
 
-    pub(crate) fn index_definitions(
-        &self,
-        collection: &str,
-    ) -> Result<Vec<IndexDefinition>, WrongoDBError> {
-        Ok(self
-            .load_index_definitions(collection)?
-            .into_values()
-            .collect())
-    }
-
     pub(crate) fn add_index(
         &self,
         collection: &str,
@@ -213,7 +203,12 @@ mod tests {
             Some("index:users:name".to_string())
         );
         assert_eq!(
-            catalog.index_definitions("users").unwrap()[0].uri,
+            catalog
+                .load_index_definitions("users")
+                .unwrap()
+                .into_values()
+                .collect::<Vec<_>>()[0]
+                .uri,
             "index:users:name"
         );
         assert_eq!(

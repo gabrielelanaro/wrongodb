@@ -1,5 +1,38 @@
 # Decisions
 
+## 2026-03-21: Make `TableCursor` own secondary index maintenance and limit public cursor opens to `table:` URIs
+
+**Decision**
+- Make `TableCursor` the logical table writer in the storage API:
+  - reads and scans still operate on the primary B-tree only
+  - `insert`, `update`, and `delete` now maintain configured secondary indexes
+    in the same transaction/WAL context
+- Extend storage metadata rows for `index:` URIs to persist:
+  - `name`
+  - `columns`
+- Make `metadata.wt` authoritative for reconstructing `TableMetadata` and its
+  attached secondary indexes when a cursor is opened.
+- Restrict public `Session::open_cursor` and `WriteUnitOfWork::open_cursor` to
+  `table:` URIs only.
+- Keep raw `index:` and `metadata:` access internal through crate-private
+  helpers over shared `Arc<RwLock<BTreeCursor>>` handles.
+- Accept this as a development-time metadata format break:
+  legacy `index:` rows without stored columns are unsupported.
+
+**Why**
+- The previous split was backwards for a WT-like table cursor:
+  `CollectionWritePath` owned secondary-index maintenance while `TableCursor`
+  only mutated one raw store.
+- Making `TableCursor` the logical table writer gives storage a cleaner
+  boundary:
+  - public table cursor for table semantics
+  - internal raw-store helpers for metadata, backfill, and direct index scans
+- Persisting indexed columns in storage metadata lets table-cursor construction
+  stop depending on higher-level schema mirrors for write-path correctness.
+- Rejecting public `index:` and `metadata:` cursor opens removes the API smell
+  where one public cursor type sometimes meant "logical table" and sometimes
+  meant "raw store".
+
 ## 2026-03-21: Make `Table` metadata-only and cache shared `BTreeCursor` handles
 
 **Decision**

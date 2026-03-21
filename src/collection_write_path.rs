@@ -127,7 +127,6 @@ impl CollectionWritePath {
         let value = encode_document(&obj)?;
         let primary_uri = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
         self.insert_record(write_unit, &primary_uri, &key, &value)?;
-        self.apply_index_add(write_unit, collection, &obj)?;
         Ok(obj)
     }
 
@@ -157,9 +156,6 @@ impl CollectionWritePath {
         let value = encode_document(&updated_doc)?;
         let primary_uri = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
         self.update_record(write_unit, &primary_uri, &key, &value)?;
-
-        self.apply_index_remove(write_unit, collection, doc)?;
-        self.apply_index_add(write_unit, collection, &updated_doc)?;
 
         Ok(UpdateResult {
             matched: 1,
@@ -194,9 +190,6 @@ impl CollectionWritePath {
             let key = encode_id_value(id)?;
             let value = encode_document(&updated_doc)?;
             self.update_record(write_unit, &primary_uri, &key, &value)?;
-
-            self.apply_index_remove(write_unit, collection, &doc)?;
-            self.apply_index_add(write_unit, collection, &updated_doc)?;
             modified += 1;
         }
 
@@ -226,7 +219,6 @@ impl CollectionWritePath {
         let key = encode_id_value(id)?;
         let primary_uri = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
         self.delete_record(write_unit, &primary_uri, &key)?;
-        self.apply_index_remove(write_unit, collection, doc)?;
         Ok(1)
     }
 
@@ -251,7 +243,6 @@ impl CollectionWritePath {
             };
             let key = encode_id_value(id)?;
             self.delete_record(write_unit, &primary_uri, &key)?;
-            self.apply_index_remove(write_unit, collection, &doc)?;
             deleted += 1;
         }
 
@@ -266,9 +257,12 @@ impl CollectionWritePath {
     ) -> Result<(), WrongoDBError> {
         self.ensure_table_registered_in_write_unit(write_unit, collection)?;
 
-        let (index_uri, inserted) = self
-            .metadata_catalog
-            .ensure_index_uri_in_write_unit(write_unit, collection, field)?;
+        let (index_uri, inserted) = self.metadata_catalog.ensure_index_uri_in_write_unit(
+            write_unit,
+            collection,
+            field,
+            vec![field.to_string()],
+        )?;
         if !inserted {
             return Ok(());
         }
@@ -286,56 +280,9 @@ impl CollectionWritePath {
             let Some(key) = encode_index_key(value, id)? else {
                 continue;
             };
-            self.insert_record(write_unit, &index_uri, &key, &[])?;
+            write_unit.raw_insert(&index_uri, &key, &[])?;
         }
 
-        Ok(())
-    }
-
-    fn apply_index_add(
-        &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
-        collection: &str,
-        doc: &Document,
-    ) -> Result<(), WrongoDBError> {
-        self.apply_index_doc(write_unit, collection, doc, true)
-    }
-
-    fn apply_index_remove(
-        &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
-        collection: &str,
-        doc: &Document,
-    ) -> Result<(), WrongoDBError> {
-        self.apply_index_doc(write_unit, collection, doc, false)
-    }
-
-    fn apply_index_doc(
-        &self,
-        write_unit: &mut WriteUnitOfWork<'_>,
-        collection: &str,
-        doc: &Document,
-        is_add: bool,
-    ) -> Result<(), WrongoDBError> {
-        let Some(id) = doc.get("_id") else {
-            return Ok(());
-        };
-        for def in self.schema_catalog.index_definitions(collection)? {
-            let Some(field) = def.columns.first() else {
-                continue;
-            };
-            let Some(value) = doc.get(field) else {
-                continue;
-            };
-            let Some(key) = encode_index_key(value, id)? else {
-                continue;
-            };
-            if is_add {
-                self.insert_record(write_unit, &def.uri, &key, &[])?;
-            } else {
-                self.delete_record(write_unit, &def.uri, &key)?;
-            }
-        }
         Ok(())
     }
 
@@ -590,8 +537,8 @@ mod tests {
         service.create_index(&mut session, "users", "name").unwrap();
 
         let mut wuow = session.transaction().unwrap();
-        let mut cursor = wuow.open_cursor("index:users:name").unwrap();
-        assert!(cursor.next().unwrap().is_some());
+        let rows = wuow.raw_scan_range("index:users:name", None, None).unwrap();
+        assert!(!rows.is_empty());
         wuow.commit().unwrap();
     }
 

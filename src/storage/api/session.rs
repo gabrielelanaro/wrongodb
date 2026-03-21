@@ -3,16 +3,19 @@ use std::sync::{Arc, Weak};
 
 use parking_lot::{Mutex, RwLock};
 
-use crate::core::errors::StorageError;
+use crate::core::errors::{DocumentValidationError, StorageError};
 use crate::storage::api::cursor::{TableCursor, TableCursorWriteAccess};
 use crate::storage::btree::BTreeCursor;
 use crate::storage::command::StorageCommand;
 use crate::storage::durability::{DurabilityBackend, StorageSyncPolicy};
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::metadata_catalog::{MetadataCatalog, METADATA_STORE_NAME, METADATA_URI};
-use crate::storage::table::{checkpoint_store, open_or_create_btree, TableMetadata};
+use crate::storage::table::{
+    apply_put_in_txn, checkpoint_store, contains_key, open_or_create_btree, scan_range,
+    TableMetadata,
+};
 use crate::storage::RecoveryUnit;
-use crate::txn::{ActiveWriteUnit, TransactionManager, TxnId};
+use crate::txn::{ActiveWriteUnit, TransactionManager, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
 /// A request-scoped execution context over shared connection infrastructure.
@@ -100,13 +103,8 @@ impl Session {
     /// a first-class storage API and should not require creating a transaction
     /// boundary object just to read or perform local writes.
     pub fn open_cursor(&self, uri: &str) -> Result<TableCursor, WrongoDBError> {
-        let store_name = self.resolve_uri(uri)?;
-        self.open_resolved_cursor_with_access(
-            uri,
-            &store_name,
-            None,
-            TableCursorWriteAccess::ReadWrite,
-        )
+        let table = self.resolve_table_metadata(uri, TXN_NONE)?;
+        self.open_table_cursor_with_access(table, TXN_NONE, None, TableCursorWriteAccess::ReadWrite)
     }
 
     /// Start a transactional write unit of work.
@@ -163,40 +161,49 @@ impl Session {
         self.durability_backend.truncate_to_checkpoint()
     }
 
-    fn open_resolved_cursor_with_access(
+    fn open_table_cursor_with_access(
         &self,
-        uri: &str,
-        store_name: &str,
+        table: TableMetadata,
+        txn_id: TxnId,
         txn_handle: Option<Weak<Mutex<crate::txn::Transaction>>>,
         write_access: TableCursorWriteAccess,
     ) -> Result<TableCursor, WrongoDBError> {
-        let store =
-            self.store_handles
-                .get_or_try_insert_with(store_name.to_string(), |store_name| {
-                    let path = self.base_path.join(store_name);
-                    Ok(RwLock::new(open_or_create_btree(path)?))
-                })?;
-        Ok(TableCursor::new(
-            TableMetadata::new(uri),
-            store,
+        let primary = self.open_raw_store_for_txn(table.uri(), txn_id)?;
+        let indexes = table
+            .indexes()
+            .iter()
+            .map(|index| self.open_raw_store_for_txn(index.uri(), txn_id))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        TableCursor::new(
+            table,
+            primary,
+            indexes,
             self.transaction_manager.clone(),
             txn_handle,
             self.recovery_unit.clone(),
             write_access,
-        ))
+        )
     }
 
-    fn resolve_uri(&self, uri: &str) -> Result<String, WrongoDBError> {
-        if uri != METADATA_URI && !uri.starts_with("table:") && !uri.starts_with("index:") {
-            return Err(StorageError(format!("unsupported URI: {uri}")).into());
+    fn resolve_table_metadata(
+        &self,
+        uri: &str,
+        txn_id: TxnId,
+    ) -> Result<TableMetadata, WrongoDBError> {
+        if !uri.starts_with("table:") {
+            return Err(StorageError(format!(
+                "unsupported URI for public cursor open: {uri}; only table:... is supported"
+            ))
+            .into());
         }
 
         self.metadata_catalog
-            .lookup_source(uri)?
+            .table_metadata_for_txn(uri, txn_id)?
             .ok_or_else(|| StorageError(format!("unknown URI: {uri}")).into())
     }
 
-    fn resolve_uri_for_txn(&self, uri: &str, txn_id: TxnId) -> Result<String, WrongoDBError> {
+    fn resolve_raw_uri_for_txn(&self, uri: &str, txn_id: TxnId) -> Result<String, WrongoDBError> {
         if uri != METADATA_URI && !uri.starts_with("table:") && !uri.starts_with("index:") {
             return Err(StorageError(format!("unsupported URI: {uri}")).into());
         }
@@ -204,6 +211,23 @@ impl Session {
         self.metadata_catalog
             .lookup_source_for_txn(uri, txn_id)?
             .ok_or_else(|| StorageError(format!("unknown URI: {uri}")).into())
+    }
+
+    fn open_raw_store(&self, store_name: &str) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
+        self.store_handles
+            .get_or_try_insert_with(store_name.to_string(), |store_name| {
+                let path = self.base_path.join(store_name);
+                Ok(RwLock::new(open_or_create_btree(path)?))
+            })
+    }
+
+    fn open_raw_store_for_txn(
+        &self,
+        uri: &str,
+        txn_id: TxnId,
+    ) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
+        let store_name = self.resolve_raw_uri_for_txn(uri, txn_id)?;
+        self.open_raw_store(&store_name)
     }
 }
 
@@ -237,15 +261,16 @@ impl<'a> WriteUnitOfWork<'a> {
     /// open the same kind of table cursor, but they do so under different
     /// transaction scopes.
     pub fn open_cursor(&mut self, uri: &str) -> Result<TableCursor, WrongoDBError> {
-        let store_name = self.session.resolve_uri_for_txn(uri, self.txn_id())?;
+        let txn_id = self.txn_id();
+        let table = self.session.resolve_table_metadata(uri, txn_id)?;
         let txn_handle = self
             .session
             .active_txn
             .as_ref()
             .map(|active| Arc::downgrade(&active.txn_handle()));
-        self.session.open_resolved_cursor_with_access(
-            uri,
-            &store_name,
+        self.session.open_table_cursor_with_access(
+            table,
+            txn_id,
             txn_handle,
             TableCursorWriteAccess::ReadWrite,
         )
@@ -325,6 +350,44 @@ impl<'a> WriteUnitOfWork<'a> {
             .as_ref()
             .expect("transaction should exist")
             .txn_id()
+    }
+
+    pub(crate) fn raw_insert(
+        &mut self,
+        uri: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), WrongoDBError> {
+        let txn_id = self.txn_id();
+        let store = self.session.open_raw_store_for_txn(uri, txn_id)?;
+        let txn_handle = self
+            .session
+            .active_txn
+            .as_ref()
+            .expect("transaction should exist")
+            .txn_handle();
+        let mut btree = store.write();
+        if contains_key(&mut btree, key, txn_id)? {
+            return Err(DocumentValidationError("duplicate key error".into()).into());
+        }
+
+        self.session
+            .recovery_unit
+            .record_put(uri, key, value, txn_id)?;
+        let mut txn = txn_handle.lock();
+        apply_put_in_txn(&mut btree, key, value, &mut txn)
+    }
+
+    pub(crate) fn raw_scan_range(
+        &mut self,
+        uri: &str,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
+        let store = self.session.open_raw_store_for_txn(uri, self.txn_id())?;
+        let mut btree = store.write();
+        let entries = scan_range(&mut btree, start, end, self.txn_id())?;
+        Ok(entries)
     }
 }
 
@@ -470,6 +533,43 @@ mod tests {
 
         let err = session.create("index:test:name").unwrap_err();
         assert!(err.to_string().contains("only table:... is supported"));
+    }
+
+    #[test]
+    fn public_open_cursor_rejects_index_and_metadata_uris() {
+        let mut session =
+            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+        session.create(TEST_URI).unwrap();
+
+        let index_err = session.open_cursor("index:items:name").unwrap_err();
+        assert!(index_err
+            .to_string()
+            .contains("only table:... is supported"));
+
+        let metadata_err = session.open_cursor(METADATA_URI).unwrap_err();
+        assert!(metadata_err
+            .to_string()
+            .contains("only table:... is supported"));
+    }
+
+    #[test]
+    fn transactional_open_cursor_rejects_index_and_metadata_uris() {
+        let mut session =
+            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+        session.create(TEST_URI).unwrap();
+
+        let mut txn = session.transaction().unwrap();
+        let index_err = txn.open_cursor("index:items:name").unwrap_err();
+        assert!(index_err
+            .to_string()
+            .contains("only table:... is supported"));
+
+        let metadata_err = txn.open_cursor(METADATA_URI).unwrap_err();
+        assert!(metadata_err
+            .to_string()
+            .contains("only table:... is supported"));
+
+        txn.abort().unwrap();
     }
 
     #[test]
