@@ -70,7 +70,7 @@ impl Session {
     /// data.
     pub fn create(&mut self, uri: &str) -> Result<(), WrongoDBError> {
         if let Some(collection) = uri.strip_prefix("table:") {
-            let store_name = self.schema_catalog.primary_store_name(collection);
+            let store_name = Self::primary_store_name(collection);
             let _ = self
                 .table_handles
                 .get_or_try_insert_with(store_name, |store_name| {
@@ -103,7 +103,7 @@ impl Session {
     /// a first-class storage API and should not require creating a transaction
     /// boundary object just to read or perform local writes.
     pub fn open_cursor(&self, uri: &str) -> Result<Cursor, WrongoDBError> {
-        let store_name = self.schema_catalog.resolve_uri(uri)?;
+        let store_name = self.resolve_uri(uri)?;
         self.open_store_cursor_with_access(&store_name, TXN_NONE, CursorWriteAccess::ReadWrite)
     }
 
@@ -202,6 +202,33 @@ impl Session {
         })?;
         Ok(Some(Arc::downgrade(&active.txn_handle())))
     }
+
+    fn resolve_uri(&self, uri: &str) -> Result<String, WrongoDBError> {
+        if let Some(collection) = uri.strip_prefix("table:") {
+            return Ok(Self::primary_store_name(collection));
+        }
+
+        if let Some(rest) = uri.strip_prefix("index:") {
+            let mut parts = rest.splitn(2, ':');
+            let collection = parts.next().unwrap_or("");
+            let index_name = parts.next().unwrap_or("");
+            if collection.is_empty() || index_name.is_empty() {
+                return Err(StorageError(format!("invalid index URI: {uri}")).into());
+            }
+            return self
+                .schema_catalog
+                .collection_schema(collection)?
+                .index_store(index_name)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| StorageError(format!("unknown index: {uri}")).into());
+        }
+
+        Err(StorageError(format!("unsupported URI: {uri}")).into())
+    }
+
+    fn primary_store_name(collection: &str) -> String {
+        format!("{collection}.main.wt")
+    }
 }
 
 /// Public handle for one active transaction started from [`Session::transaction`].
@@ -233,7 +260,7 @@ impl<'a> WriteUnitOfWork<'a> {
     /// The duplication is about binding, not behavior: both methods open the
     /// same kind of cursor, but they bind it to different transaction scopes.
     pub fn open_cursor(&mut self, uri: &str) -> Result<Cursor, WrongoDBError> {
-        let store_name = self.session.schema_catalog.resolve_uri(uri)?;
+        let store_name = self.session.resolve_uri(uri)?;
         self.session.open_store_cursor_with_access(
             &store_name,
             self.txn_id(),

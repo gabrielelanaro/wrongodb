@@ -61,10 +61,6 @@ impl SchemaCatalog {
         Self { base_path }
     }
 
-    pub(crate) fn primary_store_name(&self, collection: &str) -> String {
-        format!("{collection}.main.wt")
-    }
-
     pub(crate) fn collection_schema(
         &self,
         collection: &str,
@@ -72,31 +68,9 @@ impl SchemaCatalog {
         let indexes = self.load_index_definitions(collection)?;
         Ok(CollectionSchema {
             collection: collection.to_string(),
-            primary_store: self.primary_store_name(collection),
+            primary_store: format!("{collection}.main.wt"),
             indexes,
         })
-    }
-
-    pub(crate) fn resolve_uri(&self, uri: &str) -> Result<String, WrongoDBError> {
-        if let Some(collection) = uri.strip_prefix("table:") {
-            return Ok(self.primary_store_name(collection));
-        }
-
-        if let Some(rest) = uri.strip_prefix("index:") {
-            let mut parts = rest.splitn(2, ':');
-            let collection = parts.next().unwrap_or("");
-            let index_name = parts.next().unwrap_or("");
-            if collection.is_empty() || index_name.is_empty() {
-                return Err(StorageError(format!("invalid index URI: {uri}")).into());
-            }
-            return self
-                .collection_schema(collection)?
-                .index_store(index_name)
-                .map(ToOwned::to_owned)
-                .ok_or_else(|| StorageError(format!("unknown index: {uri}")).into());
-        }
-
-        Err(StorageError(format!("unsupported URI: {uri}")).into())
     }
 
     pub(crate) fn list_indexes(&self, collection: &str) -> Result<Vec<String>, WrongoDBError> {
@@ -256,7 +230,11 @@ mod tests {
             Some("users.name.idx.wt".to_string())
         );
         assert_eq!(
-            catalog.resolve_uri("index:users:name").unwrap(),
+            catalog
+                .collection_schema("users")
+                .unwrap()
+                .index_store("name")
+                .unwrap(),
             "users.name.idx.wt"
         );
         assert_eq!(
