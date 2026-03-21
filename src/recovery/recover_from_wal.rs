@@ -277,7 +277,8 @@ mod tests {
     use crate::durability::{CommandApplier, CommittedDurableOp, DurableOp, StoreCommandApplier};
     use crate::recovery::recover_from_wal;
     use crate::schema::SchemaCatalog;
-    use crate::storage::table_cache::TableCache;
+    use crate::storage::handle_cache::HandleCache;
+    use crate::storage::table::Table;
     use crate::storage::wal::{
         GlobalWal, Lsn, RecoveryError, WalFileReader, WalReader, WalRecord, WalRecordHeader,
     };
@@ -351,19 +352,25 @@ mod tests {
     fn recover_store_from_wal(base_path: &Path, store_name: &str, key: &[u8]) -> Option<Vec<u8>> {
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let table_cache = Arc::new(TableCache::new(
-            base_path.to_path_buf(),
-            transaction_manager.clone(),
-        ));
+        let table_handles = Arc::new(HandleCache::<String, parking_lot::RwLock<Table>>::new());
         let _schema_catalog = Arc::new(SchemaCatalog::new(base_path.to_path_buf()));
         let applier = Arc::new(StoreCommandApplier::new(
-            table_cache.clone(),
-            transaction_manager,
+            base_path.to_path_buf(),
+            table_handles.clone(),
+            transaction_manager.clone(),
         ));
         let reader = WalFileReader::open(GlobalWal::path_for_db(base_path)).unwrap();
         recover_from_wal(applier, reader).unwrap();
 
-        let table = table_cache.get_or_open_store(store_name).unwrap();
+        let table = table_handles
+            .get_or_try_insert_with(store_name.to_string(), |store_name| {
+                let path = base_path.join(store_name);
+                Ok(parking_lot::RwLock::new(Table::open_or_create_store(
+                    path,
+                    transaction_manager.clone(),
+                )?))
+            })
+            .unwrap();
         let recovered = table.write().get_version(key, TXN_NONE).unwrap();
         recovered
     }

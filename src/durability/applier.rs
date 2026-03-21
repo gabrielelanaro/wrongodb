@@ -1,12 +1,14 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::durability::{CommittedDurableOp, DurableOp};
 use crate::raft::command::CommittedCommand;
 use crate::raft::service::CommittedCommandExecutor;
-use crate::storage::table_cache::TableCache;
+use crate::storage::handle_cache::HandleCache;
+use crate::storage::table::Table;
 use crate::txn::{Transaction, TransactionManager, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
@@ -21,18 +23,21 @@ pub(crate) trait CommandApplier: Send + Sync {
 
 #[derive(Debug)]
 pub(crate) struct StoreCommandApplier {
-    table_cache: Arc<TableCache>,
+    base_path: PathBuf,
+    table_handles: Arc<HandleCache<String, RwLock<Table>>>,
     transaction_manager: Arc<TransactionManager>,
     in_flight_txns: Mutex<HashMap<TxnId, Transaction>>,
 }
 
 impl StoreCommandApplier {
     pub(crate) fn new(
-        table_cache: Arc<TableCache>,
+        base_path: PathBuf,
+        table_handles: Arc<HandleCache<String, RwLock<Table>>>,
         transaction_manager: Arc<TransactionManager>,
     ) -> Self {
         Self {
-            table_cache,
+            base_path,
+            table_handles,
             transaction_manager,
             in_flight_txns: Mutex::new(HashMap::new()),
         }
@@ -46,7 +51,15 @@ impl StoreCommandApplier {
                 value,
                 txn_id,
             } => {
-                let table = self.table_cache.get_or_open_store(&store_name)?;
+                let table =
+                    self.table_handles
+                        .get_or_try_insert_with(store_name, |store_name| {
+                            let path = self.base_path.join(store_name);
+                            Ok(RwLock::new(Table::open_or_create_store(
+                                path,
+                                self.transaction_manager.clone(),
+                            )?))
+                        })?;
                 if txn_id == TXN_NONE {
                     table.write().local_apply_put_autocommit(&key, &value)?;
                 } else {
@@ -62,7 +75,15 @@ impl StoreCommandApplier {
                 key,
                 txn_id,
             } => {
-                let table = self.table_cache.get_or_open_store(&store_name)?;
+                let table =
+                    self.table_handles
+                        .get_or_try_insert_with(store_name, |store_name| {
+                            let path = self.base_path.join(store_name);
+                            Ok(RwLock::new(Table::open_or_create_store(
+                                path,
+                                self.transaction_manager.clone(),
+                            )?))
+                        })?;
                 if txn_id == TXN_NONE {
                     let _ = table.write().local_apply_delete_autocommit(&key)?;
                 } else {
@@ -101,7 +122,7 @@ impl CommandApplier for StoreCommandApplier {
     }
 
     fn checkpoint_open_stores(&self) -> Result<(), WrongoDBError> {
-        for table in self.table_cache.all_handles() {
+        for table in self.table_handles.all_handles() {
             table.write().checkpoint_store()?;
         }
         Ok(())

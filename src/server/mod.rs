@@ -58,7 +58,8 @@ pub async fn start_server(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     let applier = Arc::new(StoreCommandApplier::new(
-        conn.table_cache(),
+        conn.base_path().to_path_buf(),
+        conn.table_handles(),
         conn.transaction_manager(),
     ));
     let replication_coordinator = Arc::new(ReplicationCoordinator::open(

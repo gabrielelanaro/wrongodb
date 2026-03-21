@@ -1,35 +1,53 @@
+use std::path::PathBuf;
 use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use crate::core::errors::{DocumentValidationError, StorageError};
 use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp};
 use crate::replication::{ReplicationCoordinator, WritePathMode};
 use crate::storage::api::WriteUnitOfWork;
-use crate::storage::table_cache::TableCache;
-use crate::txn::TxnId;
+use crate::storage::handle_cache::HandleCache;
+use crate::storage::table::Table;
+use crate::txn::{TransactionManager, TxnId};
 use crate::WrongoDBError;
 
 #[derive(Clone)]
 pub(crate) struct StoreWritePath {
-    table_cache: Arc<TableCache>,
+    base_path: PathBuf,
+    table_handles: Arc<HandleCache<String, RwLock<Table>>>,
+    transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
     replication_coordinator: Arc<ReplicationCoordinator>,
 }
 
 impl StoreWritePath {
     pub(crate) fn new(
-        table_cache: Arc<TableCache>,
+        base_path: PathBuf,
+        table_handles: Arc<HandleCache<String, RwLock<Table>>>,
+        transaction_manager: Arc<TransactionManager>,
         durability_backend: Arc<DurabilityBackend>,
         replication_coordinator: Arc<ReplicationCoordinator>,
     ) -> Self {
         Self {
-            table_cache,
+            base_path,
+            table_handles,
+            transaction_manager,
             durability_backend,
             replication_coordinator,
         }
     }
 
     pub(crate) fn ensure_store(&self, store_name: &str) -> Result<(), WrongoDBError> {
-        let _ = self.table_cache.get_or_open_store(store_name)?;
+        let _ =
+            self.table_handles
+                .get_or_try_insert_with(store_name.to_string(), |store_name| {
+                    let path = self.base_path.join(store_name);
+                    Ok(RwLock::new(Table::open_or_create_store(
+                        path,
+                        self.transaction_manager.clone(),
+                    )?))
+                })?;
         Ok(())
     }
 
@@ -131,7 +149,15 @@ impl StoreWritePath {
         key: &[u8],
         txn_id: TxnId,
     ) -> Result<bool, WrongoDBError> {
-        let table = self.table_cache.get_or_open_store(store_name)?;
+        let table =
+            self.table_handles
+                .get_or_try_insert_with(store_name.to_string(), |store_name| {
+                    let path = self.base_path.join(store_name);
+                    Ok(RwLock::new(Table::open_or_create_store(
+                        path,
+                        self.transaction_manager.clone(),
+                    )?))
+                })?;
         let mut table = table.write();
         table.contains_key(key, txn_id)
     }

@@ -1,14 +1,17 @@
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use crate::durability::{DurabilityBackend, StoreCommandApplier};
 use crate::recovery::recover_from_wal;
 use crate::replication::RaftMode;
 use crate::schema::SchemaCatalog;
 use crate::storage::api::session::Session;
-use crate::storage::table_cache::TableCache;
+use crate::storage::handle_cache::HandleCache;
+use crate::storage::table::Table;
 use crate::storage::wal::{GlobalWal, WalFileReader};
 use crate::txn::{GlobalTxnState, TransactionManager};
 use crate::WrongoDBError;
@@ -80,8 +83,9 @@ impl ConnectionConfig {
 /// In other words: `Connection` owns the engine, [`Session`](crate::Session)
 /// owns request-local state.
 pub struct Connection {
+    base_path: PathBuf,
     schema_catalog: Arc<SchemaCatalog>,
-    table_cache: Arc<TableCache>,
+    table_handles: Arc<HandleCache<String, RwLock<Table>>>,
     transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
 }
@@ -115,12 +119,10 @@ impl Connection {
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
         let schema_catalog = Arc::new(SchemaCatalog::new(base_path.clone()));
-        let table_cache = Arc::new(TableCache::new(
-            base_path.clone(),
-            transaction_manager.clone(),
-        ));
+        let table_handles = Arc::new(HandleCache::new());
         let applier = Arc::new(StoreCommandApplier::new(
-            table_cache.clone(),
+            base_path.clone(),
+            table_handles.clone(),
             transaction_manager.clone(),
         ));
 
@@ -135,8 +137,9 @@ impl Connection {
             Arc::new(DurabilityBackend::open(&base_path, standalone_local_wal)?);
 
         Ok(Self {
+            base_path,
             schema_catalog,
-            table_cache,
+            table_handles,
             transaction_manager,
             durability_backend,
         })
@@ -152,7 +155,8 @@ impl Connection {
     /// sessions can share one opened database safely.
     pub fn open_session(&self) -> Session {
         Session::new(
-            self.table_cache.clone(),
+            self.base_path.clone(),
+            self.table_handles.clone(),
             self.schema_catalog.clone(),
             self.transaction_manager.clone(),
             self.durability_backend.clone(),
@@ -163,8 +167,12 @@ impl Connection {
         self.schema_catalog.clone()
     }
 
-    pub(crate) fn table_cache(&self) -> Arc<TableCache> {
-        self.table_cache.clone()
+    pub(crate) fn base_path(&self) -> &Path {
+        &self.base_path
+    }
+
+    pub(crate) fn table_handles(&self) -> Arc<HandleCache<String, RwLock<Table>>> {
+        self.table_handles.clone()
     }
 
     pub(crate) fn durability_backend(&self) -> Arc<DurabilityBackend> {

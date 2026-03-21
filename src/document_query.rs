@@ -195,7 +195,8 @@ mod tests {
     use crate::durability::DurabilityBackend;
     use crate::replication::ReplicationCoordinator;
     use crate::schema::SchemaCatalog;
-    use crate::storage::table_cache::TableCache;
+    use crate::storage::handle_cache::HandleCache;
+    use crate::storage::table::Table;
     use crate::store_write_path::StoreWritePath;
     use crate::txn::{GlobalTxnState, TransactionManager};
 
@@ -213,23 +214,28 @@ mod tests {
 
             let transaction_manager =
                 Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-            let table_cache = Arc::new(TableCache::new(
-                base_path.clone(),
-                transaction_manager.clone(),
-            ));
-            let schema_catalog = Arc::new(SchemaCatalog::new(base_path));
+            let table_handles = Arc::new(HandleCache::<String, parking_lot::RwLock<Table>>::new());
+            let schema_catalog = Arc::new(SchemaCatalog::new(base_path.clone()));
             let backend = Arc::new(DurabilityBackend::Disabled);
             let query = DocumentQuery::new(schema_catalog.clone());
             let write_path = CollectionWritePath::new(
                 schema_catalog.clone(),
                 query.clone(),
                 StoreWritePath::new(
-                    table_cache.clone(),
+                    base_path.clone(),
+                    table_handles.clone(),
+                    transaction_manager.clone(),
                     backend.clone(),
                     Arc::new(ReplicationCoordinator::standalone()),
                 ),
             );
-            let session = Session::new(table_cache, schema_catalog, transaction_manager, backend);
+            let session = Session::new(
+                base_path,
+                table_handles,
+                schema_catalog,
+                transaction_manager,
+                backend,
+            );
 
             Self {
                 query,

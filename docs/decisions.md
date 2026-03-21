@@ -1,5 +1,26 @@
 # Decisions
 
+## 2026-03-21: Make `Connection` own a generic storage handle cache directly
+
+**Decision**
+- Add a storage-internal generic `HandleCache<K, V>` for lazily created shared
+  handles stored as `Arc<V>`.
+- Make `Connection` own `Arc<HandleCache<String, RwLock<Table>>>` directly.
+- Remove the `TableCache` wrapper entirely.
+- Keep value creation at each call site via
+  `get_or_try_insert_with(key, |key| ...)` instead of storing a factory on the
+  cache object.
+
+**Why**
+- The old `TableCache` duplicated a pattern we expect to reuse for other
+  storage-level cached resources.
+- Keeping the generic cache on `Connection` preserves the correct WT-like
+  ownership boundary: opened handles are engine-wide shared state, not
+  session-local state.
+- Using per-lookup closures keeps the generic cache focused only on lookup,
+  synchronization, and shared ownership, without baking table-specific opening
+  policy into the cache abstraction itself.
+
 ## 2026-03-21: Move the WT-like storage API under `storage/api` and reserve top-level `api` for database-layer context
 
 **Decision**

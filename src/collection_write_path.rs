@@ -486,7 +486,8 @@ mod tests {
     use crate::replication::{RaftMode, RaftPeerConfig, ReplicationCoordinator, WritePathMode};
     use crate::schema::SchemaCatalog;
     use crate::storage::api::{Connection, ConnectionConfig, Session};
-    use crate::storage::table_cache::TableCache;
+    use crate::storage::handle_cache::HandleCache;
+    use crate::storage::table::Table;
     use crate::store_write_path::StoreWritePath;
     use crate::txn::{GlobalTxnState, TransactionManager};
     use crate::WrongoDBError;
@@ -512,22 +513,30 @@ mod tests {
     ) -> (CollectionWritePath, DocumentQuery, Session) {
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let table_cache = Arc::new(TableCache::new(
-            base_path.clone(),
-            transaction_manager.clone(),
-        ));
-        let schema_catalog = Arc::new(SchemaCatalog::new(base_path));
+        let table_handles = Arc::new(HandleCache::<String, parking_lot::RwLock<Table>>::new());
+        let schema_catalog = Arc::new(SchemaCatalog::new(base_path.clone()));
         let backend = Arc::new(backend);
         let replication = Arc::new(replication);
         let document_query = DocumentQuery::new(schema_catalog.clone());
-        let store_write_path =
-            StoreWritePath::new(table_cache.clone(), backend.clone(), replication.clone());
+        let store_write_path = StoreWritePath::new(
+            base_path.clone(),
+            table_handles.clone(),
+            transaction_manager.clone(),
+            backend.clone(),
+            replication.clone(),
+        );
         let service = CollectionWritePath::new(
             schema_catalog.clone(),
             document_query.clone(),
             store_write_path,
         );
-        let session = Session::new(table_cache, schema_catalog, transaction_manager, backend);
+        let session = Session::new(
+            base_path,
+            table_handles,
+            schema_catalog,
+            transaction_manager,
+            backend,
+        );
         (service, document_query, session)
     }
 
@@ -606,7 +615,8 @@ mod tests {
                 dir.path(),
                 true,
                 Arc::new(StoreCommandApplier::new(
-                    conn.table_cache(),
+                    conn.base_path().to_path_buf(),
+                    conn.table_handles(),
                     conn.transaction_manager(),
                 )),
                 raft_mode,

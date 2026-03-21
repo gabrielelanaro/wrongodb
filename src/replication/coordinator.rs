@@ -300,24 +300,23 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::Arc;
 
+    use parking_lot::RwLock;
     use tempfile::tempdir;
 
     use super::*;
     use crate::durability::StoreCommandApplier;
     use crate::raft::hard_state::RaftHardStateStore;
     use crate::raft::runtime::RaftInboundMessage;
-    use crate::storage::table_cache::TableCache;
+    use crate::storage::handle_cache::HandleCache;
+    use crate::storage::table::Table;
     use crate::txn::{GlobalTxnState, TransactionManager, TXN_NONE};
 
     fn new_txn_manager() -> Arc<TransactionManager> {
         Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())))
     }
 
-    fn new_table_cache(
-        dir: &tempfile::TempDir,
-        txn_manager: Arc<TransactionManager>,
-    ) -> Arc<TableCache> {
-        Arc::new(TableCache::new(dir.path().to_path_buf(), txn_manager))
+    fn new_table_handles() -> Arc<HandleCache<String, RwLock<Table>>> {
+        Arc::new(HandleCache::new())
     }
 
     fn new_replication_coordinator(
@@ -326,8 +325,12 @@ mod tests {
         raft_mode: RaftMode,
     ) -> ReplicationCoordinator {
         let txn_manager = new_txn_manager();
-        let table_cache = new_table_cache(dir, txn_manager.clone());
-        let applier = Arc::new(StoreCommandApplier::new(table_cache, txn_manager));
+        let table_handles = new_table_handles();
+        let applier = Arc::new(StoreCommandApplier::new(
+            dir.path().to_path_buf(),
+            table_handles,
+            txn_manager,
+        ));
         ReplicationCoordinator::open(dir.path(), enabled, applier, raft_mode).unwrap()
     }
 
@@ -382,8 +385,12 @@ mod tests {
         file.sync_all().unwrap();
 
         let txn_manager = new_txn_manager();
-        let table_cache = new_table_cache(&dir, txn_manager.clone());
-        let applier = Arc::new(StoreCommandApplier::new(table_cache, txn_manager));
+        let table_handles = new_table_handles();
+        let applier = Arc::new(StoreCommandApplier::new(
+            dir.path().to_path_buf(),
+            table_handles,
+            txn_manager,
+        ));
         let err = ReplicationCoordinator::open(
             dir.path(),
             true,
