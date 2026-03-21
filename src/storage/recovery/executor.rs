@@ -5,10 +5,14 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 
 use crate::core::errors::StorageError;
+use crate::storage::btree::BTreeCursor;
 use crate::storage::command::StorageCommand;
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::metadata_catalog::MetadataCatalog;
-use crate::storage::table::Table;
+use crate::storage::table::{
+    apply_delete_autocommit, apply_delete_in_txn, apply_put_autocommit, apply_put_in_txn,
+    checkpoint_store, open_or_create_btree,
+};
 use crate::txn::{Transaction, TransactionManager, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
@@ -21,7 +25,7 @@ pub(crate) trait RecoveryApplier: Send + Sync {
 pub(crate) struct RecoveryExecutor {
     base_path: PathBuf,
     metadata_catalog: Arc<MetadataCatalog>,
-    table_handles: Arc<HandleCache<String, RwLock<Table>>>,
+    store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
     transaction_manager: Arc<TransactionManager>,
     in_flight_txns: Mutex<HashMap<TxnId, Transaction>>,
 }
@@ -30,33 +34,30 @@ impl RecoveryExecutor {
     pub(crate) fn new(
         base_path: PathBuf,
         metadata_catalog: Arc<MetadataCatalog>,
-        table_handles: Arc<HandleCache<String, RwLock<Table>>>,
+        store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
         transaction_manager: Arc<TransactionManager>,
     ) -> Self {
         Self {
             base_path,
             metadata_catalog,
-            table_handles,
+            store_handles,
             transaction_manager,
             in_flight_txns: Mutex::new(HashMap::new()),
         }
     }
 
-    fn open_table_for_uri(
+    fn open_store_for_uri(
         &self,
         uri: &str,
         txn_id: TxnId,
-    ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
+    ) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
         let source = self
             .metadata_catalog
             .lookup_source_for_txn(uri, txn_id)?
             .ok_or_else(|| StorageError(format!("unknown URI during apply: {uri}")))?;
-        self.table_handles.get_or_try_insert_with(source, |source| {
+        self.store_handles.get_or_try_insert_with(source, |source| {
             let path = self.base_path.join(source);
-            Ok(RwLock::new(Table::open_or_create_store(
-                path,
-                self.transaction_manager.clone(),
-            )?))
+            Ok(RwLock::new(open_or_create_btree(path)?))
         })
     }
 }
@@ -70,27 +71,36 @@ impl RecoveryApplier for RecoveryExecutor {
                 value,
                 txn_id,
             } => {
-                let table = self.open_table_for_uri(&uri, txn_id)?;
+                let store = self.open_store_for_uri(&uri, txn_id)?;
                 if txn_id == TXN_NONE {
-                    table.write().local_apply_put_autocommit(&key, &value)?;
+                    apply_put_autocommit(
+                        &mut store.write(),
+                        self.transaction_manager.as_ref(),
+                        &key,
+                        &value,
+                    )?;
                 } else {
                     let mut txns = self.in_flight_txns.lock();
                     let txn = txns
                         .entry(txn_id)
                         .or_insert_with(|| self.transaction_manager.begin_replay_txn(txn_id));
-                    table.write().local_apply_put_in_txn(&key, &value, txn)?;
+                    apply_put_in_txn(&mut store.write(), &key, &value, txn)?;
                 }
             }
             StorageCommand::Delete { uri, key, txn_id } => {
-                let table = self.open_table_for_uri(&uri, txn_id)?;
+                let store = self.open_store_for_uri(&uri, txn_id)?;
                 if txn_id == TXN_NONE {
-                    let _ = table.write().local_apply_delete_autocommit(&key)?;
+                    let _ = apply_delete_autocommit(
+                        &mut store.write(),
+                        self.transaction_manager.as_ref(),
+                        &key,
+                    )?;
                 } else {
                     let mut txns = self.in_flight_txns.lock();
                     let txn = txns
                         .entry(txn_id)
                         .or_insert_with(|| self.transaction_manager.begin_replay_txn(txn_id));
-                    let _ = table.write().local_apply_delete_in_txn(&key, txn)?;
+                    let _ = apply_delete_in_txn(&mut store.write(), &key, txn)?;
                 }
             }
             StorageCommand::TxnCommit { txn_id, .. } => {
@@ -113,8 +123,8 @@ impl RecoveryApplier for RecoveryExecutor {
     }
 
     fn checkpoint_open_stores(&self) -> Result<(), WrongoDBError> {
-        for table in self.table_handles.all_handles() {
-            table.write().checkpoint_store()?;
+        for store in self.store_handles.all_handles() {
+            checkpoint_store(&mut store.write(), self.transaction_manager.as_ref())?;
         }
         Ok(())
     }

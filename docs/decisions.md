@@ -1,5 +1,24 @@
 # Decisions
 
+## 2026-03-21: Make `Table` metadata-only and cache shared `BTreeCursor` handles
+
+**Decision**
+- Replace the operational `Table` wrapper with `TableMetadata`, which currently stores only `uri`.
+- Cache shared opened stores as `Arc<HandleCache<String, RwLock<BTreeCursor>>>`.
+- Make `TableCursor` the session-owned operational object for normal store reads, scans, and writes.
+- Keep checkpoint and WAL recovery below `TableCursor`, using low-level helpers over shared
+  `BTreeCursor` handles.
+
+**Why**
+- The old `Table` mixed two different responsibilities:
+  - logical table identity
+  - physical store operations and transaction-aware mutation helpers
+- Caching `BTreeCursor` handles directly matches the WiredTiger split more closely:
+  - higher-level table cursor for normal operations
+  - lower-level shared handle for checkpoint and recovery work
+- Keeping checkpoint and replay below `TableCursor` avoids forcing global maintenance flows through a
+  session-style cursor abstraction.
+
 ## 2026-03-21: Make `TableCursor` consult live session transaction context at call time
 
 **Decision**

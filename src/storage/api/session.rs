@@ -5,11 +5,12 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::core::errors::StorageError;
 use crate::storage::api::cursor::{TableCursor, TableCursorWriteAccess};
+use crate::storage::btree::BTreeCursor;
 use crate::storage::command::StorageCommand;
 use crate::storage::durability::{DurabilityBackend, StorageSyncPolicy};
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::metadata_catalog::{MetadataCatalog, METADATA_STORE_NAME, METADATA_URI};
-use crate::storage::table::Table;
+use crate::storage::table::{checkpoint_store, open_or_create_btree, TableMetadata};
 use crate::storage::RecoveryUnit;
 use crate::txn::{ActiveWriteUnit, TransactionManager, TxnId};
 use crate::WrongoDBError;
@@ -32,7 +33,7 @@ use crate::WrongoDBError;
 /// now?" while `Connection` answers "what engine are we attached to?".
 pub struct Session {
     base_path: PathBuf,
-    table_handles: Arc<HandleCache<String, RwLock<Table>>>,
+    store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
     metadata_catalog: Arc<MetadataCatalog>,
     transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
@@ -43,7 +44,7 @@ pub struct Session {
 impl Session {
     pub(crate) fn new(
         base_path: PathBuf,
-        table_handles: Arc<HandleCache<String, RwLock<Table>>>,
+        store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
         metadata_catalog: Arc<MetadataCatalog>,
         transaction_manager: Arc<TransactionManager>,
         durability_backend: Arc<DurabilityBackend>,
@@ -51,7 +52,7 @@ impl Session {
         let recovery_unit = durability_backend.new_recovery_unit();
         Self {
             base_path,
-            table_handles,
+            store_handles,
             metadata_catalog,
             transaction_manager,
             recovery_unit,
@@ -133,8 +134,8 @@ impl Session {
     /// durability is enabled, emits the matching durability marker only after
     /// the storage-level reconciliation pass has finished.
     ///
-    /// It lives on `Session` instead of `TableCursor` or `Table` because checkpoint
-    /// is not a one-store concern.
+    /// It lives on `Session` instead of `TableCursor` or a per-store helper
+    /// because checkpoint is not a one-store concern.
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         let mut store_names = self.metadata_catalog.all_sources()?;
         store_names.push(METADATA_STORE_NAME.to_string());
@@ -142,16 +143,13 @@ impl Session {
         store_names.dedup();
 
         for store_name in store_names {
-            let table = self
-                .table_handles
+            let store = self
+                .store_handles
                 .get_or_try_insert_with(store_name, |store_name| {
                     let path = self.base_path.join(store_name);
-                    Ok(RwLock::new(Table::open_or_create_store(
-                        path,
-                        self.transaction_manager.clone(),
-                    )?))
+                    Ok(RwLock::new(open_or_create_btree(path)?))
                 })?;
-            table.write().checkpoint_store()?;
+            checkpoint_store(&mut store.write(), self.transaction_manager.as_ref())?;
         }
 
         if self.transaction_manager.has_active_transactions()
@@ -172,18 +170,16 @@ impl Session {
         txn_handle: Option<Weak<Mutex<crate::txn::Transaction>>>,
         write_access: TableCursorWriteAccess,
     ) -> Result<TableCursor, WrongoDBError> {
-        let table =
-            self.table_handles
+        let store =
+            self.store_handles
                 .get_or_try_insert_with(store_name.to_string(), |store_name| {
                     let path = self.base_path.join(store_name);
-                    Ok(RwLock::new(Table::open_or_create_store(
-                        path,
-                        self.transaction_manager.clone(),
-                    )?))
+                    Ok(RwLock::new(open_or_create_btree(path)?))
                 })?;
         Ok(TableCursor::new(
-            table,
-            uri.to_string(),
+            TableMetadata::new(uri),
+            store,
+            self.transaction_manager.clone(),
             txn_handle,
             self.recovery_unit.clone(),
             write_access,
@@ -353,14 +349,15 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
+    use parking_lot::RwLock;
     use tempfile::tempdir;
 
     use super::*;
+    use crate::storage::btree::BTreeCursor;
     use crate::storage::durability::DurabilityBackend;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::metadata_catalog::MetadataCatalog;
     use crate::storage::recovery::{recover_from_wal, RecoveryExecutor};
-    use crate::storage::table::Table;
     use crate::storage::wal::{GlobalWal, WalFileReader, WalReader, WalRecord};
     use crate::txn::{GlobalTxnState, TransactionManager};
 
@@ -385,16 +382,15 @@ mod tests {
             std::fs::create_dir_all(&base_path).unwrap();
             let transaction_manager =
                 Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-            let table_handles = Arc::new(HandleCache::<String, RwLock<Table>>::new());
+            let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
             let metadata_catalog = Arc::new(MetadataCatalog::new(
                 base_path.clone(),
-                table_handles.clone(),
-                transaction_manager.clone(),
+                store_handles.clone(),
             ));
             let applier = Arc::new(RecoveryExecutor::new(
                 base_path.clone(),
                 metadata_catalog,
-                table_handles.clone(),
+                store_handles.clone(),
                 transaction_manager,
             ));
             recover_existing_wal_if_present(&base_path, applier.clone());
@@ -409,15 +405,14 @@ mod tests {
         fn build(base_path: PathBuf, backend: Arc<DurabilityBackend>) -> Self {
             let transaction_manager =
                 Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-            let table_handles = Arc::new(HandleCache::<String, RwLock<Table>>::new());
+            let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
             let metadata_catalog = Arc::new(MetadataCatalog::new(
                 base_path.clone(),
-                table_handles.clone(),
-                transaction_manager.clone(),
+                store_handles.clone(),
             ));
             let session = Session::new(
                 base_path,
-                table_handles,
+                store_handles,
                 metadata_catalog,
                 transaction_manager,
                 backend,
@@ -539,23 +534,22 @@ mod tests {
         let base_path = dir.path().to_path_buf();
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let table_handles = Arc::new(HandleCache::<String, RwLock<Table>>::new());
+        let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
         let backend = Arc::new(DurabilityBackend::open(&base_path, true).unwrap());
         let metadata_catalog = Arc::new(MetadataCatalog::new(
             base_path.clone(),
-            table_handles.clone(),
-            transaction_manager.clone(),
+            store_handles.clone(),
         ));
         let mut session = Session::new(
             base_path.clone(),
-            table_handles.clone(),
+            store_handles.clone(),
             metadata_catalog.clone(),
             transaction_manager.clone(),
             backend.clone(),
         );
         let mut checkpoint_session = Session::new(
             base_path,
-            table_handles,
+            store_handles,
             metadata_catalog,
             transaction_manager,
             backend,

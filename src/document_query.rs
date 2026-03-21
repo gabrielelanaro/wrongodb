@@ -202,10 +202,10 @@ mod tests {
     use super::*;
     use crate::collection_write_path::CollectionWritePath;
     use crate::schema::SchemaCatalog;
+    use crate::storage::btree::BTreeCursor;
     use crate::storage::durability::DurabilityBackend;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::metadata_catalog::MetadataCatalog;
-    use crate::storage::table::Table;
     use crate::txn::{GlobalTxnState, TransactionManager};
 
     struct QueryTestFixture {
@@ -222,11 +222,11 @@ mod tests {
 
             let transaction_manager =
                 Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-            let table_handles = Arc::new(HandleCache::<String, parking_lot::RwLock<Table>>::new());
+            let store_handles =
+                Arc::new(HandleCache::<String, parking_lot::RwLock<BTreeCursor>>::new());
             let metadata_catalog = Arc::new(MetadataCatalog::new(
                 base_path.clone(),
-                table_handles.clone(),
-                transaction_manager.clone(),
+                store_handles.clone(),
             ));
             let schema_catalog = Arc::new(SchemaCatalog::new(
                 base_path.clone(),
@@ -241,7 +241,7 @@ mod tests {
             );
             let session = Session::new(
                 base_path,
-                table_handles,
+                store_handles,
                 metadata_catalog,
                 transaction_manager,
                 backend,

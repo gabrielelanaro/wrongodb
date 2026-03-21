@@ -179,10 +179,10 @@ mod tests {
 
     use super::*;
     use crate::storage::api::Session;
+    use crate::storage::btree::BTreeCursor;
     use crate::storage::durability::DurabilityBackend;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::metadata_catalog::MetadataCatalog;
-    use crate::storage::table::Table;
     use crate::txn::{GlobalTxnState, TransactionManager};
 
     #[test]
@@ -191,16 +191,15 @@ mod tests {
         let base_path = tmp.path().to_path_buf();
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let table_handles = Arc::new(HandleCache::<String, RwLock<Table>>::new());
+        let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
         let metadata_catalog = Arc::new(MetadataCatalog::new(
             base_path.clone(),
-            table_handles.clone(),
-            transaction_manager.clone(),
+            store_handles.clone(),
         ));
         let catalog = SchemaCatalog::new(base_path.clone(), metadata_catalog.clone());
         let mut session = Session::new(
             base_path,
-            table_handles,
+            store_handles,
             metadata_catalog,
             transaction_manager,
             Arc::new(DurabilityBackend::Disabled),

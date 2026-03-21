@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::errors::StorageError;
 use crate::storage::api::WriteUnitOfWork;
+use crate::storage::btree::BTreeCursor;
 use crate::storage::handle_cache::HandleCache;
-use crate::storage::table::Table;
-use crate::txn::{TransactionManager, TxnId, TXN_NONE};
+use crate::storage::table::{get_version, open_or_create_btree, scan_range};
+use crate::txn::{TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
 // ============================================================================
@@ -56,8 +57,7 @@ struct MetadataRecord {
 #[derive(Debug, Clone)]
 pub(crate) struct MetadataCatalog {
     base_path: PathBuf,
-    table_handles: Arc<HandleCache<String, RwLock<Table>>>,
-    transaction_manager: Arc<TransactionManager>,
+    store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
 }
 
 impl MetadataCatalog {
@@ -67,13 +67,11 @@ impl MetadataCatalog {
 
     pub(crate) fn new(
         base_path: PathBuf,
-        table_handles: Arc<HandleCache<String, RwLock<Table>>>,
-        transaction_manager: Arc<TransactionManager>,
+        store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
     ) -> Self {
         Self {
             base_path,
-            table_handles,
-            transaction_manager,
+            store_handles,
         }
     }
 
@@ -172,12 +170,15 @@ impl MetadataCatalog {
     }
 
     pub(crate) fn scan_prefix(&self, prefix: &str) -> Result<Vec<MetadataEntry>, WrongoDBError> {
-        let table = self.open_metadata_table()?;
+        let btree = self.open_metadata_table()?;
         let start = prefix_start(prefix);
         let end = prefix_end(prefix);
-        let entries = table
-            .write()
-            .scan_range(start.as_deref(), end.as_deref(), TXN_NONE)?;
+        let entries = scan_range(
+            &mut btree.write(),
+            start.as_deref(),
+            end.as_deref(),
+            TXN_NONE,
+        )?;
 
         entries
             .into_iter()
@@ -205,27 +206,28 @@ impl MetadataCatalog {
         uri: &str,
         txn_id: TxnId,
     ) -> Result<Option<MetadataEntry>, WrongoDBError> {
-        let value = self
-            .open_metadata_table()?
-            .write()
-            .get_version(uri.as_bytes(), txn_id)?;
+        let value = get_version(
+            &mut self.open_metadata_table()?.write(),
+            uri.as_bytes(),
+            txn_id,
+        )?;
         value
             .map(|value| decode_metadata_entry(uri.as_bytes().to_vec(), value))
             .transpose()
     }
 
-    fn ensure_source_exists(&self, source: &str) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
-        self.table_handles
+    fn ensure_source_exists(
+        &self,
+        source: &str,
+    ) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
+        self.store_handles
             .get_or_try_insert_with(source.to_string(), |source| {
                 let path = self.base_path.join(source);
-                Ok(RwLock::new(Table::open_or_create_store(
-                    path,
-                    self.transaction_manager.clone(),
-                )?))
+                Ok(RwLock::new(open_or_create_btree(path)?))
             })
     }
 
-    fn open_metadata_table(&self) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
+    fn open_metadata_table(&self) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
         self.ensure_source_exists(METADATA_STORE_NAME)
     }
 }
@@ -310,6 +312,7 @@ mod tests {
 
     use super::*;
     use crate::storage::api::Session;
+    use crate::storage::btree::BTreeCursor;
     use crate::storage::durability::DurabilityBackend;
     use crate::txn::{GlobalTxnState, TransactionManager};
 
@@ -324,17 +327,16 @@ mod tests {
             let base_path = dir.path().to_path_buf();
             std::mem::forget(dir);
 
-            let table_handles = Arc::new(HandleCache::<String, RwLock<Table>>::new());
+            let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
             let transaction_manager =
                 Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
             let catalog = Arc::new(MetadataCatalog::new(
                 base_path.clone(),
-                table_handles.clone(),
-                transaction_manager.clone(),
+                store_handles.clone(),
             ));
             let session = Session::new(
                 base_path,
-                table_handles,
+                store_handles,
                 catalog.clone(),
                 transaction_manager,
                 Arc::new(DurabilityBackend::Disabled),

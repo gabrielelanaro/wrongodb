@@ -6,11 +6,11 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::storage::api::session::Session;
+use crate::storage::btree::BTreeCursor;
 use crate::storage::durability::DurabilityBackend;
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::metadata_catalog::MetadataCatalog;
 use crate::storage::recovery::{recover_from_wal, RecoveryExecutor};
-use crate::storage::table::Table;
 use crate::storage::wal::{GlobalWal, WalFileReader};
 use crate::txn::{GlobalTxnState, TransactionManager};
 use crate::WrongoDBError;
@@ -68,7 +68,7 @@ impl ConnectionConfig {
 pub struct Connection {
     base_path: PathBuf,
     metadata_catalog: Arc<MetadataCatalog>,
-    table_handles: Arc<HandleCache<String, RwLock<Table>>>,
+    store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
     transaction_manager: Arc<TransactionManager>,
     durability_backend: Arc<DurabilityBackend>,
 }
@@ -98,16 +98,15 @@ impl Connection {
 
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let table_handles = Arc::new(HandleCache::new());
+        let store_handles = Arc::new(HandleCache::new());
         let metadata_catalog = Arc::new(MetadataCatalog::new(
             base_path.clone(),
-            table_handles.clone(),
-            transaction_manager.clone(),
+            store_handles.clone(),
         ));
         let recovery_executor = Arc::new(RecoveryExecutor::new(
             base_path.clone(),
             metadata_catalog.clone(),
-            table_handles.clone(),
+            store_handles.clone(),
             transaction_manager.clone(),
         ));
 
@@ -120,7 +119,7 @@ impl Connection {
         Ok(Self {
             base_path,
             metadata_catalog,
-            table_handles,
+            store_handles,
             transaction_manager,
             durability_backend,
         })
@@ -137,7 +136,7 @@ impl Connection {
     pub fn open_session(&self) -> Session {
         Session::new(
             self.base_path.clone(),
-            self.table_handles.clone(),
+            self.store_handles.clone(),
             self.metadata_catalog.clone(),
             self.transaction_manager.clone(),
             self.durability_backend.clone(),

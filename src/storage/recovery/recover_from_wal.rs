@@ -190,11 +190,12 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::storage::api::{Connection, ConnectionConfig};
+    use crate::storage::btree::BTreeCursor;
     use crate::storage::command::StorageCommand;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::metadata_catalog::{MetadataCatalog, METADATA_URI};
     use crate::storage::recovery::{recover_from_wal, RecoveryApplier, RecoveryExecutor};
-    use crate::storage::table::Table;
+    use crate::storage::table::{get_version, open_or_create_btree};
     use crate::storage::wal::{
         GlobalWal, Lsn, RecoveryError, WalFileReader, WalReader, WalRecord, WalRecordHeader,
     };
@@ -286,31 +287,28 @@ mod tests {
     fn recover_store_from_wal(base_path: &Path, store_name: &str, key: &[u8]) -> Option<Vec<u8>> {
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let table_handles = Arc::new(HandleCache::<String, parking_lot::RwLock<Table>>::new());
+        let store_handles =
+            Arc::new(HandleCache::<String, parking_lot::RwLock<BTreeCursor>>::new());
         let metadata_catalog = Arc::new(MetadataCatalog::new(
             base_path.to_path_buf(),
-            table_handles.clone(),
-            transaction_manager.clone(),
+            store_handles.clone(),
         ));
         let applier = Arc::new(RecoveryExecutor::new(
             base_path.to_path_buf(),
             metadata_catalog,
-            table_handles.clone(),
+            store_handles.clone(),
             transaction_manager.clone(),
         ));
         let reader = WalFileReader::open(GlobalWal::path_for_db(base_path)).unwrap();
         recover_from_wal(applier, reader).unwrap();
 
-        let table = table_handles
+        let store = store_handles
             .get_or_try_insert_with(store_name.to_string(), |source| {
                 let path = base_path.join(source);
-                Ok(parking_lot::RwLock::new(Table::open_or_create_store(
-                    path,
-                    transaction_manager.clone(),
-                )?))
+                Ok(parking_lot::RwLock::new(open_or_create_btree(path)?))
             })
             .unwrap();
-        let recovered = table.write().get_version(key, TXN_NONE).unwrap();
+        let recovered = get_version(&mut store.write(), key, TXN_NONE).unwrap();
         recovered
     }
 

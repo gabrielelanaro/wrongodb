@@ -3,9 +3,13 @@ use std::sync::{Arc, Weak};
 use parking_lot::{Mutex, RwLock};
 
 use crate::core::errors::{DocumentValidationError, StorageError};
-use crate::storage::table::Table;
+use crate::storage::btree::BTreeCursor;
+use crate::storage::table::{
+    apply_delete_autocommit, apply_delete_in_txn, apply_put_autocommit, apply_put_in_txn,
+    contains_key, get_version, scan_range, TableMetadata,
+};
 use crate::storage::RecoveryUnit;
-use crate::txn::{Transaction, TxnId, TXN_NONE};
+use crate::txn::{Transaction, TransactionManager, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
 /// A single key/value entry returned by [`TableCursor::next`].
@@ -38,8 +42,9 @@ pub(crate) enum TableCursorWriteAccess {
 /// If a caller needs document-level writes, they should go through the
 /// higher-level command path, not extend this type.
 pub struct TableCursor {
-    table: Arc<RwLock<Table>>,
-    uri: String,
+    table: TableMetadata,
+    main_table_btree: Arc<RwLock<BTreeCursor>>,
+    transaction_manager: Arc<TransactionManager>,
     txn_handle: Option<Weak<Mutex<Transaction>>>,
     recovery_unit: Arc<dyn RecoveryUnit>,
     write_access: TableCursorWriteAccess,
@@ -52,15 +57,17 @@ pub struct TableCursor {
 
 impl TableCursor {
     pub(crate) fn new(
-        table: Arc<RwLock<Table>>,
-        uri: String,
+        table: TableMetadata,
+        main_table_btree: Arc<RwLock<BTreeCursor>>,
+        transaction_manager: Arc<TransactionManager>,
         txn_handle: Option<Weak<Mutex<Transaction>>>,
         recovery_unit: Arc<dyn RecoveryUnit>,
         write_access: TableCursorWriteAccess,
     ) -> Self {
         Self {
             table,
-            uri,
+            main_table_btree,
+            transaction_manager,
             txn_handle,
             recovery_unit,
             write_access,
@@ -114,7 +121,7 @@ impl TableCursor {
 
     fn apply_put(
         &self,
-        table: &mut Table,
+        btree: &mut BTreeCursor,
         key: &[u8],
         value: &[u8],
         txn_handle: Option<Arc<Mutex<Transaction>>>,
@@ -122,24 +129,24 @@ impl TableCursor {
         match txn_handle {
             Some(txn_handle) => {
                 let mut txn = txn_handle.lock();
-                table.local_apply_put_in_txn(key, value, &mut txn)
+                apply_put_in_txn(btree, key, value, &mut txn)
             }
-            None => table.local_apply_put_autocommit(key, value),
+            None => apply_put_autocommit(btree, self.transaction_manager.as_ref(), key, value),
         }
     }
 
     fn apply_delete(
         &self,
-        table: &mut Table,
+        btree: &mut BTreeCursor,
         key: &[u8],
         txn_handle: Option<Arc<Mutex<Transaction>>>,
     ) -> Result<bool, WrongoDBError> {
         match txn_handle {
             Some(txn_handle) => {
                 let mut txn = txn_handle.lock();
-                table.local_apply_delete_in_txn(key, &mut txn)
+                apply_delete_in_txn(btree, key, &mut txn)
             }
-            None => table.local_apply_delete_autocommit(key),
+            None => apply_delete_autocommit(btree, self.transaction_manager.as_ref(), key),
         }
     }
 
@@ -155,13 +162,13 @@ impl TableCursor {
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
         let (txn_id, txn_handle) = self.current_txn_context();
         self.ensure_writable()?;
-        let mut table = self.table.write();
-        if table.contains_key(key, txn_id)? {
+        let mut btree = self.main_table_btree.write();
+        if contains_key(&mut btree, key, txn_id)? {
             return Err(DocumentValidationError("duplicate key error".into()).into());
         }
         self.recovery_unit
-            .record_put(&self.uri, key, value, txn_id)?;
-        self.apply_put(&mut table, key, value, txn_handle)?;
+            .record_put(self.table.uri(), key, value, txn_id)?;
+        self.apply_put(&mut btree, key, value, txn_handle)?;
         Ok(())
     }
 
@@ -175,15 +182,15 @@ impl TableCursor {
     pub fn update(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
         let (txn_id, txn_handle) = self.current_txn_context();
         self.ensure_writable()?;
-        let mut table = self.table.write();
-        if !table.contains_key(key, txn_id)? {
+        let mut btree = self.main_table_btree.write();
+        if !contains_key(&mut btree, key, txn_id)? {
             return Err(WrongoDBError::Storage(StorageError(
                 "key not found for update".to_string(),
             )));
         }
         self.recovery_unit
-            .record_put(&self.uri, key, value, txn_id)?;
-        self.apply_put(&mut table, key, value, txn_handle)?;
+            .record_put(self.table.uri(), key, value, txn_id)?;
+        self.apply_put(&mut btree, key, value, txn_handle)?;
         Ok(())
     }
 
@@ -191,14 +198,15 @@ impl TableCursor {
     pub fn delete(&mut self, key: &[u8]) -> Result<(), WrongoDBError> {
         let (txn_id, txn_handle) = self.current_txn_context();
         self.ensure_writable()?;
-        let mut table = self.table.write();
-        if !table.contains_key(key, txn_id)? {
+        let mut btree = self.main_table_btree.write();
+        if !contains_key(&mut btree, key, txn_id)? {
             return Err(WrongoDBError::Storage(StorageError(
                 "key not found for delete".to_string(),
             )));
         }
-        self.recovery_unit.record_delete(&self.uri, key, txn_id)?;
-        let deleted = self.apply_delete(&mut table, key, txn_handle)?;
+        self.recovery_unit
+            .record_delete(self.table.uri(), key, txn_id)?;
+        let deleted = self.apply_delete(&mut btree, key, txn_handle)?;
         if !deleted {
             return Err(WrongoDBError::Storage(StorageError(
                 "key not found for delete".to_string(),
@@ -213,8 +221,8 @@ impl TableCursor {
     /// one-transaction question.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, WrongoDBError> {
         let txn_id = self.current_txn_id();
-        let mut table = self.table.write();
-        table.get_version(key, txn_id)
+        let mut btree = self.main_table_btree.write();
+        get_version(&mut btree, key, txn_id)
     }
 
     #[allow(clippy::should_implement_trait)]
@@ -253,7 +261,7 @@ impl TableCursor {
     }
 
     fn refill_buffer(&mut self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        let mut table = self.table.write();
+        let mut btree = self.main_table_btree.write();
 
         let mut start_key = self.range_start.as_deref();
         let mut skip_start = false;
@@ -262,7 +270,7 @@ impl TableCursor {
             skip_start = true;
         }
 
-        let entries = table.scan_range(start_key, self.range_end.as_deref(), txn_id)?;
+        let entries = scan_range(&mut btree, start_key, self.range_end.as_deref(), txn_id)?;
 
         if skip_start && !entries.is_empty() {
             if let Some(start) = start_key {
@@ -313,27 +321,33 @@ mod tests {
     use tempfile::{tempdir, TempDir};
 
     use super::*;
+    use crate::storage::table::{apply_put_autocommit, open_or_create_btree};
     use crate::storage::NoopRecoveryUnit;
-    use crate::txn::{GlobalTxnState, TransactionManager, TXN_NONE};
+    use crate::txn::{GlobalTxnState, TXN_NONE};
 
-    fn open_index_table() -> (TempDir, Arc<RwLock<Table>>, String) {
+    fn open_index_table() -> (
+        TempDir,
+        Arc<RwLock<BTreeCursor>>,
+        Arc<TransactionManager>,
+        TableMetadata,
+    ) {
         let tmp = tempdir().unwrap();
+        let uri = "index:test:cursor".to_string();
         let store_name = "cursor.idx.wt".to_string();
         let path = tmp.path().join(&store_name);
         let transaction_manager =
             Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let table = Arc::new(RwLock::new(
-            Table::open_or_create_store(path, transaction_manager).unwrap(),
-        ));
-        (tmp, table, store_name)
+        let btree = Arc::new(RwLock::new(open_or_create_btree(path).unwrap()));
+        (tmp, btree, transaction_manager, TableMetadata::new(uri))
     }
 
     #[test]
     fn insert_applies_locally() {
-        let (_tmp, table, store_name) = open_index_table();
+        let (_tmp, btree, transaction_manager, table) = open_index_table();
         let mut cursor = TableCursor::new(
-            table.clone(),
-            store_name,
+            table,
+            btree.clone(),
+            transaction_manager,
             None,
             Arc::new(NoopRecoveryUnit),
             TableCursorWriteAccess::ReadWrite,
@@ -342,21 +356,25 @@ mod tests {
         cursor.insert(b"k1", b"v1").unwrap();
 
         assert_eq!(
-            table.write().get_version(b"k1", TXN_NONE).unwrap(),
+            get_version(&mut btree.write(), b"k1", TXN_NONE).unwrap(),
             Some(b"v1".to_vec())
         );
     }
 
     #[test]
     fn delete_applies_locally() {
-        let (_tmp, table, store_name) = open_index_table();
-        table
-            .write()
-            .local_apply_put_autocommit(b"k1", b"v1")
-            .unwrap();
+        let (_tmp, btree, transaction_manager, table) = open_index_table();
+        apply_put_autocommit(
+            &mut btree.write(),
+            transaction_manager.as_ref(),
+            b"k1",
+            b"v1",
+        )
+        .unwrap();
         let mut cursor = TableCursor::new(
-            table.clone(),
-            store_name,
+            table,
+            btree.clone(),
+            transaction_manager,
             None,
             Arc::new(NoopRecoveryUnit),
             TableCursorWriteAccess::ReadWrite,
@@ -364,15 +382,19 @@ mod tests {
 
         cursor.delete(b"k1").unwrap();
 
-        assert_eq!(table.write().get_version(b"k1", TXN_NONE).unwrap(), None);
+        assert_eq!(
+            get_version(&mut btree.write(), b"k1", TXN_NONE).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn read_only_cursor_rejects_writes() {
-        let (_tmp, table, store_name) = open_index_table();
+        let (_tmp, btree, transaction_manager, table) = open_index_table();
         let mut cursor = TableCursor::new(
             table,
-            store_name,
+            btree,
+            transaction_manager,
             None,
             Arc::new(NoopRecoveryUnit),
             TableCursorWriteAccess::ReadOnly,
@@ -384,12 +406,12 @@ mod tests {
 
     #[test]
     fn transaction_bound_cursor_falls_back_to_autocommit_after_transaction_handle_drops() {
-        let (_tmp, table, store_name) = open_index_table();
-        let txn_manager = Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
-        let txn_handle = Arc::new(Mutex::new(txn_manager.begin_snapshot_txn()));
+        let (_tmp, btree, transaction_manager, table) = open_index_table();
+        let txn_handle = Arc::new(Mutex::new(transaction_manager.begin_snapshot_txn()));
         let mut cursor = TableCursor::new(
             table,
-            store_name,
+            btree,
+            transaction_manager,
             Some(Arc::downgrade(&txn_handle)),
             Arc::new(NoopRecoveryUnit),
             TableCursorWriteAccess::ReadWrite,
