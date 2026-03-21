@@ -73,11 +73,11 @@ impl RecoveryApplier for RecoveryExecutor {
             match op {
                 TxnLogOp::Put { uri, key, value } => {
                     let store = self.open_store_for_uri(uri, txn_id)?;
-                    apply_put_in_txn(&mut store.write(), key, value, &mut txn)?;
+                    apply_put_in_txn(uri, &mut store.write(), key, value, &mut txn)?;
                 }
                 TxnLogOp::Delete { uri, key } => {
                     let store = self.open_store_for_uri(uri, txn_id)?;
-                    let _ = apply_delete_in_txn(&mut store.write(), key, &mut txn)?;
+                    let _ = apply_delete_in_txn(uri, &mut store.write(), key, &mut txn)?;
                 }
             }
         }

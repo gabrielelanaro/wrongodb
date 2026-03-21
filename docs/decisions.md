@@ -1,5 +1,28 @@
 # Decisions
 
+## 2026-03-21: Buffer WAL log ops at the low-level store write boundary and suppress capture for replay transactions
+
+**Decision**
+- Move `TxnLogOp` buffering out of `TableCursor` and `Session::raw_insert`.
+- Make the low-level store write helpers in `src/storage/table.rs` do three things together:
+  - apply the B-tree mutation
+  - record the `TxnPageOp`
+  - append the matching `TxnLogOp`
+- Make log capture a transaction property:
+  - snapshot transactions capture log ops
+  - replay transactions skip log capture
+- Keep recovery on the same low-level write helpers instead of introducing a separate unlogged replay path.
+
+**Why**
+- WiredTiger logs from its low-level modify path, not from `WT_CURSOR_TABLE`.
+- During recovery, WT keeps using the same modify path but disables logging through `__wt_txn_log_op_check` when the connection is recovering.
+- Making replay transactions skip log capture gives us the same architectural split:
+  normal writes and replay share one store-write path, but only normal writes buffer WAL ops for commit.
+
+**Notes**
+- This change does not alter the WAL format or commit ordering.
+- Durability-disabled snapshot transactions still buffer `TxnLogOp`s in this increment; only replay transactions suppress capture.
+
 ## 2026-03-21: Make `TableCursor` session-bound and reset open cursors directly on rollback
 
 **Decision**

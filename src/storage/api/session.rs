@@ -304,12 +304,7 @@ impl Session {
         }
 
         let mut txn = txn_handle.lock();
-        apply_put_in_txn(&mut btree, key, value, &mut txn)?;
-        txn.record_log_op(crate::txn::TxnLogOp::Put {
-            uri: uri.to_string(),
-            key: key.to_vec(),
-            value: value.to_vec(),
-        });
+        apply_put_in_txn(uri, &mut btree, key, value, &mut txn)?;
         Ok(())
     }
 

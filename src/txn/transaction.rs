@@ -11,6 +11,12 @@ enum TransactionKind {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum TransactionLogMode {
+    Capture,
+    Skip,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum TxnState {
     Active,
     Committed { commit_ts: Timestamp },
@@ -44,6 +50,7 @@ pub struct Transaction {
     #[cfg_attr(not(test), allow(dead_code))]
     read_ts: Option<Timestamp>,
     kind: TransactionKind,
+    log_mode: TransactionLogMode,
     state: TxnState,
     page_ops: Vec<TxnPageOp>,
     log_ops: Vec<TxnLogOp>,
@@ -56,6 +63,7 @@ impl Transaction {
             snapshot: Some(snapshot),
             read_ts: None,
             kind: TransactionKind::Snapshot,
+            log_mode: TransactionLogMode::Capture,
             state: TxnState::Active,
             page_ops: Vec::new(),
             log_ops: Vec::new(),
@@ -68,6 +76,7 @@ impl Transaction {
             snapshot: None,
             read_ts: None,
             kind: TransactionKind::Replay,
+            log_mode: TransactionLogMode::Skip,
             state: TxnState::Active,
             page_ops: Vec::new(),
             log_ops: Vec::new(),
@@ -139,8 +148,19 @@ impl Transaction {
         self.page_ops.push(op);
     }
 
-    pub fn record_log_op(&mut self, op: TxnLogOp) {
-        self.log_ops.push(op);
+    pub(crate) fn record_put_log(&mut self, uri: &str, key: &[u8], value: &[u8]) {
+        self.record_log_op(TxnLogOp::Put {
+            uri: uri.to_string(),
+            key: key.to_vec(),
+            value: value.to_vec(),
+        });
+    }
+
+    pub(crate) fn record_delete_log(&mut self, uri: &str, key: &[u8]) {
+        self.record_log_op(TxnLogOp::Delete {
+            uri: uri.to_string(),
+            key: key.to_vec(),
+        });
     }
 
     pub fn log_ops(&self) -> &[TxnLogOp] {
@@ -179,6 +199,12 @@ impl Transaction {
             }
         }
         self.log_ops.clear();
+    }
+
+    fn record_log_op(&mut self, op: TxnLogOp) {
+        if self.log_mode == TransactionLogMode::Capture {
+            self.log_ops.push(op);
+        }
     }
 }
 
