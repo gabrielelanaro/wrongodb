@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::core::errors::StorageError;
-use crate::storage::metadata_catalog::{MetadataCatalog, TABLE_URI_PREFIX};
+use crate::storage::metadata_catalog::{table_uri, MetadataCatalog, TABLE_URI_PREFIX};
 use crate::txn::TxnId;
 use crate::WrongoDBError;
 
@@ -14,7 +14,7 @@ use crate::WrongoDBError;
 pub(crate) struct IndexDefinition {
     pub(crate) name: String,
     pub(crate) columns: Vec<String>,
-    pub(crate) source: String,
+    pub(crate) uri: String,
     pub(crate) key_format: Option<String>,
     pub(crate) value_format: Option<String>,
 }
@@ -120,19 +120,19 @@ impl SchemaCatalog {
             return Ok(None);
         }
 
-        let source = format!("{collection}.{name}.idx.wt");
+        let uri = crate::storage::metadata_catalog::index_uri(collection, name);
         indexes.insert(
             name.to_string(),
             IndexDefinition {
                 name: name.to_string(),
                 columns,
-                source: source.clone(),
+                uri: uri.clone(),
                 key_format: None,
                 value_format: None,
             },
         );
         self.save_index_definitions(collection, &indexes)?;
-        Ok(Some(source))
+        Ok(Some(uri))
     }
 
     fn load_index_definitions(
@@ -140,52 +140,16 @@ impl SchemaCatalog {
         collection: &str,
     ) -> Result<BTreeMap<String, IndexDefinition>, WrongoDBError> {
         let meta_path = self.base_path.join(format!("{collection}.meta.json"));
-        if meta_path.exists() {
-            let bytes = fs::read(&meta_path)?;
-            let file: CollectionSchemaFile = serde_json::from_slice(&bytes)?;
-            let mut indexes = BTreeMap::new();
-            for def in file.indexes {
-                indexes.insert(def.name.clone(), def);
-            }
-            return Ok(indexes);
+        if !meta_path.exists() {
+            return Ok(BTreeMap::new());
         }
 
-        let prefix = format!("{collection}.");
-        let mut definitions = Vec::new();
-        for entry in fs::read_dir(&self.base_path)? {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let Some(file_name) = file_name.to_str() else {
-                continue;
-            };
-            if !file_name.starts_with(&prefix) || !file_name.ends_with(".idx.wt") {
-                continue;
-            }
-            let Some(name) = file_name
-                .strip_prefix(&prefix)
-                .and_then(|suffix| suffix.strip_suffix(".idx.wt"))
-            else {
-                continue;
-            };
-            definitions.push(IndexDefinition {
-                name: name.to_string(),
-                columns: vec![name.to_string()],
-                source: file_name.to_string(),
-                key_format: None,
-                value_format: None,
-            });
-        }
-
-        definitions.sort_by(|left, right| left.name.cmp(&right.name));
+        let bytes = fs::read(&meta_path)?;
+        let file: CollectionSchemaFile = serde_json::from_slice(&bytes)?;
         let mut indexes = BTreeMap::new();
-        for def in definitions {
+        for def in file.indexes {
             indexes.insert(def.name.clone(), def);
         }
-
-        if !indexes.is_empty() {
-            self.save_index_definitions(collection, &indexes)?;
-        }
-
         Ok(indexes)
     }
 
@@ -206,10 +170,6 @@ impl SchemaCatalog {
     }
 }
 
-fn table_uri(collection: &str) -> String {
-    format!("{TABLE_URI_PREFIX}{collection}")
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -226,7 +186,7 @@ mod tests {
     use crate::txn::{GlobalTxnState, TransactionManager};
 
     #[test]
-    fn add_index_persists_and_resolves_store_name() {
+    fn add_index_persists_logical_index_uri() {
         let tmp = tempdir().unwrap();
         let base_path = tmp.path().to_path_buf();
         let transaction_manager =
@@ -251,11 +211,11 @@ mod tests {
             catalog
                 .add_index("users", "name", vec!["name".to_string()])
                 .unwrap(),
-            Some("users.name.idx.wt".to_string())
+            Some("index:users:name".to_string())
         );
         assert_eq!(
-            catalog.index_definitions("users").unwrap()[0].source,
-            "users.name.idx.wt"
+            catalog.index_definitions("users").unwrap()[0].uri,
+            "index:users:name"
         );
         assert_eq!(
             catalog.list_indexes("users").unwrap(),

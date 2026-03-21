@@ -39,7 +39,7 @@ pub(crate) enum CursorWriteAccess {
 /// they should go through the higher-level command path, not extend this type.
 pub struct Cursor {
     table: Arc<RwLock<Table>>,
-    store_name: String,
+    uri: String,
     bound_txn_id: TxnId,
     active_txn: Option<Weak<Mutex<Transaction>>>,
     recovery_unit: Arc<dyn RecoveryUnit>,
@@ -54,7 +54,7 @@ pub struct Cursor {
 impl Cursor {
     pub(crate) fn new(
         table: Arc<RwLock<Table>>,
-        store_name: String,
+        uri: String,
         bound_txn_id: TxnId,
         active_txn: Option<Weak<Mutex<Transaction>>>,
         recovery_unit: Arc<dyn RecoveryUnit>,
@@ -62,7 +62,7 @@ impl Cursor {
     ) -> Self {
         Self {
             table,
-            store_name,
+            uri,
             bound_txn_id,
             active_txn,
             recovery_unit,
@@ -155,7 +155,7 @@ impl Cursor {
             return Err(DocumentValidationError("duplicate key error".into()).into());
         }
         self.recovery_unit
-            .record_put(&self.store_name, key, value, txn_id)?;
+            .record_put(&self.uri, key, value, txn_id)?;
         self.apply_put(&mut table, key, value, txn_id)?;
         Ok(())
     }
@@ -177,7 +177,7 @@ impl Cursor {
             )));
         }
         self.recovery_unit
-            .record_put(&self.store_name, key, value, txn_id)?;
+            .record_put(&self.uri, key, value, txn_id)?;
         self.apply_put(&mut table, key, value, txn_id)?;
         Ok(())
     }
@@ -192,8 +192,7 @@ impl Cursor {
                 "key not found for delete".to_string(),
             )));
         }
-        self.recovery_unit
-            .record_delete(&self.store_name, key, txn_id)?;
+        self.recovery_unit.record_delete(&self.uri, key, txn_id)?;
         let deleted = self.apply_delete(&mut table, key, txn_id)?;
         if !deleted {
             return Err(WrongoDBError::Storage(StorageError(

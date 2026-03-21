@@ -14,7 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use self::commands::handlers::crud::{bson_to_value, value_to_bson};
 use self::commands::CommandRegistry;
 use crate::api::DatabaseContext;
-use crate::durability::StoreCommandApplier;
+use crate::recovery::CatalogRecovery;
 use crate::replication::ReplicationCoordinator;
 use crate::{Connection, ConnectionConfig, WrongoDBError};
 
@@ -57,11 +57,11 @@ pub async fn start_server(
     config: ConnectionConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
-    let applier = Arc::new(StoreCommandApplier::new(
-        conn.base_path().to_path_buf(),
-        conn.table_handles(),
-        conn.transaction_manager(),
-    ));
+    let catalog_report = CatalogRecovery::reconcile(conn.as_ref())?;
+    for source in &catalog_report.unreferenced_sources {
+        eprintln!("Catalog recovery found unreferenced source file: {source}");
+    }
+    let applier = conn.new_store_command_applier();
     let replication_coordinator = Arc::new(ReplicationCoordinator::open(
         db_path,
         config.wal_enabled,

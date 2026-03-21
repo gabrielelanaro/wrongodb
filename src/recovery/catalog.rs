@@ -1,0 +1,104 @@
+use std::fs;
+use std::path::Path;
+
+use crate::core::errors::StorageError;
+use crate::storage::api::connection::Connection;
+use crate::storage::metadata_catalog::METADATA_STORE_NAME;
+use crate::WrongoDBError;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CatalogRecoveryReport {
+    pub(crate) unreferenced_sources: Vec<String>,
+}
+
+pub(crate) struct CatalogRecovery;
+
+impl CatalogRecovery {
+    pub(crate) fn reconcile(
+        connection: &Connection,
+    ) -> Result<CatalogRecoveryReport, WrongoDBError> {
+        let metadata_catalog = connection.metadata_catalog();
+        let mut referenced_sources = metadata_catalog.all_sources()?;
+        referenced_sources.push(METADATA_STORE_NAME.to_string());
+        referenced_sources.sort();
+        referenced_sources.dedup();
+
+        let mut on_disk_sources = list_store_files(connection.base_path())?;
+        on_disk_sources.sort();
+        on_disk_sources.dedup();
+
+        let missing_sources = referenced_sources
+            .iter()
+            .filter(|source| !on_disk_sources.contains(source))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing_sources.is_empty() {
+            return Err(StorageError(format!(
+                "catalog recovery found missing referenced sources: {}",
+                missing_sources.join(", ")
+            ))
+            .into());
+        }
+
+        let unreferenced_sources = on_disk_sources
+            .into_iter()
+            .filter(|source| !referenced_sources.contains(source))
+            .collect();
+        Ok(CatalogRecoveryReport {
+            unreferenced_sources,
+        })
+    }
+}
+
+fn list_store_files(base_path: &Path) -> Result<Vec<String>, WrongoDBError> {
+    let mut store_files = Vec::new();
+    for entry in fs::read_dir(base_path)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if file_name.ends_with(".wt") {
+            store_files.push(file_name.to_string());
+        }
+    }
+    Ok(store_files)
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::storage::api::{Connection, ConnectionConfig};
+
+    #[test]
+    fn reconcile_reports_unreferenced_store_files() {
+        let dir = tempdir().unwrap();
+        let conn = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
+        std::fs::write(dir.path().join("dangling.main.wt"), b"").unwrap();
+
+        let report = CatalogRecovery::reconcile(&conn).unwrap();
+        assert_eq!(
+            report.unreferenced_sources,
+            vec!["dangling.main.wt".to_string()]
+        );
+    }
+
+    #[test]
+    fn reconcile_fails_when_metadata_references_missing_store() {
+        let dir = tempdir().unwrap();
+        let conn = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
+        let mut session = conn.open_session();
+        session.create("table:users").unwrap();
+        drop(session);
+        std::fs::remove_file(dir.path().join("users.main.wt")).unwrap();
+
+        let err = CatalogRecovery::reconcile(&conn).unwrap_err();
+        assert!(err.to_string().contains("missing referenced sources"));
+    }
+}

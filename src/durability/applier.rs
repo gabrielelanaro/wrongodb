@@ -4,10 +4,12 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
-use crate::durability::{CommittedDurableOp, DurableOp};
+use crate::core::errors::StorageError;
+use crate::durability::DurableOp;
 use crate::raft::command::CommittedCommand;
 use crate::raft::service::CommittedCommandExecutor;
 use crate::storage::handle_cache::HandleCache;
+use crate::storage::metadata_catalog::MetadataCatalog;
 use crate::storage::table::Table;
 use crate::txn::{Transaction, TransactionManager, TxnId, TXN_NONE};
 use crate::WrongoDBError;
@@ -17,13 +19,14 @@ use crate::WrongoDBError;
 /// Recovery depends on this narrow interface so replay logic can be tested
 /// independently from the concrete store implementation.
 pub(crate) trait CommandApplier: Send + Sync {
-    fn apply(&self, cmd: CommittedDurableOp) -> Result<(), WrongoDBError>;
+    fn apply(&self, op: DurableOp) -> Result<(), WrongoDBError>;
     fn checkpoint_open_stores(&self) -> Result<(), WrongoDBError>;
 }
 
 #[derive(Debug)]
 pub(crate) struct StoreCommandApplier {
     base_path: PathBuf,
+    metadata_catalog: Arc<MetadataCatalog>,
     table_handles: Arc<HandleCache<String, RwLock<Table>>>,
     transaction_manager: Arc<TransactionManager>,
     in_flight_txns: Mutex<HashMap<TxnId, Transaction>>,
@@ -32,34 +35,46 @@ pub(crate) struct StoreCommandApplier {
 impl StoreCommandApplier {
     pub(crate) fn new(
         base_path: PathBuf,
+        metadata_catalog: Arc<MetadataCatalog>,
         table_handles: Arc<HandleCache<String, RwLock<Table>>>,
         transaction_manager: Arc<TransactionManager>,
     ) -> Self {
         Self {
             base_path,
+            metadata_catalog,
             table_handles,
             transaction_manager,
             in_flight_txns: Mutex::new(HashMap::new()),
         }
     }
 
+    fn open_table_for_uri(
+        &self,
+        uri: &str,
+        txn_id: TxnId,
+    ) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
+        let source = self
+            .metadata_catalog
+            .lookup_source_for_txn(uri, txn_id)?
+            .ok_or_else(|| StorageError(format!("unknown URI during apply: {uri}")))?;
+        self.table_handles.get_or_try_insert_with(source, |source| {
+            let path = self.base_path.join(source);
+            Ok(RwLock::new(Table::open_or_create_store(
+                path,
+                self.transaction_manager.clone(),
+            )?))
+        })
+    }
+
     fn apply_op(&self, op: DurableOp) -> Result<(), WrongoDBError> {
         match op {
             DurableOp::Put {
-                store_name,
+                uri,
                 key,
                 value,
                 txn_id,
             } => {
-                let table =
-                    self.table_handles
-                        .get_or_try_insert_with(store_name, |store_name| {
-                            let path = self.base_path.join(store_name);
-                            Ok(RwLock::new(Table::open_or_create_store(
-                                path,
-                                self.transaction_manager.clone(),
-                            )?))
-                        })?;
+                let table = self.open_table_for_uri(&uri, txn_id)?;
                 if txn_id == TXN_NONE {
                     table.write().local_apply_put_autocommit(&key, &value)?;
                 } else {
@@ -70,20 +85,8 @@ impl StoreCommandApplier {
                     table.write().local_apply_put_in_txn(&key, &value, txn)?;
                 }
             }
-            DurableOp::Delete {
-                store_name,
-                key,
-                txn_id,
-            } => {
-                let table =
-                    self.table_handles
-                        .get_or_try_insert_with(store_name, |store_name| {
-                            let path = self.base_path.join(store_name);
-                            Ok(RwLock::new(Table::open_or_create_store(
-                                path,
-                                self.transaction_manager.clone(),
-                            )?))
-                        })?;
+            DurableOp::Delete { uri, key, txn_id } => {
+                let table = self.open_table_for_uri(&uri, txn_id)?;
                 if txn_id == TXN_NONE {
                     let _ = table.write().local_apply_delete_autocommit(&key)?;
                 } else {
@@ -117,8 +120,8 @@ impl StoreCommandApplier {
 }
 
 impl CommandApplier for StoreCommandApplier {
-    fn apply(&self, cmd: CommittedDurableOp) -> Result<(), WrongoDBError> {
-        self.apply_op(cmd.op)
+    fn apply(&self, op: DurableOp) -> Result<(), WrongoDBError> {
+        self.apply_op(op)
     }
 
     fn checkpoint_open_stores(&self) -> Result<(), WrongoDBError> {
@@ -131,6 +134,6 @@ impl CommandApplier for StoreCommandApplier {
 
 impl CommittedCommandExecutor for StoreCommandApplier {
     fn execute(&self, cmd: CommittedCommand) -> Result<(), WrongoDBError> {
-        self.apply(cmd.into())
+        self.apply(cmd.command.into())
     }
 }

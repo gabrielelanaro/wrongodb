@@ -241,9 +241,6 @@ mod tests {
                 schema_catalog.clone(),
                 query.clone(),
                 StoreWritePath::new(
-                    base_path.clone(),
-                    table_handles.clone(),
-                    transaction_manager.clone(),
                     backend.clone(),
                     Arc::new(ReplicationCoordinator::standalone()),
                 ),

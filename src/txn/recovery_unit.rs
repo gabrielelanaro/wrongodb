@@ -12,18 +12,13 @@ pub(crate) trait RecoveryUnit: Send + Sync + Debug {
 
     fn record_put(
         &self,
-        store_name: &str,
+        uri: &str,
         key: &[u8],
         value: &[u8],
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError>;
 
-    fn record_delete(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError>;
+    fn record_delete(&self, uri: &str, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError>;
 
     fn commit_unit_of_work(&self, txn_id: TxnId, commit_ts: TxnId) -> Result<(), WrongoDBError>;
 
@@ -40,7 +35,7 @@ impl RecoveryUnit for NoopRecoveryUnit {
 
     fn record_put(
         &self,
-        _store_name: &str,
+        _uri: &str,
         _key: &[u8],
         _value: &[u8],
         _txn_id: TxnId,
@@ -48,12 +43,7 @@ impl RecoveryUnit for NoopRecoveryUnit {
         Ok(())
     }
 
-    fn record_delete(
-        &self,
-        _store_name: &str,
-        _key: &[u8],
-        _txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
+    fn record_delete(&self, _uri: &str, _key: &[u8], _txn_id: TxnId) -> Result<(), WrongoDBError> {
         Ok(())
     }
 
@@ -84,34 +74,29 @@ impl RecoveryUnit for WalRecoveryUnit {
 
     fn record_put(
         &self,
-        store_name: &str,
+        uri: &str,
         key: &[u8],
         value: &[u8],
         txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
-        self.wal.lock().log_put(store_name, key, value, txn_id, 0)?;
+        self.wal.lock().log_put(uri, key, value, txn_id)?;
         Ok(())
     }
 
-    fn record_delete(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<(), WrongoDBError> {
-        self.wal.lock().log_delete(store_name, key, txn_id, 0)?;
+    fn record_delete(&self, uri: &str, key: &[u8], txn_id: TxnId) -> Result<(), WrongoDBError> {
+        self.wal.lock().log_delete(uri, key, txn_id)?;
         Ok(())
     }
 
     fn commit_unit_of_work(&self, txn_id: TxnId, commit_ts: TxnId) -> Result<(), WrongoDBError> {
         let mut wal = self.wal.lock();
-        wal.log_txn_commit(txn_id, commit_ts, 0)?;
+        wal.log_txn_commit(txn_id, commit_ts)?;
         wal.sync()?;
         Ok(())
     }
 
     fn abort_unit_of_work(&self, txn_id: TxnId) -> Result<(), WrongoDBError> {
-        self.wal.lock().log_txn_abort(txn_id, 0)?;
+        self.wal.lock().log_txn_abort(txn_id)?;
         Ok(())
     }
 }

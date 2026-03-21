@@ -1,6 +1,6 @@
 # Global WAL Architecture
 
-Date: 2026-02-22
+Date: 2026-03-21
 Status: Active
 
 ## Summary
@@ -9,6 +9,7 @@ WrongoDB now uses a **single connection-level WAL** per database directory:
 
 - WAL file path: `<db_dir>/global.wal`
 - Raft hard-state sidecar: `<db_dir>/raft_state.bin`
+- Replication consistency sidecar: `<db_dir>/raft_consistency.bin`
 - Scope: all main tables (`*.main.wt`) and index tables (`*.idx.wt`)
 - Recovery: one pass at `Connection::open`
 
@@ -17,30 +18,22 @@ When WAL is enabled, startup also loads Raft hard state (`current_term`, `voted_
 
 ## Record model
 
-Global WAL records are logical and include the target store name for row operations:
+Global WAL records are logical storage records and include the target logical URI for row operations:
 
-- `Put { store_name, key, value, txn_id }`
-- `Delete { store_name, key, txn_id }`
+- `Put { uri, key, value, txn_id }`
+- `Delete { uri, key, txn_id }`
 - `TxnCommit { txn_id, commit_ts }`
 - `TxnAbort { txn_id }`
 - `Checkpoint`
 
-Each physical WAL record header (v2) also carries Raft identity metadata:
+The WAL is storage-only. Record headers do not carry RAFT term/index identity.
 
-- `raft_term`
-- `raft_index`
+## WAL header (v4)
 
-`raft_index` is explicit and monotonic; it is not derived from LSN offsets.
-
-## WAL header (v2)
-
-WAL file header persists both physical and Raft snapshot state:
+WAL file header persists only storage-native recovery state:
 
 - `last_lsn`
 - `checkpoint_lsn`
-- `last_raft_index`
-- `snapshot_last_included_index`
-- `snapshot_last_included_term`
 
 ## Raft hard state sidecar
 
@@ -55,6 +48,16 @@ Startup policy:
 
 - Missing file: initialize default hard state.
 - Corrupt/invalid file: fail startup (fail-fast safety).
+
+## Replication consistency sidecar
+
+`raft_consistency.bin` stores replication-owned logical restart markers:
+
+- `applied_through_index`
+- `oplog_truncate_after` (reserved placeholder)
+
+This file is versioned and CRC-protected. It is owned by the replication layer,
+not by the WT-like storage layer.
 
 ## Durability boundary
 
@@ -74,7 +77,7 @@ This applies to row mutations, txn commit/abort markers, and checkpoint-truncate
 
 ## Recovery flow
 
-Recovery runs once at connection open:
+Physical recovery runs once at connection open:
 
 1. Read WAL records from the checkpoint boundary forward.
 2. Apply `TXN_NONE` `Put/Delete` immediately.
@@ -82,6 +85,13 @@ Recovery runs once at connection open:
 4. On `TxnCommit`, replay staged changes for that transaction and finalize commit visibility.
 5. On `TxnAbort` or EOF, discard staged changes for that transaction.
 6. Checkpoint replayed stores to persist new roots.
+
+Replication restart is a later startup phase:
+
+1. Open the RAFT protocol log.
+2. Read `raft_consistency.bin`.
+3. Validate `applied_through_index <= protocol_last_log_index`.
+4. Resume logical replay from `applied_through_index + 1`.
 
 ## Checkpoint and truncation
 
@@ -93,9 +103,8 @@ Collection checkpoint now coordinates global durability:
 
 On truncation:
 
-- `snapshot_last_included_index/term` are set to the latest appended record.
 - WAL records are removed from disk.
-- `last_raft_index` is preserved, so the next append receives `last_raft_index + 1`.
+- The file header keeps only storage recovery metadata.
 
 ## Legacy per-table WAL files
 

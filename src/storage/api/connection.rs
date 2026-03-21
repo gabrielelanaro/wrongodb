@@ -126,6 +126,7 @@ impl Connection {
         ));
         let applier = Arc::new(StoreCommandApplier::new(
             base_path.clone(),
+            metadata_catalog.clone(),
             table_handles.clone(),
             transaction_manager.clone(),
         ));
@@ -175,16 +176,17 @@ impl Connection {
         &self.base_path
     }
 
-    pub(crate) fn table_handles(&self) -> Arc<HandleCache<String, RwLock<Table>>> {
-        self.table_handles.clone()
+    pub(crate) fn new_store_command_applier(&self) -> Arc<StoreCommandApplier> {
+        Arc::new(StoreCommandApplier::new(
+            self.base_path.clone(),
+            self.metadata_catalog.clone(),
+            self.table_handles.clone(),
+            self.transaction_manager.clone(),
+        ))
     }
 
     pub(crate) fn durability_backend(&self) -> Arc<DurabilityBackend> {
         self.durability_backend.clone()
-    }
-
-    pub(crate) fn transaction_manager(&self) -> Arc<TransactionManager> {
-        self.transaction_manager.clone()
     }
 }
 

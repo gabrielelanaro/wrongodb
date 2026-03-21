@@ -352,6 +352,8 @@ enum AdvanceStep {
     KeepClimbing,
 }
 
+type KeyValue = (Vec<u8>, Vec<u8>);
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -359,7 +361,7 @@ enum AdvanceStep {
 fn collect_visible_leaf_entries(
     page: &Page,
     visibility: &ReadVisibility,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
+) -> Result<Vec<KeyValue>, WrongoDBError> {
     let leaf =
         LeafPage::open(page).map_err(|err| StorageError(format!("corrupt leaf page: {err}")))?;
     let mut by_key = BTreeMap::new();

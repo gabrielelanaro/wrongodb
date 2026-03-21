@@ -11,13 +11,13 @@ const CMD_CHECKPOINT: u8 = 5;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RaftCommand {
     Put {
-        store_name: String,
+        uri: String,
         key: Vec<u8>,
         value: Vec<u8>,
         txn_id: TxnId,
     },
     Delete {
-        store_name: String,
+        uri: String,
         key: Vec<u8>,
         txn_id: TxnId,
     },
@@ -43,24 +43,20 @@ impl RaftCommand {
         let mut out = Vec::new();
         match self {
             RaftCommand::Put {
-                store_name,
+                uri,
                 key,
                 value,
                 txn_id,
             } => {
                 out.push(CMD_PUT);
-                encode_string(&mut out, store_name);
+                encode_string(&mut out, uri);
                 encode_bytes(&mut out, key);
                 encode_bytes(&mut out, value);
                 out.extend_from_slice(&txn_id.to_le_bytes());
             }
-            RaftCommand::Delete {
-                store_name,
-                key,
-                txn_id,
-            } => {
+            RaftCommand::Delete { uri, key, txn_id } => {
                 out.push(CMD_DELETE);
-                encode_string(&mut out, store_name);
+                encode_string(&mut out, uri);
                 encode_bytes(&mut out, key);
                 out.extend_from_slice(&txn_id.to_le_bytes());
             }
@@ -89,26 +85,22 @@ impl RaftCommand {
         let mut cursor = 1usize;
         let cmd = match tag {
             CMD_PUT => {
-                let store_name = decode_string(bytes, &mut cursor)?;
+                let uri = decode_string(bytes, &mut cursor)?;
                 let key = decode_bytes(bytes, &mut cursor)?;
                 let value = decode_bytes(bytes, &mut cursor)?;
                 let txn_id = decode_u64(bytes, &mut cursor, "txn_id")?;
                 RaftCommand::Put {
-                    store_name,
+                    uri,
                     key,
                     value,
                     txn_id,
                 }
             }
             CMD_DELETE => {
-                let store_name = decode_string(bytes, &mut cursor)?;
+                let uri = decode_string(bytes, &mut cursor)?;
                 let key = decode_bytes(bytes, &mut cursor)?;
                 let txn_id = decode_u64(bytes, &mut cursor, "txn_id")?;
-                RaftCommand::Delete {
-                    store_name,
-                    key,
-                    txn_id,
-                }
+                RaftCommand::Delete { uri, key, txn_id }
             }
             CMD_TXN_COMMIT => {
                 let txn_id = decode_u64(bytes, &mut cursor, "txn_id")?;
@@ -198,13 +190,13 @@ mod tests {
     fn round_trip_all_command_variants() {
         let commands = vec![
             RaftCommand::Put {
-                store_name: "users.main.wt".to_string(),
+                uri: "table:users".to_string(),
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
                 txn_id: 7,
             },
             RaftCommand::Delete {
-                store_name: "users.main.wt".to_string(),
+                uri: "table:users".to_string(),
                 key: b"k1".to_vec(),
                 txn_id: 8,
             },
@@ -224,6 +216,20 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_reserved_metadata_uri() {
+        let command = RaftCommand::Put {
+            uri: "metadata:".to_string(),
+            key: b"table:users".to_vec(),
+            value: b"metadata-row".to_vec(),
+            txn_id: 7,
+        };
+
+        let encoded = command.encode();
+        let decoded = RaftCommand::decode(&encoded).unwrap();
+        assert_eq!(decoded, command);
+    }
+
+    #[test]
     fn decode_rejects_unknown_tag() {
         let err = RaftCommand::decode(&[0xFF]).unwrap_err();
         assert!(err.to_string().contains("unknown raft command tag"));
@@ -232,7 +238,7 @@ mod tests {
     #[test]
     fn decode_rejects_truncated_payload() {
         let command = RaftCommand::Put {
-            store_name: "users.main.wt".to_string(),
+            uri: "table:users".to_string(),
             key: b"k1".to_vec(),
             value: b"v1".to_vec(),
             txn_id: 7,

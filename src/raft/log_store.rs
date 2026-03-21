@@ -10,7 +10,7 @@ use crate::WrongoDBError;
 
 const RAFT_LOG_FILE: &str = "raft_log.bin";
 const RAFT_LOG_MAGIC: &[u8; 8] = b"RFTLOG01";
-const RAFT_LOG_VERSION: u16 = 1;
+const RAFT_LOG_VERSION: u16 = 2;
 const RAFT_LOG_HEADER_SIZE: usize = 16;
 const RAFT_LOG_RECORD_HEADER_SIZE: usize = 16;
 type ScanEntriesResult = (Vec<ProtocolLogEntry>, Vec<u64>, Option<u64>);

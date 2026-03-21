@@ -133,7 +133,7 @@ impl RaftServiceHandle {
             .map_err(|_| StorageError("raft service dropped leadership response".into()))?
     }
 
-    pub(crate) fn sync(&self) -> Result<(), WrongoDBError> {
+    pub(crate) fn sync(&self) -> Result<u64, WrongoDBError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.cmd_tx
             .send(RaftServiceCommand::Sync { reply: reply_tx })
@@ -202,7 +202,7 @@ enum RaftServiceCommand {
         reply: Sender<Result<RaftLeadershipState, WrongoDBError>>,
     },
     Sync {
-        reply: Sender<Result<(), WrongoDBError>>,
+        reply: Sender<Result<u64, WrongoDBError>>,
     },
     #[cfg(test)]
     TruncateToCheckpoint {
@@ -381,7 +381,7 @@ fn process_proposal(
                     if let Some(err) = current_fatal_error(state) {
                         let _ = reply.send(Err(err));
                     } else {
-                        let _ = reply.send(runtime.sync_node());
+                        let _ = reply.send(sync_applied_state(runtime, state));
                     }
                 }
                 #[cfg(test)]
@@ -456,7 +456,7 @@ fn handle_non_proposal_command(
             if let Some(err) = current_fatal_error(state) {
                 let _ = reply.send(Err(err));
             } else {
-                let _ = reply.send(runtime.sync_node());
+                let _ = reply.send(sync_applied_state(runtime, state));
             }
             true
         }
@@ -536,6 +536,11 @@ fn flush_outbound_and_apply(
         state.executor_applied_index = applied.index;
     }
     Ok(())
+}
+
+fn sync_applied_state(runtime: &mut RaftRuntime, state: &ActorState) -> Result<u64, WrongoDBError> {
+    runtime.sync_node()?;
+    Ok(state.executor_applied_index)
 }
 
 fn run_listener(
@@ -631,7 +636,7 @@ mod tests {
         let start = Instant::now();
         let index = service
             .propose(RaftCommand::Put {
-                store_name: "users.main.wt".to_string(),
+                uri: "table:users".to_string(),
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
                 txn_id: 1,
@@ -660,7 +665,7 @@ mod tests {
         let service = RaftServiceHandle::start(node, cfg).unwrap();
         let err = service
             .propose(RaftCommand::Put {
-                store_name: "users.main.wt".to_string(),
+                uri: "table:users".to_string(),
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
                 txn_id: 1,
@@ -670,7 +675,7 @@ mod tests {
 
         let err = service
             .propose(RaftCommand::Put {
-                store_name: "users.main.wt".to_string(),
+                uri: "table:users".to_string(),
                 key: b"k2".to_vec(),
                 value: b"v2".to_vec(),
                 txn_id: 1,

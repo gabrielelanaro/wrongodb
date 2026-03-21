@@ -86,6 +86,14 @@ impl RaftNodeCore {
         db_dir: P,
         cfg: RaftNodeConfig,
     ) -> Result<Self, WrongoDBError> {
+        Self::open_with_config_and_applied_index(db_dir, cfg, 0)
+    }
+
+    pub(crate) fn open_with_config_and_applied_index<P: AsRef<Path>>(
+        db_dir: P,
+        cfg: RaftNodeConfig,
+        applied_through_index: u64,
+    ) -> Result<Self, WrongoDBError> {
         let hard_state_store = RaftHardStateStore::open_or_create(db_dir.as_ref())?;
         let hard_state = hard_state_store.state().clone();
         let protocol_log_store = RaftLogStore::open_or_create(db_dir.as_ref())?;
@@ -116,16 +124,14 @@ impl RaftNodeCore {
         )?;
 
         let wal = GlobalWal::open_or_create(db_dir)?;
-        let _ = wal.last_raft_term();
-        let last_raft_index = wal.last_raft_index();
-        if last_raft_index > protocol_last_log_index {
+        if applied_through_index > protocol_last_log_index {
             return Err(StorageError(format!(
-                "raft wal index {last_raft_index} exceeds protocol log index {protocol_last_log_index}"
+                "applied_through_index {applied_through_index} exceeds protocol log index {protocol_last_log_index}"
             ))
             .into());
         }
-        let commit_index = protocol_last_log_index.min(last_raft_index);
-        let last_applied_protocol_index = commit_index;
+        let commit_index = applied_through_index;
+        let last_applied_protocol_index = applied_through_index;
         let mut protocol_state = protocol_state;
         protocol_state.commit_index = commit_index;
         let progress = RaftProgress {
@@ -285,7 +291,7 @@ impl RaftNodeCore {
                 .clone();
 
             let command = RaftCommand::decode(&entry.payload)?;
-            self.apply_command_to_wal(&command, entry.term)?;
+            self.apply_command_to_wal(&command)?;
             self.applied_commands.push_back(CommittedCommand {
                 index: apply_index,
                 term: entry.term,
@@ -417,37 +423,27 @@ impl RaftNodeCore {
         Ok(())
     }
 
-    fn apply_command_to_wal(
-        &mut self,
-        command: &RaftCommand,
-        raft_term: u64,
-    ) -> Result<(), WrongoDBError> {
+    fn apply_command_to_wal(&mut self, command: &RaftCommand) -> Result<(), WrongoDBError> {
         match command {
             RaftCommand::Put {
-                store_name,
+                uri,
                 key,
                 value,
                 txn_id,
             } => {
-                let _ = self
-                    .wal
-                    .log_put(store_name, key, value, *txn_id, raft_term)?;
+                let _ = self.wal.log_put(uri, key, value, *txn_id)?;
             }
-            RaftCommand::Delete {
-                store_name,
-                key,
-                txn_id,
-            } => {
-                let _ = self.wal.log_delete(store_name, key, *txn_id, raft_term)?;
+            RaftCommand::Delete { uri, key, txn_id } => {
+                let _ = self.wal.log_delete(uri, key, *txn_id)?;
             }
             RaftCommand::TxnCommit { txn_id, commit_ts } => {
-                let _ = self.wal.log_txn_commit(*txn_id, *commit_ts, raft_term)?;
+                let _ = self.wal.log_txn_commit(*txn_id, *commit_ts)?;
             }
             RaftCommand::TxnAbort { txn_id } => {
-                let _ = self.wal.log_txn_abort(*txn_id, raft_term)?;
+                let _ = self.wal.log_txn_abort(*txn_id)?;
             }
             RaftCommand::Checkpoint => {
-                let lsn = self.wal.log_checkpoint(raft_term)?;
+                let lsn = self.wal.log_checkpoint()?;
                 self.wal.set_checkpoint_lsn(lsn)?;
             }
         }
@@ -519,7 +515,6 @@ mod tests {
 
     use super::*;
     use crate::raft::command::RaftCommand;
-    use crate::raft::log_store::RaftLogStore;
     use crate::raft::protocol::{AppendEntriesRequest, ProtocolLogEntry, RequestVoteRequest};
     use crate::raft::role_engine::{RaftEffect, RaftRole};
     use crate::storage::wal::{WalFileReader, WalReader, WalRecord};
@@ -608,7 +603,7 @@ mod tests {
 
         let (proposal_index, effects) = node
             .propose_command(&RaftCommand::Put {
-                store_name: "users.main.wt".to_string(),
+                uri: "table:users".to_string(),
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
                 txn_id: 1,
@@ -635,14 +630,14 @@ mod tests {
         let mut node = RaftNodeCore::open(dir.path()).unwrap();
 
         node.propose_command(&RaftCommand::Put {
-            store_name: "users.main.wt".to_string(),
+            uri: "table:users".to_string(),
             key: b"k1".to_vec(),
             value: b"v1".to_vec(),
             txn_id: 1,
         })
         .unwrap();
         node.propose_command(&RaftCommand::Delete {
-            store_name: "users.main.wt".to_string(),
+            uri: "table:users".to_string(),
             key: b"k1".to_vec(),
             txn_id: 1,
         })
@@ -666,7 +661,7 @@ mod tests {
             elect_with_single_peer(&mut node, "n2");
             let (proposal_index, _effects) = node
                 .propose_command(&RaftCommand::Put {
-                    store_name: "users.main.wt".to_string(),
+                    uri: "table:users".to_string(),
                     key: b"k1".to_vec(),
                     value: b"v1".to_vec(),
                     txn_id: 1,
@@ -689,31 +684,27 @@ mod tests {
     }
 
     #[test]
-    fn startup_fails_when_wal_index_exceeds_protocol_log_index() {
+    fn startup_fails_when_applied_index_exceeds_protocol_log_index() {
         let dir = tempdir().unwrap();
-        {
-            let mut node = RaftNodeCore::open(dir.path()).unwrap();
-            node.propose_command(&RaftCommand::Put {
-                store_name: "users.main.wt".to_string(),
-                key: b"k1".to_vec(),
-                value: b"v1".to_vec(),
-                txn_id: 1,
-            })
-            .unwrap();
-            node.apply_committed_entries().unwrap();
-            node.sync().unwrap();
-        }
+        let mut node = RaftNodeCore::open(dir.path()).unwrap();
+        node.propose_command(&RaftCommand::Put {
+            uri: "table:users".to_string(),
+            key: b"k1".to_vec(),
+            value: b"v1".to_vec(),
+            txn_id: 1,
+        })
+        .unwrap();
+        node.sync().unwrap();
 
-        {
-            let mut log_store = RaftLogStore::open_or_create(dir.path()).unwrap();
-            log_store.truncate_from(1).unwrap();
-            log_store.sync().unwrap();
-        }
-
-        let err = RaftNodeCore::open(dir.path()).unwrap_err();
+        let err = RaftNodeCore::open_with_config_and_applied_index(
+            dir.path(),
+            RaftNodeConfig::default(),
+            2,
+        )
+        .unwrap_err();
         assert!(err
             .to_string()
-            .contains("raft wal index 1 exceeds protocol log index 0"));
+            .contains("applied_through_index 2 exceeds protocol log index 1"));
     }
 
     struct InMemoryCluster {
@@ -789,13 +780,13 @@ mod tests {
     }
 
     #[test]
-    fn append_uses_current_term_in_wal_header() {
+    fn append_writes_a_storage_wal_record() {
         let dir = tempdir().unwrap();
         let mut node = RaftNodeCore::open(dir.path()).unwrap();
         node.set_current_term(5).unwrap();
         let (_index, _effects) = node
             .propose_command(&RaftCommand::Put {
-                store_name: "users.main.wt".to_string(),
+                uri: "table:users".to_string(),
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
                 txn_id: 1,
@@ -806,8 +797,8 @@ mod tests {
 
         let mut reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
         let (header, _record) = reader.read_record().unwrap().unwrap();
-        assert_eq!(header.raft_term, 5);
-        assert_eq!(header.raft_index, 1);
+        assert_eq!(header.lsn, crate::storage::wal::Lsn::new(0, 512));
+        assert_eq!(header.prev_lsn, crate::storage::wal::Lsn::new(0, 0));
     }
 
     #[test]
@@ -825,7 +816,7 @@ mod tests {
 
         let (_idx, _effects) = node
             .propose_command(&RaftCommand::Put {
-                store_name: "users.main.wt".to_string(),
+                uri: "table:users".to_string(),
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
                 txn_id: 1,
@@ -890,13 +881,13 @@ mod tests {
 
         let commands = vec![
             RaftCommand::Put {
-                store_name: "users.main.wt".to_string(),
+                uri: "table:users".to_string(),
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
                 txn_id: 1,
             },
             RaftCommand::Delete {
-                store_name: "users.main.wt".to_string(),
+                uri: "table:users".to_string(),
                 key: b"k1".to_vec(),
                 txn_id: 1,
             },

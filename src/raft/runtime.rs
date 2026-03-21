@@ -349,7 +349,7 @@ mod tests {
 
         let proposal_index = runtime
             .propose(&RaftCommand::Put {
-                store_name: "users.main.wt".to_string(),
+                uri: "table:users".to_string(),
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
                 txn_id: 1,
@@ -387,7 +387,7 @@ mod tests {
 
         let err = runtime
             .propose(&RaftCommand::Put {
-                store_name: "users.main.wt".to_string(),
+                uri: "table:users".to_string(),
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
                 txn_id: 1,
@@ -440,7 +440,7 @@ mod tests {
         let (proposal_index, effects) = leader
             .node
             .propose_command(&RaftCommand::Put {
-                store_name: "users.main.wt".to_string(),
+                uri: "table:users".to_string(),
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
                 txn_id: 1,

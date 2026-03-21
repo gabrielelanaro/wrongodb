@@ -16,6 +16,7 @@ use crate::WrongoDBError;
 // ============================================================================
 
 pub(crate) const METADATA_STORE_NAME: &str = "metadata.wt";
+pub(crate) const METADATA_URI: &str = "metadata:";
 pub(crate) const TABLE_URI_PREFIX: &str = "table:";
 pub(crate) const INDEX_URI_PREFIX: &str = "index:";
 
@@ -89,9 +90,66 @@ impl MetadataCatalog {
         uri: &str,
         txn_id: TxnId,
     ) -> Result<Option<String>, WrongoDBError> {
+        if uri == METADATA_URI {
+            return Ok(Some(METADATA_STORE_NAME.to_string()));
+        }
+
         Ok(self
             .lookup_entry_for_txn(uri, txn_id)?
             .map(|entry| entry.source))
+    }
+
+    pub(crate) fn ensure_table_uri_in_write_unit(
+        &self,
+        write_unit: &mut WriteUnitOfWork<'_>,
+        collection: &str,
+    ) -> Result<String, WrongoDBError> {
+        let uri = table_uri(collection);
+        if self
+            .lookup_source_for_txn(&uri, write_unit.txn_id())?
+            .is_some()
+        {
+            return Ok(uri);
+        }
+
+        let source = table_source_name(collection);
+        self.ensure_source_exists(&source)?;
+        let _inserted = self.put_if_absent_in_write_unit(
+            write_unit,
+            MetadataEntry {
+                uri: uri.clone(),
+                kind: MetadataKind::Table,
+                source,
+            },
+        )?;
+        Ok(uri)
+    }
+
+    pub(crate) fn ensure_index_uri_in_write_unit(
+        &self,
+        write_unit: &mut WriteUnitOfWork<'_>,
+        collection: &str,
+        name: &str,
+    ) -> Result<(String, bool), WrongoDBError> {
+        let uri = index_uri(collection, name);
+        if self
+            .lookup_source_for_txn(&uri, write_unit.txn_id())?
+            .is_some()
+        {
+            return Ok((uri, false));
+        }
+
+        let source = index_source_name(collection, name);
+        self.ensure_source_exists(&source)?;
+        let inserted = self.put_if_absent_in_write_unit(
+            write_unit,
+            MetadataEntry {
+                uri: uri.clone(),
+                kind: MetadataKind::Index,
+                source,
+            },
+        )?;
+        Ok((uri, inserted))
     }
 
     pub(crate) fn put_if_absent_in_write_unit(
@@ -106,8 +164,7 @@ impl MetadataCatalog {
             return Ok(false);
         }
 
-        self.ensure_metadata_store()?;
-        let mut cursor = write_unit.open_store_cursor_by_name(METADATA_STORE_NAME)?;
+        let mut cursor = write_unit.open_cursor(METADATA_URI)?;
         let key = encode_metadata_key(&entry.uri);
         let value = encode_metadata_value(&entry)?;
         cursor.insert(&key, &value)?;
@@ -157,19 +214,19 @@ impl MetadataCatalog {
             .transpose()
     }
 
-    fn ensure_metadata_store(&self) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
-        self.open_metadata_table()
-    }
-
-    fn open_metadata_table(&self) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
+    fn ensure_source_exists(&self, source: &str) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
         self.table_handles
-            .get_or_try_insert_with(METADATA_STORE_NAME.to_string(), |store_name| {
-                let path = self.base_path.join(store_name);
+            .get_or_try_insert_with(source.to_string(), |source| {
+                let path = self.base_path.join(source);
                 Ok(RwLock::new(Table::open_or_create_store(
                     path,
                     self.transaction_manager.clone(),
                 )?))
             })
+    }
+
+    fn open_metadata_table(&self) -> Result<Arc<RwLock<Table>>, WrongoDBError> {
+        self.ensure_source_exists(METADATA_STORE_NAME)
     }
 }
 
@@ -222,6 +279,22 @@ fn prefix_end(prefix: &str) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+pub(crate) fn table_uri(collection: &str) -> String {
+    format!("{TABLE_URI_PREFIX}{collection}")
+}
+
+pub(crate) fn index_uri(collection: &str, name: &str) -> String {
+    format!("{INDEX_URI_PREFIX}{collection}:{name}")
+}
+
+fn table_source_name(collection: &str) -> String {
+    format!("{collection}.main.wt")
+}
+
+fn index_source_name(collection: &str, name: &str) -> String {
+    format!("{collection}.{name}.idx.wt")
 }
 
 // ============================================================================

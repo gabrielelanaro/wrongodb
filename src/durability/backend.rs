@@ -82,28 +82,24 @@ impl LocalWalDurabilityBackend {
         let mut wal = self.wal.lock();
         match op {
             DurableOp::Put {
-                store_name,
+                uri,
                 key,
                 value,
                 txn_id,
             } => {
-                wal.log_put(&store_name, &key, &value, txn_id, 0)?;
+                wal.log_put(&uri, &key, &value, txn_id)?;
             }
-            DurableOp::Delete {
-                store_name,
-                key,
-                txn_id,
-            } => {
-                wal.log_delete(&store_name, &key, txn_id, 0)?;
+            DurableOp::Delete { uri, key, txn_id } => {
+                wal.log_delete(&uri, &key, txn_id)?;
             }
             DurableOp::TxnCommit { txn_id, commit_ts } => {
-                wal.log_txn_commit(txn_id, commit_ts, 0)?;
+                wal.log_txn_commit(txn_id, commit_ts)?;
             }
             DurableOp::TxnAbort { txn_id } => {
-                wal.log_txn_abort(txn_id, 0)?;
+                wal.log_txn_abort(txn_id)?;
             }
             DurableOp::Checkpoint => {
-                wal.log_checkpoint(0)?;
+                wal.log_checkpoint()?;
             }
         }
         if guarantee == DurabilityGuarantee::Sync {
@@ -137,7 +133,7 @@ mod tests {
         backend
             .record(
                 DurableOp::Put {
-                    store_name: "users.main.wt".to_string(),
+                    uri: "table:users".to_string(),
                     key: b"k1".to_vec(),
                     value: b"v1".to_vec(),
                     txn_id: crate::txn::TXN_NONE,

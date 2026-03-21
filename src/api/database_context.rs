@@ -31,16 +31,10 @@ impl DatabaseContext {
             connection.base_path().to_path_buf(),
             metadata_catalog.clone(),
         ));
-        let table_handles = connection.table_handles();
         let durability_backend = connection.durability_backend();
         let document_query = DocumentQuery::new(schema_catalog.clone());
-        let store_write_path = StoreWritePath::new(
-            connection.base_path().to_path_buf(),
-            table_handles,
-            connection.transaction_manager(),
-            durability_backend,
-            replication_coordinator.clone(),
-        );
+        let store_write_path =
+            StoreWritePath::new(durability_backend, replication_coordinator.clone());
         let collection_write_path = CollectionWritePath::new(
             metadata_catalog,
             schema_catalog.clone(),

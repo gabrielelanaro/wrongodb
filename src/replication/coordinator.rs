@@ -3,15 +3,14 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use crate::core::errors::StorageError;
 use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp, StoreCommandApplier};
 use crate::raft::node::{RaftNodeConfig, RaftNodeCore};
 use crate::raft::service::{RaftServiceConfig, RaftServiceHandle};
-use crate::replication::{RaftMode, RaftPeerConfig};
+use crate::replication::{RaftMode, RaftPeerConfig, ReplicationConsistencyStore};
 use crate::WrongoDBError;
-
-#[cfg(test)]
-use parking_lot::Mutex;
 
 /// Wire-protocol-facing primary/leader state derived from replication.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +42,7 @@ pub(crate) enum ReplicationCoordinator {
 #[derive(Debug)]
 pub(crate) struct RaftReplicationCoordinator {
     raft_service: RaftServiceHandle,
+    consistency_store: Arc<Mutex<ReplicationConsistencyStore>>,
 }
 
 #[cfg(test)]
@@ -170,9 +170,18 @@ impl RaftReplicationCoordinator {
     ) -> Result<Self, WrongoDBError> {
         let (raft_cfg, mut service_cfg) = raft_configs_from_mode(raft_mode)?;
         service_cfg.executor = applier;
-        let raft_node = RaftNodeCore::open_with_config(base_path, raft_cfg)?;
+        let consistency_store = Arc::new(Mutex::new(ReplicationConsistencyStore::open_or_create(
+            base_path,
+        )?));
+        let applied_through_index = consistency_store.lock().state().applied_through_index;
+        let raft_node = RaftNodeCore::open_with_config_and_applied_index(
+            base_path,
+            raft_cfg,
+            applied_through_index,
+        )?;
         Ok(Self {
             raft_service: RaftServiceHandle::start(raft_node, service_cfg)?,
+            consistency_store,
         })
     }
 
@@ -190,7 +199,10 @@ impl RaftReplicationCoordinator {
     fn record(&self, op: DurableOp, guarantee: DurabilityGuarantee) -> Result<(), WrongoDBError> {
         self.raft_service.propose(op.into())?;
         if guarantee == DurabilityGuarantee::Sync {
-            self.raft_service.sync()?;
+            let applied_through_index = self.raft_service.sync()?;
+            self.consistency_store
+                .lock()
+                .set_applied_through_index(applied_through_index)?;
         }
         Ok(())
     }
@@ -307,7 +319,9 @@ mod tests {
     use crate::durability::StoreCommandApplier;
     use crate::raft::hard_state::RaftHardStateStore;
     use crate::raft::runtime::RaftInboundMessage;
+    use crate::storage::api::{Connection, ConnectionConfig};
     use crate::storage::handle_cache::HandleCache;
+    use crate::storage::metadata_catalog::MetadataCatalog;
     use crate::storage::table::Table;
     use crate::txn::{GlobalTxnState, TransactionManager, TXN_NONE};
 
@@ -326,8 +340,14 @@ mod tests {
     ) -> ReplicationCoordinator {
         let txn_manager = new_txn_manager();
         let table_handles = new_table_handles();
+        let metadata_catalog = Arc::new(MetadataCatalog::new(
+            dir.path().to_path_buf(),
+            table_handles.clone(),
+            txn_manager.clone(),
+        ));
         let applier = Arc::new(StoreCommandApplier::new(
             dir.path().to_path_buf(),
+            metadata_catalog,
             table_handles,
             txn_manager,
         ));
@@ -386,8 +406,14 @@ mod tests {
 
         let txn_manager = new_txn_manager();
         let table_handles = new_table_handles();
+        let metadata_catalog = Arc::new(MetadataCatalog::new(
+            dir.path().to_path_buf(),
+            table_handles.clone(),
+            txn_manager.clone(),
+        ));
         let applier = Arc::new(StoreCommandApplier::new(
             dir.path().to_path_buf(),
+            metadata_catalog,
             table_handles,
             txn_manager,
         ));
@@ -429,7 +455,7 @@ mod tests {
             .record(
                 &durability,
                 DurableOp::Put {
-                    store_name: "users.main.wt".to_string(),
+                    uri: "table:users".to_string(),
                     key: b"k1".to_vec(),
                     value: b"v1".to_vec(),
                     txn_id: TXN_NONE,
@@ -470,5 +496,46 @@ mod tests {
                 },
             })
             .unwrap();
+    }
+
+    #[test]
+    fn sync_persists_applied_through_index_in_consistency_file() {
+        let dir = tempdir().unwrap();
+        let conn = Connection::open(
+            dir.path(),
+            ConnectionConfig::new(false, RaftMode::Standalone),
+        )
+        .unwrap();
+        let mut session = conn.open_session();
+        session.create("table:users").unwrap();
+        session.checkpoint().unwrap();
+        drop(session);
+        drop(conn);
+
+        let coordinator = new_replication_coordinator(
+            &dir,
+            true,
+            RaftMode::Cluster {
+                local_node_id: "n1".to_string(),
+                local_raft_addr: free_local_addr(),
+                peers: Vec::new(),
+            },
+        );
+
+        coordinator
+            .record(
+                &DurabilityBackend::Disabled,
+                DurableOp::Put {
+                    uri: "table:users".to_string(),
+                    key: b"k1".to_vec(),
+                    value: b"v1".to_vec(),
+                    txn_id: TXN_NONE,
+                },
+                DurabilityGuarantee::Sync,
+            )
+            .unwrap();
+
+        let consistency = ReplicationConsistencyStore::open_or_create(dir.path()).unwrap();
+        assert_eq!(consistency.state().applied_through_index, 1);
     }
 }

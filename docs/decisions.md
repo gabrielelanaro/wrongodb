@@ -1,5 +1,59 @@
 # Decisions
 
+## 2026-03-21: Remove RAFT identity from the storage WAL and persist logical restart markers in replication-owned state
+
+**Decision**
+- Remove `raft_term` and `raft_index` from storage WAL record headers.
+- Remove WAL file-header fields that tracked RAFT progress or snapshot boundaries.
+- Keep `Connection::open()` responsible only for physical storage recovery by replaying the storage WAL.
+- Remove `ConnectionRecoveryState` and stop exposing replication progress through `Connection`.
+- Persist replication restart markers in a replication-owned consistency file outside the WT-like storage layer.
+- Store at least:
+  - `applied_through_index`
+  - reserved `oplog_truncate_after`
+- Make replication startup read the protocol log and the replication consistency file directly, instead of deriving a restart boundary from the storage WAL.
+- Treat this as a persistence-format break with no compatibility shim:
+  - WAL version bumped to `4`
+
+**Why**
+- RAFT term/index identity belongs to the replicated log, not to the storage WAL.
+- `Connection` should remain a WT-like storage handle and should not expose replication-specific restart state.
+- Keeping logical restart markers in a replication-owned file preserves the intended boundary:
+  - storage recovery makes files consistent
+  - catalog recovery reconciles storage metadata
+  - replication recovery decides how far logical replay should advance
+- This matches the intended MongoDB/WiredTiger layering more closely than mixing RAFT coordinates into storage durability metadata.
+
+## 2026-03-21: Make storage durability and recovery target logical URIs instead of physical store names
+
+**Decision**
+- Make `StoreWritePath` URI-only and keep it as a thin logical write
+  coordinator above the storage session API.
+- Change durable mutations, WAL records, RAFT commands, and recovery-unit
+  callbacks to target logical URIs such as:
+  - `table:<collection>`
+  - `index:<collection>:<name>`
+  - reserved `metadata:`
+- Keep physical recovery inside `Connection::open()`.
+- Make startup recovery explicitly layered:
+  - storage recovery inside `Connection::open()`
+  - catalog reconciliation against the opened connection
+  - replication recovery from replication-owned restart markers
+- Move URI-to-source allocation and lookup behind `MetadataCatalog`, including
+  transactional URI resolution for replay.
+- Treat the logical-URI refactor as part of the persistence-format break across:
+  - WAL version `4`
+  - raft log version `2`
+
+**Why**
+- Higher write paths should not know about hidden physical file names like
+  `users.main.wt`; that is storage/catalog implementation detail.
+- Using logical URIs in durability and replay aligns runtime writes, startup
+  recovery, and catalog state around the same abstraction boundary.
+- Keeping source allocation inside `MetadataCatalog` lets recovery replay
+  transactional metadata writes before data writes in the same transaction,
+  which is required for URI-based recovery to succeed.
+
 ## 2026-03-21: Make `metadata.wt` the storage metadata source of truth while keeping collection semantics in `SchemaCatalog`
 
 **Decision**

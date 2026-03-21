@@ -7,9 +7,7 @@ use crate::core::errors::StorageError;
 use crate::durability::DurabilityBackend;
 use crate::storage::api::cursor::{Cursor, CursorWriteAccess};
 use crate::storage::handle_cache::HandleCache;
-use crate::storage::metadata_catalog::{
-    MetadataCatalog, MetadataEntry, MetadataKind, METADATA_STORE_NAME,
-};
+use crate::storage::metadata_catalog::{MetadataCatalog, METADATA_STORE_NAME, METADATA_URI};
 use crate::storage::table::Table;
 use crate::txn::{ActiveWriteUnit, RecoveryUnit, TransactionManager, TxnId, TXN_NONE};
 use crate::WrongoDBError;
@@ -72,24 +70,9 @@ impl Session {
     /// data.
     pub fn create(&mut self, uri: &str) -> Result<(), WrongoDBError> {
         if let Some(collection) = uri.strip_prefix("table:") {
-            let store_name = Self::primary_store_name(collection);
-            let _ =
-                self.table_handles
-                    .get_or_try_insert_with(store_name.clone(), |store_name| {
-                        let path = self.base_path.join(store_name);
-                        Ok(RwLock::new(Table::open_or_create_store(
-                            path,
-                            self.transaction_manager.clone(),
-                        )?))
-                    })?;
-            let entry = MetadataEntry {
-                uri: uri.to_string(),
-                kind: MetadataKind::Table,
-                source: store_name,
-            };
             let metadata_catalog = self.metadata_catalog.clone();
             let mut write_unit = self.transaction()?;
-            metadata_catalog.put_if_absent_in_write_unit(&mut write_unit, entry)?;
+            let _ = metadata_catalog.ensure_table_uri_in_write_unit(&mut write_unit, collection)?;
             write_unit.commit()?;
             return Ok(());
         }
@@ -115,7 +98,12 @@ impl Session {
     /// boundary object just to read or perform local writes.
     pub fn open_cursor(&self, uri: &str) -> Result<Cursor, WrongoDBError> {
         let store_name = self.resolve_uri(uri)?;
-        self.open_store_cursor_with_access(&store_name, TXN_NONE, CursorWriteAccess::ReadWrite)
+        self.open_resolved_cursor_with_access(
+            uri,
+            &store_name,
+            TXN_NONE,
+            CursorWriteAccess::ReadWrite,
+        )
     }
 
     /// Start a transactional write unit of work.
@@ -177,8 +165,9 @@ impl Session {
         self.durability_backend.truncate_to_checkpoint()
     }
 
-    fn open_store_cursor_with_access(
+    fn open_resolved_cursor_with_access(
         &self,
+        uri: &str,
         store_name: &str,
         bound_txn_id: TxnId,
         write_access: CursorWriteAccess,
@@ -195,7 +184,7 @@ impl Session {
         let active_txn = self.bound_transaction_handle(bound_txn_id)?;
         Ok(Cursor::new(
             table,
-            store_name.to_string(),
+            uri.to_string(),
             bound_txn_id,
             active_txn,
             self.recovery_unit.clone(),
@@ -220,7 +209,7 @@ impl Session {
     }
 
     fn resolve_uri(&self, uri: &str) -> Result<String, WrongoDBError> {
-        if !uri.starts_with("table:") && !uri.starts_with("index:") {
+        if uri != METADATA_URI && !uri.starts_with("table:") && !uri.starts_with("index:") {
             return Err(StorageError(format!("unsupported URI: {uri}")).into());
         }
 
@@ -230,17 +219,13 @@ impl Session {
     }
 
     fn resolve_uri_for_txn(&self, uri: &str, txn_id: TxnId) -> Result<String, WrongoDBError> {
-        if !uri.starts_with("table:") && !uri.starts_with("index:") {
+        if uri != METADATA_URI && !uri.starts_with("table:") && !uri.starts_with("index:") {
             return Err(StorageError(format!("unsupported URI: {uri}")).into());
         }
 
         self.metadata_catalog
             .lookup_source_for_txn(uri, txn_id)?
             .ok_or_else(|| StorageError(format!("unknown URI: {uri}")).into())
-    }
-
-    fn primary_store_name(collection: &str) -> String {
-        format!("{collection}.main.wt")
     }
 }
 
@@ -274,7 +259,8 @@ impl<'a> WriteUnitOfWork<'a> {
     /// same kind of cursor, but they bind it to different transaction scopes.
     pub fn open_cursor(&mut self, uri: &str) -> Result<Cursor, WrongoDBError> {
         let store_name = self.session.resolve_uri_for_txn(uri, self.txn_id())?;
-        self.session.open_store_cursor_with_access(
+        self.session.open_resolved_cursor_with_access(
+            uri,
             &store_name,
             self.txn_id(),
             CursorWriteAccess::ReadWrite,
@@ -356,17 +342,6 @@ impl<'a> WriteUnitOfWork<'a> {
             .expect("transaction should exist")
             .txn_id()
     }
-
-    pub(crate) fn open_store_cursor_by_name(
-        &mut self,
-        store_name: &str,
-    ) -> Result<Cursor, WrongoDBError> {
-        self.session.open_store_cursor_with_access(
-            store_name,
-            self.txn_id(),
-            CursorWriteAccess::ReadWrite,
-        )
-    }
 }
 
 impl<'a> Drop for WriteUnitOfWork<'a> {
@@ -402,7 +377,6 @@ mod tests {
     use crate::txn::{GlobalTxnState, TransactionManager};
 
     const TEST_URI: &str = "table:items";
-    const TEST_STORE: &str = "items.main.wt";
     const TEST_KEY: &[u8] = b"k1";
     const TEST_VALUE: &[u8] = b"v1";
 
@@ -424,8 +398,14 @@ mod tests {
             let transaction_manager =
                 Arc::new(TransactionManager::new(Arc::new(GlobalTxnState::new())));
             let table_handles = Arc::new(HandleCache::<String, RwLock<Table>>::new());
+            let metadata_catalog = Arc::new(MetadataCatalog::new(
+                base_path.clone(),
+                table_handles.clone(),
+                transaction_manager.clone(),
+            ));
             let applier = Arc::new(StoreCommandApplier::new(
                 base_path.clone(),
+                metadata_catalog,
                 table_handles.clone(),
                 transaction_manager,
             ));
@@ -643,11 +623,11 @@ mod tests {
         assert!(records.iter().any(|record| matches!(
             record,
             WalRecord::Put {
-                store_name,
+                uri,
                 key,
                 value,
                 txn_id: record_txn_id,
-            } if store_name == TEST_STORE
+            } if uri == TEST_URI
                 && key == TEST_KEY
                 && value == TEST_VALUE
                 && *record_txn_id == txn_id

@@ -10,9 +10,7 @@ use crate::index::encode_index_key;
 use crate::replication::WritePathMode;
 use crate::schema::SchemaCatalog;
 use crate::storage::api::{Session, WriteUnitOfWork};
-use crate::storage::metadata_catalog::{
-    MetadataCatalog, MetadataEntry, MetadataKind, INDEX_URI_PREFIX, TABLE_URI_PREFIX,
-};
+use crate::storage::metadata_catalog::{table_uri, MetadataCatalog};
 use crate::store_write_path::StoreWritePath;
 use crate::{Document, WrongoDBError};
 
@@ -132,9 +130,9 @@ impl CollectionWritePath {
             .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
         let key = encode_id_value(id)?;
         let value = encode_document(&obj)?;
-        let primary_store = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
+        let primary_uri = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
         self.store_write_path
-            .insert(write_unit, &primary_store, &key, &value)?;
+            .insert(write_unit, &primary_uri, &key, &value)?;
         self.apply_index_add(write_unit, collection, &obj)?;
         Ok(obj)
     }
@@ -163,9 +161,9 @@ impl CollectionWritePath {
             .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
         let key = encode_id_value(id)?;
         let value = encode_document(&updated_doc)?;
-        let primary_store = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
+        let primary_uri = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
         self.store_write_path
-            .update(write_unit, &primary_store, &key, &value)?;
+            .update(write_unit, &primary_uri, &key, &value)?;
 
         self.apply_index_remove(write_unit, collection, doc)?;
         self.apply_index_add(write_unit, collection, &updated_doc)?;
@@ -193,7 +191,7 @@ impl CollectionWritePath {
             });
         }
 
-        let primary_store = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
+        let primary_uri = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
         let mut modified = 0;
         for doc in docs {
             let updated_doc = apply_update(&doc, &update)?;
@@ -203,7 +201,7 @@ impl CollectionWritePath {
             let key = encode_id_value(id)?;
             let value = encode_document(&updated_doc)?;
             self.store_write_path
-                .update(write_unit, &primary_store, &key, &value)?;
+                .update(write_unit, &primary_uri, &key, &value)?;
 
             self.apply_index_remove(write_unit, collection, &doc)?;
             self.apply_index_add(write_unit, collection, &updated_doc)?;
@@ -234,9 +232,9 @@ impl CollectionWritePath {
             return Ok(0);
         };
         let key = encode_id_value(id)?;
-        let primary_store = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
+        let primary_uri = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
         self.store_write_path
-            .delete(write_unit, &primary_store, &key)?;
+            .delete(write_unit, &primary_uri, &key)?;
         self.apply_index_remove(write_unit, collection, doc)?;
         Ok(1)
     }
@@ -254,7 +252,7 @@ impl CollectionWritePath {
             return Ok(0);
         }
 
-        let primary_store = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
+        let primary_uri = self.ensure_table_registered_in_write_unit(write_unit, collection)?;
         let mut deleted = 0;
         for doc in docs {
             let Some(id) = doc.get("_id") else {
@@ -262,7 +260,7 @@ impl CollectionWritePath {
             };
             let key = encode_id_value(id)?;
             self.store_write_path
-                .delete(write_unit, &primary_store, &key)?;
+                .delete(write_unit, &primary_uri, &key)?;
             self.apply_index_remove(write_unit, collection, &doc)?;
             deleted += 1;
         }
@@ -278,22 +276,14 @@ impl CollectionWritePath {
     ) -> Result<(), WrongoDBError> {
         self.ensure_table_registered_in_write_unit(write_unit, collection)?;
 
-        let uri = Self::index_uri(collection, field);
-        let store_name = Self::index_store_name(collection, field);
-        let inserted = self.metadata_catalog.put_if_absent_in_write_unit(
-            write_unit,
-            MetadataEntry {
-                uri,
-                kind: MetadataKind::Index,
-                source: store_name.clone(),
-            },
-        )?;
+        let (index_uri, inserted) = self
+            .metadata_catalog
+            .ensure_index_uri_in_write_unit(write_unit, collection, field)?;
         if !inserted {
             return Ok(());
         }
 
-        self.store_write_path.ensure_store(&store_name)?;
-        let mut primary_cursor = write_unit.open_cursor(&format!("table:{collection}"))?;
+        let mut primary_cursor = write_unit.open_cursor(&table_uri(collection))?;
 
         while let Some((_, bytes)) = primary_cursor.next()? {
             let doc = decode_document(&bytes)?;
@@ -307,7 +297,7 @@ impl CollectionWritePath {
                 continue;
             };
             self.store_write_path
-                .insert(write_unit, &store_name, &key, &[])?;
+                .insert(write_unit, &index_uri, &key, &[])?;
         }
 
         Ok(())
@@ -353,10 +343,9 @@ impl CollectionWritePath {
             };
             if is_add {
                 self.store_write_path
-                    .insert(write_unit, &def.source, &key, &[])?;
+                    .insert(write_unit, &def.uri, &key, &[])?;
             } else {
-                self.store_write_path
-                    .delete(write_unit, &def.source, &key)?;
+                self.store_write_path.delete(write_unit, &def.uri, &key)?;
             }
         }
         Ok(())
@@ -367,17 +356,8 @@ impl CollectionWritePath {
         write_unit: &mut WriteUnitOfWork<'_>,
         collection: &str,
     ) -> Result<String, WrongoDBError> {
-        let store_name = Self::primary_store_name(collection);
-        self.store_write_path.ensure_store(&store_name)?;
-        self.metadata_catalog.put_if_absent_in_write_unit(
-            write_unit,
-            MetadataEntry {
-                uri: Self::table_uri(collection),
-                kind: MetadataKind::Table,
-                source: store_name.clone(),
-            },
-        )?;
-        Ok(store_name)
+        self.metadata_catalog
+            .ensure_table_uri_in_write_unit(write_unit, collection)
     }
 
     fn run_in_write_unit<R, F>(&self, session: &mut Session, f: F) -> Result<R, WrongoDBError>
@@ -408,22 +388,6 @@ impl CollectionWritePath {
                 Err(err)
             }
         }
-    }
-
-    fn table_uri(collection: &str) -> String {
-        format!("{TABLE_URI_PREFIX}{collection}")
-    }
-
-    fn index_uri(collection: &str, field: &str) -> String {
-        format!("{INDEX_URI_PREFIX}{collection}:{field}")
-    }
-
-    fn primary_store_name(collection: &str) -> String {
-        format!("{collection}.main.wt")
-    }
-
-    fn index_store_name(collection: &str, field: &str) -> String {
-        format!("{collection}.{field}.idx.wt")
     }
 }
 
@@ -510,9 +474,7 @@ mod tests {
     use crate::collection_write_path::CollectionWritePath;
     use crate::core::bson::{encode_document, encode_id_value};
     use crate::document_query::DocumentQuery;
-    use crate::durability::{
-        DurabilityBackend, DurabilityGuarantee, DurableOp, StoreCommandApplier,
-    };
+    use crate::durability::{DurabilityBackend, DurabilityGuarantee, DurableOp};
     use crate::replication::{RaftMode, RaftPeerConfig, ReplicationCoordinator, WritePathMode};
     use crate::schema::SchemaCatalog;
     use crate::storage::api::{Connection, ConnectionConfig, Session};
@@ -557,13 +519,7 @@ mod tests {
         let backend = Arc::new(backend);
         let replication = Arc::new(replication);
         let document_query = DocumentQuery::new(schema_catalog.clone());
-        let store_write_path = StoreWritePath::new(
-            base_path.clone(),
-            table_handles.clone(),
-            transaction_manager.clone(),
-            backend.clone(),
-            replication.clone(),
-        );
+        let store_write_path = StoreWritePath::new(backend.clone(), replication.clone());
         let service = CollectionWritePath::new(
             metadata_catalog.clone(),
             schema_catalog.clone(),
@@ -654,11 +610,7 @@ mod tests {
             ReplicationCoordinator::open(
                 dir.path(),
                 true,
-                Arc::new(StoreCommandApplier::new(
-                    conn.base_path().to_path_buf(),
-                    conn.table_handles(),
-                    conn.transaction_manager(),
-                )),
+                conn.new_store_command_applier(),
                 raft_mode,
             )
             .unwrap(),
@@ -777,7 +729,7 @@ mod tests {
             vec![
                 (
                     DurableOp::Put {
-                        store_name: "items.main.wt".to_string(),
+                        uri: "table:items".to_string(),
                         key: encoded_key,
                         value: encoded_doc,
                         txn_id: 1,
@@ -825,7 +777,7 @@ mod tests {
                 vec![
                     (
                         DurableOp::Put {
-                            store_name: "items.main.wt".to_string(),
+                            uri: "table:items".to_string(),
                             key: encoded_key,
                             value: encoded_doc,
                             txn_id: 1,
@@ -861,7 +813,7 @@ mod tests {
                 vec![
                     (
                         DurableOp::Put {
-                            store_name: "items.main.wt".to_string(),
+                            uri: "table:items".to_string(),
                             key: encoded_key,
                             value: encoded_doc,
                             txn_id: 2,
