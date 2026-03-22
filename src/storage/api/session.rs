@@ -3,7 +3,7 @@ use std::sync::{Arc, Weak};
 
 use parking_lot::{Mutex, RwLock};
 
-use crate::core::errors::{DocumentValidationError, StorageError};
+use crate::core::errors::StorageError;
 use crate::storage::api::cursor::{TableCursor, TableCursorState, TableCursorWriteAccess};
 use crate::storage::btree::BTreeCursor;
 use crate::storage::handle_cache::HandleCache;
@@ -15,7 +15,7 @@ use crate::storage::reserved_store::{
     reserved_store_identity_for_uri, reserved_store_names, StoreId,
 };
 use crate::storage::table::{
-    checkpoint_store, contains_key, get_version, open_or_create_btree, scan_range, TableMetadata,
+    checkpoint_store, get_version, open_or_create_btree, scan_range, TableMetadata,
 };
 use crate::txn::{GlobalTxnState, Transaction, TxnId, TXN_NONE};
 use crate::WrongoDBError;
@@ -28,7 +28,6 @@ pub(crate) type ActiveTransactionHandle = Arc<Mutex<Transaction>>;
 type StoreEntries = Vec<(Vec<u8>, Vec<u8>)>;
 
 struct ResolvedStore {
-    store_id: StoreId,
     handle: Arc<RwLock<BTreeCursor>>,
 }
 
@@ -99,6 +98,38 @@ impl Session {
         Err(WrongoDBError::Storage(StorageError(format!(
             "unsupported URI for Session::create_table: {table_uri}; only table:... is supported"
         ))))
+    }
+
+    /// Ensure that a storage-layer `index:` row and backing store exist.
+    pub(crate) fn create_index(
+        &mut self,
+        index_entry: &MetadataEntry,
+    ) -> Result<(), WrongoDBError> {
+        if self.current_transaction().is_some() {
+            return Err(WrongoDBError::TransactionAlreadyActive);
+        }
+
+        if !index_entry.is_index() {
+            return Err(WrongoDBError::Storage(StorageError(format!(
+                "unsupported URI for Session::create_index: {}; only index:... is supported",
+                index_entry.uri()
+            ))));
+        }
+
+        let table_uri = Self::table_uri_for_index(index_entry.uri())?;
+        if self.metadata_store.get(&table_uri)?.is_none() {
+            return Err(WrongoDBError::Storage(StorageError(format!(
+                "unknown URI: {table_uri}"
+            ))));
+        }
+
+        if self.metadata_store.get(index_entry.uri())?.is_some() {
+            return Ok(());
+        }
+
+        self.ensure_named_store(index_entry.source())?;
+        self.metadata_store.insert(index_entry)?;
+        Ok(())
     }
 
     /// Open a cursor for `table:<name>` in the current transaction context.
@@ -231,33 +262,6 @@ impl Session {
     // Store operations
     // ------------------------------------------------------------------------
 
-    pub(crate) fn insert_into_store(
-        &self,
-        store_uri: &str,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<(), WrongoDBError> {
-        let txn_id = self.current_txn_id();
-        if txn_id == TXN_NONE {
-            return Err(
-                StorageError("insert_into_store requires an active transaction".into()).into(),
-            );
-        }
-
-        let resolved = self.resolve_store(store_uri)?;
-        let txn_handle = self.current_transaction().ok_or_else(|| {
-            StorageError("insert_into_store requires an active transaction".into())
-        })?;
-        let mut btree = resolved.handle.write();
-        if contains_key(&mut btree, key, txn_id)? {
-            return Err(DocumentValidationError("duplicate key error".into()).into());
-        }
-
-        let mut txn = txn_handle.lock();
-        btree.put(resolved.store_id, key, value, &mut txn)?;
-        Ok(())
-    }
-
     pub(crate) fn ensure_named_store(&self, store_name: &str) -> Result<(), WrongoDBError> {
         let _ = self.open_store_by_name(store_name)?;
         Ok(())
@@ -379,9 +383,8 @@ impl Session {
     }
 
     fn resolve_store(&self, uri: &str) -> Result<ResolvedStore, WrongoDBError> {
-        if let Some((store_id, store_name)) = reserved_store_identity_for_uri(uri) {
+        if let Some((_, store_name)) = reserved_store_identity_for_uri(uri) {
             return Ok(ResolvedStore {
-                store_id,
                 handle: self.open_store_by_name(store_name)?,
             });
         }
@@ -391,9 +394,21 @@ impl Session {
         };
 
         Ok(ResolvedStore {
-            store_id: entry.store_id(),
             handle: self.open_store_by_name(entry.source())?,
         })
+    }
+
+    fn table_uri_for_index(index_uri: &str) -> Result<String, WrongoDBError> {
+        let Some(rest) = index_uri.strip_prefix(INDEX_URI_PREFIX) else {
+            return Err(StorageError(format!(
+                "unsupported URI for Session::create_index: {index_uri}; only index:... is supported"
+            ))
+            .into());
+        };
+        let Some((collection, _)) = rest.split_once(':') else {
+            return Err(StorageError(format!("invalid index URI: {index_uri}")).into());
+        };
+        Ok(format!("{TABLE_URI_PREFIX}{collection}"))
     }
 
     fn open_store_by_name(
@@ -597,12 +612,50 @@ mod tests {
     }
 
     #[test]
+    fn create_index_creates_backing_store_and_metadata() {
+        let mut session =
+            SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
+        session.create_table(TEST_URI).unwrap();
+
+        let entry = MetadataEntry::index(
+            "items",
+            "name_1",
+            vec!["name".to_string()],
+            session.metadata_store.allocate_store_id(),
+        );
+        let source = entry.source().to_string();
+
+        session.create_index(&entry).unwrap();
+        session.create_index(&entry).unwrap();
+
+        let stored = session.metadata_store.get(entry.uri()).unwrap().unwrap();
+        assert_eq!(stored.source(), source);
+        assert!(session.base_path.join(source).exists());
+    }
+
+    #[test]
     fn create_rejects_index_uris() {
         let mut session =
             SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
 
         let err = session.create_table("index:test:name").unwrap_err();
         assert!(err.to_string().contains("only table:... is supported"));
+    }
+
+    #[test]
+    fn create_index_rejects_missing_table() {
+        let mut session =
+            SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
+
+        let entry = MetadataEntry::index(
+            "items",
+            "name_1",
+            vec!["name".to_string()],
+            session.metadata_store.allocate_store_id(),
+        );
+
+        let err = session.create_index(&entry).unwrap_err();
+        assert!(err.to_string().contains("unknown URI: table:items"));
     }
 
     #[test]

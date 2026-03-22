@@ -1,5 +1,17 @@
 # Decisions
 
+## 2026-03-22: Move low-level index creation into `Session` and keep collection readiness above it
+
+**Decision**
+- Add `Session::create_index` as the storage-layer primitive for creating the backing `index:` store and persisting the corresponding `metadata.wt` row.
+- Keep `CollectionWritePath` responsible for durable collection-catalog updates, index readiness, and BSON-backed backfill of existing documents.
+- Use the raw named-store write path (`put_into_named_store`) during index backfill so a partially completed create flow can be retried without tripping the duplicate-key guard used by normal inserts.
+
+**Why**
+- WiredTiger keeps the physical `index:` object under the session schema API, but WrongoDB still needs a higher-level collection layer to manage the durable catalog and the `ready` bit.
+- The BSON document decoding and index-key derivation live above `Session`, so the storage layer should create the object while the collection layer decides which rows to backfill.
+- Backfill needs to be retry-friendly across the split create/ready flow.
+
 ## 2026-03-22: Split WT-style storage metadata from the Mongo-style collection catalog
 
 **Decision**

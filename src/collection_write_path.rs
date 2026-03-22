@@ -116,6 +116,10 @@ impl CollectionWritePath {
     }
 
     /// Creates one secondary index from the normalized server-side request.
+    ///
+    /// If the durable catalog already knows about the index but it is still
+    /// marked not-ready, this resumes the storage backfill and flips the ready
+    /// bit once the existing rows are copied into the secondary store.
     pub(crate) fn create_index(
         &self,
         session: &mut Session,
@@ -124,9 +128,9 @@ impl CollectionWritePath {
     ) -> Result<(), WrongoDBError> {
         let (table_uri, _) = self.ensure_collection_registered_committed(session, collection)?;
         let indexed_field = request.indexed_field()?;
-        let (index_uri, created) =
+        let (index_uri, ready) =
             self.ensure_index_registered_committed(session, collection, &request, &indexed_field)?;
-        if created {
+        if !ready {
             self.backfill_index_committed(session, &table_uri, &index_uri, &indexed_field)?;
             self.durable_catalog.set_index_ready_committed(
                 session,
@@ -348,13 +352,27 @@ impl CollectionWritePath {
         indexed_field: &str,
     ) -> Result<(String, bool), WrongoDBError> {
         let index_uri = index_uri(collection, request.name());
-        if self
+        if let Some(ready) = self
             .durable_catalog
             .collection(session, collection)?
-            .and_then(|definition| definition.indexes().get(request.name()).cloned())
-            .is_some()
+            .and_then(|definition| {
+                definition
+                    .indexes()
+                    .get(request.name())
+                    .map(|index| index.ready())
+            })
         {
-            return Ok((index_uri, false));
+            if self.metadata_store.get(&index_uri)?.is_none() {
+                let entry = MetadataEntry::index(
+                    collection,
+                    request.name(),
+                    vec![indexed_field.to_string()],
+                    self.metadata_store.allocate_store_id(),
+                );
+                session.create_index(&entry)?;
+            }
+
+            return Ok((index_uri, ready));
         }
 
         if self.metadata_store.get(&index_uri)?.is_none() {
@@ -364,16 +382,15 @@ impl CollectionWritePath {
                 vec![indexed_field.to_string()],
                 self.metadata_store.allocate_store_id(),
             );
-            session.ensure_named_store(entry.source())?;
-            self.metadata_store.insert(&entry)?;
+            session.create_index(&entry)?;
         }
 
-        let inserted = self.durable_catalog.ensure_index_committed(
+        let _ = self.durable_catalog.ensure_index_committed(
             session,
             collection,
             IndexDefinition::from_request_with_ready(request, index_uri.clone(), false),
         )?;
-        Ok((index_uri, inserted))
+        Ok((index_uri, false))
     }
 
     fn backfill_index_committed(
@@ -383,8 +400,17 @@ impl CollectionWritePath {
         index_uri: &str,
         indexed_field: &str,
     ) -> Result<(), WrongoDBError> {
+        let index_entry = self
+            .metadata_store
+            .get(index_uri)?
+            .ok_or_else(|| StorageError(format!("unknown index URI: {index_uri}")))?;
+        let store_name = index_entry.source().to_string();
+        let store_id = index_entry.store_id();
+
         session.with_transaction(|session| {
             let mut primary_cursor = session.open_table_cursor(table_uri)?;
+            // Use the raw named-store write path so index backfill can be retried
+            // without tripping the duplicate-key guard used by normal inserts.
             while let Some((_, bytes)) = primary_cursor.next()? {
                 let doc = decode_document(&bytes)?;
                 let Some(id) = doc.get("_id") else {
@@ -396,7 +422,7 @@ impl CollectionWritePath {
                 let Some(key) = encode_index_key(value, id)? else {
                     continue;
                 };
-                session.insert_into_store(index_uri, &key, &[])?;
+                session.put_into_named_store(&store_name, store_id, &key, &[])?;
             }
             Ok(())
         })
@@ -661,10 +687,10 @@ mod tests {
             .unwrap();
 
         let request = CreateIndexRequest::single_field_ascending("name");
-        let (index_uri, created) = service
+        let (index_uri, ready) = service
             .ensure_index_registered_committed(&mut session, "users", &request, "name")
             .unwrap();
-        assert!(created);
+        assert!(!ready);
 
         session
             .with_transaction(|session| {
@@ -673,6 +699,15 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+
+        service
+            .create_index(&mut session, "users", request)
+            .unwrap();
+
+        let committed_indexes = _collection_catalog.list_index_definitions("users");
+        assert!(committed_indexes
+            .iter()
+            .any(|index| index.name() == "name_1" && index.ready()));
 
         let docs = query
             .find(&mut session, "users", Some(json!({"name": "alice"})))
