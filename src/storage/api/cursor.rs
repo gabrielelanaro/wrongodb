@@ -419,8 +419,8 @@ mod tests {
     use super::*;
     use crate::core::bson::{encode_document, encode_id_value};
     use crate::storage::api::Session;
-    use crate::storage::durability::DurabilityBackend;
     use crate::storage::handle_cache::HandleCache;
+    use crate::storage::log_manager::LogManager;
     use crate::storage::metadata_catalog::MetadataCatalog;
     use crate::storage::table::open_or_create_btree;
     use crate::txn::{GlobalTxnState, TXN_NONE};
@@ -428,7 +428,7 @@ mod tests {
     fn build_test_session(
         base_path: &Path,
         global_txn: Arc<GlobalTxnState>,
-        backend: Arc<DurabilityBackend>,
+        log_manager: Arc<LogManager>,
     ) -> Session {
         let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
         let metadata_catalog = Arc::new(MetadataCatalog::new(
@@ -440,7 +440,7 @@ mod tests {
             store_handles,
             metadata_catalog,
             global_txn,
-            backend,
+            log_manager,
         )
     }
 
@@ -457,7 +457,7 @@ mod tests {
         let path = tmp.path().join(&store_name);
         let global_txn = Arc::new(GlobalTxnState::new());
         let btree = Arc::new(RwLock::new(open_or_create_btree(path).unwrap()));
-        let session = build_test_session(tmp.path(), global_txn.clone(), disabled_backend());
+        let session = build_test_session(tmp.path(), global_txn.clone(), disabled_log_manager());
         (tmp, btree, session, global_txn, TableMetadata::new(uri))
     }
 
@@ -483,7 +483,7 @@ mod tests {
                 vec!["name".to_string()],
             )],
         );
-        let session = build_test_session(tmp.path(), global_txn.clone(), disabled_backend());
+        let session = build_test_session(tmp.path(), global_txn.clone(), disabled_log_manager());
         (tmp, primary, index, session, global_txn, table)
     }
 
@@ -495,8 +495,8 @@ mod tests {
         encode_index_key(&json!(name), &json!(id)).unwrap().unwrap()
     }
 
-    fn disabled_backend() -> Arc<DurabilityBackend> {
-        Arc::new(DurabilityBackend::Disabled)
+    fn disabled_log_manager() -> Arc<LogManager> {
+        Arc::new(LogManager::disabled())
     }
 
     #[test]

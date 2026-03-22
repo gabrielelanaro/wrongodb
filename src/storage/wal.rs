@@ -1,7 +1,17 @@
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
+
+use crc32fast::Hasher;
+
+use crate::core::errors::{StorageError, WrongoDBError};
+use crate::txn::{Timestamp, TxnId, TxnLogOp};
+
 // ============================================================================
 // Constants
 // ============================================================================
 
+#[cfg(test)]
 const GLOBAL_WAL_FILE_NAME: &str = "global.wal";
 const WAL_MAGIC: &[u8; 8] = b"WALG001\0";
 const WAL_VERSION: u16 = 5;
@@ -12,94 +22,108 @@ const RECORD_HEADER_SIZE: usize = 26;
 // Public Types
 // ============================================================================
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-
-use crc32fast::Hasher;
-
-use crate::core::errors::{StorageError, WrongoDBError};
-use crate::txn::{Timestamp, TxnId, TxnLogOp};
-
-/// Log Sequence Number - uniquely identifies a position in the WAL.
+/// Log Sequence Number that identifies one position in the WAL.
+///
+/// The current implementation keeps a single log file, so `file_id` stays `0`.
+/// The type still carries both fields because record headers and recovery code
+/// already speak in terms of full LSNs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Lsn {
+    /// Log file identifier for the record position.
     pub file_id: u32,
+    /// Byte offset within the log file.
     pub offset: u64,
 }
 
-/// WAL record type.
+/// WAL record discriminator stored in each record header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WalRecordType {
+    /// One committed transaction record containing all logical operations.
     TxnCommit = 1,
+    /// One checkpoint marker record.
     Checkpoint = 2,
 }
 
-/// Global WAL record containing logical operation data.
+/// WAL record payload used for recovery replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalRecord {
+    /// Committed transaction payload.
     TxnCommit {
+        /// Transaction identifier that produced the committed operations.
         txn_id: TxnId,
+        /// Commit timestamp assigned when the transaction became durable.
         commit_ts: Timestamp,
+        /// Logical operations replayed during recovery.
         ops: Vec<TxnLogOp>,
     },
+    /// Checkpoint marker record.
     Checkpoint,
 }
 
-/// WAL record header - precedes each record in the WAL.
+/// Fixed-size header that precedes each WAL record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalRecordHeader {
+    /// Encoded [`WalRecordType`] discriminator.
     pub record_type: u8,
+    /// Reserved record flags.
     pub flags: u8,
+    /// Payload length in bytes.
     pub payload_len: u16,
+    /// LSN assigned to this record.
     pub lsn: Lsn,
+    /// LSN of the previous valid record in the chain.
     pub prev_lsn: Lsn,
+    /// CRC32 over the header prefix plus payload bytes.
     pub crc32: u32,
 }
 
-/// Recovery-specific error type for WAL operations.
+/// Recovery-specific error type for sequential WAL replay.
 #[derive(Debug)]
 pub enum RecoveryError {
+    /// Record bytes were read successfully but failed the CRC check.
     ChecksumMismatch {
         offset: u64,
         expected: u32,
         actual: u32,
     },
+    /// Record chaining no longer matches the previous valid LSN.
     BrokenLsnChain {
         current_lsn: Lsn,
         expected_prev: Lsn,
         actual_prev: Lsn,
     },
-    CorruptRecordHeader {
-        offset: u64,
-        details: String,
-    },
+    /// The fixed-size header is malformed.
+    CorruptRecordHeader { offset: u64, details: String },
+    /// The payload bytes are malformed for the decoded record type.
     CorruptRecordPayload {
         record_type: WalRecordType,
         offset: u64,
         details: String,
     },
+    /// The file is not a usable WAL at all.
     InvalidWalFile(String),
+    /// Underlying I/O failure while opening or reading the WAL.
     Io(std::io::Error),
 }
 
 /// Reader interface for sequential WAL replay.
 pub trait WalReader {
+    /// Read the next valid record from the current reader position.
+    ///
+    /// Returns `Ok(None)` on clean EOF and on a truncated tail where a full
+    /// header or payload is no longer available.
     fn read_record(&mut self) -> Result<Option<(WalRecordHeader, WalRecord)>, RecoveryError>;
 }
 
-/// File-backed WAL reader for recovery operations.
+/// File-backed WAL reader used during recovery.
+///
+/// The reader starts at the checkpoint LSN recorded in the file header when
+/// present, otherwise at the first record after the file header.
 pub struct WalFileReader {
     file: File,
     current_offset: u64,
     last_valid_lsn: Lsn,
-}
-
-/// Global WAL handle with batching/sync policy.
-#[derive(Debug)]
-pub struct GlobalWal {
-    file: WalFile,
 }
 
 // ============================================================================
@@ -108,7 +132,7 @@ pub struct GlobalWal {
 
 /// WAL file header - written at the start of the WAL file.
 #[derive(Debug, Clone)]
-struct WalFileHeader {
+struct LogFileHeader {
     magic: [u8; 8],
     version: u16,
     last_lsn: Lsn,
@@ -117,9 +141,9 @@ struct WalFileHeader {
 }
 
 #[derive(Debug)]
-struct WalFile {
+pub(crate) struct LogFile {
     file: File,
-    header: WalFileHeader,
+    header: LogFileHeader,
     write_buffer: Vec<u8>,
     buffer_capacity: usize,
     last_lsn: Lsn,
@@ -131,10 +155,12 @@ struct WalFile {
 // ============================================================================
 
 impl Lsn {
+    /// Construct one LSN from a log file identifier and byte offset.
     pub fn new(file_id: u32, offset: u64) -> Self {
         Self { file_id, offset }
     }
 
+    /// Whether this LSN points at a real record position.
     pub fn is_valid(&self) -> bool {
         self.file_id != 0 || self.offset != 0
     }
@@ -161,6 +187,7 @@ impl TryFrom<u8> for WalRecordType {
 // ============================================================================
 
 impl WalRecord {
+    /// Return the discriminator stored in the corresponding record header.
     pub fn record_type(&self) -> WalRecordType {
         match self {
             WalRecord::TxnCommit { .. } => WalRecordType::TxnCommit,
@@ -367,6 +394,11 @@ impl From<std::io::Error> for RecoveryError {
 // ============================================================================
 
 impl WalFileReader {
+    /// Open one WAL file for sequential recovery replay.
+    ///
+    /// The file header is validated before any record is read. If the header
+    /// contains a checkpoint LSN, the reader starts from that offset so replay
+    /// skips records older than the last completed checkpoint.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, RecoveryError> {
         let path = path.as_ref();
         if !path.exists() {
@@ -380,7 +412,7 @@ impl WalFileReader {
 
         let mut header_bytes = vec![0u8; WAL_HEADER_SIZE];
         file.read_exact(&mut header_bytes)?;
-        let header = WalFileHeader::deserialize(&header_bytes)
+        let header = LogFileHeader::deserialize(&header_bytes)
             .map_err(|e| RecoveryError::InvalidWalFile(format!("invalid header: {e}")))?;
 
         if !header.validate_crc() {
@@ -478,76 +510,10 @@ impl WalReader for WalFileReader {
 }
 
 // ============================================================================
-// GlobalWal Implementation
+// LogFileHeader Implementation
 // ============================================================================
 
-impl GlobalWal {
-    // ------------------------------------------------------------------------
-    // Constructors
-    // ------------------------------------------------------------------------
-
-    pub fn open_or_create<P: AsRef<Path>>(db_dir: P) -> Result<Self, WrongoDBError> {
-        let path = Self::path_for_db(db_dir);
-        let file = if path.exists() {
-            WalFile::open(path)?
-        } else {
-            WalFile::create(path)?
-        };
-        Ok(Self { file })
-    }
-
-    // ------------------------------------------------------------------------
-    // Path Helpers
-    // ------------------------------------------------------------------------
-
-    pub fn path_for_db<P: AsRef<Path>>(db_dir: P) -> PathBuf {
-        db_dir.as_ref().join(GLOBAL_WAL_FILE_NAME)
-    }
-
-    // ------------------------------------------------------------------------
-    // Logging Operations
-    // ------------------------------------------------------------------------
-
-    pub fn log_txn_commit(
-        &mut self,
-        txn_id: TxnId,
-        commit_ts: Timestamp,
-        ops: &[TxnLogOp],
-    ) -> Result<Lsn, WrongoDBError> {
-        self.file.log_txn_commit(txn_id, commit_ts, ops)
-    }
-
-    pub fn log_checkpoint(&mut self) -> Result<Lsn, WrongoDBError> {
-        self.file.log_checkpoint()
-    }
-
-    // ------------------------------------------------------------------------
-    // Checkpoint Operations
-    // ------------------------------------------------------------------------
-
-    #[cfg(test)]
-    pub fn set_checkpoint_lsn(&mut self, lsn: Lsn) -> Result<(), WrongoDBError> {
-        self.file.set_checkpoint_lsn(lsn)
-    }
-
-    pub fn truncate_to_checkpoint(&mut self) -> Result<(), WrongoDBError> {
-        self.file.truncate_to_checkpoint()
-    }
-
-    // ------------------------------------------------------------------------
-    // Sync
-    // ------------------------------------------------------------------------
-
-    pub fn sync(&mut self) -> Result<(), WrongoDBError> {
-        self.file.sync()
-    }
-}
-
-// ============================================================================
-// WalFileHeader Implementation
-// ============================================================================
-
-impl WalFileHeader {
+impl LogFileHeader {
     fn new() -> Self {
         let mut header = Self {
             magic: *WAL_MAGIC,
@@ -678,20 +644,29 @@ impl WalFileHeader {
 }
 
 // ============================================================================
-// WalFile Implementation
+// LogFile Implementation
 // ============================================================================
 
-impl WalFile {
+impl LogFile {
     const DEFAULT_BUFFER_CAPACITY: usize = 64 * 1024;
 
     // ------------------------------------------------------------------------
     // Constructors
     // ------------------------------------------------------------------------
 
+    pub(crate) fn open_or_create<P: AsRef<Path>>(path: P) -> Result<Self, WrongoDBError> {
+        let path = path.as_ref();
+        if path.exists() {
+            return Self::open(path);
+        }
+
+        Self::create(path)
+    }
+
     fn create<P: AsRef<Path>>(path: P) -> Result<Self, WrongoDBError> {
         let mut file = File::create(path)?;
 
-        let header = WalFileHeader::new();
+        let header = LogFileHeader::new();
         let header_bytes = header.serialize();
         file.write_all(&header_bytes)?;
         file.sync_all()?;
@@ -712,7 +687,7 @@ impl WalFile {
 
         let mut header_bytes = vec![0u8; WAL_HEADER_SIZE];
         file.read_exact(&mut header_bytes)?;
-        let mut header = WalFileHeader::deserialize(&header_bytes)?;
+        let mut header = LogFileHeader::deserialize(&header_bytes)?;
 
         if !header.validate_crc() {
             return Err(StorageError("WAL header CRC32 mismatch".into()).into());
@@ -767,7 +742,7 @@ impl WalFile {
         Ok(())
     }
 
-    fn truncate_to_checkpoint(&mut self) -> Result<(), WrongoDBError> {
+    pub(crate) fn truncate_to_checkpoint(&mut self) -> Result<(), WrongoDBError> {
         self.sync()?;
         self.file.set_len(WAL_HEADER_SIZE as u64)?;
 
@@ -789,7 +764,7 @@ impl WalFile {
     // Sync
     // ------------------------------------------------------------------------
 
-    fn sync(&mut self) -> Result<(), WrongoDBError> {
+    pub(crate) fn sync(&mut self) -> Result<(), WrongoDBError> {
         self.flush_buffer()?;
         self.file.sync_all()?;
         Ok(())
@@ -799,7 +774,7 @@ impl WalFile {
     // Logging Operations
     // ------------------------------------------------------------------------
 
-    fn log_txn_commit(
+    pub(crate) fn log_txn_commit(
         &mut self,
         txn_id: TxnId,
         commit_ts: Timestamp,
@@ -812,7 +787,7 @@ impl WalFile {
         })
     }
 
-    fn log_checkpoint(&mut self) -> Result<Lsn, WrongoDBError> {
+    pub(crate) fn log_checkpoint(&mut self) -> Result<Lsn, WrongoDBError> {
         self.append_record(WalRecord::Checkpoint)
     }
 
@@ -879,7 +854,7 @@ impl WalFile {
     }
 }
 
-impl Drop for WalFile {
+impl Drop for LogFile {
     fn drop(&mut self) {
         let _ = self.flush_buffer();
     }
@@ -1023,11 +998,15 @@ mod tests {
 
     use super::*;
 
-    fn read_header(path: &Path) -> WalFileHeader {
+    fn read_header(path: &Path) -> LogFileHeader {
         let mut file = File::open(path).unwrap();
         let mut bytes = vec![0u8; WAL_HEADER_SIZE];
         file.read_exact(&mut bytes).unwrap();
-        WalFileHeader::deserialize(&bytes).unwrap()
+        LogFileHeader::deserialize(&bytes).unwrap()
+    }
+
+    fn wal_path(dir: &Path) -> std::path::PathBuf {
+        dir.join(GLOBAL_WAL_FILE_NAME)
     }
 
     #[test]
@@ -1086,7 +1065,8 @@ mod tests {
     #[test]
     fn create_log_and_read() {
         let dir = tempdir().unwrap();
-        let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
+        let wal_path = wal_path(dir.path());
+        let mut wal = LogFile::open_or_create(&wal_path).unwrap();
 
         wal.log_txn_commit(
             1,
@@ -1100,7 +1080,7 @@ mod tests {
         .unwrap();
         wal.sync().unwrap();
 
-        let mut reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
+        let mut reader = WalFileReader::open(&wal_path).unwrap();
         let (header, record) = reader.read_record().unwrap().unwrap();
         assert_eq!(header.lsn, Lsn::new(0, WAL_HEADER_SIZE as u64));
         assert_eq!(header.prev_lsn, Lsn::new(0, 0));
@@ -1129,8 +1109,8 @@ mod tests {
     #[test]
     fn wal_crc_mismatch_when_header_bytes_are_corrupted() {
         let dir = tempdir().unwrap();
-        let wal_path = GlobalWal::path_for_db(dir.path());
-        let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
+        let wal_path = wal_path(dir.path());
+        let mut wal = LogFile::open_or_create(&wal_path).unwrap();
         wal.log_txn_commit(
             1,
             1,
@@ -1161,7 +1141,8 @@ mod tests {
     #[test]
     fn lsn_offsets_advance_monotonically() {
         let dir = tempdir().unwrap();
-        let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
+        let wal_path = wal_path(dir.path());
+        let mut wal = LogFile::open_or_create(&wal_path).unwrap();
 
         wal.log_txn_commit(
             1,
@@ -1182,7 +1163,7 @@ mod tests {
         wal.log_checkpoint().unwrap();
         wal.sync().unwrap();
 
-        let mut reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
+        let mut reader = WalFileReader::open(&wal_path).unwrap();
         let mut headers = Vec::new();
         while let Some((header, _)) = reader.read_record().unwrap() {
             headers.push(header);
@@ -1196,7 +1177,8 @@ mod tests {
     #[test]
     fn truncate_then_append_restarts_record_sequence_after_checkpoint() {
         let dir = tempdir().unwrap();
-        let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
+        let wal_path = wal_path(dir.path());
+        let mut wal = LogFile::open_or_create(&wal_path).unwrap();
 
         wal.log_txn_commit(
             1,
@@ -1225,7 +1207,7 @@ mod tests {
         .unwrap();
         wal.sync().unwrap();
 
-        let mut reader = WalFileReader::open(GlobalWal::path_for_db(dir.path())).unwrap();
+        let mut reader = WalFileReader::open(&wal_path).unwrap();
         let (header, _) = reader.read_record().unwrap().unwrap();
         assert_eq!(header.lsn, Lsn::new(0, WAL_HEADER_SIZE as u64));
         assert_eq!(header.prev_lsn, Lsn::new(0, 0));
@@ -1234,8 +1216,8 @@ mod tests {
     #[test]
     fn truncate_clears_checkpoint_and_last_lsn_metadata() {
         let dir = tempdir().unwrap();
-        let wal_path = GlobalWal::path_for_db(dir.path());
-        let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
+        let wal_path = wal_path(dir.path());
+        let mut wal = LogFile::open_or_create(&wal_path).unwrap();
 
         wal.log_txn_commit(
             1,
@@ -1262,7 +1244,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join("legacy.wal");
 
-        let mut header = WalFileHeader {
+        let mut header = LogFileHeader {
             magic: *WAL_MAGIC,
             version: 1,
             last_lsn: Lsn::new(0, 0),

@@ -38,13 +38,13 @@ fn recovery_replays_committed_transaction_writes() {
     let db_path = tmp.path().join("db");
 
     {
-        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
         insert_kv(&conn, "test", b"k1", b"a");
         insert_kv(&conn, "test", b"k2", b"b");
     }
 
     {
-        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
         assert!(exists(&conn, "test", b"k1"));
         assert!(exists(&conn, "test", b"k2"));
     }
@@ -56,17 +56,17 @@ fn recovery_replays_records_appended_after_restart() {
     let db_path = tmp.path().join("db");
 
     {
-        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
         insert_kv(&conn, "test", b"k1", b"a");
     }
 
     {
-        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
         insert_kv(&conn, "test", b"k2", b"b");
     }
 
     {
-        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
         assert!(exists(&conn, "test", b"k1"));
         assert!(exists(&conn, "test", b"k2"));
     }
@@ -78,7 +78,7 @@ fn recovery_skips_incomplete_transaction_commit_record() {
     let db_path = tmp.path().join("db");
 
     {
-        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
         insert_kv(&conn, "test", b"k1", b"a");
         insert_kv(&conn, "test", b"k2", b"b");
     }
@@ -93,7 +93,7 @@ fn recovery_skips_incomplete_transaction_commit_record() {
         .unwrap();
 
     {
-        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
         assert!(exists(&conn, "test", b"k1"));
         assert!(!exists(&conn, "test", b"k2"));
     }
@@ -105,7 +105,7 @@ fn recovery_skips_explicitly_aborted_transaction_writes() {
     let db_path = tmp.path().join("db");
 
     {
-        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
         let mut session = conn.open_session();
         session.create_table("table:test").unwrap();
 
@@ -116,7 +116,7 @@ fn recovery_skips_explicitly_aborted_transaction_writes() {
     }
 
     {
-        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
         assert!(!exists(&conn, "test", b"k1"));
     }
 }
@@ -127,7 +127,7 @@ fn recovery_replays_transactional_writes_at_commit_time() {
     let db_path = tmp.path().join("db");
 
     {
-        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
         insert_kv_non_transactional(&conn, "test", b"shared", b"plain");
 
         let mut session = conn.open_session();
@@ -140,7 +140,7 @@ fn recovery_replays_transactional_writes_at_commit_time() {
     }
 
     {
-        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
         assert_eq!(
             read_value(&conn, "test", b"shared").as_deref(),
             Some(b"txn".as_slice())
@@ -154,7 +154,7 @@ fn recovery_handles_corrupted_global_wal_tail() {
     let db_path = tmp.path().join("db");
 
     {
-        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
         insert_kv(&conn, "test", b"k1", b"a");
     }
 
@@ -165,7 +165,7 @@ fn recovery_handles_corrupted_global_wal_tail() {
         file.write_all(b"CORRUPTED_TAIL").unwrap();
     }
 
-    let _ = Connection::open(&db_path, ConnectionConfig::default());
+    let _ = Connection::open(&db_path, ConnectionConfig::new());
 }
 
 #[test]
@@ -174,7 +174,7 @@ fn recovery_replay_does_not_append_new_wal_records() {
     let db_path = tmp.path().join("db");
 
     {
-        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
         insert_kv(&conn, "test", b"k1", b"a");
     }
 
@@ -183,7 +183,7 @@ fn recovery_replay_does_not_append_new_wal_records() {
     assert!(before > 512);
 
     {
-        let _conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let _conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
     }
 
     let after = std::fs::metadata(&wal_path).unwrap().len();
@@ -196,25 +196,26 @@ fn recovery_handles_empty_committed_transaction() {
     let db_path = tmp.path().join("db");
 
     {
-        let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+        let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
         let mut session = conn.open_session();
         session.with_transaction(|_| Ok(())).unwrap();
     }
 
-    let _reopened = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+    let _reopened = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
 }
 
 #[test]
 fn wal_disabled_mode_opens_without_global_wal() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("db");
-    let cfg = ConnectionConfig::new(false);
+    let cfg = ConnectionConfig::new().logging_enabled(false);
 
     {
         let conn = Connection::open(&db_path, cfg).unwrap();
         insert_kv(&conn, "test", b"k1", b"a");
     }
 
-    let _reopened = Connection::open(&db_path, ConnectionConfig::new(false)).unwrap();
+    let _reopened =
+        Connection::open(&db_path, ConnectionConfig::new().logging_enabled(false)).unwrap();
     assert!(!global_wal_path(&db_path).exists());
 }

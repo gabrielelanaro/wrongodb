@@ -6,8 +6,8 @@ use parking_lot::{Mutex, RwLock};
 use crate::core::errors::{DocumentValidationError, StorageError};
 use crate::storage::api::cursor::{TableCursor, TableCursorState, TableCursorWriteAccess};
 use crate::storage::btree::BTreeCursor;
-use crate::storage::durability::{DurabilityBackend, StorageSyncPolicy};
 use crate::storage::handle_cache::HandleCache;
+use crate::storage::log_manager::LogManager;
 use crate::storage::metadata_catalog::{MetadataCatalog, METADATA_STORE_NAME, METADATA_URI};
 use crate::storage::table::{
     checkpoint_store, contains_key, open_or_create_btree, scan_range, TableMetadata,
@@ -28,7 +28,7 @@ pub struct Session {
     store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
     metadata_catalog: Arc<MetadataCatalog>,
     global_txn: Arc<GlobalTxnState>,
-    durability_backend: Arc<DurabilityBackend>,
+    log_manager: Arc<LogManager>,
     active_transaction: Mutex<Option<ActiveTransactionHandle>>,
     open_cursor_states: Mutex<Vec<Weak<Mutex<TableCursorState>>>>,
 }
@@ -43,13 +43,13 @@ impl Session {
         store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
         metadata_catalog: Arc<MetadataCatalog>,
         global_txn: Arc<GlobalTxnState>,
-        durability_backend: Arc<DurabilityBackend>,
+        log_manager: Arc<LogManager>,
     ) -> Self {
         Self {
             base_path,
             store_handles,
             metadata_catalog,
-            durability_backend,
+            log_manager,
             global_txn,
             active_transaction: Mutex::new(None),
             open_cursor_states: Mutex::new(Vec::new()),
@@ -117,13 +117,12 @@ impl Session {
             checkpoint_store(&mut store.write(), self.global_txn.as_ref())?;
         }
 
-        if self.global_txn.has_active_transactions() || !self.durability_backend.is_enabled() {
+        if self.global_txn.has_active_transactions() || !self.log_manager.is_enabled() {
             return Ok(());
         }
 
-        self.durability_backend
-            .record_checkpoint(StorageSyncPolicy::Sync)?;
-        self.durability_backend.truncate_to_checkpoint()
+        self.log_manager.log_checkpoint()?;
+        self.log_manager.truncate_to_checkpoint()
     }
 
     // ------------------------------------------------------------------------
@@ -153,7 +152,7 @@ impl Session {
 
         let result = {
             let mut txn = txn_handle.lock();
-            self.log_and_commit_transaction(&mut txn)
+            self.durably_commit_transaction(&mut txn)
         };
 
         if result.is_err() {
@@ -190,7 +189,7 @@ impl Session {
         let result = f(txn_id, &mut txn);
         match result {
             Ok(value) => {
-                if let Err(err) = self.log_and_commit_transaction(&mut txn) {
+                if let Err(err) = self.durably_commit_transaction(&mut txn) {
                     self.reset_open_cursor_states();
                     let _ = txn.abort(self.global_txn.as_ref());
                     return Err(err);
@@ -268,7 +267,7 @@ impl Session {
     }
 
     // ------------------------------------------------------------------------
-    // Lookup and commit helpers
+    // Lookup and durability helpers
     // ------------------------------------------------------------------------
 
     fn load_table_metadata(
@@ -319,14 +318,12 @@ impl Session {
         self.active_transaction.lock().clone()
     }
 
-    fn log_and_commit_transaction(&self, txn: &mut Transaction) -> Result<(), WrongoDBError> {
+    fn durably_commit_transaction(&self, txn: &mut Transaction) -> Result<(), WrongoDBError> {
         let commit_ts = txn.id();
-        self.durability_backend.log_transaction_commit(
-            txn.id(),
-            commit_ts,
-            txn.log_ops(),
-            StorageSyncPolicy::Sync,
-        )?;
+        // The commit record must reach the log before MVCC state becomes
+        // globally visible.
+        self.log_manager
+            .log_transaction_commit(txn.id(), commit_ts, txn.log_ops())?;
         txn.commit(self.global_txn.as_ref())?;
         Ok(())
     }
@@ -387,11 +384,11 @@ mod tests {
 
     use super::*;
     use crate::storage::btree::BTreeCursor;
-    use crate::storage::durability::DurabilityBackend;
     use crate::storage::handle_cache::HandleCache;
+    use crate::storage::log_manager::{open_recovery_reader_if_present, LogManager, LoggingConfig};
     use crate::storage::metadata_catalog::MetadataCatalog;
     use crate::storage::recovery::{recover_from_wal, RecoveryExecutor};
-    use crate::storage::wal::{GlobalWal, WalFileReader, WalReader, WalRecord};
+    use crate::storage::wal::{WalFileReader, WalReader, WalRecord};
     use crate::txn::GlobalTxnState;
 
     const TEST_URI: &str = "table:items";
@@ -403,11 +400,11 @@ mod tests {
     }
 
     impl SessionTestFixture {
-        fn with_backend(backend: DurabilityBackend) -> Self {
+        fn with_log_manager(log_manager: LogManager) -> Self {
             let dir = tempdir().unwrap();
             let base_path = dir.path().to_path_buf();
             std::mem::forget(dir);
-            Self::build(base_path, Arc::new(backend))
+            Self::build(base_path, Arc::new(log_manager))
         }
 
         fn open_local_wal<P: AsRef<Path>>(path: P) -> Self {
@@ -426,15 +423,16 @@ mod tests {
                 global_txn,
             ));
             recover_existing_wal_if_present(&base_path, applier.clone());
-            let backend = Arc::new(DurabilityBackend::open(&base_path, true).unwrap());
-            Self::build(base_path, backend)
+            let log_manager =
+                Arc::new(LogManager::open(&base_path, &LoggingConfig::default()).unwrap());
+            Self::build(base_path, log_manager)
         }
 
         fn into_session(self) -> Session {
             self.session
         }
 
-        fn build(base_path: PathBuf, backend: Arc<DurabilityBackend>) -> Self {
+        fn build(base_path: PathBuf, log_manager: Arc<LogManager>) -> Self {
             let global_txn = Arc::new(GlobalTxnState::new());
             let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
             let metadata_catalog = Arc::new(MetadataCatalog::new(
@@ -446,7 +444,7 @@ mod tests {
                 store_handles,
                 metadata_catalog,
                 global_txn,
-                backend,
+                log_manager,
             );
 
             Self { session }
@@ -454,12 +452,9 @@ mod tests {
     }
 
     fn recover_existing_wal_if_present(base_path: &Path, applier: Arc<RecoveryExecutor>) {
-        let wal_path = GlobalWal::path_for_db(base_path);
-        if !wal_path.exists() {
+        let Some(reader) = open_recovery_reader_if_present(base_path) else {
             return;
-        }
-
-        let reader = WalFileReader::open(&wal_path).unwrap();
+        };
         recover_from_wal(applier, reader).unwrap();
     }
 
@@ -485,7 +480,7 @@ mod tests {
     #[test]
     fn create_table_allows_non_transactional_cursor_access() {
         let mut session =
-            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+            SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
         session.create_table(TEST_URI).unwrap();
 
         let mut cursor = session.open_table_cursor(TEST_URI).unwrap();
@@ -497,7 +492,7 @@ mod tests {
     #[test]
     fn create_rejects_index_uris() {
         let mut session =
-            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+            SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
 
         let err = session.create_table("index:test:name").unwrap_err();
         assert!(err.to_string().contains("only table:... is supported"));
@@ -506,7 +501,7 @@ mod tests {
     #[test]
     fn public_open_cursor_rejects_index_and_metadata_uris() {
         let mut session =
-            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+            SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
         session.create_table(TEST_URI).unwrap();
 
         let index_err = session.open_table_cursor("index:items:name").unwrap_err();
@@ -523,7 +518,7 @@ mod tests {
     #[test]
     fn transaction_open_cursor_rejects_index_and_metadata_uris() {
         let mut session =
-            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+            SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
         session.create_table(TEST_URI).unwrap();
 
         session
@@ -545,7 +540,7 @@ mod tests {
     #[test]
     fn transaction_cursor_reads_its_uncommitted_write() {
         let mut session =
-            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+            SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
         session.create_table(TEST_URI).unwrap();
 
         session
@@ -561,7 +556,7 @@ mod tests {
     #[test]
     fn local_mode_commit_makes_transactional_cursor_write_visible() {
         let mut session =
-            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+            SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
         session.create_table(TEST_URI).unwrap();
 
         session
@@ -575,7 +570,7 @@ mod tests {
     #[test]
     fn local_mode_abort_discards_transactional_cursor_write() {
         let mut session =
-            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+            SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
         session.create_table(TEST_URI).unwrap();
 
         let _ = session.with_transaction(|session| {
@@ -592,7 +587,7 @@ mod tests {
     #[test]
     fn dropped_with_transaction_guard_discards_transactional_cursor_write() {
         let mut session =
-            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+            SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
         session.create_table(TEST_URI).unwrap();
 
         let _ = session.with_transaction(|session| {
@@ -607,7 +602,7 @@ mod tests {
     #[test]
     fn implicit_write_failure_resets_other_open_cursors() {
         let mut session =
-            SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
+            SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
         session.create_table(TEST_URI).unwrap();
 
         {
@@ -635,7 +630,8 @@ mod tests {
         let base_path = dir.path().to_path_buf();
         let global_txn = Arc::new(GlobalTxnState::new());
         let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
-        let backend = Arc::new(DurabilityBackend::open(&base_path, true).unwrap());
+        let log_manager =
+            Arc::new(LogManager::open(&base_path, &LoggingConfig::default()).unwrap());
         let metadata_catalog = Arc::new(MetadataCatalog::new(
             base_path.clone(),
             store_handles.clone(),
@@ -645,14 +641,14 @@ mod tests {
             store_handles.clone(),
             metadata_catalog.clone(),
             global_txn.clone(),
-            backend.clone(),
+            log_manager.clone(),
         );
         let mut checkpoint_session = Session::new(
             base_path,
             store_handles,
             metadata_catalog,
             global_txn,
-            backend,
+            log_manager,
         );
         session.create_table(TEST_URI).unwrap();
 

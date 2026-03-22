@@ -7,7 +7,7 @@ use wrongodb::{Connection, ConnectionConfig};
 #[test]
 fn test_connection_basic() {
     let tmp = tempfile::tempdir().unwrap();
-    let conn = Connection::open(tmp.path().join("test"), ConnectionConfig::default()).unwrap();
+    let conn = Connection::open(tmp.path().join("test"), ConnectionConfig::new()).unwrap();
 
     let mut session = conn.open_session();
     session.create_table("table:test").unwrap();
@@ -27,7 +27,7 @@ fn test_connection_basic() {
 #[test]
 fn test_connection_with_config() {
     let tmp = tempfile::tempdir().unwrap();
-    let config = ConnectionConfig::new(false);
+    let config = ConnectionConfig::new().logging_enabled(false);
     let conn = Connection::open(tmp.path().join("test"), config).unwrap();
 
     let mut session = conn.open_session();
@@ -53,7 +53,7 @@ fn test_connection_with_config() {
 #[test]
 fn test_session_delete() {
     let tmp = tempfile::tempdir().unwrap();
-    let conn = Connection::open(tmp.path().join("test"), ConnectionConfig::default()).unwrap();
+    let conn = Connection::open(tmp.path().join("test"), ConnectionConfig::new()).unwrap();
 
     let mut session = conn.open_session();
     session.create_table("table:items").unwrap();
@@ -82,7 +82,7 @@ fn test_session_delete() {
 #[test]
 fn test_session_autocommit_visibility_with_wal() {
     let tmp = tempfile::tempdir().unwrap();
-    let conn = Connection::open(tmp.path().join("test"), ConnectionConfig::default()).unwrap();
+    let conn = Connection::open(tmp.path().join("test"), ConnectionConfig::new()).unwrap();
 
     let mut session = conn.open_session();
     session.create_table("table:kv").unwrap();

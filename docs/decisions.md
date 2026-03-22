@@ -2385,3 +2385,31 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
   one transaction produces one replayable data record.
 - Replay becomes simpler and more robust once the WAL already contains committed transaction
   boundaries instead of requiring recovery-time reconstruction.
+
+## 2026-03-22: Replace `DurabilityBackend` and `GlobalWal` with a concrete `LogManager`
+
+**Decision**
+- Remove the storage-internal `DurabilityBackend` enum and the `GlobalWal` facade.
+- Add a connection-owned `LogManager` as the concrete runtime owner of commit logging and
+  checkpoint logging.
+- Keep startup recovery separate from runtime logging, but move WAL discovery behind
+  `open_recovery_reader_if_present(...)` so `Connection` no longer reaches into a `GlobalWal`
+  helper.
+- Keep the current single-file `global.wal` format for now, but make it an implementation detail of
+  the logging subsystem through the lower-level `LogFile` writer in `storage::wal`.
+- Replace the old `ConnectionConfig::new(bool)` durability toggle with a nested logging config:
+  - `ConnectionConfig { logging: LoggingConfig }`
+  - `LoggingConfig { enabled, transaction_sync }`
+  - `TransactionSyncConfig { enabled, method }`
+  - `LogSyncMethod::{Fsync, Dsync, None}`
+
+**Why**
+- WiredTiger has a concrete connection-owned log manager, not a small runtime enum that pretends
+  durability is pluggable before the engine actually has multiple implementations.
+- `GlobalWal` added a second facade on top of the actual WAL file logic without carrying its own
+  storage invariants. Removing it shortens the mental path from `Connection` to session commit and
+  checkpoint logging.
+- The nested logging config moves the public API toward WT's shape now, while preserving existing
+  behavior: logging stays enabled by default and commits still sync by default.
+- Keeping recovery separate from runtime logging preserves the current startup semantics and avoids
+  conflating "replay existing durable state" with "append new runtime log records".

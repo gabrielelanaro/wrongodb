@@ -175,8 +175,8 @@ mod tests {
     use super::*;
     use crate::storage::api::Session;
     use crate::storage::btree::BTreeCursor;
-    use crate::storage::durability::DurabilityBackend;
     use crate::storage::handle_cache::HandleCache;
+    use crate::storage::log_manager::LogManager;
     use crate::storage::metadata_catalog::MetadataCatalog;
     use crate::txn::GlobalTxnState;
 
@@ -196,7 +196,7 @@ mod tests {
             store_handles,
             metadata_catalog,
             global_txn,
-            Arc::new(DurabilityBackend::Disabled),
+            Arc::new(LogManager::disabled()),
         );
         session.create_table("table:users").unwrap();
 

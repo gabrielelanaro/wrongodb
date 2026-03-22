@@ -1,8 +1,8 @@
 pub(crate) mod api;
 pub mod block;
 pub mod btree;
-pub(crate) mod durability;
 pub(crate) mod handle_cache;
+pub(crate) mod log_manager;
 pub(crate) mod metadata_catalog;
 pub mod mvcc;
 pub mod page_store;

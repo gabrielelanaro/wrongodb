@@ -393,7 +393,7 @@ mod tests {
     use super::*;
     use crate::storage::api::Session;
     use crate::storage::btree::BTreeCursor;
-    use crate::storage::durability::DurabilityBackend;
+    use crate::storage::log_manager::LogManager;
     use crate::txn::GlobalTxnState;
 
     fn insert_entries_in_transaction(
@@ -429,7 +429,7 @@ mod tests {
                 store_handles,
                 catalog.clone(),
                 global_txn,
-                Arc::new(DurabilityBackend::Disabled),
+                Arc::new(LogManager::disabled()),
             );
 
             Self { catalog, session }

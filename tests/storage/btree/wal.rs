@@ -16,7 +16,7 @@ fn global_wal_created_when_enabled() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("db");
 
-    let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+    let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
     insert_kv(&conn, "test", b"k1", b"v1").unwrap();
 
     assert!(global_wal_path(&db_path).exists());
@@ -26,7 +26,7 @@ fn global_wal_created_when_enabled() {
 fn global_wal_not_created_when_disabled() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("db");
-    let cfg = ConnectionConfig::new(false);
+    let cfg = ConnectionConfig::new().logging_enabled(false);
 
     let conn = Connection::open(&db_path, cfg).unwrap();
     insert_kv(&conn, "test", b"k1", b"v1").unwrap();
@@ -39,7 +39,7 @@ fn global_wal_grows_after_committed_writes() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("db");
 
-    let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
+    let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
 
     for i in 0..20 {
         let key = format!("k{i}");

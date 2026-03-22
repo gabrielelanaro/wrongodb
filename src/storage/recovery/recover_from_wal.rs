@@ -88,7 +88,7 @@ mod tests {
     use crate::storage::recovery::{recover_from_wal, RecoveryApplier, RecoveryExecutor};
     use crate::storage::table::{get_version, open_or_create_btree};
     use crate::storage::wal::{
-        GlobalWal, Lsn, RecoveryError, WalFileReader, WalReader, WalRecord, WalRecordHeader,
+        LogFile, Lsn, RecoveryError, WalFileReader, WalReader, WalRecord, WalRecordHeader,
     };
     use crate::txn::{GlobalTxnState, TxnLogOp, TXN_NONE};
 
@@ -193,7 +193,7 @@ mod tests {
             store_handles.clone(),
             global_txn,
         ));
-        let reader = WalFileReader::open(GlobalWal::path_for_db(base_path)).unwrap();
+        let reader = WalFileReader::open(base_path.join("global.wal")).unwrap();
         recover_from_wal(applier, reader).unwrap();
 
         let store = store_handles
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn test_recover_from_wal_skips_incomplete_write_from_real_wal_file() {
         let dir = tempdir().unwrap();
-        let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
+        let mut wal = LogFile::open_or_create(dir.path().join("global.wal")).unwrap();
         wal.log_txn_commit(
             7,
             7,
@@ -289,7 +289,7 @@ mod tests {
         .unwrap();
         wal.sync().unwrap();
 
-        let wal_path = GlobalWal::path_for_db(dir.path());
+        let wal_path = dir.path().join("global.wal");
         let len = std::fs::metadata(&wal_path).unwrap().len();
         let file = std::fs::OpenOptions::new()
             .write(true)
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn test_recover_from_wal_replays_metadata_before_data_within_same_transaction() {
         let dir = tempdir().unwrap();
-        let mut wal = GlobalWal::open_or_create(dir.path()).unwrap();
+        let mut wal = LogFile::open_or_create(dir.path().join("global.wal")).unwrap();
 
         wal.log_txn_commit(
             7,
@@ -325,7 +325,7 @@ mod tests {
         .unwrap();
         wal.sync().unwrap();
 
-        let conn = Connection::open(dir.path(), ConnectionConfig::new(true)).unwrap();
+        let conn = Connection::open(dir.path(), ConnectionConfig::new()).unwrap();
 
         assert_eq!(
             conn.metadata_catalog()

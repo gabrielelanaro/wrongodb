@@ -194,8 +194,8 @@ mod tests {
     use crate::collection_write_path::CollectionWritePath;
     use crate::schema::SchemaCatalog;
     use crate::storage::btree::BTreeCursor;
-    use crate::storage::durability::DurabilityBackend;
     use crate::storage::handle_cache::HandleCache;
+    use crate::storage::log_manager::LogManager;
     use crate::storage::metadata_catalog::MetadataCatalog;
     use crate::txn::GlobalTxnState;
 
@@ -222,7 +222,7 @@ mod tests {
                 base_path.clone(),
                 metadata_catalog.clone(),
             ));
-            let backend = Arc::new(DurabilityBackend::Disabled);
+            let log_manager = Arc::new(LogManager::disabled());
             let query = DocumentQuery::new(schema_catalog.clone());
             let write_path = CollectionWritePath::new(
                 metadata_catalog.clone(),
@@ -234,7 +234,7 @@ mod tests {
                 store_handles,
                 metadata_catalog,
                 global_txn,
-                backend,
+                log_manager,
             );
 
             Self {

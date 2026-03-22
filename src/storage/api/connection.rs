@@ -7,51 +7,67 @@ use parking_lot::RwLock;
 
 use crate::storage::api::session::Session;
 use crate::storage::btree::BTreeCursor;
-use crate::storage::durability::DurabilityBackend;
 use crate::storage::handle_cache::HandleCache;
+use crate::storage::log_manager::{open_recovery_reader_if_present, LogManager};
+pub use crate::storage::log_manager::{LogSyncMethod, LoggingConfig, TransactionSyncConfig};
 use crate::storage::metadata_catalog::MetadataCatalog;
 use crate::storage::recovery::{recover_from_wal, RecoveryExecutor};
-use crate::storage::wal::{GlobalWal, WalFileReader};
 use crate::txn::GlobalTxnState;
 use crate::WrongoDBError;
 
 /// Configuration used when opening a [`Connection`].
 ///
 /// The public connection constructor stays intentionally small. This struct is
-/// where callers choose storage durability mode without having to know about
+/// where callers choose storage logging policy without having to know about
 /// the internal storage and recovery wiring.
-#[derive(Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectionConfig {
-    /// Enables WAL recording for storage writes.
-    ///
-    /// WAL replay on startup is always attempted if `global.wal` exists. This
-    /// flag only controls whether new local writes append to the WAL after the
-    /// connection is opened.
-    pub wal_enabled: bool,
+    /// Runtime logging configuration for storage commits and checkpoints.
+    pub logging: LoggingConfig,
 }
 
 impl Default for ConnectionConfig {
     fn default() -> Self {
-        Self { wal_enabled: true }
+        Self {
+            logging: LoggingConfig::default(),
+        }
     }
 }
 
 impl ConnectionConfig {
-    /// Create a config from explicit storage durability policy inputs.
+    /// Create a config from the default logging policy.
     ///
-    /// Callers provide the storage-affecting inputs at the construction site so
-    /// the local durability mode stays visible instead of being implied by a
-    /// hidden default.
-    pub fn new(wal_enabled: bool) -> Self {
-        Self { wal_enabled }
+    /// The returned config preserves the current behavior: logging enabled and
+    /// synchronous commit flushes.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Override whether WAL recording is enabled.
+    /// Override whether runtime logging is enabled.
     ///
-    /// This stays on the config builder so durability mode is chosen before the
-    /// engine is opened, not mutated later at runtime.
-    pub fn wal_enabled(mut self, enabled: bool) -> Self {
-        self.wal_enabled = enabled;
+    /// Startup recovery still runs if a log file is present. This flag only
+    /// controls whether newly opened connections append new log records.
+    pub fn logging_enabled(mut self, enabled: bool) -> Self {
+        self.logging.enabled = enabled;
+        self
+    }
+
+    /// Override whether commits should sync the log by default.
+    ///
+    /// When disabled, commits still append log records if logging is enabled,
+    /// but they do not force the log to stable storage on each commit.
+    pub fn transaction_sync_enabled(mut self, enabled: bool) -> Self {
+        self.logging.transaction_sync.enabled = enabled;
+        self
+    }
+
+    /// Override the configured log sync method.
+    ///
+    /// `Fsync` and `Dsync` are currently implemented the same way in the local
+    /// log manager, but both names are exposed so the public API already
+    /// matches the intended WT-style configuration shape.
+    pub fn transaction_sync_method(mut self, method: LogSyncMethod) -> Self {
+        self.logging.transaction_sync.method = method;
         self
     }
 }
@@ -70,7 +86,7 @@ pub struct Connection {
     metadata_catalog: Arc<MetadataCatalog>,
     store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
     global_txn: Arc<GlobalTxnState>,
-    durability_backend: Arc<DurabilityBackend>,
+    log_manager: Arc<LogManager>,
 }
 
 impl fmt::Debug for Connection {
@@ -92,7 +108,7 @@ impl Connection {
     where
         P: AsRef<Path>,
     {
-        let ConnectionConfig { wal_enabled } = config;
+        let ConnectionConfig { logging } = config;
         let base_path = path.as_ref().to_path_buf();
         fs::create_dir_all(&base_path)?;
 
@@ -109,18 +125,18 @@ impl Connection {
             global_txn.clone(),
         ));
 
-        if let Some(recovery_reader) = open_recovery_reader(&base_path) {
+        if let Some(recovery_reader) = open_recovery_reader_if_present(&base_path) {
             recover_from_wal(recovery_executor, recovery_reader)?;
         }
 
-        let durability_backend = Arc::new(DurabilityBackend::open(&base_path, wal_enabled)?);
+        let log_manager = Arc::new(LogManager::open(&base_path, &logging)?);
 
         Ok(Self {
             base_path,
             metadata_catalog,
             store_handles,
             global_txn,
-            durability_backend,
+            log_manager,
         })
     }
 
@@ -138,7 +154,7 @@ impl Connection {
             self.store_handles.clone(),
             self.metadata_catalog.clone(),
             self.global_txn.clone(),
-            self.durability_backend.clone(),
+            self.log_manager.clone(),
         )
     }
 
@@ -148,20 +164,5 @@ impl Connection {
 
     pub(crate) fn base_path(&self) -> &Path {
         &self.base_path
-    }
-}
-
-fn open_recovery_reader(base_path: &Path) -> Option<WalFileReader> {
-    let wal_path = GlobalWal::path_for_db(base_path);
-    if !wal_path.exists() {
-        return None;
-    }
-
-    match WalFileReader::open(&wal_path) {
-        Ok(reader) => Some(reader),
-        Err(err) => {
-            eprintln!("Skipping global WAL recovery (failed to open WAL): {err}");
-            None
-        }
     }
 }

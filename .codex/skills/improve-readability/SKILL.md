@@ -26,6 +26,9 @@ Keep helpers that name an important domain concept or invariant.
 <improvement id="tight-interfaces" applies-to="class,module">
 Prefer small public interfaces with explicit names over generic ones.
 </improvement>
+<improvement id="fully-documented-interfaces" applies-to="class,function,method,module">
+If an interface is used by other modules, fully document it. Document the type or module itself, all functions and methods that form the interface, and all fields on structs that are part of that interface.
+</improvement>
 <improvement id="explain-behavior-and-constraints" applies-to="module,function,method,class">
 Write comments to explain behavior and important constraints.
 </improvement>
@@ -44,6 +47,26 @@ Do not put logic in mod.rs, use that just to organize the exports.
 
 The outcome is simple, easy to grasp code, where the excess has been removed, terminology is consistent, and the intent is obvious.
 
-Identify the list of module, classes, functions, analize each one of them individually for the improvements that applies to them
+Identify the list of module, classes, functions, filenames, directory analize each one of them individually for the improvements that applies to them
 
-Work thorugh this checklist and summarize for each item the improvement you intend to make (or None, but be explicit with each one of these.) Only then, proceed with the implementation.
+Work thorugh this checklist and summarize for each item the improvement you intend to make (or None, but be explicit with each one of these.)
+
+Example summary:
+
+- <improvement-id>:
+    classes:
+       <class-1>: ok
+       <class-2>: improve
+       ...
+    methods:
+       <meth-1>: ...
+    modules:
+       <mod-1>: ...
+    functions:
+       <func-1>: ...
+    filenames:
+       <fn-1>: ...
+    directories:
+       <dir-1>: ...
+
+Only after this careful analysis, proceed with the implementation.

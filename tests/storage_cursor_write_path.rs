@@ -14,7 +14,7 @@ fn insert_kv(conn: &Connection, key: &[u8], value: &[u8]) -> Result<(), WrongoDB
 fn wal_enabled_connection_allows_public_cursor_writes() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("db");
-    let conn = Connection::open(&path, ConnectionConfig::new(true)).unwrap();
+    let conn = Connection::open(&path, ConnectionConfig::new()).unwrap();
 
     insert_kv(&conn, b"alice", b"value").unwrap();
 
@@ -28,7 +28,7 @@ fn wal_enabled_connection_allows_public_cursor_writes() {
 fn wal_disabled_connection_allows_public_cursor_writes() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("db");
-    let conn = Connection::open(&path, ConnectionConfig::new(false)).unwrap();
+    let conn = Connection::open(&path, ConnectionConfig::new().logging_enabled(false)).unwrap();
 
     insert_kv(&conn, b"alice", b"value").unwrap();
 

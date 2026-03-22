@@ -418,15 +418,15 @@ mod tests {
     use crate::schema::SchemaCatalog;
     use crate::storage::api::Session;
     use crate::storage::btree::BTreeCursor;
-    use crate::storage::durability::DurabilityBackend;
     use crate::storage::handle_cache::HandleCache;
+    use crate::storage::log_manager::LogManager;
     use crate::storage::metadata_catalog::MetadataCatalog;
     use crate::txn::GlobalTxnState;
     use crate::WrongoDBError;
 
     fn test_services(
         base_path: std::path::PathBuf,
-        backend: DurabilityBackend,
+        log_manager: LogManager,
     ) -> (CollectionWritePath, DocumentQuery, Session) {
         let global_txn = Arc::new(GlobalTxnState::new());
         let store_handles =
@@ -439,7 +439,7 @@ mod tests {
             base_path.clone(),
             metadata_catalog.clone(),
         ));
-        let backend = Arc::new(backend);
+        let log_manager = Arc::new(log_manager);
         let document_query = DocumentQuery::new(schema_catalog.clone());
         let service = CollectionWritePath::new(
             metadata_catalog.clone(),
@@ -451,7 +451,7 @@ mod tests {
             store_handles,
             metadata_catalog,
             global_txn,
-            backend,
+            log_manager,
         );
         (service, document_query, session)
     }
@@ -517,7 +517,7 @@ mod tests {
     fn create_index_backfills_existing_documents() {
         let tmp = tempdir().unwrap();
         let (service, _query, mut session) =
-            test_services(tmp.path().to_path_buf(), DurabilityBackend::Disabled);
+            test_services(tmp.path().to_path_buf(), LogManager::disabled());
 
         service
             .insert_one(&mut session, "users", json!({"_id": 1, "name": "alice"}))
@@ -537,7 +537,7 @@ mod tests {
     fn crud_roundtrip() {
         let tmp = tempdir().unwrap();
         let (service, query, mut session) =
-            test_services(tmp.path().to_path_buf(), DurabilityBackend::Disabled);
+            test_services(tmp.path().to_path_buf(), LogManager::disabled());
 
         let inserted = service
             .insert_one(&mut session, "users", json!({"name": "alice", "age": 30}))
@@ -585,7 +585,7 @@ mod tests {
     fn create_index_registers_index_name() {
         let tmp = tempdir().unwrap();
         let (service, query, mut session) =
-            test_services(tmp.path().to_path_buf(), DurabilityBackend::Disabled);
+            test_services(tmp.path().to_path_buf(), LogManager::disabled());
 
         service
             .insert_one(&mut session, "users", json!({"_id": 1, "name": "alice"}))
@@ -600,7 +600,7 @@ mod tests {
     fn failing_transaction_aborts_changes() {
         let tmp = tempdir().unwrap();
         let (service, query, mut session) =
-            test_services(tmp.path().to_path_buf(), DurabilityBackend::Disabled);
+            test_services(tmp.path().to_path_buf(), LogManager::disabled());
 
         let err = service
             .run_in_transaction(&mut session, |this, session| {

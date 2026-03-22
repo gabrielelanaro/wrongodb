@@ -34,7 +34,10 @@ fn storage_api_mod_reexports_storage_surface() {
     let storage_api_mod = read("src/storage/api/mod.rs");
 
     assert!(!storage_api_mod.contains("pub use crate::replication::{RaftMode, RaftPeerConfig};"));
-    assert!(storage_api_mod.contains("pub use connection::{Connection, ConnectionConfig};"));
+    assert!(storage_api_mod.contains("pub use connection::{"));
+    assert!(storage_api_mod.contains(
+        "Connection, ConnectionConfig, LogSyncMethod, LoggingConfig, TransactionSyncConfig,"
+    ));
     assert!(storage_api_mod.contains("pub use cursor::{CursorEntry, TableCursor};"));
     assert!(storage_api_mod.contains("pub use session::Session;"));
     assert!(!storage_api_mod.contains("WriteUnitOfWork"));
