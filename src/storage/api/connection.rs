@@ -11,7 +11,7 @@ use crate::storage::handle_cache::HandleCache;
 use crate::storage::log_manager::{open_recovery_reader_if_present, LogManager};
 pub use crate::storage::log_manager::{LogSyncMethod, LoggingConfig, TransactionSyncConfig};
 use crate::storage::metadata_catalog::MetadataCatalog;
-use crate::storage::recovery::{recover_from_wal, RecoveryExecutor};
+use crate::storage::recovery::recover_from_wal;
 use crate::txn::GlobalTxnState;
 use crate::WrongoDBError;
 
@@ -118,15 +118,14 @@ impl Connection {
             base_path.clone(),
             store_handles.clone(),
         ));
-        let recovery_executor = Arc::new(RecoveryExecutor::new(
-            base_path.clone(),
-            metadata_catalog.clone(),
-            store_handles.clone(),
-            global_txn.clone(),
-        ));
-
         if let Some(recovery_reader) = open_recovery_reader_if_present(&base_path) {
-            recover_from_wal(recovery_executor, recovery_reader)?;
+            recover_from_wal(
+                &base_path,
+                metadata_catalog.as_ref(),
+                store_handles.as_ref(),
+                global_txn.as_ref(),
+                recovery_reader,
+            )?;
         }
 
         let log_manager = Arc::new(LogManager::open(&base_path, &logging)?);

@@ -387,7 +387,7 @@ mod tests {
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::log_manager::{open_recovery_reader_if_present, LogManager, LoggingConfig};
     use crate::storage::metadata_catalog::MetadataCatalog;
-    use crate::storage::recovery::{recover_from_wal, RecoveryExecutor};
+    use crate::storage::recovery::recover_from_wal;
     use crate::storage::wal::{WalFileReader, WalReader, WalRecord};
     use crate::txn::GlobalTxnState;
 
@@ -416,13 +416,12 @@ mod tests {
                 base_path.clone(),
                 store_handles.clone(),
             ));
-            let applier = Arc::new(RecoveryExecutor::new(
-                base_path.clone(),
-                metadata_catalog,
-                store_handles.clone(),
-                global_txn,
-            ));
-            recover_existing_wal_if_present(&base_path, applier.clone());
+            recover_existing_wal_if_present(
+                &base_path,
+                metadata_catalog.as_ref(),
+                store_handles.as_ref(),
+                global_txn.as_ref(),
+            );
             let log_manager =
                 Arc::new(LogManager::open(&base_path, &LoggingConfig::default()).unwrap());
             Self::build(base_path, log_manager)
@@ -451,11 +450,23 @@ mod tests {
         }
     }
 
-    fn recover_existing_wal_if_present(base_path: &Path, applier: Arc<RecoveryExecutor>) {
+    fn recover_existing_wal_if_present(
+        base_path: &Path,
+        metadata_catalog: &MetadataCatalog,
+        store_handles: &HandleCache<String, RwLock<BTreeCursor>>,
+        global_txn: &GlobalTxnState,
+    ) {
         let Some(reader) = open_recovery_reader_if_present(base_path) else {
             return;
         };
-        recover_from_wal(applier, reader).unwrap();
+        recover_from_wal(
+            base_path,
+            metadata_catalog,
+            store_handles,
+            global_txn,
+            reader,
+        )
+        .unwrap();
     }
 
     fn read_wal_records(db_dir: &std::path::Path) -> Vec<WalRecord> {

@@ -1,12 +1,20 @@
+use std::path::Path;
 use std::sync::Arc;
 
+use parking_lot::RwLock;
+
 use crate::core::errors::StorageError;
-use crate::storage::recovery::RecoveryApplier;
+use crate::storage::btree::BTreeCursor;
+use crate::storage::handle_cache::HandleCache;
+use crate::storage::metadata_catalog::MetadataCatalog;
+use crate::storage::table::{checkpoint_store, open_or_create_btree};
 use crate::storage::wal::{RecoveryError, WalReader, WalRecord};
-use crate::txn::{TxnId, TxnLogOp};
+use crate::txn::{GlobalTxnState, Transaction, TxnId, TxnLogOp};
 use crate::WrongoDBError;
 
-#[derive(Debug)]
+type StoreHandleCache = HandleCache<String, RwLock<BTreeCursor>>;
+
+#[derive(Debug, PartialEq, Eq)]
 struct CommittedTransaction {
     txn_id: TxnId,
     ops: Vec<TxnLogOp>,
@@ -18,14 +26,63 @@ struct CommittedTransaction {
 /// final WAL write as end-of-log, which lets startup proceed after a crash that
 /// interrupted the last append.
 pub(crate) fn recover_from_wal(
-    applier: Arc<impl RecoveryApplier>,
+    base_path: &Path,
+    metadata_catalog: &MetadataCatalog,
+    store_handles: &StoreHandleCache,
+    global_txn: &GlobalTxnState,
     mut reader: impl WalReader,
 ) -> Result<(), WrongoDBError> {
     while let Some(txn) = next_committed_transaction(&mut reader)? {
-        applier.apply_committed_transaction(txn.txn_id, &txn.ops)?;
+        apply_committed_transaction(
+            base_path,
+            metadata_catalog,
+            store_handles,
+            global_txn,
+            txn.txn_id,
+            &txn.ops,
+        )?;
     }
 
-    applier.checkpoint_open_stores()?;
+    checkpoint_recovered_stores(store_handles, global_txn)?;
+    Ok(())
+}
+
+fn apply_committed_transaction(
+    base_path: &Path,
+    metadata_catalog: &MetadataCatalog,
+    store_handles: &StoreHandleCache,
+    global_txn: &GlobalTxnState,
+    txn_id: TxnId,
+    ops: &[TxnLogOp],
+) -> Result<(), WrongoDBError> {
+    let mut txn = Transaction::replay(txn_id);
+
+    for op in ops {
+        apply_replayed_operation(
+            base_path,
+            metadata_catalog,
+            store_handles,
+            &mut txn,
+            txn_id,
+            op,
+        )?;
+    }
+
+    // Replay transactions publish recovered changes into MVCC state without
+    // buffering fresh WAL records.
+    txn.commit(global_txn)?;
+    Ok(())
+}
+
+fn checkpoint_recovered_stores(
+    store_handles: &StoreHandleCache,
+    global_txn: &GlobalTxnState,
+) -> Result<(), WrongoDBError> {
+    // Recovery only opens the stores it needs, so checkpointing the handle
+    // cache seals exactly the recovered working set.
+    for store in store_handles.all_handles() {
+        checkpoint_store(&mut store.write(), global_txn)?;
+    }
     Ok(())
 }
 
@@ -67,13 +124,70 @@ fn read_next_record_or_stop_at_corrupt_tail(
     }
 }
 
+fn apply_replayed_operation(
+    base_path: &Path,
+    metadata_catalog: &MetadataCatalog,
+    store_handles: &StoreHandleCache,
+    txn: &mut Transaction,
+    txn_id: TxnId,
+    op: &TxnLogOp,
+) -> Result<(), WrongoDBError> {
+    match op {
+        TxnLogOp::Put { uri, key, value } => {
+            let store = open_store_for_recovery_uri(
+                base_path,
+                metadata_catalog,
+                store_handles,
+                uri,
+                txn_id,
+            )?;
+            store.write().put(uri, key, value, txn)?;
+        }
+        TxnLogOp::Delete { uri, key } => {
+            let store = open_store_for_recovery_uri(
+                base_path,
+                metadata_catalog,
+                store_handles,
+                uri,
+                txn_id,
+            )?;
+            let _ = store.write().delete(uri, key, txn)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn open_store_for_recovery_uri(
+    base_path: &Path,
+    metadata_catalog: &MetadataCatalog,
+    store_handles: &StoreHandleCache,
+    uri: &str,
+    txn_id: TxnId,
+) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
+    let store_name = metadata_catalog
+        .lookup_store_name_for_txn(uri, txn_id)?
+        .ok_or_else(|| StorageError(format!("unknown URI during recovery: {uri}")))?;
+    open_store_by_name(base_path, store_handles, &store_name)
+}
+
+fn open_store_by_name(
+    base_path: &Path,
+    store_handles: &StoreHandleCache,
+    store_name: &str,
+) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
+    store_handles.get_or_try_insert_with(store_name.to_string(), |store_name| {
+        let path = base_path.join(store_name);
+        Ok(RwLock::new(open_or_create_btree(path)?))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::Arc;
 
-    use parking_lot::Mutex;
     use serde::Serialize;
     use tempfile::tempdir;
 
@@ -81,7 +195,7 @@ mod tests {
     use crate::storage::btree::BTreeCursor;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::metadata_catalog::{MetadataCatalog, METADATA_URI};
-    use crate::storage::recovery::{recover_from_wal, RecoveryApplier, RecoveryExecutor};
+    use crate::storage::recovery::recover_from_wal;
     use crate::storage::table::{get_version, open_or_create_btree};
     use crate::storage::wal::{
         LogFile, Lsn, RecoveryError, WalFileReader, WalReader, WalRecord, WalRecordHeader,
@@ -89,38 +203,6 @@ mod tests {
     use crate::txn::{GlobalTxnState, TxnLogOp, TXN_NONE};
 
     const TEST_URI: &str = "table:test";
-
-    #[derive(Debug, Default)]
-    struct RecordingRecoveryApplier {
-        applied: Mutex<Vec<(u64, Vec<TxnLogOp>)>>,
-        checkpoint_count: Mutex<usize>,
-    }
-
-    impl RecordingRecoveryApplier {
-        fn applied(&self) -> Vec<(u64, Vec<TxnLogOp>)> {
-            self.applied.lock().clone()
-        }
-
-        fn checkpoint_count(&self) -> usize {
-            *self.checkpoint_count.lock()
-        }
-    }
-
-    impl RecoveryApplier for RecordingRecoveryApplier {
-        fn apply_committed_transaction(
-            &self,
-            txn_id: u64,
-            ops: &[TxnLogOp],
-        ) -> Result<(), crate::WrongoDBError> {
-            self.applied.lock().push((txn_id, ops.to_vec()));
-            Ok(())
-        }
-
-        fn checkpoint_open_stores(&self) -> Result<(), crate::WrongoDBError> {
-            *self.checkpoint_count.lock() += 1;
-            Ok(())
-        }
-    }
 
     struct TestWalReader {
         records: VecDeque<(WalRecordHeader, WalRecord)>,
@@ -183,14 +265,15 @@ mod tests {
             base_path.to_path_buf(),
             store_handles.clone(),
         ));
-        let applier = Arc::new(RecoveryExecutor::new(
-            base_path.to_path_buf(),
-            metadata_catalog,
-            store_handles.clone(),
-            global_txn,
-        ));
         let reader = WalFileReader::open(base_path.join("global.wal")).unwrap();
-        recover_from_wal(applier, reader).unwrap();
+        recover_from_wal(
+            base_path,
+            metadata_catalog.as_ref(),
+            store_handles.as_ref(),
+            global_txn.as_ref(),
+            reader,
+        )
+        .unwrap();
 
         let store = store_handles
             .get_or_try_insert_with(store_name.to_string(), |store_name| {
@@ -203,9 +286,8 @@ mod tests {
     }
 
     #[test]
-    fn test_recover_from_wal_replays_autocommit_writes() {
-        let applier = Arc::new(RecordingRecoveryApplier::default());
-        let reader = TestWalReader::new(vec![test_wal_record(
+    fn test_next_committed_transaction_returns_commit_record() {
+        let mut reader = TestWalReader::new(vec![test_wal_record(
             1,
             WalRecord::TxnCommit {
                 txn_id: 7,
@@ -218,28 +300,25 @@ mod tests {
             },
         )]);
 
-        recover_from_wal(applier.clone(), reader).unwrap();
-
         assert_eq!(
-            applier.applied(),
-            vec![(
-                7,
-                vec![TxnLogOp::Put {
+            super::next_committed_transaction(&mut reader).unwrap(),
+            Some(super::CommittedTransaction {
+                txn_id: 7,
+                ops: vec![TxnLogOp::Put {
                     uri: TEST_URI.to_string(),
                     key: b"k1".to_vec(),
                     value: b"v1".to_vec(),
                 }],
-            )]
+            })
         );
-        assert_eq!(applier.checkpoint_count(), 1);
     }
 
     #[test]
-    fn test_recover_from_wal_applies_only_committed_transactional_changes() {
-        let applier = Arc::new(RecordingRecoveryApplier::default());
-        let reader = TestWalReader::new(vec![
+    fn test_next_committed_transaction_skips_checkpoint_records() {
+        let mut reader = TestWalReader::new(vec![
+            test_wal_record(1, WalRecord::Checkpoint),
             test_wal_record(
-                1,
+                2,
                 WalRecord::TxnCommit {
                     txn_id: 7,
                     commit_ts: 7,
@@ -250,23 +329,19 @@ mod tests {
                     }],
                 },
             ),
-            test_wal_record(2, WalRecord::Checkpoint),
         ]);
 
-        recover_from_wal(applier.clone(), reader).unwrap();
-
         assert_eq!(
-            applier.applied(),
-            vec![(
-                7,
-                vec![TxnLogOp::Put {
+            super::next_committed_transaction(&mut reader).unwrap(),
+            Some(super::CommittedTransaction {
+                txn_id: 7,
+                ops: vec![TxnLogOp::Put {
                     uri: TEST_URI.to_string(),
                     key: b"committed".to_vec(),
                     value: b"v1".to_vec(),
                 }],
-            )]
+            })
         );
-        assert_eq!(applier.checkpoint_count(), 1);
     }
 
     #[test]

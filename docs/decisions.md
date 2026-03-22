@@ -2413,3 +2413,40 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
   behavior: logging stays enabled by default and commits still sync by default.
 - Keeping recovery separate from runtime logging preserves the current startup semantics and avoids
   conflating "replay existing durable state" with "append new runtime log records".
+
+## 2026-03-22: Keep recovery as one concrete module instead of a scanner-to-applier trait seam
+
+**Decision**
+- Remove the `RecoveryApplier` trait and the separate `src/storage/recovery/executor.rs` file.
+- Merge the concrete `RecoveryExecutor` into `src/storage/recovery/recover_from_wal.rs`.
+- Make `recover_from_wal(...)` take `&RecoveryExecutor` directly and keep the scan/apply split as
+  private helpers inside the same module.
+- Replace trait-mocking unit tests with tests over private WAL-scanning helpers plus the existing
+  end-to-end replay tests.
+
+**Why**
+- There was only one real recovery implementation, so the trait added indirection without giving us
+  a meaningful extension point.
+- WT keeps recovery as one concrete subsystem with concrete recovery state and helper functions,
+  rather than introducing a separate apply interface just for log scanning.
+- Merging the files shortens the mental path through startup recovery: read WAL records, replay each
+  committed transaction, checkpoint the recovered stores.
+
+## 2026-03-22: Make `recover_from_wal` the only recovery interface
+
+**Decision**
+- Remove the caller-constructed `RecoveryExecutor` bundle.
+- Make `recover_from_wal(...)` take its concrete recovery dependencies explicitly:
+  - `base_path`
+  - `metadata_catalog`
+  - `store_handles`
+  - `global_txn`
+  - `reader`
+- Keep the helper split entirely private inside `src/storage/recovery/recover_from_wal.rs`.
+
+**Why**
+- `RecoveryExecutor` had no independent behavior or alternate clients; it was only packaging inputs
+  for `recover_from_wal(...)`.
+- Passing the real recovery dependencies at the module boundary makes the public shape honest:
+  `recover_from_wal(...)` is the recovery interface.
+- Keeping the helpers private still avoids reintroducing a fake architectural seam elsewhere.
