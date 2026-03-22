@@ -18,16 +18,16 @@ impl CatalogRecovery {
         connection: &Connection,
     ) -> Result<CatalogRecoveryReport, WrongoDBError> {
         let metadata_catalog = connection.metadata_catalog();
-        let mut referenced_sources = metadata_catalog.all_sources()?;
-        referenced_sources.push(METADATA_STORE_NAME.to_string());
-        referenced_sources.sort();
-        referenced_sources.dedup();
+        let mut referenced_store_names = metadata_catalog.all_store_names()?;
+        referenced_store_names.push(METADATA_STORE_NAME.to_string());
+        referenced_store_names.sort();
+        referenced_store_names.dedup();
 
         let mut on_disk_sources = list_store_files(connection.base_path())?;
         on_disk_sources.sort();
         on_disk_sources.dedup();
 
-        let missing_sources = referenced_sources
+        let missing_sources = referenced_store_names
             .iter()
             .filter(|source| !on_disk_sources.contains(source))
             .cloned()
@@ -42,7 +42,7 @@ impl CatalogRecovery {
 
         let unreferenced_sources = on_disk_sources
             .into_iter()
-            .filter(|source| !referenced_sources.contains(source))
+            .filter(|source| !referenced_store_names.contains(source))
             .collect();
         Ok(CatalogRecoveryReport {
             unreferenced_sources,

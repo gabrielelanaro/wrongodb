@@ -329,7 +329,7 @@ mod tests {
 
         assert_eq!(
             conn.metadata_catalog()
-                .lookup_source("table:items")
+                .lookup_store_name("table:items")
                 .unwrap(),
             Some("items.main.wt".to_string())
         );

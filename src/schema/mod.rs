@@ -56,9 +56,9 @@ impl SchemaCatalog {
         txn_id: TxnId,
     ) -> Result<CollectionSchema, WrongoDBError> {
         let uri = table_uri(collection);
-        let _primary_store = self
+        let _primary_store_name = self
             .metadata_catalog
-            .lookup_source_for_txn(&uri, txn_id)?
+            .lookup_store_name_for_txn(&uri, txn_id)?
             .ok_or_else(|| StorageError(format!("unknown collection: {uri}")))?;
         let indexes = self.load_index_definitions(collection)?;
         Ok(CollectionSchema { indexes })
@@ -76,7 +76,12 @@ impl SchemaCatalog {
             .metadata_catalog
             .scan_prefix(TABLE_URI_PREFIX)?
             .into_iter()
-            .filter_map(|entry| entry.uri.strip_prefix(TABLE_URI_PREFIX).map(str::to_string))
+            .filter_map(|entry| {
+                entry
+                    .uri()
+                    .strip_prefix(TABLE_URI_PREFIX)
+                    .map(str::to_string)
+            })
             .collect::<Vec<_>>();
         names.sort();
         names.dedup();
@@ -91,7 +96,7 @@ impl SchemaCatalog {
         let uri = table_uri(collection);
         Ok(self
             .metadata_catalog
-            .lookup_source_for_txn(&uri, txn_id)?
+            .lookup_store_name_for_txn(&uri, txn_id)?
             .is_some())
     }
 

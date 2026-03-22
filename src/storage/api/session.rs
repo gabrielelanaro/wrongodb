@@ -107,7 +107,7 @@ impl Session {
 
     /// Flush all known stores to a stable checkpoint.
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
-        let mut store_names = self.metadata_catalog.all_sources()?;
+        let mut store_names = self.metadata_catalog.all_store_names()?;
         store_names.push(METADATA_STORE_NAME.to_string());
         store_names.sort();
         store_names.dedup();
@@ -299,7 +299,7 @@ impl Session {
 
         let store_name = self
             .metadata_catalog
-            .lookup_source_for_txn(uri, txn_id)?
+            .lookup_store_name_for_txn(uri, txn_id)?
             .ok_or_else(|| StorageError(format!("unknown URI: {uri}")))?;
         self.open_store_by_name(&store_name)
     }

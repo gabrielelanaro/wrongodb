@@ -48,14 +48,15 @@ impl RecoveryExecutor {
         uri: &str,
         txn_id: TxnId,
     ) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
-        let source = self
+        let store_name = self
             .metadata_catalog
-            .lookup_source_for_txn(uri, txn_id)?
+            .lookup_store_name_for_txn(uri, txn_id)?
             .ok_or_else(|| StorageError(format!("unknown URI during apply: {uri}")))?;
-        self.store_handles.get_or_try_insert_with(source, |source| {
-            let path = self.base_path.join(source);
-            Ok(RwLock::new(open_or_create_btree(path)?))
-        })
+        self.store_handles
+            .get_or_try_insert_with(store_name, |store_name| {
+                let path = self.base_path.join(store_name);
+                Ok(RwLock::new(open_or_create_btree(path)?))
+            })
     }
 }
 
