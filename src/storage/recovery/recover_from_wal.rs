@@ -2,52 +2,55 @@ use std::sync::Arc;
 
 use crate::core::errors::StorageError;
 use crate::storage::recovery::RecoveryApplier;
-use crate::storage::wal::{RecoveryError, WalReader, WalRecord, WalRecordHeader};
+use crate::storage::wal::{RecoveryError, WalReader, WalRecord};
+use crate::txn::{TxnId, TxnLogOp};
 use crate::WrongoDBError;
 
 #[derive(Debug)]
-enum RecoveryAction {
-    ApplyCommittedTransaction {
-        txn_id: crate::txn::TxnId,
-        ops: Vec<crate::txn::TxnLogOp>,
-    },
-    Ignore,
+struct CommittedTransaction {
+    txn_id: TxnId,
+    ops: Vec<TxnLogOp>,
 }
 
-/// Replays committed WAL operations into the storage recovery executor.
+/// Replays committed transactions from the global WAL into storage.
+///
+/// Recovery stops when it reaches a corrupted tail record. That treats a torn
+/// final WAL write as end-of-log, which lets startup proceed after a crash that
+/// interrupted the last append.
 pub(crate) fn recover_from_wal(
     applier: Arc<impl RecoveryApplier>,
     mut reader: impl WalReader,
 ) -> Result<(), WrongoDBError> {
-    while let Some(action) = read_next_recovery_action(&mut reader)? {
-        match action {
-            RecoveryAction::ApplyCommittedTransaction { txn_id, ops } => {
-                applier.apply_committed_transaction(txn_id, &ops)?;
-            }
-            RecoveryAction::Ignore => {}
-        }
+    while let Some(txn) = next_committed_transaction(&mut reader)? {
+        applier.apply_committed_transaction(txn.txn_id, &txn.ops)?;
     }
 
     applier.checkpoint_open_stores()?;
     Ok(())
 }
 
-fn read_next_recovery_action(
+fn next_committed_transaction(
     reader: &mut dyn WalReader,
-) -> Result<Option<RecoveryAction>, WrongoDBError> {
-    let Some((header, record)) = next_recovery_record(reader, "recovery")? else {
-        return Ok(None);
-    };
+) -> Result<Option<CommittedTransaction>, WrongoDBError> {
+    loop {
+        let Some(record) = read_next_record_or_stop_at_corrupt_tail(reader)? else {
+            return Ok(None);
+        };
 
-    Ok(Some(classify_recovery_action(header, record)))
+        match record {
+            WalRecord::TxnCommit { txn_id, ops, .. } => {
+                return Ok(Some(CommittedTransaction { txn_id, ops }));
+            }
+            WalRecord::Checkpoint => {}
+        }
+    }
 }
 
-fn next_recovery_record(
+fn read_next_record_or_stop_at_corrupt_tail(
     reader: &mut dyn WalReader,
-    pass: &str,
-) -> Result<Option<(WalRecordHeader, WalRecord)>, WrongoDBError> {
+) -> Result<Option<WalRecord>, WrongoDBError> {
     match reader.read_record() {
-        Ok(Some((header, record))) => Ok(Some((header, record))),
+        Ok(Some((_header, record))) => Ok(Some(record)),
         Ok(None) => Ok(None),
         Err(
             err @ (RecoveryError::ChecksumMismatch { .. }
@@ -55,19 +58,12 @@ fn next_recovery_record(
             | RecoveryError::CorruptRecordHeader { .. }
             | RecoveryError::CorruptRecordPayload { .. }),
         ) => {
-            eprintln!("Stopping global WAL replay during {pass} at corrupted tail: {err}");
+            // A crash can leave the final record partially written. Recovery
+            // treats that damaged tail as the end of the durable log.
+            eprintln!("Stopping global WAL replay at corrupted tail: {err}");
             Ok(None)
         }
-        Err(err) => Err(StorageError(format!("failed reading WAL during {pass}: {err}")).into()),
-    }
-}
-
-fn classify_recovery_action(_header: WalRecordHeader, record: WalRecord) -> RecoveryAction {
-    match record {
-        WalRecord::TxnCommit { txn_id, ops, .. } => {
-            RecoveryAction::ApplyCommittedTransaction { txn_id, ops }
-        }
-        WalRecord::Checkpoint => RecoveryAction::Ignore,
+        Err(err) => Err(StorageError(format!("failed reading WAL during recovery: {err}")).into()),
     }
 }
 
@@ -95,12 +91,12 @@ mod tests {
     const TEST_URI: &str = "table:test";
 
     #[derive(Debug, Default)]
-    struct RecordingCommandApplier {
+    struct RecordingRecoveryApplier {
         applied: Mutex<Vec<(u64, Vec<TxnLogOp>)>>,
         checkpoint_count: Mutex<usize>,
     }
 
-    impl RecordingCommandApplier {
+    impl RecordingRecoveryApplier {
         fn applied(&self) -> Vec<(u64, Vec<TxnLogOp>)> {
             self.applied.lock().clone()
         }
@@ -110,7 +106,7 @@ mod tests {
         }
     }
 
-    impl RecoveryApplier for RecordingCommandApplier {
+    impl RecoveryApplier for RecordingRecoveryApplier {
         fn apply_committed_transaction(
             &self,
             txn_id: u64,
@@ -156,7 +152,7 @@ mod tests {
         }
     }
 
-    fn wal_entry(index: u64, record: WalRecord) -> (WalRecordHeader, WalRecord) {
+    fn test_wal_record(index: u64, record: WalRecord) -> (WalRecordHeader, WalRecord) {
         let record_type = record.record_type() as u8;
         (
             WalRecordHeader {
@@ -179,7 +175,7 @@ mod tests {
         .unwrap()
     }
 
-    fn recover_store_from_wal(base_path: &Path, store_name: &str, key: &[u8]) -> Option<Vec<u8>> {
+    fn recover_value_from_wal(base_path: &Path, store_name: &str, key: &[u8]) -> Option<Vec<u8>> {
         let global_txn = Arc::new(GlobalTxnState::new());
         let store_handles =
             Arc::new(HandleCache::<String, parking_lot::RwLock<BTreeCursor>>::new());
@@ -197,8 +193,8 @@ mod tests {
         recover_from_wal(applier, reader).unwrap();
 
         let store = store_handles
-            .get_or_try_insert_with(store_name.to_string(), |source| {
-                let path = base_path.join(source);
+            .get_or_try_insert_with(store_name.to_string(), |store_name| {
+                let path = base_path.join(store_name);
                 Ok(parking_lot::RwLock::new(open_or_create_btree(path)?))
             })
             .unwrap();
@@ -208,8 +204,8 @@ mod tests {
 
     #[test]
     fn test_recover_from_wal_replays_autocommit_writes() {
-        let applier = Arc::new(RecordingCommandApplier::default());
-        let reader = TestWalReader::new(vec![wal_entry(
+        let applier = Arc::new(RecordingRecoveryApplier::default());
+        let reader = TestWalReader::new(vec![test_wal_record(
             1,
             WalRecord::TxnCommit {
                 txn_id: 7,
@@ -240,9 +236,9 @@ mod tests {
 
     #[test]
     fn test_recover_from_wal_applies_only_committed_transactional_changes() {
-        let applier = Arc::new(RecordingCommandApplier::default());
+        let applier = Arc::new(RecordingRecoveryApplier::default());
         let reader = TestWalReader::new(vec![
-            wal_entry(
+            test_wal_record(
                 1,
                 WalRecord::TxnCommit {
                     txn_id: 7,
@@ -254,7 +250,7 @@ mod tests {
                     }],
                 },
             ),
-            wal_entry(2, WalRecord::Checkpoint),
+            test_wal_record(2, WalRecord::Checkpoint),
         ]);
 
         recover_from_wal(applier.clone(), reader).unwrap();
@@ -297,7 +293,7 @@ mod tests {
             .unwrap();
         file.set_len(len.saturating_sub(8)).unwrap();
 
-        let recovered = recover_store_from_wal(dir.path(), "items.main.wt", b"abort-me");
+        let recovered = recover_value_from_wal(dir.path(), "items.main.wt", b"abort-me");
         assert_eq!(recovered, None);
     }
 
