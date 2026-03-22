@@ -357,4 +357,4 @@ pub struct BlockFilePageStore { ... }
 You can find the repositories to compare the implementation of wrongodb with the reference implementation of WiredTiger and MongoDB:
 
 - WiredTiger: ~/workspace/wiredtiger
-- MongoDB: ~/workspace/mongo
+- MongoDB: ~/workspace/mongodb

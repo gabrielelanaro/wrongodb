@@ -270,4 +270,4 @@ impl DataHandleCache { fn get_or_open(&self, uri: &str, base_path: &Path, wal_en
 You can find the repositories to compare the implementation of wrongodb with the reference implementation of WiredTiger and MongoDB:
 
 - WiredTiger: ~/workspace/wiredtiger
-- MongoDB: ~/workspace/mongo
+- MongoDB: ~/workspace/mongodb

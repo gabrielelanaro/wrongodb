@@ -1,5 +1,19 @@
 # Decisions
 
+## 2026-03-22: Keep raw catalog storage free of session bootstrap calls
+
+**Decision**
+- Remove `CatalogStore::ensure_store_exists`.
+- Keep `_catalog.wt` bootstrap in `DurableCatalog::ensure_store_exists`, which calls the session
+  named-store opener directly.
+- Let `CatalogStore` only read, write, and scan raw catalog rows.
+
+**Why**
+- The raw catalog layer should not own session bootstrap policy.
+- `DurableCatalog` is the higher-level catalog API and already owns the server-facing catalog
+  semantics, so it is the right place to keep reserved-store setup.
+- This keeps the lower layer focused on row encoding/decoding instead of session plumbing.
+
 ## 2026-03-22: Make `Session::create_table` schema-aware and remove the wrapper
 
 **Decision**
