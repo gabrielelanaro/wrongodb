@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -7,13 +8,14 @@ use crate::core::errors::StorageError;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::metadata_store::MetadataStore;
-use crate::storage::reserved_store::reserved_store_name_for_uri;
+use crate::storage::reserved_store::{reserved_store_name_for_id, StoreId, METADATA_STORE_ID};
 use crate::storage::table::{checkpoint_store, open_or_create_btree};
 use crate::storage::wal::{RecoveryError, WalReader, WalRecord};
 use crate::txn::{GlobalTxnState, Transaction, TxnId, TxnLogOp};
 use crate::WrongoDBError;
 
 type StoreHandleCache = HandleCache<String, RwLock<BTreeCursor>>;
+type StoreNameById = HashMap<StoreId, String>;
 
 #[derive(Debug, PartialEq, Eq)]
 struct CommittedTransaction {
@@ -33,44 +35,100 @@ pub(crate) fn recover_from_wal(
     global_txn: &GlobalTxnState,
     mut reader: impl WalReader,
 ) -> Result<(), WrongoDBError> {
-    while let Some(txn) = next_committed_transaction(&mut reader)? {
-        apply_committed_transaction(
-            base_path,
-            metadata_store,
-            store_handles,
-            global_txn,
-            txn.txn_id,
-            &txn.ops,
-        )?;
-    }
+    let transactions = read_committed_transactions(&mut reader)?;
+
+    apply_metadata_transactions(base_path, store_handles, global_txn, &transactions)?;
+    let store_names_by_id = rebuild_store_name_map(metadata_store)?;
+    apply_non_metadata_transactions(
+        base_path,
+        store_handles,
+        global_txn,
+        &store_names_by_id,
+        &transactions,
+    )?;
 
     checkpoint_recovered_stores(store_handles, global_txn)?;
     Ok(())
 }
 
-fn apply_committed_transaction(
+fn read_committed_transactions(
+    reader: &mut dyn WalReader,
+) -> Result<Vec<CommittedTransaction>, WrongoDBError> {
+    let mut transactions = Vec::new();
+    while let Some(txn) = next_committed_transaction(reader)? {
+        transactions.push(txn);
+    }
+    Ok(transactions)
+}
+
+fn apply_metadata_transactions(
     base_path: &Path,
-    metadata_store: &MetadataStore,
     store_handles: &StoreHandleCache,
     global_txn: &GlobalTxnState,
+    transactions: &[CommittedTransaction],
+) -> Result<(), WrongoDBError> {
+    for txn in transactions {
+        apply_committed_transaction(
+            base_path,
+            store_handles,
+            global_txn,
+            &HashMap::new(),
+            txn.txn_id,
+            &txn.ops,
+            ReplayPass::MetadataOnly,
+        )?;
+    }
+    Ok(())
+}
+
+fn rebuild_store_name_map(metadata_store: &MetadataStore) -> Result<StoreNameById, WrongoDBError> {
+    Ok(metadata_store
+        .scan_prefix("")?
+        .into_iter()
+        .map(|entry| (entry.store_id(), entry.source().to_string()))
+        .collect())
+}
+
+fn apply_non_metadata_transactions(
+    base_path: &Path,
+    store_handles: &StoreHandleCache,
+    global_txn: &GlobalTxnState,
+    store_names_by_id: &StoreNameById,
+    transactions: &[CommittedTransaction],
+) -> Result<(), WrongoDBError> {
+    for txn in transactions {
+        apply_committed_transaction(
+            base_path,
+            store_handles,
+            global_txn,
+            store_names_by_id,
+            txn.txn_id,
+            &txn.ops,
+            ReplayPass::NonMetadata,
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_committed_transaction(
+    base_path: &Path,
+    store_handles: &StoreHandleCache,
+    global_txn: &GlobalTxnState,
+    store_names_by_id: &StoreNameById,
     txn_id: TxnId,
     ops: &[TxnLogOp],
+    replay_pass: ReplayPass,
 ) -> Result<(), WrongoDBError> {
     let mut txn = Transaction::replay(txn_id);
 
     for op in ops {
-        apply_replayed_operation(
-            base_path,
-            metadata_store,
-            store_handles,
-            &mut txn,
-            txn_id,
-            op,
-        )?;
+        if !replay_pass.includes(op) {
+            continue;
+        }
+
+        apply_replayed_operation(base_path, store_handles, store_names_by_id, &mut txn, op)?;
     }
 
-    // Replay transactions publish recovered changes into MVCC state without
-    // buffering fresh WAL records.
     txn.commit(global_txn)?;
     Ok(())
 }
@@ -79,8 +137,6 @@ fn checkpoint_recovered_stores(
     store_handles: &StoreHandleCache,
     global_txn: &GlobalTxnState,
 ) -> Result<(), WrongoDBError> {
-    // Recovery only opens the stores it needs, so checkpointing the handle
-    // cache seals exactly the recovered working set.
     for store in store_handles.all_handles() {
         checkpoint_store(&mut store.write(), global_txn)?;
     }
@@ -116,8 +172,6 @@ fn read_next_record_or_stop_at_corrupt_tail(
             | RecoveryError::CorruptRecordHeader { .. }
             | RecoveryError::CorruptRecordPayload { .. }),
         ) => {
-            // A crash can leave the final record partially written. Recovery
-            // treats that damaged tail as the end of the durable log.
             eprintln!("Stopping global WAL replay at corrupted tail: {err}");
             Ok(None)
         }
@@ -127,39 +181,41 @@ fn read_next_record_or_stop_at_corrupt_tail(
 
 fn apply_replayed_operation(
     base_path: &Path,
-    metadata_store: &MetadataStore,
     store_handles: &StoreHandleCache,
+    store_names_by_id: &StoreNameById,
     txn: &mut Transaction,
-    txn_id: TxnId,
     op: &TxnLogOp,
 ) -> Result<(), WrongoDBError> {
     match op {
-        TxnLogOp::Put { uri, key, value } => {
+        TxnLogOp::Put {
+            store_id,
+            key,
+            value,
+        } => {
             let store =
-                open_store_for_recovery_uri(base_path, metadata_store, store_handles, uri, txn_id)?;
-            store.write().put(uri, key, value, txn)?;
+                open_store_for_recovery_id(base_path, store_handles, store_names_by_id, *store_id)?;
+            store.write().put(*store_id, key, value, txn)?;
         }
-        TxnLogOp::Delete { uri, key } => {
+        TxnLogOp::Delete { store_id, key } => {
             let store =
-                open_store_for_recovery_uri(base_path, metadata_store, store_handles, uri, txn_id)?;
-            let _ = store.write().delete(uri, key, txn)?;
+                open_store_for_recovery_id(base_path, store_handles, store_names_by_id, *store_id)?;
+            let _ = store.write().delete(*store_id, key, txn)?;
         }
     }
 
     Ok(())
 }
 
-fn open_store_for_recovery_uri(
+fn open_store_for_recovery_id(
     base_path: &Path,
-    metadata_store: &MetadataStore,
     store_handles: &StoreHandleCache,
-    uri: &str,
-    txn_id: TxnId,
+    store_names_by_id: &StoreNameById,
+    store_id: StoreId,
 ) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
-    let store_name = reserved_store_name_for_uri(uri)
+    let store_name = reserved_store_name_for_id(store_id)
         .map(str::to_string)
-        .or(metadata_store.lookup_store_name_for_txn(uri, txn_id)?)
-        .ok_or_else(|| StorageError(format!("unknown URI during recovery: {uri}")))?;
+        .or_else(|| store_names_by_id.get(&store_id).cloned())
+        .ok_or_else(|| StorageError(format!("unknown store id during recovery: {store_id}")))?;
     open_store_by_name(base_path, store_handles, &store_name)
 }
 
@@ -174,6 +230,25 @@ fn open_store_by_name(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayPass {
+    MetadataOnly,
+    NonMetadata,
+}
+
+impl ReplayPass {
+    fn includes(&self, op: &TxnLogOp) -> bool {
+        let store_id = match op {
+            TxnLogOp::Put { store_id, .. } | TxnLogOp::Delete { store_id, .. } => *store_id,
+        };
+
+        match self {
+            Self::MetadataOnly => store_id == METADATA_STORE_ID,
+            Self::NonMetadata => store_id != METADATA_STORE_ID,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -186,16 +261,17 @@ mod tests {
     use crate::storage::api::{Connection, ConnectionConfig};
     use crate::storage::btree::BTreeCursor;
     use crate::storage::handle_cache::HandleCache;
+    use crate::storage::log_manager::LogManager;
     use crate::storage::metadata_store::MetadataStore;
     use crate::storage::recovery::recover_from_wal;
-    use crate::storage::reserved_store::METADATA_URI;
+    use crate::storage::reserved_store::{StoreId, FIRST_DYNAMIC_STORE_ID, METADATA_STORE_ID};
     use crate::storage::table::{get_version, open_or_create_btree};
     use crate::storage::wal::{
         LogFile, Lsn, RecoveryError, WalFileReader, WalReader, WalRecord, WalRecordHeader,
     };
     use crate::txn::{GlobalTxnState, TxnLogOp, TXN_NONE};
 
-    const TEST_URI: &str = "table:test";
+    const TEST_STORE_ID: StoreId = FIRST_DYNAMIC_STORE_ID;
 
     struct TestWalReader {
         records: VecDeque<(WalRecordHeader, WalRecord)>,
@@ -204,6 +280,7 @@ mod tests {
     #[derive(Serialize)]
     struct EncodedMetadataRecord {
         source: String,
+        store_id: StoreId,
     }
 
     impl TestWalReader {
@@ -235,21 +312,28 @@ mod tests {
         )
     }
 
-    fn encode_metadata_value(source: &str) -> Vec<u8> {
+    fn encode_metadata_value(source: &str, store_id: StoreId) -> Vec<u8> {
         bson::to_vec(&EncodedMetadataRecord {
             source: source.to_string(),
+            store_id,
         })
         .unwrap()
     }
 
     fn recover_value_from_wal(base_path: &Path, store_name: &str, key: &[u8]) -> Option<Vec<u8>> {
         let global_txn = Arc::new(GlobalTxnState::new());
+        let log_manager = Arc::new(LogManager::disabled());
         let store_handles =
             Arc::new(HandleCache::<String, parking_lot::RwLock<BTreeCursor>>::new());
-        let metadata_store = Arc::new(MetadataStore::new(
-            base_path.to_path_buf(),
-            store_handles.clone(),
-        ));
+        let metadata_store = Arc::new(
+            MetadataStore::new(
+                base_path.to_path_buf(),
+                store_handles.clone(),
+                global_txn.clone(),
+                log_manager,
+            )
+            .unwrap(),
+        );
         let reader = WalFileReader::open(base_path.join("global.wal")).unwrap();
         recover_from_wal(
             base_path,
@@ -278,7 +362,7 @@ mod tests {
                 txn_id: 7,
                 commit_ts: 7,
                 ops: vec![TxnLogOp::Put {
-                    uri: TEST_URI.to_string(),
+                    store_id: TEST_STORE_ID,
                     key: b"k1".to_vec(),
                     value: b"v1".to_vec(),
                 }],
@@ -290,7 +374,7 @@ mod tests {
             Some(super::CommittedTransaction {
                 txn_id: 7,
                 ops: vec![TxnLogOp::Put {
-                    uri: TEST_URI.to_string(),
+                    store_id: TEST_STORE_ID,
                     key: b"k1".to_vec(),
                     value: b"v1".to_vec(),
                 }],
@@ -308,7 +392,7 @@ mod tests {
                     txn_id: 7,
                     commit_ts: 7,
                     ops: vec![TxnLogOp::Put {
-                        uri: TEST_URI.to_string(),
+                        store_id: TEST_STORE_ID,
                         key: b"committed".to_vec(),
                         value: b"v1".to_vec(),
                     }],
@@ -321,7 +405,7 @@ mod tests {
             Some(super::CommittedTransaction {
                 txn_id: 7,
                 ops: vec![TxnLogOp::Put {
-                    uri: TEST_URI.to_string(),
+                    store_id: TEST_STORE_ID,
                     key: b"committed".to_vec(),
                     value: b"v1".to_vec(),
                 }],
@@ -337,7 +421,7 @@ mod tests {
             7,
             7,
             &[TxnLogOp::Put {
-                uri: "table:items".to_string(),
+                store_id: TEST_STORE_ID,
                 key: b"abort-me".to_vec(),
                 value: b"v1".to_vec(),
             }],
@@ -367,12 +451,12 @@ mod tests {
             7,
             &[
                 TxnLogOp::Put {
-                    uri: METADATA_URI.to_string(),
+                    store_id: METADATA_STORE_ID,
                     key: b"table:items".to_vec(),
-                    value: encode_metadata_value("items.main.wt"),
+                    value: encode_metadata_value("items.main.wt", FIRST_DYNAMIC_STORE_ID),
                 },
                 TxnLogOp::Put {
-                    uri: "table:items".to_string(),
+                    store_id: FIRST_DYNAMIC_STORE_ID,
                     key: b"k1".to_vec(),
                     value: b"v1".to_vec(),
                 },
@@ -385,8 +469,9 @@ mod tests {
 
         assert_eq!(
             conn.metadata_store()
-                .lookup_store_name("table:items")
-                .unwrap(),
+                .get("table:items")
+                .unwrap()
+                .map(|entry| entry.source().to_string()),
             Some("items.main.wt".to_string())
         );
 

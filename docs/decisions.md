@@ -2501,3 +2501,33 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
 - Passing the real recovery dependencies at the module boundary makes the public shape honest:
   `recover_from_wal(...)` is the recovery interface.
 - Keeping the helpers private still avoids reintroducing a fake architectural seam elsewhere.
+
+## 2026-03-22: Make `MetadataStore` committed-only and log storage writes by `StoreId`
+
+**Decision**
+- Refactor `MetadataStore` into a committed-only typed repository over `metadata.wt`.
+- Remove transaction-visible metadata APIs such as `lookup_store_name_for_txn(...)` and
+  `table_metadata_for_txn(...)`.
+- Persist a stable `store_id` alongside each metadata row and allocate dynamic store ids starting at
+  `2`, with reserved ids:
+  - `0` for `metadata.wt`
+  - `1` for `_catalog.wt`
+- Change storage WAL entries to log `store_id` instead of logical `uri`.
+- Recover metadata rows first, rebuild `store_id -> store_name`, then replay non-metadata WAL ops.
+- Treat collection and index registration as committed schema operations:
+  - implicit collection creation happens before the caller's data transaction
+  - index registration enters the durable catalog with `ready=false`, backfills, then flips to
+    `ready=true`
+- Ignore `ready=false` indexes in query planning.
+
+**Why**
+- The old design leaked MVCC visibility into the metadata API because recovery had to re-resolve
+  logical URIs from WAL records. That pushed `txn_id` through code that should only care about
+  storage metadata.
+- Logging `store_id` removes recovery's dependency on transaction-visible metadata lookups and
+  matches WT's stable file-identity direction more closely.
+- Keeping `MetadataStore` committed-only breaks the `Session <-> MetadataStore` circular design
+  smell and leaves schema orchestration in the existing write/session call sites instead of hiding
+  it behind a fake manager type.
+- Marking new indexes `ready=false` keeps committed schema publication compatible with safe query
+  planning while backfill is still in progress.

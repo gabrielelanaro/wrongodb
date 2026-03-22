@@ -5,7 +5,6 @@ use crate::catalog::{CatalogStore, DurableCatalog};
 use crate::core::errors::StorageError;
 use crate::storage::api::connection::Connection;
 use crate::storage::reserved_store::reserved_store_names;
-use crate::txn::TXN_NONE;
 use crate::WrongoDBError;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -26,7 +25,7 @@ impl CatalogRecovery {
         }
 
         let durable_catalog = DurableCatalog::new(CatalogStore::new());
-        durable_catalog.validate_storage_references(&session, metadata_store.as_ref(), TXN_NONE)?;
+        durable_catalog.validate_storage_references(&session, metadata_store.as_ref())?;
 
         let mut referenced_store_names = metadata_store.all_store_names()?;
         referenced_store_names.extend(

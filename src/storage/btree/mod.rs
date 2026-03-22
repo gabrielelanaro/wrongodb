@@ -10,6 +10,7 @@ pub use iter::BTreeRangeIter;
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::mvcc::ReconcileStats;
 use crate::storage::page_store::{Page, PageEdit, PageRead, PageStore, PageType, RowInsert};
+use crate::storage::reserved_store::StoreId;
 use crate::txn::{
     ReadVisibility, Transaction, TxnId, Update, UpdateChain, UpdateHandle, UpdateType,
 };
@@ -188,7 +189,7 @@ impl BTreeCursor {
 
     pub(crate) fn put(
         &mut self,
-        uri: &str,
+        store_id: StoreId,
         key: &[u8],
         value: &[u8],
         txn: &mut Transaction,
@@ -199,7 +200,7 @@ impl BTreeCursor {
             "leaf update failed",
         )?;
         txn.track_update(update_handle);
-        txn.record_put_log(uri, key, value);
+        txn.record_put_log(store_id, key, value);
         Ok(())
     }
 
@@ -228,7 +229,7 @@ impl BTreeCursor {
 
     pub(crate) fn delete(
         &mut self,
-        uri: &str,
+        store_id: StoreId,
         key: &[u8],
         txn: &mut Transaction,
     ) -> Result<bool, WrongoDBError> {
@@ -238,7 +239,7 @@ impl BTreeCursor {
             "leaf tombstone failed",
         )?;
         txn.track_update(update_handle);
-        txn.record_delete_log(uri, key);
+        txn.record_delete_log(store_id, key);
         Ok(true)
     }
 
@@ -865,7 +866,10 @@ mod tests {
 
     use super::*;
     use crate::storage::page_store::{BlockFilePageStore, PageWrite, RootStore};
+    use crate::storage::reserved_store::FIRST_DYNAMIC_STORE_ID;
     use crate::txn::{GlobalTxnState, TXN_NONE};
+
+    const TEST_STORE_ID: u64 = FIRST_DYNAMIC_STORE_ID;
 
     fn create_tree(path: &Path) -> BTreeCursor {
         let mut store = BlockFilePageStore::create(path, 512).unwrap();
@@ -885,7 +889,7 @@ mod tests {
         let mut txn = global_txn.begin_snapshot_txn();
 
         tree.write_base_row(b"k1", b"base").unwrap();
-        tree.put("table:test", b"k1", b"txn", &mut txn).unwrap();
+        tree.put(TEST_STORE_ID, b"k1", b"txn", &mut txn).unwrap();
 
         assert_eq!(
             tree.get(b"k1", &ReadVisibility::from_txn_id(7)).unwrap(),
@@ -906,7 +910,7 @@ mod tests {
         let global_txn = Arc::new(GlobalTxnState::new());
         let mut txn = global_txn.begin_snapshot_txn();
 
-        tree.put("table:test", b"k1", b"txn", &mut txn).unwrap();
+        tree.put(TEST_STORE_ID, b"k1", b"txn", &mut txn).unwrap();
 
         assert_eq!(
             tree.get(b"k1", &ReadVisibility::from_txn_id(9)).unwrap(),
@@ -928,7 +932,7 @@ mod tests {
         let mut txn = global_txn.begin_snapshot_txn();
 
         tree.write_base_row(b"k1", b"base").unwrap();
-        tree.delete("table:test", b"k1", &mut txn).unwrap();
+        tree.delete(TEST_STORE_ID, b"k1", &mut txn).unwrap();
 
         assert_eq!(
             tree.get(b"k1", &ReadVisibility::from_txn_id(11)).unwrap(),

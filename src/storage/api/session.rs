@@ -8,17 +8,35 @@ use crate::storage::api::cursor::{TableCursor, TableCursorState, TableCursorWrit
 use crate::storage::btree::BTreeCursor;
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::log_manager::LogManager;
-use crate::storage::metadata_store::{MetadataStore, INDEX_URI_PREFIX, TABLE_URI_PREFIX};
-use crate::storage::reserved_store::{reserved_store_names, METADATA_URI};
+use crate::storage::metadata_store::{
+    MetadataEntry, MetadataStore, INDEX_URI_PREFIX, TABLE_URI_PREFIX,
+};
+use crate::storage::reserved_store::{
+    reserved_store_identity_for_uri, reserved_store_names, StoreId,
+};
 use crate::storage::table::{
     checkpoint_store, contains_key, get_version, open_or_create_btree, scan_range, TableMetadata,
 };
 use crate::txn::{GlobalTxnState, Transaction, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
+#[cfg(test)]
+use crate::storage::reserved_store::METADATA_URI;
+
 pub(crate) type ActiveTransactionHandle = Arc<Mutex<Transaction>>;
 
 type StoreEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
+struct ResolvedStore {
+    store_id: StoreId,
+    handle: Arc<RwLock<BTreeCursor>>,
+}
+
+struct LoadedTable {
+    table: TableMetadata,
+    primary: Arc<RwLock<BTreeCursor>>,
+    indexes: Vec<Arc<RwLock<BTreeCursor>>>,
+}
 
 /// A short-lived handle for one storage request.
 ///
@@ -64,11 +82,18 @@ impl Session {
     /// Ensure that `table:<name>` exists.
     pub fn create_table(&mut self, table_uri: &str) -> Result<(), WrongoDBError> {
         if let Some(collection) = table_uri.strip_prefix(TABLE_URI_PREFIX) {
-            let metadata_store = self.metadata_store.clone();
-            return self.with_transaction(|session| {
-                let _ = metadata_store.ensure_table_uri_in_transaction(session, collection)?;
-                Ok(())
-            });
+            if self.current_transaction().is_some() {
+                return Err(WrongoDBError::TransactionAlreadyActive);
+            }
+
+            if self.metadata_store.get(table_uri)?.is_some() {
+                return Ok(());
+            }
+
+            let entry = MetadataEntry::table(collection, self.metadata_store.allocate_store_id());
+            self.ensure_named_store(entry.source())?;
+            self.metadata_store.insert(&entry)?;
+            return Ok(());
         }
 
         Err(WrongoDBError::Storage(StorageError(format!(
@@ -78,20 +103,13 @@ impl Session {
 
     /// Open a cursor for `table:<name>` in the current transaction context.
     pub fn open_table_cursor(&self, table_uri: &str) -> Result<TableCursor<'_>, WrongoDBError> {
-        let txn_id = self.current_txn_id();
-        let table = self.load_table_metadata(table_uri, txn_id)?;
-        let primary = self.open_store_for_uri(table.uri(), txn_id)?;
-        let indexes = table
-            .indexes()
-            .iter()
-            .map(|index| self.open_store_for_uri(index.uri(), txn_id))
-            .collect::<Result<Vec<_>, _>>()?;
+        let loaded = self.load_table_runtime(table_uri)?;
 
         TableCursor::new(
             self,
-            table,
-            primary,
-            indexes,
+            loaded.table,
+            loaded.primary,
+            loaded.indexes,
             TableCursorWriteAccess::ReadWrite,
         )
     }
@@ -226,17 +244,17 @@ impl Session {
             );
         }
 
-        let store = self.open_store_for_uri(store_uri, txn_id)?;
+        let resolved = self.resolve_store(store_uri)?;
         let txn_handle = self.current_transaction().ok_or_else(|| {
             StorageError("insert_into_store requires an active transaction".into())
         })?;
-        let mut btree = store.write();
+        let mut btree = resolved.handle.write();
         if contains_key(&mut btree, key, txn_id)? {
             return Err(DocumentValidationError("duplicate key error".into()).into());
         }
 
         let mut txn = txn_handle.lock();
-        btree.put(store_uri, key, value, &mut txn)?;
+        btree.put(resolved.store_id, key, value, &mut txn)?;
         Ok(())
     }
 
@@ -248,7 +266,7 @@ impl Session {
     pub(crate) fn put_into_named_store(
         &self,
         store_name: &str,
-        store_uri: &str,
+        store_id: StoreId,
         key: &[u8],
         value: &[u8],
     ) -> Result<(), WrongoDBError> {
@@ -257,7 +275,7 @@ impl Session {
         })?;
         let store = self.open_store_by_name(store_name)?;
         let mut txn = txn_handle.lock();
-        store.write().put(store_uri, key, value, &mut txn)?;
+        store.write().put(store_id, key, value, &mut txn)?;
         Ok(())
     }
 
@@ -291,8 +309,8 @@ impl Session {
         end: Option<&[u8]>,
     ) -> Result<StoreEntries, WrongoDBError> {
         let txn_id = self.current_txn_id();
-        let store = self.open_store_for_uri(store_uri, txn_id)?;
-        let mut btree = store.write();
+        let resolved = self.resolve_store(store_uri)?;
+        let mut btree = resolved.handle.write();
         scan_range(&mut btree, start, end, txn_id)
     }
 
@@ -319,11 +337,7 @@ impl Session {
     // Lookup and durability helpers
     // ------------------------------------------------------------------------
 
-    fn load_table_metadata(
-        &self,
-        table_uri: &str,
-        txn_id: TxnId,
-    ) -> Result<TableMetadata, WrongoDBError> {
+    fn load_table_runtime(&self, table_uri: &str) -> Result<LoadedTable, WrongoDBError> {
         if !table_uri.starts_with(TABLE_URI_PREFIX) {
             return Err(StorageError(format!(
                 "unsupported URI for public cursor open: {table_uri}; only table:... is supported"
@@ -331,28 +345,55 @@ impl Session {
             .into());
         }
 
-        self.metadata_store
-            .table_metadata_for_txn(table_uri, txn_id)?
-            .ok_or_else(|| StorageError(format!("unknown URI: {table_uri}")).into())
-    }
-
-    fn open_store_for_uri(
-        &self,
-        uri: &str,
-        txn_id: TxnId,
-    ) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
-        if uri != METADATA_URI
-            && !uri.starts_with(TABLE_URI_PREFIX)
-            && !uri.starts_with(INDEX_URI_PREFIX)
-        {
-            return Err(StorageError(format!("unsupported URI: {uri}")).into());
+        let Some(table_entry) = self.metadata_store.get(table_uri)? else {
+            return Err(StorageError(format!("unknown URI: {table_uri}")).into());
+        };
+        if !table_entry.is_table() {
+            return Err(StorageError(format!("URI is not a table: {table_uri}")).into());
         }
 
-        let store_name = self
-            .metadata_store
-            .lookup_store_name_for_txn(uri, txn_id)?
-            .ok_or_else(|| StorageError(format!("unknown URI: {uri}")))?;
-        self.open_store_by_name(&store_name)
+        let collection = table_uri.strip_prefix(TABLE_URI_PREFIX).ok_or_else(|| {
+            StorageError(format!(
+                "unsupported URI for public cursor open: {table_uri}; only table:... is supported"
+            ))
+        })?;
+        let index_prefix = format!("{INDEX_URI_PREFIX}{collection}:");
+        let mut index_entries = self.metadata_store.scan_prefix(&index_prefix)?;
+        index_entries.sort_by(|left, right| left.uri().cmp(right.uri()));
+
+        let primary = self.open_store_by_name(table_entry.source())?;
+        let indexes = index_entries
+            .iter()
+            .map(|entry| self.open_store_by_name(entry.source()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let index_metadata = index_entries
+            .into_iter()
+            .map(MetadataEntry::into_index_metadata)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(LoadedTable {
+            table: TableMetadata::with_indexes(table_uri, table_entry.store_id(), index_metadata),
+            primary,
+            indexes,
+        })
+    }
+
+    fn resolve_store(&self, uri: &str) -> Result<ResolvedStore, WrongoDBError> {
+        if let Some((store_id, store_name)) = reserved_store_identity_for_uri(uri) {
+            return Ok(ResolvedStore {
+                store_id,
+                handle: self.open_store_by_name(store_name)?,
+            });
+        }
+
+        let Some(entry) = self.metadata_store.get(uri)? else {
+            return Err(StorageError(format!("unknown URI: {uri}")).into());
+        };
+
+        Ok(ResolvedStore {
+            store_id: entry.store_id(),
+            handle: self.open_store_by_name(entry.source())?,
+        })
     }
 
     fn open_store_by_name(
@@ -464,16 +505,23 @@ mod tests {
             std::fs::create_dir_all(&base_path).unwrap();
             let global_txn = Arc::new(GlobalTxnState::new());
             let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
-            let metadata_store =
-                Arc::new(MetadataStore::new(base_path.clone(), store_handles.clone()));
+            let log_manager =
+                Arc::new(LogManager::open(&base_path, &LoggingConfig::default()).unwrap());
+            let metadata_store = Arc::new(
+                MetadataStore::new(
+                    base_path.clone(),
+                    store_handles.clone(),
+                    global_txn.clone(),
+                    log_manager.clone(),
+                )
+                .unwrap(),
+            );
             recover_existing_wal_if_present(
                 &base_path,
                 metadata_store.as_ref(),
                 store_handles.as_ref(),
                 global_txn.as_ref(),
             );
-            let log_manager =
-                Arc::new(LogManager::open(&base_path, &LoggingConfig::default()).unwrap());
             Self::build(base_path, log_manager)
         }
 
@@ -484,8 +532,15 @@ mod tests {
         fn build(base_path: PathBuf, log_manager: Arc<LogManager>) -> Self {
             let global_txn = Arc::new(GlobalTxnState::new());
             let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
-            let metadata_store =
-                Arc::new(MetadataStore::new(base_path.clone(), store_handles.clone()));
+            let metadata_store = Arc::new(
+                MetadataStore::new(
+                    base_path.clone(),
+                    store_handles.clone(),
+                    global_txn.clone(),
+                    log_manager.clone(),
+                )
+                .unwrap(),
+            );
             let session = Session::new(
                 base_path,
                 store_handles,
@@ -684,7 +739,15 @@ mod tests {
         let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
         let log_manager =
             Arc::new(LogManager::open(&base_path, &LoggingConfig::default()).unwrap());
-        let metadata_store = Arc::new(MetadataStore::new(base_path.clone(), store_handles.clone()));
+        let metadata_store = Arc::new(
+            MetadataStore::new(
+                base_path.clone(),
+                store_handles.clone(),
+                global_txn.clone(),
+                log_manager.clone(),
+            )
+            .unwrap(),
+        );
         let mut session = Session::new(
             base_path.clone(),
             store_handles.clone(),
@@ -740,6 +803,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut session = SessionTestFixture::open_local_wal(dir.path()).into_session();
         session.create_table(TEST_URI).unwrap();
+        let store_id = session
+            .metadata_store
+            .get(TEST_URI)
+            .unwrap()
+            .unwrap()
+            .store_id();
 
         let txn_id = {
             let mut txn_id = 0;
@@ -762,7 +831,7 @@ mod tests {
             } if *record_txn_id == txn_id
                 && *commit_ts == txn_id
                 && ops == &vec![crate::txn::TxnLogOp::Put {
-                    uri: TEST_URI.to_string(),
+                    store_id,
                     key: TEST_KEY.to_vec(),
                     value: TEST_VALUE.to_vec(),
                 }]

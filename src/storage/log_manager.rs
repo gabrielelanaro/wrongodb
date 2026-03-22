@@ -228,7 +228,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::storage::reserved_store::FIRST_DYNAMIC_STORE_ID;
     use crate::storage::wal::{WalReader, WalRecord};
+
+    const TEST_STORE_ID: u64 = FIRST_DYNAMIC_STORE_ID;
 
     fn log_path(base_path: &Path) -> PathBuf {
         base_path.join(LOG_FILE_NAME)
@@ -244,7 +247,7 @@ mod tests {
                 7,
                 7,
                 &[TxnLogOp::Put {
-                    uri: "table:users".to_string(),
+                    store_id: TEST_STORE_ID,
                     key: b"k1".to_vec(),
                     value: b"v1".to_vec(),
                 }],
@@ -262,7 +265,7 @@ mod tests {
                 7,
                 7,
                 &[TxnLogOp::Put {
-                    uri: "table:users".to_string(),
+                    store_id: TEST_STORE_ID,
                     key: b"k1".to_vec(),
                     value: b"v1".to_vec(),
                 }],
@@ -296,7 +299,7 @@ mod tests {
                 1,
                 1,
                 &[TxnLogOp::Put {
-                    uri: "table:users".to_string(),
+                    store_id: TEST_STORE_ID,
                     key: b"k1".to_vec(),
                     value: b"v1".to_vec(),
                 }],

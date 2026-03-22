@@ -130,10 +130,11 @@ impl DocumentQuery {
         }
 
         if let Some(index) = collection_definition.indexes().values().find(|index| {
-            index
-                .indexed_field()
-                .map(|field| filter_doc.contains_key(&field))
-                .unwrap_or(false)
+            index.ready()
+                && index
+                    .indexed_field()
+                    .map(|field| filter_doc.contains_key(&field))
+                    .unwrap_or(false)
         }) {
             let field = index.indexed_field()?;
             let value = filter_doc.get(&field).expect("field selected from filter");
@@ -211,11 +212,18 @@ mod tests {
             let global_txn = Arc::new(GlobalTxnState::new());
             let store_handles =
                 Arc::new(HandleCache::<String, parking_lot::RwLock<BTreeCursor>>::new());
-            let metadata_store =
-                Arc::new(MetadataStore::new(base_path.clone(), store_handles.clone()));
+            let log_manager = Arc::new(LogManager::disabled());
+            let metadata_store = Arc::new(
+                MetadataStore::new(
+                    base_path.clone(),
+                    store_handles.clone(),
+                    global_txn.clone(),
+                    log_manager.clone(),
+                )
+                .unwrap(),
+            );
             let durable_catalog = Arc::new(DurableCatalog::new(CatalogStore::new()));
             let collection_catalog = Arc::new(CollectionCatalog::new());
-            let log_manager = Arc::new(LogManager::disabled());
             let session = Session::new(
                 base_path,
                 store_handles,

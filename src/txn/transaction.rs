@@ -1,4 +1,5 @@
 use crate::core::errors::WrongoDBError;
+use crate::storage::reserved_store::StoreId;
 use crate::txn::global_txn::GlobalTxnState;
 use crate::txn::snapshot::Snapshot;
 use crate::txn::update::{Update, UpdateHandle};
@@ -26,12 +27,12 @@ pub enum TxnState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxnLogOp {
     Put {
-        uri: String,
+        store_id: StoreId,
         key: Vec<u8>,
         value: Vec<u8>,
     },
     Delete {
-        uri: String,
+        store_id: StoreId,
         key: Vec<u8>,
     },
 }
@@ -142,17 +143,17 @@ impl Transaction {
         self.tracked_updates.push(update_handle);
     }
 
-    pub(crate) fn record_put_log(&mut self, uri: &str, key: &[u8], value: &[u8]) {
+    pub(crate) fn record_put_log(&mut self, store_id: StoreId, key: &[u8], value: &[u8]) {
         self.record_log_op(TxnLogOp::Put {
-            uri: uri.to_string(),
+            store_id,
             key: key.to_vec(),
             value: value.to_vec(),
         });
     }
 
-    pub(crate) fn record_delete_log(&mut self, uri: &str, key: &[u8]) {
+    pub(crate) fn record_delete_log(&mut self, store_id: StoreId, key: &[u8]) {
         self.record_log_op(TxnLogOp::Delete {
-            uri: uri.to_string(),
+            store_id,
             key: key.to_vec(),
         });
     }

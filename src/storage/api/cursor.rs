@@ -123,7 +123,7 @@ impl<'session> TableCursor<'session> {
                 if contains_key(&mut primary, key, txn_id)? {
                     return Err(DocumentValidationError("duplicate key error".into()).into());
                 }
-                primary.put(self.table.uri(), key, value, txn)?;
+                primary.put(self.table.store_id(), key, value, txn)?;
             }
 
             self.insert_secondary_indexes(&index_entries, txn_id, txn)
@@ -148,7 +148,7 @@ impl<'session> TableCursor<'session> {
 
             {
                 let mut primary = self.primary.write();
-                primary.put(self.table.uri(), key, value, txn)?;
+                primary.put(self.table.store_id(), key, value, txn)?;
             }
 
             self.insert_secondary_indexes(&new_index_entries, txn_id, txn)
@@ -171,7 +171,7 @@ impl<'session> TableCursor<'session> {
             self.delete_secondary_indexes(&old_index_entries, txn_id, txn)?;
 
             let mut primary = self.primary.write();
-            primary.delete(self.table.uri(), key, txn).map(|_| ())
+            primary.delete(self.table.store_id(), key, txn).map(|_| ())
         })?;
 
         self.reset();
@@ -376,7 +376,7 @@ impl<'session> TableCursor<'session> {
         for (index_pos, key) in entries {
             let metadata = &self.table.indexes()[*index_pos];
             let mut btree = self.indexes[*index_pos].write();
-            btree.put(metadata.uri(), key, &[], txn)?;
+            btree.put(metadata.store_id(), key, &[], txn)?;
         }
         Ok(())
     }
@@ -393,7 +393,7 @@ impl<'session> TableCursor<'session> {
             if !contains_key(&mut btree, key, txn_id)? {
                 continue;
             }
-            btree.delete(metadata.uri(), key, txn)?;
+            btree.delete(metadata.store_id(), key, txn)?;
         }
         Ok(())
     }
@@ -422,8 +422,12 @@ mod tests {
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::log_manager::LogManager;
     use crate::storage::metadata_store::MetadataStore;
+    use crate::storage::reserved_store::FIRST_DYNAMIC_STORE_ID;
     use crate::storage::table::open_or_create_btree;
     use crate::txn::{GlobalTxnState, TXN_NONE};
+
+    const PRIMARY_STORE_ID: u64 = FIRST_DYNAMIC_STORE_ID;
+    const INDEX_STORE_ID: u64 = FIRST_DYNAMIC_STORE_ID + 1;
 
     fn build_test_session(
         base_path: &Path,
@@ -431,10 +435,15 @@ mod tests {
         log_manager: Arc<LogManager>,
     ) -> Session {
         let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
-        let metadata_store = Arc::new(MetadataStore::new(
-            base_path.to_path_buf(),
-            store_handles.clone(),
-        ));
+        let metadata_store = Arc::new(
+            MetadataStore::new(
+                base_path.to_path_buf(),
+                store_handles.clone(),
+                global_txn.clone(),
+                log_manager.clone(),
+            )
+            .unwrap(),
+        );
         Session::new(
             base_path.to_path_buf(),
             store_handles,
@@ -477,9 +486,11 @@ mod tests {
         let index = Arc::new(RwLock::new(open_or_create_btree(index_path).unwrap()));
         let table = TableMetadata::with_indexes(
             "table:users",
+            PRIMARY_STORE_ID,
             vec![IndexMetadata::new(
                 "name",
                 "index:users:name",
+                INDEX_STORE_ID,
                 vec!["name".to_string()],
             )],
         );
@@ -525,7 +536,7 @@ mod tests {
         let mut seed_txn = global_txn.begin_snapshot_txn();
         btree
             .write()
-            .put(table.uri(), b"k1", b"v1", &mut seed_txn)
+            .put(table.store_id(), b"k1", b"v1", &mut seed_txn)
             .unwrap();
         seed_txn.commit(global_txn.as_ref()).unwrap();
 
@@ -587,12 +598,12 @@ mod tests {
         let mut seed_txn = global_txn.begin_snapshot_txn();
         primary
             .write()
-            .put(table.uri(), &key, &old_value, &mut seed_txn)
+            .put(table.store_id(), &key, &old_value, &mut seed_txn)
             .unwrap();
         index
             .write()
             .put(
-                table.indexes()[0].uri(),
+                table.indexes()[0].store_id(),
                 &index_key_for_name(1, "alice"),
                 &[],
                 &mut seed_txn,
@@ -639,12 +650,12 @@ mod tests {
         let mut seed_txn = global_txn.begin_snapshot_txn();
         primary
             .write()
-            .put(table.uri(), &key, &value, &mut seed_txn)
+            .put(table.store_id(), &key, &value, &mut seed_txn)
             .unwrap();
         index
             .write()
             .put(
-                table.indexes()[0].uri(),
+                table.indexes()[0].store_id(),
                 &index_key_for_name(1, "alice"),
                 &[],
                 &mut seed_txn,

@@ -10,7 +10,7 @@ use crate::storage::btree::BTreeCursor;
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::log_manager::{open_recovery_reader_if_present, LogManager};
 pub use crate::storage::log_manager::{LogSyncMethod, LoggingConfig, TransactionSyncConfig};
-use crate::storage::metadata_store::MetadataStore;
+use crate::storage::metadata_store::{reseed_next_store_id_from_metadata, MetadataStore};
 use crate::storage::recovery::recover_from_wal;
 use crate::txn::GlobalTxnState;
 use crate::WrongoDBError;
@@ -114,7 +114,13 @@ impl Connection {
 
         let global_txn = Arc::new(GlobalTxnState::new());
         let store_handles = Arc::new(HandleCache::new());
-        let metadata_store = Arc::new(MetadataStore::new(base_path.clone(), store_handles.clone()));
+        let log_manager = Arc::new(LogManager::open(&base_path, &logging)?);
+        let metadata_store = Arc::new(MetadataStore::new(
+            base_path.clone(),
+            store_handles.clone(),
+            global_txn.clone(),
+            log_manager.clone(),
+        )?);
         if let Some(recovery_reader) = open_recovery_reader_if_present(&base_path) {
             recover_from_wal(
                 &base_path,
@@ -125,7 +131,7 @@ impl Connection {
             )?;
         }
 
-        let log_manager = Arc::new(LogManager::open(&base_path, &logging)?);
+        reseed_next_store_id_from_metadata(metadata_store.as_ref())?;
 
         Ok(Self {
             base_path,

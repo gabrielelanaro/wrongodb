@@ -5,6 +5,7 @@ use crate::storage::block::file::NONE_BLOCK_ID;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::mvcc::ReconcileStats;
 use crate::storage::page_store::{BlockFilePageStore, Page, PageStore};
+use crate::storage::reserved_store::StoreId;
 use crate::txn::{GlobalTxnState, ReadVisibility, TxnId};
 use crate::WrongoDBError;
 
@@ -16,6 +17,7 @@ type ScanEntries = Vec<StoreEntry>;
 pub struct IndexMetadata {
     name: String,
     uri: String,
+    store_id: StoreId,
     columns: Vec<String>,
 }
 
@@ -27,11 +29,13 @@ impl IndexMetadata {
     pub(crate) fn new(
         name: impl Into<String>,
         uri: impl Into<String>,
+        store_id: StoreId,
         columns: Vec<String>,
     ) -> Self {
         Self {
             name: name.into(),
             uri: uri.into(),
+            store_id,
             columns,
         }
     }
@@ -49,6 +53,10 @@ impl IndexMetadata {
         &self.uri
     }
 
+    pub(crate) fn store_id(&self) -> StoreId {
+        self.store_id
+    }
+
     pub fn columns(&self) -> &[String] {
         &self.columns
     }
@@ -62,6 +70,7 @@ impl IndexMetadata {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableMetadata {
     uri: String,
+    store_id: StoreId,
     indexes: Vec<IndexMetadata>,
 }
 
@@ -72,15 +81,23 @@ impl TableMetadata {
 
     #[cfg(test)]
     pub(crate) fn new(uri: impl Into<String>) -> Self {
+        use crate::storage::reserved_store::FIRST_DYNAMIC_STORE_ID;
+
         Self {
             uri: uri.into(),
+            store_id: FIRST_DYNAMIC_STORE_ID,
             indexes: Vec::new(),
         }
     }
 
-    pub(crate) fn with_indexes(uri: impl Into<String>, indexes: Vec<IndexMetadata>) -> Self {
+    pub(crate) fn with_indexes(
+        uri: impl Into<String>,
+        store_id: StoreId,
+        indexes: Vec<IndexMetadata>,
+    ) -> Self {
         Self {
             uri: uri.into(),
+            store_id,
             indexes,
         }
     }
@@ -89,8 +106,13 @@ impl TableMetadata {
     // Public API
     // ------------------------------------------------------------------------
 
+    #[allow(dead_code)]
     pub fn uri(&self) -> &str {
         &self.uri
+    }
+
+    pub(crate) fn store_id(&self) -> StoreId {
+        self.store_id
     }
 
     pub fn indexes(&self) -> &[IndexMetadata] {
@@ -156,14 +178,14 @@ pub(crate) fn scan_range(
 
 #[cfg(test)]
 pub(crate) fn apply_put_autocommit(
-    uri: &str,
+    store_id: StoreId,
     btree: &mut BTreeCursor,
     global_txn: &GlobalTxnState,
     key: &[u8],
     value: &[u8],
 ) -> Result<(), WrongoDBError> {
     let mut txn = global_txn.begin_snapshot_txn();
-    if let Err(err) = btree.put(uri, key, value, &mut txn) {
+    if let Err(err) = btree.put(store_id, key, value, &mut txn) {
         let _ = txn.abort(global_txn);
         return Err(err);
     }
@@ -173,13 +195,13 @@ pub(crate) fn apply_put_autocommit(
 
 #[cfg(test)]
 pub(crate) fn apply_delete_autocommit(
-    uri: &str,
+    store_id: StoreId,
     btree: &mut BTreeCursor,
     global_txn: &GlobalTxnState,
     key: &[u8],
 ) -> Result<bool, WrongoDBError> {
     let mut txn = global_txn.begin_snapshot_txn();
-    let deleted = match btree.delete(uri, key, &mut txn) {
+    let deleted = match btree.delete(store_id, key, &mut txn) {
         Ok(deleted) => deleted,
         Err(err) => {
             let _ = txn.abort(global_txn);
@@ -237,9 +259,10 @@ mod tests {
 
     use super::*;
     use crate::storage::mvcc::ReconcileStats;
+    use crate::storage::reserved_store::FIRST_DYNAMIC_STORE_ID;
     use crate::txn::{GlobalTxnState, Transaction, TxnLogOp, TXN_NONE};
 
-    const TEST_URI: &str = "table:test";
+    const TEST_STORE_ID: StoreId = FIRST_DYNAMIC_STORE_ID;
 
     fn open_store(store_name: &str) -> (tempfile::TempDir, Arc<GlobalTxnState>, BTreeCursor) {
         let tmp = tempdir().unwrap();
@@ -253,13 +276,13 @@ mod tests {
     fn local_apply_writes_do_not_depend_on_hooks() {
         let (_tmp, global_txn, mut btree) = open_store("table.idx.wt");
 
-        apply_put_autocommit(TEST_URI, &mut btree, global_txn.as_ref(), b"k1", b"v1").unwrap();
+        apply_put_autocommit(TEST_STORE_ID, &mut btree, global_txn.as_ref(), b"k1", b"v1").unwrap();
         assert_eq!(
             get_version(&mut btree, b"k1", TXN_NONE).unwrap(),
             Some(b"v1".to_vec())
         );
         let deleted =
-            apply_delete_autocommit(TEST_URI, &mut btree, global_txn.as_ref(), b"k1").unwrap();
+            apply_delete_autocommit(TEST_STORE_ID, &mut btree, global_txn.as_ref(), b"k1").unwrap();
         assert!(deleted);
         assert_eq!(get_version(&mut btree, b"k1", TXN_NONE).unwrap(), None);
     }
@@ -269,7 +292,7 @@ mod tests {
         let (_tmp, global_txn, mut btree) = open_store("table.idx.wt");
 
         let mut txn = global_txn.begin_snapshot_txn();
-        btree.put(TEST_URI, b"k1", b"v1", &mut txn).unwrap();
+        btree.put(TEST_STORE_ID, b"k1", b"v1", &mut txn).unwrap();
         txn.commit(global_txn.as_ref()).unwrap();
 
         assert_eq!(
@@ -301,7 +324,7 @@ mod tests {
 
         let mut first_writer = global_txn.begin_snapshot_txn();
         btree
-            .put(TEST_URI, b"k1", b"v1", &mut first_writer)
+            .put(TEST_STORE_ID, b"k1", b"v1", &mut first_writer)
             .unwrap();
         first_writer.commit(global_txn.as_ref()).unwrap();
 
@@ -310,7 +333,7 @@ mod tests {
 
         let mut second_writer = global_txn.begin_snapshot_txn();
         btree
-            .put(TEST_URI, b"k1", b"v2", &mut second_writer)
+            .put(TEST_STORE_ID, b"k1", b"v2", &mut second_writer)
             .unwrap();
         second_writer.commit(global_txn.as_ref()).unwrap();
 
@@ -353,10 +376,10 @@ mod tests {
     fn reconcile_materializes_deletes_and_drops_tombstone_chains() {
         let (_tmp, global_txn, mut btree) = open_store("table.idx.wt");
 
-        apply_put_autocommit(TEST_URI, &mut btree, global_txn.as_ref(), b"k1", b"v1").unwrap();
+        apply_put_autocommit(TEST_STORE_ID, &mut btree, global_txn.as_ref(), b"k1", b"v1").unwrap();
 
         let mut txn = global_txn.begin_snapshot_txn();
-        let deleted = btree.delete(TEST_URI, b"k1", &mut txn).unwrap();
+        let deleted = btree.delete(TEST_STORE_ID, b"k1", &mut txn).unwrap();
         assert!(deleted);
         txn.commit(global_txn.as_ref()).unwrap();
 
@@ -376,12 +399,12 @@ mod tests {
     fn scan_range_merges_page_local_inserts_and_slot_updates() {
         let (_tmp, global_txn, mut btree) = open_store("table.idx.wt");
 
-        apply_put_autocommit(TEST_URI, &mut btree, global_txn.as_ref(), b"k1", b"v1").unwrap();
-        apply_put_autocommit(TEST_URI, &mut btree, global_txn.as_ref(), b"k3", b"v3").unwrap();
+        apply_put_autocommit(TEST_STORE_ID, &mut btree, global_txn.as_ref(), b"k1", b"v1").unwrap();
+        apply_put_autocommit(TEST_STORE_ID, &mut btree, global_txn.as_ref(), b"k3", b"v3").unwrap();
 
         let mut txn = global_txn.begin_snapshot_txn();
-        btree.put(TEST_URI, b"k2", b"v2", &mut txn).unwrap();
-        btree.put(TEST_URI, b"k3", b"v3x", &mut txn).unwrap();
+        btree.put(TEST_STORE_ID, b"k2", b"v2", &mut txn).unwrap();
+        btree.put(TEST_STORE_ID, b"k3", b"v3x", &mut txn).unwrap();
 
         let entries = scan_range(&mut btree, None, None, txn.id()).unwrap();
         assert_eq!(
@@ -398,11 +421,11 @@ mod tests {
     fn scan_range_skips_page_local_tombstones() {
         let (_tmp, global_txn, mut btree) = open_store("table.idx.wt");
 
-        apply_put_autocommit(TEST_URI, &mut btree, global_txn.as_ref(), b"k1", b"v1").unwrap();
-        apply_put_autocommit(TEST_URI, &mut btree, global_txn.as_ref(), b"k2", b"v2").unwrap();
+        apply_put_autocommit(TEST_STORE_ID, &mut btree, global_txn.as_ref(), b"k1", b"v1").unwrap();
+        apply_put_autocommit(TEST_STORE_ID, &mut btree, global_txn.as_ref(), b"k2", b"v2").unwrap();
 
         let mut txn = global_txn.begin_snapshot_txn();
-        let deleted = btree.delete(TEST_URI, b"k1", &mut txn).unwrap();
+        let deleted = btree.delete(TEST_STORE_ID, b"k1", &mut txn).unwrap();
         assert!(deleted);
 
         let entries = scan_range(&mut btree, None, None, txn.id()).unwrap();
@@ -414,12 +437,12 @@ mod tests {
         let (_tmp, global_txn, mut btree) = open_store("table.idx.wt");
         let mut txn = global_txn.begin_snapshot_txn();
 
-        btree.put(TEST_URI, b"k1", b"v1", &mut txn).unwrap();
+        btree.put(TEST_STORE_ID, b"k1", b"v1", &mut txn).unwrap();
 
         assert_eq!(
             txn.log_ops(),
             &[TxnLogOp::Put {
-                uri: TEST_URI.to_string(),
+                store_id: TEST_STORE_ID,
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
             }]
@@ -429,16 +452,16 @@ mod tests {
     #[test]
     fn snapshot_write_records_delete_log_op() {
         let (_tmp, global_txn, mut btree) = open_store("table.idx.wt");
-        apply_put_autocommit(TEST_URI, &mut btree, global_txn.as_ref(), b"k1", b"v1").unwrap();
+        apply_put_autocommit(TEST_STORE_ID, &mut btree, global_txn.as_ref(), b"k1", b"v1").unwrap();
         let mut txn = global_txn.begin_snapshot_txn();
 
-        let deleted = btree.delete(TEST_URI, b"k1", &mut txn).unwrap();
+        let deleted = btree.delete(TEST_STORE_ID, b"k1", &mut txn).unwrap();
 
         assert!(deleted);
         assert_eq!(
             txn.log_ops(),
             &[TxnLogOp::Delete {
-                uri: TEST_URI.to_string(),
+                store_id: TEST_STORE_ID,
                 key: b"k1".to_vec(),
             }]
         );
@@ -449,7 +472,7 @@ mod tests {
         let (_tmp, _global_txn, mut btree) = open_store("table.idx.wt");
         let mut txn = Transaction::replay(42);
 
-        btree.put(TEST_URI, b"k1", b"v1", &mut txn).unwrap();
+        btree.put(TEST_STORE_ID, b"k1", b"v1", &mut txn).unwrap();
 
         assert!(txn.log_ops().is_empty());
     }

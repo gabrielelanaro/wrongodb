@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::errors::StorageError;
 use crate::storage::api::Session;
-use crate::storage::reserved_store::{CATALOG_STORE_NAME, CATALOG_URI};
+use crate::storage::reserved_store::{CATALOG_STORE_ID, CATALOG_STORE_NAME};
 use crate::txn::TxnId;
 use crate::WrongoDBError;
 
@@ -72,7 +72,7 @@ impl CatalogStore {
         let value = bson::to_vec(record)?;
         session.put_into_named_store(
             CATALOG_STORE_NAME,
-            CATALOG_URI,
+            CATALOG_STORE_ID,
             collection.as_bytes(),
             &value,
         )

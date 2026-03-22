@@ -14,7 +14,7 @@ use crate::txn::{Timestamp, TxnId, TxnLogOp};
 #[cfg(test)]
 const GLOBAL_WAL_FILE_NAME: &str = "global.wal";
 const WAL_MAGIC: &[u8; 8] = b"WALG001\0";
-const WAL_VERSION: u16 = 5;
+const WAL_VERSION: u16 = 6;
 const WAL_HEADER_SIZE: usize = 512;
 const RECORD_HEADER_SIZE: usize = 26;
 
@@ -864,32 +864,24 @@ impl Drop for LogFile {
 // Helper Functions
 // ============================================================================
 
-fn serialize_string(buf: &mut Vec<u8>, value: &str) {
-    let bytes = value.as_bytes();
-    buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-    buf.extend_from_slice(bytes);
-}
-
 fn serialize_log_op(buf: &mut Vec<u8>, op: &TxnLogOp) {
     match op {
-        TxnLogOp::Put { uri, key, value } => {
+        TxnLogOp::Put {
+            store_id,
+            key,
+            value,
+        } => {
             buf.push(1);
-            serialize_string(buf, uri);
+            buf.extend_from_slice(&store_id.to_le_bytes());
             serialize_bytes(buf, key);
             serialize_bytes(buf, value);
         }
-        TxnLogOp::Delete { uri, key } => {
+        TxnLogOp::Delete { store_id, key } => {
             buf.push(2);
-            serialize_string(buf, uri);
+            buf.extend_from_slice(&store_id.to_le_bytes());
             serialize_bytes(buf, key);
         }
     }
-}
-
-fn deserialize_string(data: &[u8], cursor: &mut usize) -> Result<String, WrongoDBError> {
-    let bytes = deserialize_bytes(data, cursor)?;
-    String::from_utf8(bytes)
-        .map_err(|e| StorageError(format!("invalid utf8 in WAL uri: {e}")).into())
 }
 
 fn serialize_bytes(buf: &mut Vec<u8>, value: &[u8]) {
@@ -907,6 +899,19 @@ fn read_u32(data: &[u8], cursor: &mut usize) -> Result<u32, WrongoDBError> {
             .map_err(|_| StorageError("invalid u32 encoding".into()))?,
     );
     *cursor += 4;
+    Ok(out)
+}
+
+fn read_u64(data: &[u8], cursor: &mut usize) -> Result<u64, WrongoDBError> {
+    if *cursor + 8 > data.len() {
+        return Err(StorageError("unexpected EOF reading u64".into()).into());
+    }
+    let out = u64::from_le_bytes(
+        data[*cursor..*cursor + 8]
+            .try_into()
+            .map_err(|_| StorageError("invalid u64 encoding".into()))?,
+    );
+    *cursor += 8;
     Ok(out)
 }
 
@@ -938,15 +943,19 @@ fn deserialize_log_op(data: &[u8], cursor: &mut usize) -> Result<TxnLogOp, Wrong
 
     match op_type {
         1 => {
-            let uri = deserialize_string(data, cursor)?;
+            let store_id = read_u64(data, cursor)?;
             let key = deserialize_bytes(data, cursor)?;
             let value = deserialize_bytes(data, cursor)?;
-            Ok(TxnLogOp::Put { uri, key, value })
+            Ok(TxnLogOp::Put {
+                store_id,
+                key,
+                value,
+            })
         }
         2 => {
-            let uri = deserialize_string(data, cursor)?;
+            let store_id = read_u64(data, cursor)?;
             let key = deserialize_bytes(data, cursor)?;
-            Ok(TxnLogOp::Delete { uri, key })
+            Ok(TxnLogOp::Delete { store_id, key })
         }
         _ => Err(StorageError(format!("invalid txn log op type: {op_type}")).into()),
     }
@@ -997,6 +1006,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::storage::reserved_store::{FIRST_DYNAMIC_STORE_ID, METADATA_STORE_ID};
+
+    const TEST_STORE_ID: u64 = FIRST_DYNAMIC_STORE_ID;
 
     fn read_header(path: &Path) -> LogFileHeader {
         let mut file = File::open(path).unwrap();
@@ -1015,7 +1027,7 @@ mod tests {
             txn_id: 42,
             commit_ts: 42,
             ops: vec![TxnLogOp::Put {
-                uri: "table:users".to_string(),
+                store_id: TEST_STORE_ID,
                 key: b"k".to_vec(),
                 value: b"v".to_vec(),
             }],
@@ -1033,7 +1045,7 @@ mod tests {
             txn_id: 42,
             commit_ts: 42,
             ops: vec![TxnLogOp::Put {
-                uri: "metadata:".to_string(),
+                store_id: METADATA_STORE_ID,
                 key: b"table:users".to_vec(),
                 value: b"metadata-row".to_vec(),
             }],
@@ -1072,7 +1084,7 @@ mod tests {
             1,
             1,
             &[TxnLogOp::Put {
-                uri: "table:users".to_string(),
+                store_id: TEST_STORE_ID,
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
             }],
@@ -1096,7 +1108,7 @@ mod tests {
                 assert_eq!(
                     ops,
                     vec![TxnLogOp::Put {
-                        uri: "table:users".to_string(),
+                        store_id: TEST_STORE_ID,
                         key: b"k1".to_vec(),
                         value: b"v1".to_vec(),
                     }]
@@ -1115,7 +1127,7 @@ mod tests {
             1,
             1,
             &[TxnLogOp::Put {
-                uri: "table:users".to_string(),
+                store_id: TEST_STORE_ID,
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
             }],
@@ -1149,12 +1161,12 @@ mod tests {
             1,
             &[
                 TxnLogOp::Put {
-                    uri: "table:users".to_string(),
+                    store_id: TEST_STORE_ID,
                     key: b"k1".to_vec(),
                     value: b"v1".to_vec(),
                 },
                 TxnLogOp::Delete {
-                    uri: "table:users".to_string(),
+                    store_id: TEST_STORE_ID,
                     key: b"k1".to_vec(),
                 },
             ],
@@ -1184,7 +1196,7 @@ mod tests {
             1,
             1,
             &[TxnLogOp::Put {
-                uri: "table:users".to_string(),
+                store_id: TEST_STORE_ID,
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
             }],
@@ -1199,7 +1211,7 @@ mod tests {
             2,
             2,
             &[TxnLogOp::Put {
-                uri: "table:users".to_string(),
+                store_id: TEST_STORE_ID,
                 key: b"k2".to_vec(),
                 value: b"v2".to_vec(),
             }],
@@ -1223,7 +1235,7 @@ mod tests {
             1,
             1,
             &[TxnLogOp::Put {
-                uri: "table:users".to_string(),
+                store_id: TEST_STORE_ID,
                 key: b"k1".to_vec(),
                 value: b"v1".to_vec(),
             }],

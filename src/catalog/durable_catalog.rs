@@ -8,7 +8,7 @@ use crate::catalog::{CatalogRecord, CatalogStore};
 use crate::core::errors::StorageError;
 use crate::storage::api::Session;
 use crate::storage::metadata_store::{MetadataStore, INDEX_URI_PREFIX, TABLE_URI_PREFIX};
-use crate::txn::TxnId;
+use crate::txn::{TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
 /// Normalized `createIndexes` request supported by the durable catalog.
@@ -88,9 +88,12 @@ impl IndexDefinition {
         }
     }
 
-    /// Builds a ready index definition from a normalized create-index request.
-    pub(crate) fn from_request(request: &CreateIndexRequest, uri: String) -> Self {
-        Self::new(request.name.clone(), uri, request.spec.clone(), true)
+    pub(crate) fn from_request_with_ready(
+        request: &CreateIndexRequest,
+        uri: String,
+        ready: bool,
+    ) -> Self {
+        Self::new(request.name.clone(), uri, request.spec.clone(), ready)
     }
 
     pub(crate) fn name(&self) -> &str {
@@ -114,6 +117,10 @@ impl IndexDefinition {
             .get_document("key")
             .map_err(|_| StorageError(format!("index {} is missing a key document", self.name)))?;
         single_field_ascending_key_field(key)
+    }
+
+    pub(crate) fn ready(&self) -> bool {
+        self.ready
     }
 }
 
@@ -215,6 +222,14 @@ impl DurableCatalog {
             .transpose()
     }
 
+    pub(crate) fn collection(
+        &self,
+        session: &Session,
+        collection: &str,
+    ) -> Result<Option<CollectionDefinition>, WrongoDBError> {
+        self.collection_for_txn(session, collection, TXN_NONE)
+    }
+
     /// Lists every collection definition visible to `txn_id`.
     pub(crate) fn list_collections_for_txn(
         &self,
@@ -253,6 +268,17 @@ impl DurableCatalog {
         Ok((definition, true))
     }
 
+    pub(crate) fn insert_collection_if_missing_committed(
+        &self,
+        session: &mut Session,
+        collection: &str,
+        table_uri: &str,
+    ) -> Result<(CollectionDefinition, bool), WrongoDBError> {
+        session.with_transaction(|session| {
+            self.insert_collection_if_missing_in_transaction(session, collection, table_uri)
+        })
+    }
+
     /// Registers `index` on the durable collection row if it is still missing.
     pub(crate) fn ensure_index_in_transaction(
         &self,
@@ -274,6 +300,29 @@ impl DurableCatalog {
         Ok(true)
     }
 
+    pub(crate) fn ensure_index_committed(
+        &self,
+        session: &mut Session,
+        collection: &str,
+        index: IndexDefinition,
+    ) -> Result<bool, WrongoDBError> {
+        session.with_transaction(|session| {
+            self.ensure_index_in_transaction(session, collection, index)
+        })
+    }
+
+    pub(crate) fn set_index_ready_committed(
+        &self,
+        session: &mut Session,
+        collection: &str,
+        index_name: &str,
+        ready: bool,
+    ) -> Result<(), WrongoDBError> {
+        session.with_transaction(|session| {
+            self.set_index_ready_in_transaction(session, collection, index_name, ready)
+        })
+    }
+
     // ------------------------------------------------------------------------
     // Validation
     // ------------------------------------------------------------------------
@@ -284,11 +333,34 @@ impl DurableCatalog {
         &self,
         session: &Session,
         metadata_store: &MetadataStore,
-        txn_id: TxnId,
     ) -> Result<(), WrongoDBError> {
-        for collection in self.list_collections_for_txn(session, txn_id)? {
-            validate_collection_references(&collection, metadata_store, txn_id)?;
+        for collection in self.list_collections_for_txn(session, TXN_NONE)? {
+            validate_collection_references(&collection, metadata_store)?;
         }
+        Ok(())
+    }
+
+    fn set_index_ready_in_transaction(
+        &self,
+        session: &Session,
+        collection: &str,
+        index_name: &str,
+        ready: bool,
+    ) -> Result<(), WrongoDBError> {
+        let mut definition = self
+            .collection_for_txn(session, collection, session.current_txn_id())?
+            .ok_or_else(|| StorageError(format!("unknown collection: {collection}")))?;
+        let Some(index) = definition.indexes.get_mut(index_name) else {
+            return Err(StorageError(format!(
+                "unknown index {index_name} on collection {collection}"
+            ))
+            .into());
+        };
+        index.ready = ready;
+
+        let record = catalog_record_from_collection_definition(&definition)?;
+        self.store
+            .put_record_in_transaction(session, collection, &record)?;
         Ok(())
     }
 }
@@ -396,12 +468,8 @@ fn catalog_record_from_collection_definition(
 fn validate_collection_references(
     collection: &CollectionDefinition,
     metadata_store: &MetadataStore,
-    txn_id: TxnId,
 ) -> Result<(), WrongoDBError> {
-    if metadata_store
-        .lookup_store_name_for_txn(collection.table_uri(), txn_id)?
-        .is_none()
-    {
+    if metadata_store.get(collection.table_uri())?.is_none() {
         return Err(StorageError(format!(
             "catalog collection {} references missing table URI {}",
             collection.name(),
@@ -411,10 +479,7 @@ fn validate_collection_references(
     }
 
     for index in collection.indexes().values() {
-        if metadata_store
-            .lookup_store_name_for_txn(index.uri(), txn_id)?
-            .is_none()
-        {
+        if metadata_store.get(index.uri())?.is_none() {
             return Err(StorageError(format!(
                 "catalog collection {} references missing index URI {}",
                 collection.name(),

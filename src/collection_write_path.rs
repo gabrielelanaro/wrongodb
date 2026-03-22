@@ -5,11 +5,11 @@ use serde_json::Value;
 use crate::catalog::{CollectionCatalog, CreateIndexRequest, DurableCatalog, IndexDefinition};
 use crate::core::bson::{decode_document, encode_document, encode_id_value};
 use crate::core::document::{normalize_document_in_place, validate_is_object};
-use crate::core::errors::DocumentValidationError;
+use crate::core::errors::{DocumentValidationError, StorageError};
 use crate::document_query::DocumentQuery;
 use crate::index::encode_index_key;
 use crate::storage::api::Session;
-use crate::storage::metadata_store::MetadataStore;
+use crate::storage::metadata_store::{index_uri, table_uri, MetadataEntry, MetadataStore};
 use crate::{Document, WrongoDBError};
 
 /// Summary of an update command result.
@@ -55,14 +55,10 @@ impl CollectionWritePath {
         collection: &str,
         doc: Value,
     ) -> Result<Document, WrongoDBError> {
-        let (document, created_collection) = self
-            .run_in_transaction(session, |this, session| {
-                this.insert_one_in_transaction(session, collection, doc)
-            })?;
-        if created_collection {
-            self.refresh_collection_cache(session, collection)?;
-        }
-        Ok(document)
+        let _ = self.ensure_collection_registered_committed(session, collection)?;
+        self.run_in_transaction(session, |this, session| {
+            this.insert_one_in_transaction(session, collection, doc)
+        })
     }
 
     /// Updates the first document matching `filter`.
@@ -73,6 +69,7 @@ impl CollectionWritePath {
         filter: Option<Value>,
         update: Value,
     ) -> Result<UpdateResult, WrongoDBError> {
+        let _ = self.ensure_collection_registered_committed(session, collection)?;
         self.run_in_transaction(session, |this, session| {
             this.update_one_in_transaction(session, collection, filter, update)
         })
@@ -86,6 +83,7 @@ impl CollectionWritePath {
         filter: Option<Value>,
         update: Value,
     ) -> Result<UpdateResult, WrongoDBError> {
+        let _ = self.ensure_collection_registered_committed(session, collection)?;
         self.run_in_transaction(session, |this, session| {
             this.update_many_in_transaction(session, collection, filter, update)
         })
@@ -98,6 +96,7 @@ impl CollectionWritePath {
         collection: &str,
         filter: Option<Value>,
     ) -> Result<usize, WrongoDBError> {
+        let _ = self.ensure_collection_registered_committed(session, collection)?;
         self.run_in_transaction(session, |this, session| {
             this.delete_one_in_transaction(session, collection, filter)
         })
@@ -110,6 +109,7 @@ impl CollectionWritePath {
         collection: &str,
         filter: Option<Value>,
     ) -> Result<usize, WrongoDBError> {
+        let _ = self.ensure_collection_registered_committed(session, collection)?;
         self.run_in_transaction(session, |this, session| {
             this.delete_many_in_transaction(session, collection, filter)
         })
@@ -122,10 +122,18 @@ impl CollectionWritePath {
         collection: &str,
         request: CreateIndexRequest,
     ) -> Result<(), WrongoDBError> {
-        let created = self.run_in_transaction(session, |this, session| {
-            this.create_index_in_transaction(session, collection, &request)
-        })?;
+        let (table_uri, _) = self.ensure_collection_registered_committed(session, collection)?;
+        let indexed_field = request.indexed_field()?;
+        let (index_uri, created) =
+            self.ensure_index_registered_committed(session, collection, &request, &indexed_field)?;
         if created {
+            self.backfill_index_committed(session, &table_uri, &index_uri, &indexed_field)?;
+            self.durable_catalog.set_index_ready_committed(
+                session,
+                collection,
+                request.name(),
+                true,
+            )?;
             self.refresh_collection_cache(session, collection)?;
         }
         Ok(())
@@ -137,7 +145,7 @@ impl CollectionWritePath {
         session: &mut Session,
         collection: &str,
         doc: Value,
-    ) -> Result<(Document, bool), WrongoDBError> {
+    ) -> Result<Document, WrongoDBError> {
         validate_is_object(&doc)?;
         let mut obj = doc.as_object().expect("validated object").clone();
         normalize_document_in_place(&mut obj)?;
@@ -147,10 +155,9 @@ impl CollectionWritePath {
             .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
         let key = encode_id_value(id)?;
         let value = encode_document(&obj)?;
-        let (table_uri, created_collection) =
-            self.ensure_collection_registered_in_transaction(session, collection)?;
+        let table_uri = self.registered_table_uri(session, collection)?;
         self.insert_record(session, &table_uri, &key, &value)?;
-        Ok((obj, created_collection))
+        Ok(obj)
     }
 
     /// Updates the first matching document inside the caller's active transaction.
@@ -178,8 +185,7 @@ impl CollectionWritePath {
             .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
         let key = encode_id_value(id)?;
         let value = encode_document(&updated_doc)?;
-        let (table_uri, _) =
-            self.ensure_collection_registered_in_transaction(session, collection)?;
+        let table_uri = self.registered_table_uri(session, collection)?;
         self.update_record(session, &table_uri, &key, &value)?;
 
         Ok(UpdateResult {
@@ -206,8 +212,7 @@ impl CollectionWritePath {
             });
         }
 
-        let (table_uri, _) =
-            self.ensure_collection_registered_in_transaction(session, collection)?;
+        let table_uri = self.registered_table_uri(session, collection)?;
         let mut modified = 0;
         for doc in docs {
             let updated_doc = apply_update(&doc, &update)?;
@@ -245,8 +250,7 @@ impl CollectionWritePath {
             return Ok(0);
         };
         let key = encode_id_value(id)?;
-        let (table_uri, _) =
-            self.ensure_collection_registered_in_transaction(session, collection)?;
+        let table_uri = self.registered_table_uri(session, collection)?;
         self.delete_record(session, &table_uri, &key)?;
         Ok(1)
     }
@@ -265,8 +269,7 @@ impl CollectionWritePath {
             return Ok(0);
         }
 
-        let (table_uri, _) =
-            self.ensure_collection_registered_in_transaction(session, collection)?;
+        let table_uri = self.registered_table_uri(session, collection)?;
         let mut deleted = 0;
         for doc in docs {
             let Some(id) = doc.get("_id") else {
@@ -278,54 +281,6 @@ impl CollectionWritePath {
         }
 
         Ok(deleted)
-    }
-
-    /// Registers and backfills one secondary index inside the caller's active
-    /// transaction.
-    pub(crate) fn create_index_in_transaction(
-        &self,
-        session: &mut Session,
-        collection: &str,
-        request: &CreateIndexRequest,
-    ) -> Result<bool, WrongoDBError> {
-        let (table_uri, _) =
-            self.ensure_collection_registered_in_transaction(session, collection)?;
-        let indexed_field = request.indexed_field()?;
-
-        let (index_uri, _created_storage_entry) =
-            self.metadata_store.ensure_index_uri_in_transaction(
-                session,
-                collection,
-                request.name(),
-                vec![indexed_field.clone()],
-            )?;
-        // The durable catalog owns the Mongo-visible index definition; the
-        // storage metadata only owns the raw `index:` URI and backing source.
-        let inserted = self.durable_catalog.ensure_index_in_transaction(
-            session,
-            collection,
-            IndexDefinition::from_request(request, index_uri.clone()),
-        )?;
-        if !inserted {
-            return Ok(false);
-        }
-
-        let mut primary_cursor = session.open_table_cursor(&table_uri)?;
-        while let Some((_, bytes)) = primary_cursor.next()? {
-            let doc = decode_document(&bytes)?;
-            let Some(id) = doc.get("_id") else {
-                continue;
-            };
-            let Some(value) = doc.get(&indexed_field) else {
-                continue;
-            };
-            let Some(key) = encode_index_key(value, id)? else {
-                continue;
-            };
-            session.insert_into_store(&index_uri, &key, &[])?;
-        }
-
-        Ok(true)
     }
 
     fn insert_record(
@@ -360,33 +315,104 @@ impl CollectionWritePath {
         cursor.delete(key)
     }
 
-    fn ensure_collection_registered_in_transaction(
+    fn ensure_collection_registered_committed(
         &self,
         session: &mut Session,
         collection: &str,
     ) -> Result<(String, bool), WrongoDBError> {
-        // Collection creation touches both stores: `metadata.wt` owns the raw
-        // `table:` binding while `_catalog.wt` owns the server-facing
-        // collection definition.
-        if let Some(definition) = self.durable_catalog.collection_for_txn(
-            session,
-            collection,
-            session.current_txn_id(),
-        )? {
+        if let Some(definition) = self.durable_catalog.collection(session, collection)? {
             return Ok((definition.table_uri().to_string(), false));
         }
 
-        let table_uri = self
-            .metadata_store
-            .ensure_table_uri_in_transaction(session, collection)?;
+        let table_uri = table_uri(collection);
+        if self.metadata_store.get(&table_uri)?.is_none() {
+            let entry = MetadataEntry::table(collection, self.metadata_store.allocate_store_id());
+            session.ensure_named_store(entry.source())?;
+            self.metadata_store.insert(&entry)?;
+        }
+
         let (_, created_collection) = self
             .durable_catalog
-            .insert_collection_if_missing_in_transaction(session, collection, &table_uri)?;
+            .insert_collection_if_missing_committed(session, collection, &table_uri)?;
+        if created_collection {
+            self.refresh_collection_cache(session, collection)?;
+        }
         Ok((table_uri, created_collection))
     }
 
-    // The committed collection catalog is only refreshed after the outer write
-    // transaction succeeds. Failed transactions must not publish catalog state.
+    fn ensure_index_registered_committed(
+        &self,
+        session: &mut Session,
+        collection: &str,
+        request: &CreateIndexRequest,
+        indexed_field: &str,
+    ) -> Result<(String, bool), WrongoDBError> {
+        let index_uri = index_uri(collection, request.name());
+        if self
+            .durable_catalog
+            .collection(session, collection)?
+            .and_then(|definition| definition.indexes().get(request.name()).cloned())
+            .is_some()
+        {
+            return Ok((index_uri, false));
+        }
+
+        if self.metadata_store.get(&index_uri)?.is_none() {
+            let entry = MetadataEntry::index(
+                collection,
+                request.name(),
+                vec![indexed_field.to_string()],
+                self.metadata_store.allocate_store_id(),
+            );
+            session.ensure_named_store(entry.source())?;
+            self.metadata_store.insert(&entry)?;
+        }
+
+        let inserted = self.durable_catalog.ensure_index_committed(
+            session,
+            collection,
+            IndexDefinition::from_request_with_ready(request, index_uri.clone(), false),
+        )?;
+        Ok((index_uri, inserted))
+    }
+
+    fn backfill_index_committed(
+        &self,
+        session: &mut Session,
+        table_uri: &str,
+        index_uri: &str,
+        indexed_field: &str,
+    ) -> Result<(), WrongoDBError> {
+        session.with_transaction(|session| {
+            let mut primary_cursor = session.open_table_cursor(table_uri)?;
+            while let Some((_, bytes)) = primary_cursor.next()? {
+                let doc = decode_document(&bytes)?;
+                let Some(id) = doc.get("_id") else {
+                    continue;
+                };
+                let Some(value) = doc.get(indexed_field) else {
+                    continue;
+                };
+                let Some(key) = encode_index_key(value, id)? else {
+                    continue;
+                };
+                session.insert_into_store(index_uri, &key, &[])?;
+            }
+            Ok(())
+        })
+    }
+
+    fn registered_table_uri(
+        &self,
+        session: &mut Session,
+        collection: &str,
+    ) -> Result<String, WrongoDBError> {
+        self.durable_catalog
+            .collection_for_txn(session, collection, session.current_txn_id())?
+            .map(|definition| definition.table_uri().to_string())
+            .ok_or_else(|| StorageError(format!("unknown collection: {collection}")).into())
+    }
+
     fn refresh_collection_cache(
         &self,
         session: &Session,
@@ -508,10 +534,18 @@ mod tests {
         let global_txn = Arc::new(GlobalTxnState::new());
         let store_handles =
             Arc::new(HandleCache::<String, parking_lot::RwLock<BTreeCursor>>::new());
-        let metadata_store = Arc::new(MetadataStore::new(base_path.clone(), store_handles.clone()));
+        let log_manager = Arc::new(log_manager);
+        let metadata_store = Arc::new(
+            MetadataStore::new(
+                base_path.clone(),
+                store_handles.clone(),
+                global_txn.clone(),
+                log_manager.clone(),
+            )
+            .unwrap(),
+        );
         let durable_catalog = Arc::new(DurableCatalog::new(CatalogStore::new()));
         let collection_catalog = Arc::new(CollectionCatalog::new());
-        let log_manager = Arc::new(log_manager);
         let session = Session::new(
             base_path,
             store_handles,
@@ -617,6 +651,36 @@ mod tests {
     }
 
     #[test]
+    fn ready_false_indexes_are_ignored_until_backfill_completes() {
+        let tmp = tempdir().unwrap();
+        let (service, query, _collection_catalog, mut session) =
+            test_services(tmp.path().to_path_buf(), LogManager::disabled());
+
+        service
+            .insert_one(&mut session, "users", json!({"_id": 1, "name": "alice"}))
+            .unwrap();
+
+        let request = CreateIndexRequest::single_field_ascending("name");
+        let (index_uri, created) = service
+            .ensure_index_registered_committed(&mut session, "users", &request, "name")
+            .unwrap();
+        assert!(created);
+
+        session
+            .with_transaction(|session| {
+                let rows = session.scan_store_range(&index_uri, None, None)?;
+                assert!(rows.is_empty());
+                Ok(())
+            })
+            .unwrap();
+
+        let docs = query
+            .find(&mut session, "users", Some(json!({"name": "alice"})))
+            .unwrap();
+        assert_eq!(docs.len(), 1);
+    }
+
+    #[test]
     fn crud_roundtrip() {
         let tmp = tempdir().unwrap();
         let (service, query, _collection_catalog, mut session) =
@@ -693,8 +757,12 @@ mod tests {
     #[test]
     fn failing_transaction_aborts_changes() {
         let tmp = tempdir().unwrap();
-        let (service, query, _collection_catalog, mut session) =
+        let (service, query, collection_catalog, mut session) =
             test_services(tmp.path().to_path_buf(), LogManager::disabled());
+        let (_table_uri, created_collection) = service
+            .ensure_collection_registered_committed(&mut session, "items")
+            .unwrap();
+        assert!(created_collection);
 
         let err = service
             .run_in_transaction(&mut session, |this, session| {
@@ -713,5 +781,6 @@ mod tests {
             .find(&mut session, "items", Some(json!({"_id": "abort-me"})))
             .unwrap()
             .is_empty());
+        assert!(collection_catalog.lookup_collection("items").is_some());
     }
 }
