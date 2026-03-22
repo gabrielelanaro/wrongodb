@@ -204,27 +204,41 @@ impl Session {
     /// Open a cursor for `file:<name>` in the current transaction context.
     pub fn open_file_cursor(&self, file_uri: &str) -> Result<FileCursor<'_>, WrongoDBError> {
         let loaded = self.load_file_runtime(file_uri)?;
+        let state = self.create_cursor_state();
 
-        FileCursor::new(
+        Ok(FileCursor::new(
             self,
             file_uri,
             loaded.store_id,
             loaded.handle,
             TableCursorWriteAccess::ReadWrite,
-        )
+            state,
+        ))
     }
 
     /// Open a cursor for `table:<name>` in the current transaction context.
     pub fn open_table_cursor(&self, table_uri: &str) -> Result<TableCursor<'_>, WrongoDBError> {
         let loaded = self.load_table_runtime(table_uri)?;
 
-        TableCursor::new(
+        if loaded.table.indexes().len() != loaded.indexes.len() {
+            return Err(StorageError(format!(
+                "table cursor index handle mismatch: metadata has {}, runtime has {}",
+                loaded.table.indexes().len(),
+                loaded.indexes.len()
+            ))
+            .into());
+        }
+
+        let state = self.create_cursor_state();
+
+        Ok(TableCursor::new(
             self,
             loaded.table,
             loaded.primary,
             loaded.indexes,
             TableCursorWriteAccess::ReadWrite,
-        )
+            state,
+        ))
     }
 
     /// Open a cursor for `index:<collection>:<name>` in the current transaction context.
@@ -234,14 +248,16 @@ impl Session {
     /// to fetch full documents from the main table.
     pub fn open_index_cursor(&self, index_uri: &str) -> Result<FileCursor<'_>, WrongoDBError> {
         let resolved = self.resolve_store(index_uri)?;
+        let state = self.create_cursor_state();
 
-        FileCursor::new(
+        Ok(FileCursor::new(
             self,
             index_uri,
             resolved.store_id,
             resolved.handle,
             TableCursorWriteAccess::ReadWrite,
-        )
+            state,
+        ))
     }
 
     /// Run `f` inside a session transaction.
@@ -361,8 +377,10 @@ impl Session {
     // Cursor lifecycle
     // ------------------------------------------------------------------------
 
-    pub(crate) fn track_open_cursor(&self, state: &Arc<Mutex<TableCursorState>>) {
-        self.open_cursor_states.lock().push(Arc::downgrade(state));
+    fn create_cursor_state(&self) -> Arc<Mutex<TableCursorState>> {
+        let state = Arc::new(Mutex::new(TableCursorState::default()));
+        self.open_cursor_states.lock().push(Arc::downgrade(&state));
+        state
     }
 
     fn reset_open_cursor_states(&self) {
