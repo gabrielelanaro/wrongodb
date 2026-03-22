@@ -288,7 +288,7 @@ impl Session {
             .unwrap_or(TXN_NONE)
     }
 
-    pub(crate) fn begin_transaction(&mut self) -> Result<(), WrongoDBError> {
+    fn begin_transaction(&mut self) -> Result<(), WrongoDBError> {
         let mut active_transaction = self.active_transaction.lock();
         if active_transaction.is_some() {
             return Err(WrongoDBError::TransactionAlreadyActive);
@@ -298,7 +298,7 @@ impl Session {
         Ok(())
     }
 
-    pub(crate) fn commit_transaction(&mut self) -> Result<(), WrongoDBError> {
+    fn commit_transaction(&mut self) -> Result<(), WrongoDBError> {
         let Some(txn_handle) = self.active_transaction.lock().take() else {
             return Ok(());
         };
@@ -317,7 +317,7 @@ impl Session {
         result
     }
 
-    pub(crate) fn rollback_transaction(&mut self) -> Result<(), WrongoDBError> {
+    fn rollback_transaction(&mut self) -> Result<(), WrongoDBError> {
         let Some(txn_handle) = self.active_transaction.lock().take() else {
             return Ok(());
         };
