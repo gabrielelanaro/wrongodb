@@ -11,7 +11,7 @@ fn main() {
     {
         let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
         let mut session = conn.open_session();
-        session.create_table("table:test").unwrap();
+        session.create_table("table:test", Vec::new()).unwrap();
         session
             .with_transaction(|session| {
                 println!("Inserting key0");

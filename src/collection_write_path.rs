@@ -75,7 +75,7 @@ impl CollectionWritePath {
         }
 
         let table_uri = table_uri(collection);
-        session.create_table_with_columns(&table_uri, storage_columns.clone())?;
+        session.create_table(&table_uri, storage_columns.clone())?;
         let (_, created) = self
             .durable_catalog
             .insert_collection_if_missing_committed(

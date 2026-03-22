@@ -5,7 +5,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let conn = Connection::open("test_checkpoint", ConnectionConfig::default())?;
     let mut session = conn.open_session();
-    session.create_table("table:test")?;
+    session.create_table("table:test", Vec::new())?;
 
     for i in 0..10 {
         let mut cursor = session.open_table_cursor("table:test")?;

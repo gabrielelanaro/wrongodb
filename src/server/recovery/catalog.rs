@@ -107,7 +107,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let conn = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
         let mut session = conn.open_session();
-        session.create_table("table:users").unwrap();
+        session.create_table("table:users", Vec::new()).unwrap();
         drop(session);
         std::fs::remove_file(dir.path().join("users.main.wt")).unwrap();
 

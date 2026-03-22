@@ -79,12 +79,8 @@ impl Session {
     // Public API
     // ------------------------------------------------------------------------
 
-    /// Ensure that `table:<name>` exists.
-    pub fn create_table(&mut self, table_uri: &str) -> Result<(), WrongoDBError> {
-        self.create_table_with_columns(table_uri, Vec::new())
-    }
-
-    pub(crate) fn create_table_with_columns(
+    /// Ensure that `table:<name>` exists with the requested storage columns.
+    pub fn create_table(
         &mut self,
         table_uri: &str,
         value_columns: Vec<String>,
@@ -685,7 +681,7 @@ mod tests {
     fn create_table_allows_non_transactional_cursor_access() {
         let mut session =
             SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
-        session.create_table(TEST_URI).unwrap();
+        session.create_table(TEST_URI, Vec::new()).unwrap();
 
         let mut cursor = session.open_table_cursor(TEST_URI).unwrap();
         cursor.insert(TEST_KEY, TEST_VALUE).unwrap();
@@ -698,7 +694,7 @@ mod tests {
         let mut session =
             SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
         session
-            .create_table_with_columns(TEST_URI, vec!["name".to_string()])
+            .create_table(TEST_URI, vec!["name".to_string()])
             .unwrap();
 
         let entry = MetadataEntry::index(
@@ -722,7 +718,9 @@ mod tests {
         let mut session =
             SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
 
-        let err = session.create_table("index:test:name").unwrap_err();
+        let err = session
+            .create_table("index:test:name", Vec::new())
+            .unwrap_err();
         assert!(err.to_string().contains("only table:... is supported"));
     }
 
@@ -746,7 +744,7 @@ mod tests {
     fn public_open_cursor_rejects_index_and_metadata_uris() {
         let mut session =
             SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
-        session.create_table(TEST_URI).unwrap();
+        session.create_table(TEST_URI, Vec::new()).unwrap();
 
         let index_err = session.open_table_cursor("index:items:name").unwrap_err();
         assert!(index_err
@@ -763,7 +761,7 @@ mod tests {
     fn transaction_open_cursor_rejects_index_and_metadata_uris() {
         let mut session =
             SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
-        session.create_table(TEST_URI).unwrap();
+        session.create_table(TEST_URI, Vec::new()).unwrap();
 
         session
             .with_transaction(|session| {
@@ -785,7 +783,7 @@ mod tests {
     fn transaction_cursor_reads_its_uncommitted_write() {
         let mut session =
             SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
-        session.create_table(TEST_URI).unwrap();
+        session.create_table(TEST_URI, Vec::new()).unwrap();
 
         session
             .with_transaction(|session| {
@@ -801,7 +799,7 @@ mod tests {
     fn local_mode_commit_makes_transactional_cursor_write_visible() {
         let mut session =
             SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
-        session.create_table(TEST_URI).unwrap();
+        session.create_table(TEST_URI, Vec::new()).unwrap();
 
         session
             .with_transaction(|session| insert_in_transaction(session, TEST_KEY, TEST_VALUE))
@@ -815,7 +813,7 @@ mod tests {
     fn local_mode_abort_discards_transactional_cursor_write() {
         let mut session =
             SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
-        session.create_table(TEST_URI).unwrap();
+        session.create_table(TEST_URI, Vec::new()).unwrap();
 
         let _ = session.with_transaction(|session| {
             insert_in_transaction(session, TEST_KEY, TEST_VALUE)?;
@@ -832,7 +830,7 @@ mod tests {
     fn dropped_with_transaction_guard_discards_transactional_cursor_write() {
         let mut session =
             SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
-        session.create_table(TEST_URI).unwrap();
+        session.create_table(TEST_URI, Vec::new()).unwrap();
 
         let _ = session.with_transaction(|session| {
             insert_in_transaction(session, TEST_KEY, TEST_VALUE)?;
@@ -847,7 +845,7 @@ mod tests {
     fn implicit_write_failure_resets_other_open_cursors() {
         let mut session =
             SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
-        session.create_table(TEST_URI).unwrap();
+        session.create_table(TEST_URI, Vec::new()).unwrap();
 
         {
             let mut cursor = session.open_table_cursor(TEST_URI).unwrap();
@@ -899,7 +897,7 @@ mod tests {
             global_txn,
             log_manager,
         );
-        session.create_table(TEST_URI).unwrap();
+        session.create_table(TEST_URI, Vec::new()).unwrap();
 
         session.begin_transaction().unwrap();
         insert_in_transaction(&mut session, TEST_KEY, TEST_VALUE).unwrap();
@@ -920,7 +918,7 @@ mod tests {
     fn checkpoint_truncates_when_no_active_transactions() {
         let dir = tempdir().unwrap();
         let mut session = SessionTestFixture::open_local_wal(dir.path()).into_session();
-        session.create_table(TEST_URI).unwrap();
+        session.create_table(TEST_URI, Vec::new()).unwrap();
 
         session
             .with_transaction(|session| insert_in_transaction(session, TEST_KEY, TEST_VALUE))
@@ -939,7 +937,7 @@ mod tests {
     fn local_wal_mode_records_transactional_cursor_write_and_commit_markers() {
         let dir = tempdir().unwrap();
         let mut session = SessionTestFixture::open_local_wal(dir.path()).into_session();
-        session.create_table(TEST_URI).unwrap();
+        session.create_table(TEST_URI, Vec::new()).unwrap();
         let store_id = session
             .metadata_store
             .get(TEST_URI)

@@ -11,7 +11,7 @@ pub fn insert_kv(
     value: &[u8],
 ) -> Result<(), WrongoDBError> {
     let mut session = conn.open_session();
-    session.create_table(&table_uri(collection))?;
+    session.create_table(&table_uri(collection), Vec::new())?;
     session.with_transaction(|session| insert_kv_in_transaction(session, collection, key, value))
 }
 
@@ -21,7 +21,7 @@ pub fn insert_kv_in_session(
     key: &[u8],
     value: &[u8],
 ) -> Result<(), WrongoDBError> {
-    session.create_table(&table_uri(collection))?;
+    session.create_table(&table_uri(collection), Vec::new())?;
     let mut cursor = session.open_table_cursor(&table_uri(collection))?;
     cursor.insert(key, value)
 }
@@ -42,7 +42,7 @@ pub fn update_kv_in_session(
     key: &[u8],
     value: &[u8],
 ) -> Result<(), WrongoDBError> {
-    session.create_table(&table_uri(collection))?;
+    session.create_table(&table_uri(collection), Vec::new())?;
     let mut cursor = session.open_table_cursor(&table_uri(collection))?;
     cursor.update(key, value)
 }
@@ -62,7 +62,7 @@ pub fn delete_kv_in_session(
     collection: &str,
     key: &[u8],
 ) -> Result<(), WrongoDBError> {
-    session.create_table(&table_uri(collection))?;
+    session.create_table(&table_uri(collection), Vec::new())?;
     let mut cursor = session.open_table_cursor(&table_uri(collection))?;
     cursor.delete(key)
 }
@@ -90,7 +90,7 @@ pub fn get_kv_in_session(
     collection: &str,
     key: &[u8],
 ) -> Result<Option<Vec<u8>>, WrongoDBError> {
-    session.create_table(&table_uri(collection))?;
+    session.create_table(&table_uri(collection), Vec::new())?;
     let mut cursor = session.open_table_cursor(&table_uri(collection))?;
     cursor.get(key)
 }
@@ -108,7 +108,7 @@ pub fn scan_kv(
     session: &mut Session,
     collection: &str,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, WrongoDBError> {
-    session.create_table(&table_uri(collection))?;
+    session.create_table(&table_uri(collection), Vec::new())?;
     let mut cursor = session.open_table_cursor(&table_uri(collection))?;
     let mut entries = Vec::new();
     while let Some(entry) = cursor.next()? {

@@ -11,7 +11,7 @@ fn main() {
     println!("=== Phase 1: Create and insert 0-4 ===");
     {
         let mut session = conn.open_session();
-        session.create_table("table:test").unwrap();
+        session.create_table("table:test", Vec::new()).unwrap();
 
         session
             .with_transaction(|session| {

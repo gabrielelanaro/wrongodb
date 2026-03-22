@@ -10,7 +10,7 @@ fn test_connection_basic() {
     let conn = Connection::open(tmp.path().join("test"), ConnectionConfig::new()).unwrap();
 
     let mut session = conn.open_session();
-    session.create_table("table:test").unwrap();
+    session.create_table("table:test", Vec::new()).unwrap();
 
     {
         session
@@ -31,7 +31,7 @@ fn test_connection_with_config() {
     let conn = Connection::open(tmp.path().join("test"), config).unwrap();
 
     let mut session = conn.open_session();
-    session.create_table("table:users").unwrap();
+    session.create_table("table:users", Vec::new()).unwrap();
 
     {
         session
@@ -56,7 +56,7 @@ fn test_session_delete() {
     let conn = Connection::open(tmp.path().join("test"), ConnectionConfig::new()).unwrap();
 
     let mut session = conn.open_session();
-    session.create_table("table:items").unwrap();
+    session.create_table("table:items", Vec::new()).unwrap();
 
     {
         session
@@ -85,7 +85,7 @@ fn test_session_autocommit_visibility_with_wal() {
     let conn = Connection::open(tmp.path().join("test"), ConnectionConfig::new()).unwrap();
 
     let mut session = conn.open_session();
-    session.create_table("table:kv").unwrap();
+    session.create_table("table:kv", Vec::new()).unwrap();
 
     insert_kv_in_session(&mut session, "kv", b"k1", b"v1").unwrap();
     assert_eq!(get_kv(&conn, "kv", b"k1").unwrap().unwrap(), b"v1".to_vec());

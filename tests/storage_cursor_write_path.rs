@@ -4,7 +4,7 @@ use wrongodb::{Connection, ConnectionConfig, WrongoDBError};
 
 fn insert_kv(conn: &Connection, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
     let mut session = conn.open_session();
-    session.create_table("table:test")?;
+    session.create_table("table:test", Vec::new())?;
     let mut cursor = session.open_table_cursor("table:test")?;
     cursor.insert(key, value)?;
     Ok(())

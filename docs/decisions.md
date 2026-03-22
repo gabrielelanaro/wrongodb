@@ -1,5 +1,18 @@
 # Decisions
 
+## 2026-03-22: Make `Session::create_table` schema-aware and remove the wrapper
+
+**Decision**
+- Change `Session::create_table` to take `value_columns: Vec<String>`.
+- Remove `Session::create_table_with_columns`.
+- Keep empty `value_columns` as the explicit KV-table shape.
+- Update collection creation and tests to pass `Vec::new()` when no storage columns are declared.
+
+**Why**
+- The wrapper did not add policy; it only forwarded to the schema-aware implementation.
+- The storage boundary is clearer if schema is always explicit.
+- Zero-column tables remain supported without a second API surface.
+
 ## 2026-03-22: Switch collection storage to explicit WT-style row schemas and move index fill into `Session`
 
 **Decision**
