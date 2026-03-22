@@ -4,11 +4,10 @@ use bson::{spec::BinarySubtype, Binary, Bson, Document};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::catalog::{CatalogRecord, CatalogStore};
+use crate::catalog::{CatalogRecord, CatalogStore, CATALOG_FILE_URI};
 use crate::core::errors::StorageError;
 use crate::storage::api::Session;
 use crate::storage::metadata_store::{MetadataStore, INDEX_URI_PREFIX, TABLE_URI_PREFIX};
-use crate::txn::{TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
 /// Normalized `createIndexes` request supported by the durable catalog.
@@ -63,7 +62,7 @@ impl CreateIndexRequest {
     }
 }
 
-/// Server-facing definition of a secondary index persisted in `_catalog.wt`.
+/// Server-facing definition of a secondary index persisted in `file:_catalog.wt`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct IndexDefinition {
     name: String,
@@ -126,7 +125,7 @@ impl IndexDefinition {
 
 /// Durable server-side definition of one collection.
 ///
-/// This is the parsed view over one `_catalog.wt` row. It carries server-facing
+/// This is the parsed view over one `file:_catalog.wt` row. It carries server-facing
 /// collection state such as the UUID, options, and secondary index specs while
 /// pointing back to the storage-layer `table:` and `index:` URIs.
 #[derive(Debug, Clone, PartialEq)]
@@ -185,7 +184,7 @@ impl CollectionDefinition {
     }
 }
 
-/// Parsed durable collection catalog stored in the reserved `_catalog.wt`.
+/// Parsed durable collection catalog stored in the metadata-managed `file:_catalog.wt`.
 ///
 /// `DurableCatalog` sits above [`CatalogStore`]. It translates raw catalog rows
 /// into collection and index definitions, validates their invariants, and keeps
@@ -201,7 +200,7 @@ impl DurableCatalog {
     // Constructors
     // ------------------------------------------------------------------------
 
-    /// Creates the durable catalog over the raw `_catalog.wt` store.
+    /// Creates the durable catalog over the raw `file:_catalog.wt` store.
     pub(crate) fn new(store: CatalogStore) -> Self {
         Self { store }
     }
@@ -210,47 +209,58 @@ impl DurableCatalog {
     // Bootstrap
     // ------------------------------------------------------------------------
 
-    /// Ensures that the reserved `_catalog.wt` store exists.
-    pub(crate) fn ensure_store_exists(&self, session: &Session) -> Result<(), WrongoDBError> {
-        self.store.ensure_store_exists(session)
+    /// Ensures that the metadata-managed `file:_catalog.wt` object exists.
+    pub(crate) fn ensure_store_exists(&self, session: &mut Session) -> Result<(), WrongoDBError> {
+        session.create_file(CATALOG_FILE_URI)
     }
 
     // ------------------------------------------------------------------------
     // Read API
     // ------------------------------------------------------------------------
 
-    /// Loads the collection definition visible to `txn_id`.
-    pub(crate) fn collection_for_txn(
+    /// Loads the collection definition visible in the session's current transaction context.
+    pub(crate) fn collection_visible(
         &self,
         session: &Session,
         collection: &str,
-        txn_id: TxnId,
     ) -> Result<Option<CollectionDefinition>, WrongoDBError> {
         self.store
-            .record_for_txn(session, collection, txn_id)?
+            .record_visible(session, collection)?
             .map(|record| collection_definition_from_record(collection.to_string(), record))
             .transpose()
     }
 
-    pub(crate) fn collection(
+    /// Loads the committed collection definition.
+    ///
+    /// Callers should pass a session without an active transaction.
+    pub(crate) fn collection_committed(
         &self,
         session: &Session,
         collection: &str,
     ) -> Result<Option<CollectionDefinition>, WrongoDBError> {
-        self.collection_for_txn(session, collection, TXN_NONE)
+        self.collection_visible(session, collection)
     }
 
-    /// Lists every collection definition visible to `txn_id`.
-    pub(crate) fn list_collections_for_txn(
+    /// Lists every collection definition visible in the session's current transaction context.
+    pub(crate) fn list_collections_visible(
         &self,
         session: &Session,
-        txn_id: TxnId,
     ) -> Result<Vec<CollectionDefinition>, WrongoDBError> {
         self.store
-            .list_records_for_txn(session, txn_id)?
+            .list_records_visible(session)?
             .into_iter()
             .map(|(collection, record)| collection_definition_from_record(collection, record))
             .collect()
+    }
+
+    /// Lists every committed collection definition.
+    ///
+    /// Callers should pass a session without an active transaction.
+    pub(crate) fn list_collections_committed(
+        &self,
+        session: &Session,
+    ) -> Result<Vec<CollectionDefinition>, WrongoDBError> {
+        self.list_collections_visible(session)
     }
 
     // ------------------------------------------------------------------------
@@ -266,9 +276,7 @@ impl DurableCatalog {
         table_uri: &str,
         storage_columns: &[String],
     ) -> Result<(CollectionDefinition, bool), WrongoDBError> {
-        if let Some(existing) =
-            self.collection_for_txn(session, collection, session.current_txn_id())?
-        {
+        if let Some(existing) = self.collection_visible(session, collection)? {
             return Ok((existing, false));
         }
 
@@ -304,7 +312,7 @@ impl DurableCatalog {
         index: IndexDefinition,
     ) -> Result<bool, WrongoDBError> {
         let mut definition = self
-            .collection_for_txn(session, collection, session.current_txn_id())?
+            .collection_visible(session, collection)?
             .ok_or_else(|| StorageError(format!("unknown collection: {collection}")))?;
         if definition.indexes.contains_key(index.name()) {
             return Ok(false);
@@ -351,7 +359,7 @@ impl DurableCatalog {
         session: &Session,
         metadata_store: &MetadataStore,
     ) -> Result<(), WrongoDBError> {
-        for collection in self.list_collections_for_txn(session, TXN_NONE)? {
+        for collection in self.list_collections_committed(session)? {
             validate_collection_references(&collection, metadata_store)?;
         }
         Ok(())
@@ -365,7 +373,7 @@ impl DurableCatalog {
         ready: bool,
     ) -> Result<(), WrongoDBError> {
         let mut definition = self
-            .collection_for_txn(session, collection, session.current_txn_id())?
+            .collection_visible(session, collection)?
             .ok_or_else(|| StorageError(format!("unknown collection: {collection}")))?;
         let Some(index) = definition.indexes.get_mut(index_name) else {
             return Err(StorageError(format!(

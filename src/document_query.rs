@@ -77,11 +77,9 @@ impl DocumentQuery {
         collection: &str,
         filter: Option<Value>,
     ) -> Result<Vec<Document>, WrongoDBError> {
-        let Some(collection_definition) = self.durable_catalog.collection_for_txn(
-            session,
-            collection,
-            session.current_txn_id(),
-        )?
+        let Some(collection_definition) = self
+            .durable_catalog
+            .collection_visible(session, collection)?
         else {
             return Ok(Vec::new());
         };
@@ -225,14 +223,14 @@ mod tests {
             );
             let durable_catalog = Arc::new(DurableCatalog::new(CatalogStore::new()));
             let collection_catalog = Arc::new(CollectionCatalog::new());
-            let session = Session::new(
+            let mut session = Session::new(
                 base_path,
                 store_handles,
                 metadata_store.clone(),
                 global_txn,
                 log_manager,
             );
-            durable_catalog.ensure_store_exists(&session).unwrap();
+            durable_catalog.ensure_store_exists(&mut session).unwrap();
             collection_catalog
                 .load_from_durable(&session, durable_catalog.as_ref())
                 .unwrap();

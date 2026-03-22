@@ -24,8 +24,8 @@ impl DatabaseContext {
         let metadata_store = connection.metadata_store();
         let durable_catalog = Arc::new(DurableCatalog::new(CatalogStore::new()));
         let collection_catalog = Arc::new(CollectionCatalog::new());
-        let session = connection.open_session();
-        durable_catalog.ensure_store_exists(&session)?;
+        let mut session = connection.open_session();
+        durable_catalog.ensure_store_exists(&mut session)?;
         collection_catalog.load_from_durable(&session, durable_catalog.as_ref())?;
 
         let document_query = DocumentQuery::new(durable_catalog.clone());

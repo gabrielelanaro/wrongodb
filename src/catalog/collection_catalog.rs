@@ -4,7 +4,6 @@ use parking_lot::RwLock;
 
 use crate::catalog::{CollectionDefinition, DurableCatalog, IndexDefinition};
 use crate::storage::api::Session;
-use crate::txn::TXN_NONE;
 use crate::WrongoDBError;
 
 /// In-memory committed view of the durable collection catalog.
@@ -30,7 +29,7 @@ impl CollectionCatalog {
         durable_catalog: &DurableCatalog,
     ) -> Result<(), WrongoDBError> {
         let collections = durable_catalog
-            .list_collections_for_txn(session, TXN_NONE)?
+            .list_collections_committed(session)?
             .into_iter()
             .map(|collection| (collection.name().to_string(), collection))
             .collect();
@@ -46,7 +45,7 @@ impl CollectionCatalog {
         collection: &str,
     ) -> Result<(), WrongoDBError> {
         let mut collections = self.collections.write();
-        match durable_catalog.collection_for_txn(session, collection, TXN_NONE)? {
+        match durable_catalog.collection_committed(session, collection)? {
             Some(definition) => {
                 collections.insert(collection.to_string(), definition);
             }

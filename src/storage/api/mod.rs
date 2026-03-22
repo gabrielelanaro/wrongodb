@@ -5,5 +5,6 @@ pub(crate) mod session;
 pub use connection::{
     Connection, ConnectionConfig, LogSyncMethod, LoggingConfig, TransactionSyncConfig,
 };
-pub use cursor::{CursorEntry, TableCursor};
+#[allow(unused_imports)]
+pub use cursor::{CursorEntry, FileCursor, TableCursor};
 pub use session::Session;

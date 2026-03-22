@@ -19,12 +19,10 @@ impl CatalogRecovery {
         connection: &Connection,
     ) -> Result<CatalogRecoveryReport, WrongoDBError> {
         let metadata_store = connection.metadata_store();
-        let session = connection.open_session();
-        for store_name in reserved_store_names() {
-            session.ensure_named_store(store_name)?;
-        }
+        let mut session = connection.open_session();
 
         let durable_catalog = DurableCatalog::new(CatalogStore::new());
+        durable_catalog.ensure_store_exists(&mut session)?;
         durable_catalog.validate_storage_references(&session, metadata_store.as_ref())?;
 
         let mut referenced_store_names = metadata_store.all_store_names()?;

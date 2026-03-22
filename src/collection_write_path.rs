@@ -68,7 +68,7 @@ impl CollectionWritePath {
 
         if self
             .durable_catalog
-            .collection(session, collection)?
+            .collection_committed(session, collection)?
             .is_some()
         {
             return Err(StorageError(format!("collection already exists: {collection}")).into());
@@ -386,17 +386,12 @@ impl CollectionWritePath {
         let index_uri = index_uri(collection, request.name());
         let stored_entry = self.metadata_store.get(&index_uri)?;
         let metadata_entry = stored_entry.clone().unwrap_or_else(|| {
-            MetadataEntry::index(
-                collection,
-                request.name(),
-                vec![indexed_field.to_string()],
-                self.metadata_store.allocate_store_id(),
-            )
+            MetadataEntry::index(collection, request.name(), vec![indexed_field.to_string()])
         });
 
         if let Some(ready) = self
             .durable_catalog
-            .collection(session, collection)?
+            .collection_committed(session, collection)?
             .and_then(|definition| {
                 definition
                     .indexes()
@@ -429,7 +424,7 @@ impl CollectionWritePath {
         collection: &str,
     ) -> Result<CollectionDefinition, WrongoDBError> {
         self.durable_catalog
-            .collection(session, collection)?
+            .collection_committed(session, collection)?
             .ok_or_else(|| StorageError(format!("unknown collection: {collection}")).into())
     }
 
@@ -439,7 +434,7 @@ impl CollectionWritePath {
         collection: &str,
     ) -> Result<CollectionDefinition, WrongoDBError> {
         self.durable_catalog
-            .collection_for_txn(session, collection, session.current_txn_id())?
+            .collection_visible(session, collection)?
             .ok_or_else(|| StorageError(format!("unknown collection: {collection}")).into())
     }
 
@@ -593,14 +588,14 @@ mod tests {
         );
         let durable_catalog = Arc::new(DurableCatalog::new(CatalogStore::new()));
         let collection_catalog = Arc::new(CollectionCatalog::new());
-        let session = Session::new(
+        let mut session = Session::new(
             base_path,
             store_handles,
             metadata_store.clone(),
             global_txn,
             log_manager,
         );
-        durable_catalog.ensure_store_exists(&session).unwrap();
+        durable_catalog.ensure_store_exists(&mut session).unwrap();
         collection_catalog
             .load_from_durable(&session, durable_catalog.as_ref())
             .unwrap();

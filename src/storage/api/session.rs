@@ -4,20 +4,21 @@ use std::sync::{Arc, Weak};
 use parking_lot::{Mutex, RwLock};
 
 use crate::core::errors::StorageError;
-use crate::storage::api::cursor::{TableCursor, TableCursorState, TableCursorWriteAccess};
+use crate::storage::api::cursor::{
+    FileCursor, TableCursor, TableCursorState, TableCursorWriteAccess,
+};
 use crate::storage::btree::BTreeCursor;
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::log_manager::LogManager;
 use crate::storage::metadata_store::{
-    MetadataEntry, MetadataStore, INDEX_URI_PREFIX, TABLE_URI_PREFIX,
+    file_name_from_uri, table_file_uri, MetadataEntry, MetadataStore, FILE_URI_PREFIX,
+    INDEX_URI_PREFIX, TABLE_URI_PREFIX,
 };
 use crate::storage::reserved_store::{
     reserved_store_identity_for_uri, reserved_store_names, StoreId,
 };
 use crate::storage::row::{index_key_from_row, validate_storage_columns};
-use crate::storage::table::{
-    checkpoint_store, get_version, open_or_create_btree, scan_range, TableMetadata,
-};
+use crate::storage::table::{checkpoint_store, open_or_create_btree, scan_range, TableMetadata};
 use crate::txn::{GlobalTxnState, Transaction, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
@@ -29,6 +30,7 @@ pub(crate) type ActiveTransactionHandle = Arc<Mutex<Transaction>>;
 type StoreEntries = Vec<(Vec<u8>, Vec<u8>)>;
 
 struct ResolvedStore {
+    store_id: StoreId,
     handle: Arc<RwLock<BTreeCursor>>,
 }
 
@@ -79,6 +81,36 @@ impl Session {
     // Public API
     // ------------------------------------------------------------------------
 
+    /// Ensure that the managed `file:<name>` object exists.
+    pub fn create_file(&mut self, file_uri: &str) -> Result<(), WrongoDBError> {
+        if self.current_transaction().is_some() {
+            return Err(WrongoDBError::TransactionAlreadyActive);
+        }
+
+        let file_name = file_name_from_uri(file_uri)?;
+        if reserved_store_names().contains(&file_name) {
+            return Err(StorageError(format!(
+                "reserved store file is not managed through file URIs: {file_uri}"
+            ))
+            .into());
+        }
+        if let Some(existing) = self.metadata_store.get(file_uri)? {
+            if !existing.is_file() {
+                return Err(WrongoDBError::Storage(StorageError(format!(
+                    "metadata row for {file_uri} is not a file"
+                ))));
+            }
+            let _ = self.open_store_by_name(file_name)?;
+            return Ok(());
+        }
+
+        let _ = self.open_store_by_name(file_name)?;
+        self.metadata_store.insert(&MetadataEntry::file(
+            file_name,
+            self.metadata_store.allocate_store_id(),
+        ))
+    }
+
     /// Ensure that `table:<name>` exists with the requested storage columns.
     pub fn create_table(
         &mut self,
@@ -97,6 +129,7 @@ impl Session {
                     && existing.value_columns() == value_columns.as_slice()
                     && existing.key_columns().len() == 1
                     && existing.key_columns()[0] == "_id"
+                    && existing.source_uri()? == table_file_uri(collection)
                 {
                     return Ok(());
                 }
@@ -106,12 +139,8 @@ impl Session {
                 ))));
             }
 
-            let entry = MetadataEntry::table(
-                collection,
-                value_columns,
-                self.metadata_store.allocate_store_id(),
-            );
-            self.ensure_named_store(entry.source())?;
+            self.create_file(&table_file_uri(collection))?;
+            let entry = MetadataEntry::table(collection, value_columns);
             self.metadata_store.insert(&entry)?;
             return Ok(());
         }
@@ -147,23 +176,43 @@ impl Session {
 
         let loaded = self.load_table_runtime(table_uri)?;
         let stored_index = self.ensure_index_store_exists(&loaded.table, index_entry)?;
-        let index_metadata = stored_index.clone().into_index_metadata()?;
-        let store_name = stored_index.source().to_string();
-        let store_id = stored_index.store_id();
+        let index_runtime = self.load_file_runtime(stored_index.source_uri()?)?;
+        let index_metadata = stored_index
+            .clone()
+            .into_index_metadata(index_runtime.store_id)?;
+        let index_file_uri = stored_index.source_uri()?.to_string();
         let table = loaded.table.clone();
 
         self.with_transaction(|session| {
             let mut primary_cursor = session.open_table_cursor(table_uri)?;
+            let mut index_cursor = session.open_file_cursor(&index_file_uri)?;
             while let Some((primary_key, primary_value)) = primary_cursor.next()? {
                 let Some(index_key) =
                     index_key_from_row(&table, &index_metadata, &primary_key, &primary_value)?
                 else {
                     continue;
                 };
-                session.put_into_named_store(&store_name, store_id, &index_key, &[])?;
+                if index_cursor.get(&index_key)?.is_some() {
+                    index_cursor.update(&index_key, &[])?;
+                } else {
+                    index_cursor.insert(&index_key, &[])?;
+                }
             }
             Ok(())
         })
+    }
+
+    /// Open a cursor for `file:<name>` in the current transaction context.
+    pub fn open_file_cursor(&self, file_uri: &str) -> Result<FileCursor<'_>, WrongoDBError> {
+        let loaded = self.load_file_runtime(file_uri)?;
+
+        FileCursor::new(
+            self,
+            file_uri,
+            loaded.store_id,
+            loaded.handle,
+            TableCursorWriteAccess::ReadWrite,
+        )
     }
 
     /// Open a cursor for `table:<name>` in the current transaction context.
@@ -296,50 +345,6 @@ impl Session {
     // Store operations
     // ------------------------------------------------------------------------
 
-    pub(crate) fn ensure_named_store(&self, store_name: &str) -> Result<(), WrongoDBError> {
-        let _ = self.open_store_by_name(store_name)?;
-        Ok(())
-    }
-
-    pub(crate) fn put_into_named_store(
-        &self,
-        store_name: &str,
-        store_id: StoreId,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<(), WrongoDBError> {
-        let txn_handle = self.current_transaction().ok_or_else(|| {
-            StorageError("put_into_named_store requires an active transaction".into())
-        })?;
-        let store = self.open_store_by_name(store_name)?;
-        let mut txn = txn_handle.lock();
-        store.write().put(store_id, key, value, &mut txn)?;
-        Ok(())
-    }
-
-    pub(crate) fn read_from_named_store(
-        &self,
-        store_name: &str,
-        key: &[u8],
-        txn_id: TxnId,
-    ) -> Result<Option<Vec<u8>>, WrongoDBError> {
-        let store = self.open_store_by_name(store_name)?;
-        let result = get_version(&mut store.write(), key, txn_id);
-        result
-    }
-
-    pub(crate) fn scan_named_store_range(
-        &self,
-        store_name: &str,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-        txn_id: TxnId,
-    ) -> Result<StoreEntries, WrongoDBError> {
-        let store = self.open_store_by_name(store_name)?;
-        let mut btree = store.write();
-        scan_range(&mut btree, start, end, txn_id)
-    }
-
     pub(crate) fn scan_store_range(
         &self,
         store_uri: &str,
@@ -399,27 +404,61 @@ impl Session {
         let mut index_entries = self.metadata_store.scan_prefix(&index_prefix)?;
         index_entries.sort_by(|left, right| left.uri().cmp(right.uri()));
 
-        let primary = self.open_store_by_name(table_entry.source())?;
-        let indexes = index_entries
-            .iter()
-            .map(|entry| self.open_store_by_name(entry.source()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let index_metadata = index_entries
-            .into_iter()
-            .map(MetadataEntry::into_index_metadata)
-            .collect::<Result<Vec<_>, _>>()?;
-        let table = table_entry.into_table_metadata(index_metadata)?;
+        let primary = self.load_file_runtime(table_entry.source_uri()?)?;
+        let mut indexes = Vec::new();
+        let mut index_metadata = Vec::new();
+        for entry in index_entries {
+            let resolved = self.load_file_runtime(entry.source_uri()?)?;
+            indexes.push(resolved.handle.clone());
+            index_metadata.push(entry.into_index_metadata(resolved.store_id)?);
+        }
+        let table = table_entry.into_table_metadata(primary.store_id, index_metadata)?;
 
         Ok(LoadedTable {
             table,
-            primary,
+            primary: primary.handle,
             indexes,
         })
     }
 
-    fn resolve_store(&self, uri: &str) -> Result<ResolvedStore, WrongoDBError> {
-        if let Some((_, store_name)) = reserved_store_identity_for_uri(uri) {
+    fn load_file_runtime(&self, file_uri: &str) -> Result<ResolvedStore, WrongoDBError> {
+        if let Some((store_id, store_name)) = reserved_store_identity_for_uri(file_uri) {
             return Ok(ResolvedStore {
+                store_id,
+                handle: self.open_store_by_name(store_name)?,
+            });
+        }
+
+        if !file_uri.starts_with(FILE_URI_PREFIX) {
+            return Err(StorageError(format!(
+                "unsupported URI for public file cursor open: {file_uri}; only file:... is supported"
+            ))
+            .into());
+        }
+        if reserved_store_names().contains(&file_name_from_uri(file_uri)?) {
+            return Err(StorageError(format!(
+                "reserved store file is not exposed as a public file cursor: {file_uri}"
+            ))
+            .into());
+        }
+
+        let Some(file_entry) = self.metadata_store.get(file_uri)? else {
+            return Err(StorageError(format!("unknown URI: {file_uri}")).into());
+        };
+        if !file_entry.is_file() {
+            return Err(StorageError(format!("URI is not a file: {file_uri}")).into());
+        }
+
+        Ok(ResolvedStore {
+            store_id: file_entry.store_id()?,
+            handle: self.open_store_by_name(file_entry.file_name()?)?,
+        })
+    }
+
+    fn resolve_store(&self, uri: &str) -> Result<ResolvedStore, WrongoDBError> {
+        if let Some((store_id, store_name)) = reserved_store_identity_for_uri(uri) {
+            return Ok(ResolvedStore {
+                store_id,
                 handle: self.open_store_by_name(store_name)?,
             });
         }
@@ -428,9 +467,11 @@ impl Session {
             return Err(StorageError(format!("unknown URI: {uri}")).into());
         };
 
-        Ok(ResolvedStore {
-            handle: self.open_store_by_name(entry.source())?,
-        })
+        if entry.is_file() {
+            return self.load_file_runtime(entry.uri());
+        }
+
+        self.load_file_runtime(entry.source_uri()?)
     }
 
     fn table_uri_for_index(index_uri: &str) -> Result<String, WrongoDBError> {
@@ -447,7 +488,7 @@ impl Session {
     }
 
     fn ensure_index_store_exists(
-        &self,
+        &mut self,
         table: &TableMetadata,
         index_entry: &MetadataEntry,
     ) -> Result<MetadataEntry, WrongoDBError> {
@@ -471,21 +512,23 @@ impl Session {
         }
 
         let stored_entry = if let Some(existing) = self.metadata_store.get(index_entry.uri())? {
-            if existing.columns() != index_entry.columns() {
+            if existing.columns() != index_entry.columns()
+                || existing.source_uri()? != index_entry.source_uri()?
+            {
                 return Err(StorageError(format!(
-                    "index metadata for {} does not match the requested columns",
+                    "index metadata for {} does not match the requested definition",
                     index_entry.uri()
                 ))
                 .into());
             }
             existing
         } else {
-            self.ensure_named_store(index_entry.source())?;
+            self.create_file(index_entry.source_uri()?)?;
             self.metadata_store.insert(index_entry)?;
             index_entry.clone()
         };
 
-        self.ensure_named_store(stored_entry.source())?;
+        self.create_file(stored_entry.source_uri()?)?;
         Ok(stored_entry)
     }
 
@@ -577,6 +620,7 @@ mod tests {
     use crate::storage::wal::{WalFileReader, WalReader, WalRecord};
     use crate::txn::GlobalTxnState;
 
+    const TEST_FILE_URI: &str = "file:items.main.wt";
     const TEST_URI: &str = "table:items";
     const TEST_KEY: &[u8] = b"k1";
     const TEST_VALUE: &[u8] = b"v1";
@@ -690,6 +734,51 @@ mod tests {
     }
 
     #[test]
+    fn create_file_allows_non_transactional_cursor_access() {
+        let mut session =
+            SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
+        session.create_file(TEST_FILE_URI).unwrap();
+
+        let stored = session.metadata_store.get(TEST_FILE_URI).unwrap().unwrap();
+        assert!(stored.is_file());
+        assert!(session.base_path.join("items.main.wt").exists());
+
+        let mut cursor = session.open_file_cursor(TEST_FILE_URI).unwrap();
+        cursor.insert(TEST_KEY, TEST_VALUE).unwrap();
+
+        assert_eq!(cursor.get(TEST_KEY).unwrap(), Some(TEST_VALUE.to_vec()));
+    }
+
+    #[test]
+    fn public_open_file_cursor_rejects_non_file_and_unknown_uris() {
+        let session = SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
+
+        let table_err = session.open_file_cursor(TEST_URI).unwrap_err();
+        assert!(table_err.to_string().contains("only file:... is supported"));
+
+        let missing_err = session.open_file_cursor(TEST_FILE_URI).unwrap_err();
+        assert!(missing_err
+            .to_string()
+            .contains("unknown URI: file:items.main.wt"));
+
+        let reserved_err = session.open_file_cursor("file:metadata.wt").unwrap_err();
+        assert!(reserved_err
+            .to_string()
+            .contains("reserved store file is not exposed as a public file cursor"));
+    }
+
+    #[test]
+    fn create_file_rejects_reserved_metadata_store_name() {
+        let mut session =
+            SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
+
+        let err = session.create_file("file:metadata.wt").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("reserved store file is not managed through file URIs"));
+    }
+
+    #[test]
     fn create_index_creates_backing_store_and_metadata() {
         let mut session =
             SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
@@ -697,20 +786,18 @@ mod tests {
             .create_table(TEST_URI, vec!["name".to_string()])
             .unwrap();
 
-        let entry = MetadataEntry::index(
-            "items",
-            "name_1",
-            vec!["name".to_string()],
-            session.metadata_store.allocate_store_id(),
-        );
-        let source = entry.source().to_string();
+        let entry = MetadataEntry::index("items", "name_1", vec!["name".to_string()]);
+        let source = entry.source_uri().unwrap().to_string();
 
         session.create_index(TEST_URI, &entry).unwrap();
         session.create_index(TEST_URI, &entry).unwrap();
 
         let stored = session.metadata_store.get(entry.uri()).unwrap().unwrap();
-        assert_eq!(stored.source(), source);
-        assert!(session.base_path.join(source).exists());
+        assert_eq!(stored.source_uri().unwrap(), source);
+        assert!(session
+            .base_path
+            .join(file_name_from_uri(&source).unwrap())
+            .exists());
     }
 
     #[test]
@@ -729,12 +816,7 @@ mod tests {
         let mut session =
             SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
 
-        let entry = MetadataEntry::index(
-            "items",
-            "name_1",
-            vec!["name".to_string()],
-            session.metadata_store.allocate_store_id(),
-        );
+        let entry = MetadataEntry::index("items", "name_1", vec!["name".to_string()]);
 
         let err = session.create_index(TEST_URI, &entry).unwrap_err();
         assert!(err.to_string().contains("unknown URI: table:items"));
@@ -943,7 +1025,17 @@ mod tests {
             .get(TEST_URI)
             .unwrap()
             .unwrap()
-            .store_id();
+            .source_uri()
+            .map(|source_uri| {
+                session
+                    .metadata_store
+                    .get(source_uri)
+                    .unwrap()
+                    .unwrap()
+                    .store_id()
+                    .unwrap()
+            })
+            .unwrap();
 
         let txn_id = {
             let mut txn_id = 0;

@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 use crate::core::errors::StorageError;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::handle_cache::HandleCache;
-use crate::storage::metadata_store::MetadataStore;
+use crate::storage::metadata_store::{MetadataStore, FILE_URI_PREFIX};
 use crate::storage::reserved_store::{reserved_store_name_for_id, StoreId, METADATA_STORE_ID};
 use crate::storage::table::{checkpoint_store, open_or_create_btree};
 use crate::storage::wal::{RecoveryError, WalReader, WalRecord};
@@ -82,11 +82,11 @@ fn apply_metadata_transactions(
 }
 
 fn rebuild_store_name_map(metadata_store: &MetadataStore) -> Result<StoreNameById, WrongoDBError> {
-    Ok(metadata_store
-        .scan_prefix("")?
+    metadata_store
+        .scan_prefix(FILE_URI_PREFIX)?
         .into_iter()
-        .map(|entry| (entry.store_id(), entry.source().to_string()))
-        .collect())
+        .map(|entry| Ok((entry.store_id()?, entry.file_name()?.to_string())))
+        .collect::<Result<HashMap<_, _>, WrongoDBError>>()
 }
 
 fn apply_non_metadata_transactions(
@@ -279,9 +279,9 @@ mod tests {
 
     #[derive(Serialize)]
     struct EncodedMetadataRecord {
-        source: String,
-        store_id: StoreId,
-        row_format: &'static str,
+        source: Option<String>,
+        store_id: Option<StoreId>,
+        row_format: Option<&'static str>,
         key_columns: Vec<String>,
         value_columns: Vec<String>,
         columns: Vec<String>,
@@ -316,11 +316,23 @@ mod tests {
         )
     }
 
-    fn encode_metadata_value(source: &str, store_id: StoreId) -> Vec<u8> {
+    fn encode_file_metadata_value(store_id: StoreId) -> Vec<u8> {
         bson::to_vec(&EncodedMetadataRecord {
-            source: source.to_string(),
-            store_id,
-            row_format: "wt_row_v1",
+            source: None,
+            store_id: Some(store_id),
+            row_format: None,
+            key_columns: Vec::new(),
+            value_columns: Vec::new(),
+            columns: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn encode_table_metadata_value(source: &str) -> Vec<u8> {
+        bson::to_vec(&EncodedMetadataRecord {
+            source: Some(source.to_string()),
+            store_id: None,
+            row_format: Some("wt_row_v1"),
             key_columns: vec!["_id".to_string()],
             value_columns: Vec::new(),
             columns: Vec::new(),
@@ -460,8 +472,13 @@ mod tests {
             &[
                 TxnLogOp::Put {
                     store_id: METADATA_STORE_ID,
+                    key: b"file:items.main.wt".to_vec(),
+                    value: encode_file_metadata_value(FIRST_DYNAMIC_STORE_ID),
+                },
+                TxnLogOp::Put {
+                    store_id: METADATA_STORE_ID,
                     key: b"table:items".to_vec(),
-                    value: encode_metadata_value("items.main.wt", FIRST_DYNAMIC_STORE_ID),
+                    value: encode_table_metadata_value("file:items.main.wt"),
                 },
                 TxnLogOp::Put {
                     store_id: FIRST_DYNAMIC_STORE_ID,
@@ -479,8 +496,8 @@ mod tests {
             conn.metadata_store()
                 .get("table:items")
                 .unwrap()
-                .map(|entry| entry.source().to_string()),
-            Some("items.main.wt".to_string())
+                .map(|entry| entry.source_uri().unwrap().to_string()),
+            Some("file:items.main.wt".to_string())
         );
 
         let mut session = conn.open_session();

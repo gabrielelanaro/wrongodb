@@ -2592,3 +2592,31 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
   it behind a fake manager type.
 - Marking new indexes `ready=false` keeps committed schema publication compatible with safe query
   planning while backfill is still in progress.
+
+## 2026-03-22: Add first-class `file:` metadata rows and public file cursors
+
+**Decision**
+- Make `file:` a first-class metadata object in `metadata.wt`.
+- Let `file:` rows be the only metadata rows that own `store_id`.
+- Make `table:` and `index:` rows reference a `source=file:...` URI instead of owning physical
+  store identity directly.
+- Add public `Session::create_file("file:...")` and `Session::open_file_cursor("file:...")`.
+- Keep `metadata.wt` as the only reserved store file and reject `file:metadata.wt` from the public
+  file API.
+- Move the durable catalog off the reserved `_catalog.wt` path and onto the metadata-managed
+  `file:_catalog.wt` object.
+- Remove the raw named-store helpers from `Session`:
+  - `ensure_named_store`
+  - `put_into_named_store`
+  - `read_from_named_store`
+  - `scan_named_store_range`
+
+**Why**
+- This matches WiredTiger's object model more closely: sessions open `file:` objects directly, and
+  higher-level schema objects point at a source instead of pretending to be the physical store.
+- Giving `store_id` ownership only to `file:` rows makes recovery and checkpointing resolve durable
+  file identity from one metadata kind instead of overloading `table:` and `index:` rows.
+- Exposing a public file cursor lets internal subsystems like the catalog use the same cursor
+  boundary as other storage objects instead of peeking into `Session` internals.
+- Treating `metadata.wt` as the sole reserved file keeps the bootstrap boundary small while letting
+  the catalog participate in normal metadata, WAL replay, and checkpoint flows.

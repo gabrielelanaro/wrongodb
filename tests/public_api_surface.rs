@@ -38,7 +38,7 @@ fn storage_api_mod_reexports_storage_surface() {
     assert!(storage_api_mod.contains(
         "Connection, ConnectionConfig, LogSyncMethod, LoggingConfig, TransactionSyncConfig,"
     ));
-    assert!(storage_api_mod.contains("pub use cursor::{CursorEntry, TableCursor};"));
+    assert!(storage_api_mod.contains("pub use cursor::{CursorEntry, FileCursor, TableCursor};"));
     assert!(storage_api_mod.contains("pub use session::Session;"));
     assert!(!storage_api_mod.contains("WriteUnitOfWork"));
 }

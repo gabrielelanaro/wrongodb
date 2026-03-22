@@ -7,12 +7,9 @@ pub(crate) type StoreId = u64;
 pub(crate) const METADATA_URI: &str = "metadata:";
 pub(crate) const METADATA_STORE_NAME: &str = "metadata.wt";
 pub(crate) const METADATA_STORE_ID: StoreId = 0;
-pub(crate) const CATALOG_URI: &str = "catalog:";
-pub(crate) const CATALOG_STORE_NAME: &str = "_catalog.wt";
-pub(crate) const CATALOG_STORE_ID: StoreId = 1;
-pub(crate) const FIRST_DYNAMIC_STORE_ID: StoreId = 2;
+pub(crate) const FIRST_DYNAMIC_STORE_ID: StoreId = 1;
 
-const RESERVED_STORE_NAMES: [&str; 2] = [METADATA_STORE_NAME, CATALOG_STORE_NAME];
+const RESERVED_STORE_NAMES: [&str; 1] = [METADATA_STORE_NAME];
 
 // ============================================================================
 // Helpers
@@ -21,7 +18,6 @@ const RESERVED_STORE_NAMES: [&str; 2] = [METADATA_STORE_NAME, CATALOG_STORE_NAME
 pub(crate) fn reserved_store_name_for_id(store_id: StoreId) -> Option<&'static str> {
     match store_id {
         METADATA_STORE_ID => Some(METADATA_STORE_NAME),
-        CATALOG_STORE_ID => Some(CATALOG_STORE_NAME),
         _ => None,
     }
 }
@@ -29,7 +25,6 @@ pub(crate) fn reserved_store_name_for_id(store_id: StoreId) -> Option<&'static s
 pub(crate) fn reserved_store_identity_for_uri(uri: &str) -> Option<(StoreId, &'static str)> {
     match uri {
         METADATA_URI => Some((METADATA_STORE_ID, METADATA_STORE_NAME)),
-        CATALOG_URI => Some((CATALOG_STORE_ID, CATALOG_STORE_NAME)),
         _ => None,
     }
 }

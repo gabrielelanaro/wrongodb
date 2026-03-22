@@ -5,11 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::errors::StorageError;
 use crate::storage::api::Session;
-use crate::storage::reserved_store::{CATALOG_STORE_ID, CATALOG_STORE_NAME};
-use crate::txn::TxnId;
 use crate::WrongoDBError;
 
-/// Raw `_catalog.wt` row persisted for a single collection.
+pub(crate) const CATALOG_FILE_URI: &str = "file:_catalog.wt";
+
+/// Raw `file:_catalog.wt` row persisted for a single collection.
 ///
 /// The top-level fields mirror MongoDB's separation between storage bindings
 /// and parsed collection metadata:
@@ -29,7 +29,7 @@ pub(crate) struct CatalogRecord {
     pub(crate) md: Document,
 }
 
-/// Thin raw wrapper around the reserved `_catalog.wt` store.
+/// Thin raw wrapper around the metadata-managed `file:_catalog.wt` object.
 ///
 /// `CatalogStore` only deals with raw collection rows. Higher-level parsing,
 /// validation, and server semantics live in [`crate::catalog::DurableCatalog`].
@@ -37,26 +37,20 @@ pub(crate) struct CatalogRecord {
 pub(crate) struct CatalogStore;
 
 impl CatalogStore {
-    /// Creates the raw `_catalog.wt` store wrapper.
+    /// Creates the raw catalog store wrapper.
     pub(crate) fn new() -> Self {
         Self
     }
 
-    /// Ensures that the reserved `_catalog.wt` store exists.
-    pub(crate) fn ensure_store_exists(&self, session: &Session) -> Result<(), WrongoDBError> {
-        session.ensure_named_store(CATALOG_STORE_NAME)
-    }
-
-    /// Reads the collection row visible to `txn_id`.
-    pub(crate) fn record_for_txn(
+    /// Reads the collection row visible in the session's current transaction context.
+    pub(crate) fn record_visible(
         &self,
         session: &Session,
         collection: &str,
-        txn_id: TxnId,
     ) -> Result<Option<CatalogRecord>, WrongoDBError> {
-        self.ensure_store_exists(session)?;
-        session
-            .read_from_named_store(CATALOG_STORE_NAME, collection.as_bytes(), txn_id)?
+        let mut cursor = session.open_file_cursor(CATALOG_FILE_URI)?;
+        cursor
+            .get(collection.as_bytes())?
             .map(decode_catalog_record)
             .transpose()
     }
@@ -68,33 +62,31 @@ impl CatalogStore {
         collection: &str,
         record: &CatalogRecord,
     ) -> Result<(), WrongoDBError> {
-        self.ensure_store_exists(session)?;
         let value = bson::to_vec(record)?;
-        session.put_into_named_store(
-            CATALOG_STORE_NAME,
-            CATALOG_STORE_ID,
-            collection.as_bytes(),
-            &value,
-        )
+        let mut cursor = session.open_file_cursor(CATALOG_FILE_URI)?;
+        if cursor.get(collection.as_bytes())?.is_some() {
+            cursor.update(collection.as_bytes(), &value)
+        } else {
+            cursor.insert(collection.as_bytes(), &value)
+        }
     }
 
-    /// Reads every collection row visible to `txn_id`.
-    pub(crate) fn list_records_for_txn(
+    /// Reads every collection row visible in the session's current transaction context.
+    pub(crate) fn list_records_visible(
         &self,
         session: &Session,
-        txn_id: TxnId,
     ) -> Result<Vec<(String, CatalogRecord)>, WrongoDBError> {
-        self.ensure_store_exists(session)?;
-        session
-            .scan_named_store_range(CATALOG_STORE_NAME, None, None, txn_id)?
-            .into_iter()
-            .map(|(key, value)| {
-                let collection = String::from_utf8(key).map_err(|err| {
-                    StorageError(format!("catalog row key is not valid UTF-8: {err}"))
-                })?;
-                Ok((collection, decode_catalog_record(value)?))
-            })
-            .collect()
+        let mut cursor = session.open_file_cursor(CATALOG_FILE_URI)?;
+        let mut rows = Vec::new();
+
+        while let Some((key, value)) = cursor.next()? {
+            let collection = String::from_utf8(key).map_err(|err| {
+                StorageError(format!("catalog row key is not valid UTF-8: {err}"))
+            })?;
+            rows.push((collection, decode_catalog_record(value)?));
+        }
+
+        Ok(rows)
     }
 }
 
