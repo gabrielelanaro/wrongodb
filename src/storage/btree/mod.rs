@@ -8,12 +8,12 @@ mod search;
 pub use iter::BTreeRangeIter;
 
 use crate::core::errors::{StorageError, WrongoDBError};
-use crate::storage::mvcc::ReconcileStats;
+use crate::storage::mvcc::{
+    ReconcileStats, Update, UpdateChain, UpdateHandle, UpdateType,
+};
 use crate::storage::page_store::{Page, PageEdit, PageRead, PageStore, PageType, RowInsert};
 use crate::storage::reserved_store::StoreId;
-use crate::txn::{
-    ReadVisibility, Transaction, TxnId, Update, UpdateChain, UpdateHandle, UpdateType,
-};
+use crate::txn::{ReadVisibility, Transaction, TxnId};
 use internal_ops::put_separator as put_internal_separator;
 use layout::{
     build_internal_page, internal_entries, leaf_entries, map_leaf_err, split_internal_entries,

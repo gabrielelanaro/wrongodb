@@ -1,8 +1,8 @@
 use crate::core::errors::WrongoDBError;
+use crate::storage::mvcc::{Update, UpdateHandle};
 use crate::storage::reserved_store::StoreId;
 use crate::txn::global_txn::GlobalTxnState;
 use crate::txn::snapshot::Snapshot;
-use crate::txn::update::{Update, UpdateHandle};
 use crate::txn::{Timestamp, TxnId, TXN_NONE};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

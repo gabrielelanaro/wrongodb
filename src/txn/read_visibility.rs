@@ -1,4 +1,5 @@
-use crate::txn::{TxnId, Update, TXN_ABORTED};
+use crate::storage::mvcc::Update;
+use crate::txn::{TxnId, TXN_ABORTED};
 
 /// Read-time visibility context consumed by storage cursors.
 ///

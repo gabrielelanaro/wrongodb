@@ -4,7 +4,7 @@ pub mod btree;
 pub(crate) mod handle_cache;
 pub(crate) mod log_manager;
 pub(crate) mod metadata_store;
-pub mod mvcc;
+pub(crate) mod mvcc;
 pub mod page_store;
 pub(crate) mod recovery;
 pub(crate) mod reserved_store;

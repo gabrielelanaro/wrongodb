@@ -1,4 +1,5 @@
-use super::{GlobalTxnState, Transaction, Update, UpdateChain, UpdateHandle, UpdateType, TXN_NONE};
+use super::{GlobalTxnState, Transaction, TXN_NONE};
+use crate::storage::mvcc::{Update, UpdateChain, UpdateHandle, UpdateType};
 
 #[test]
 fn snapshot_visibility_basic() {

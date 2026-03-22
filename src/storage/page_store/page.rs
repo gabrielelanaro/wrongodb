@@ -1,7 +1,7 @@
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use thiserror::Error;
 
-use crate::txn::UpdateChain;
+use crate::storage::mvcc::UpdateChain;
 
 // ============================================================================
 // Constants
@@ -510,7 +510,7 @@ fn write_u64(buf: &mut [u8], off: usize, value: u64) -> Result<(), PageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::txn::{Update, UpdateChain, UpdateType};
+    use crate::storage::mvcc::{Update, UpdateChain, UpdateType};
 
     #[test]
     fn leaf_constructor_sets_cached_header() {
