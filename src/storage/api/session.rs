@@ -15,37 +15,29 @@ use crate::storage::table::{
 use crate::txn::{GlobalTxnState, Transaction, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
-pub(crate) type ActiveTxnHandle = Arc<Mutex<Transaction>>;
+pub(crate) type ActiveTransactionHandle = Arc<Mutex<Transaction>>;
 
-type RawScanEntries = Vec<(Vec<u8>, Vec<u8>)>;
+type StoreEntries = Vec<(Vec<u8>, Vec<u8>)>;
 
-/// A request-scoped execution context over shared connection infrastructure.
+/// A short-lived handle for one storage request.
 ///
-/// `Connection` owns long-lived shared components (storage handles, schema
-/// metadata, global transaction state, and durability machinery). `Session`
-/// exists to own mutable per-request state that must not be global.
-///
-/// `Session` is where callers:
-/// - open cursors
-/// - start transactions
-/// - trigger checkpoint
-///
-/// It intentionally does not own document write orchestration. That lives in
-/// higher internal layers.
-///
-/// In practice this means `Session` answers "what can this request do right
-/// now?" while `Connection` answers "what engine are we attached to?".
+/// A session tracks the current transaction, opens table cursors, and
+/// coordinates checkpoints over shared connection state.
 pub struct Session {
     base_path: PathBuf,
     store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
     metadata_catalog: Arc<MetadataCatalog>,
     global_txn: Arc<GlobalTxnState>,
     durability_backend: Arc<DurabilityBackend>,
-    active_txn: Mutex<Option<ActiveTxnHandle>>,
-    open_cursors: Mutex<Vec<Weak<Mutex<TableCursorState>>>>,
+    active_transaction: Mutex<Option<ActiveTransactionHandle>>,
+    open_cursor_states: Mutex<Vec<Weak<Mutex<TableCursorState>>>>,
 }
 
 impl Session {
+    // ------------------------------------------------------------------------
+    // Constructors
+    // ------------------------------------------------------------------------
+
     pub(crate) fn new(
         base_path: PathBuf,
         store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
@@ -59,23 +51,18 @@ impl Session {
             metadata_catalog,
             durability_backend,
             global_txn,
-            active_txn: Mutex::new(None),
-            open_cursors: Mutex::new(Vec::new()),
+            active_transaction: Mutex::new(None),
+            open_cursor_states: Mutex::new(Vec::new()),
         }
     }
 
-    /// Ensure the primary store for `table:<collection>` exists.
-    ///
-    /// This method exists so callers can bootstrap a table through the same
-    /// session object they use to open cursors, instead of forcing schema
-    /// creation through the higher-level document write path.
-    ///
-    /// Only `table:...` URIs are supported publicly. Index creation stays
-    /// internal because it is not a single-store operation: it has to update
-    /// schema metadata and backfill index entries from existing collection
-    /// data.
-    pub fn create(&mut self, uri: &str) -> Result<(), WrongoDBError> {
-        if let Some(collection) = uri.strip_prefix("table:") {
+    // ------------------------------------------------------------------------
+    // Public API
+    // ------------------------------------------------------------------------
+
+    /// Ensure that `table:<name>` exists.
+    pub fn create_table(&mut self, table_uri: &str) -> Result<(), WrongoDBError> {
+        if let Some(collection) = table_uri.strip_prefix("table:") {
             let metadata_catalog = self.metadata_catalog.clone();
             return self.with_transaction(|session| {
                 let _ = metadata_catalog.ensure_table_uri_in_transaction(session, collection)?;
@@ -84,42 +71,41 @@ impl Session {
         }
 
         Err(WrongoDBError::Storage(StorageError(format!(
-            "unsupported URI for Session::create: {uri}; only table:... is supported"
+            "unsupported URI for Session::create_table: {table_uri}; only table:... is supported"
         ))))
     }
 
-    /// Open a table cursor using the session's current transaction state.
-    ///
-    /// Cursors consult live session transaction state at call time, so the same
-    /// cursor type works both outside a transaction and inside
-    /// [`Session::with_transaction`].
-    pub fn open_cursor(&self, uri: &str) -> Result<TableCursor<'_>, WrongoDBError> {
-        let txn_id = self.txn_id();
-        let table = self.resolve_table_metadata(uri, txn_id)?;
-        self.open_table_cursor_with_access(table, txn_id, TableCursorWriteAccess::ReadWrite)
+    /// Open a cursor for `table:<name>` in the current transaction context.
+    pub fn open_table_cursor(&self, table_uri: &str) -> Result<TableCursor<'_>, WrongoDBError> {
+        let txn_id = self.current_txn_id();
+        let table = self.load_table_metadata(table_uri, txn_id)?;
+        let primary = self.open_store_for_uri(table.uri(), txn_id)?;
+        let indexes = table
+            .indexes()
+            .iter()
+            .map(|index| self.open_store_for_uri(index.uri(), txn_id))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        TableCursor::new(
+            self,
+            table,
+            primary,
+            indexes,
+            TableCursorWriteAccess::ReadWrite,
+        )
     }
 
-    /// Run `f` inside one session-owned transaction.
-    ///
-    /// This keeps the public Rust API narrow while preserving WT's session
-    /// ownership of transaction state internally.
+    /// Run `f` inside a session transaction.
     pub fn with_transaction<R>(
         &mut self,
         f: impl FnOnce(&mut Session) -> Result<R, WrongoDBError>,
     ) -> Result<R, WrongoDBError> {
-        self.begin_transaction_internal()?;
+        self.begin_transaction()?;
         let guard = SessionTransactionGuard::new(self);
         guard.run(f)
     }
 
-    /// Reconcile and checkpoint all known stores.
-    ///
-    /// Checkpoint is session-level because it coordinates many stores and, when
-    /// durability is enabled, emits the matching durability marker only after
-    /// the storage-level reconciliation pass has finished.
-    ///
-    /// It lives on `Session` instead of `TableCursor` or a per-store helper
-    /// because checkpoint is not a one-store concern.
+    /// Flush all known stores to a stable checkpoint.
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
         let mut store_names = self.metadata_catalog.all_sources()?;
         store_names.push(METADATA_STORE_NAME.to_string());
@@ -127,12 +113,7 @@ impl Session {
         store_names.dedup();
 
         for store_name in store_names {
-            let store = self
-                .store_handles
-                .get_or_try_insert_with(store_name, |store_name| {
-                    let path = self.base_path.join(store_name);
-                    Ok(RwLock::new(open_or_create_btree(path)?))
-                })?;
+            let store = self.open_store_by_name(&store_name)?;
             checkpoint_store(&mut store.write(), self.global_txn.as_ref())?;
         }
 
@@ -145,94 +126,38 @@ impl Session {
         self.durability_backend.truncate_to_checkpoint()
     }
 
-    fn open_table_cursor_with_access(
-        &self,
-        table: TableMetadata,
-        txn_id: TxnId,
-        write_access: TableCursorWriteAccess,
-    ) -> Result<TableCursor<'_>, WrongoDBError> {
-        let primary = self.open_raw_store_for_txn(table.uri(), txn_id)?;
-        let indexes = table
-            .indexes()
-            .iter()
-            .map(|index| self.open_raw_store_for_txn(index.uri(), txn_id))
-            .collect::<Result<Vec<_>, _>>()?;
+    // ------------------------------------------------------------------------
+    // Transaction lifecycle
+    // ------------------------------------------------------------------------
 
-        TableCursor::new(self, table, primary, indexes, write_access)
-    }
-
-    fn resolve_table_metadata(
-        &self,
-        uri: &str,
-        txn_id: TxnId,
-    ) -> Result<TableMetadata, WrongoDBError> {
-        if !uri.starts_with("table:") {
-            return Err(StorageError(format!(
-                "unsupported URI for public cursor open: {uri}; only table:... is supported"
-            ))
-            .into());
-        }
-
-        self.metadata_catalog
-            .table_metadata_for_txn(uri, txn_id)?
-            .ok_or_else(|| StorageError(format!("unknown URI: {uri}")).into())
-    }
-
-    fn resolve_raw_uri_for_txn(&self, uri: &str, txn_id: TxnId) -> Result<String, WrongoDBError> {
-        if uri != METADATA_URI && !uri.starts_with("table:") && !uri.starts_with("index:") {
-            return Err(StorageError(format!("unsupported URI: {uri}")).into());
-        }
-
-        self.metadata_catalog
-            .lookup_source_for_txn(uri, txn_id)?
-            .ok_or_else(|| StorageError(format!("unknown URI: {uri}")).into())
-    }
-
-    fn open_raw_store(&self, store_name: &str) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
-        self.store_handles
-            .get_or_try_insert_with(store_name.to_string(), |store_name| {
-                let path = self.base_path.join(store_name);
-                Ok(RwLock::new(open_or_create_btree(path)?))
-            })
-    }
-
-    fn open_raw_store_for_txn(
-        &self,
-        uri: &str,
-        txn_id: TxnId,
-    ) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
-        let store_name = self.resolve_raw_uri_for_txn(uri, txn_id)?;
-        self.open_raw_store(&store_name)
-    }
-
-    pub(crate) fn txn_id(&self) -> TxnId {
-        self.active_txn_handle()
+    pub(crate) fn current_txn_id(&self) -> TxnId {
+        self.current_transaction()
             .map(|txn| txn.lock().id())
             .unwrap_or(TXN_NONE)
     }
 
-    pub(crate) fn begin_transaction_internal(&mut self) -> Result<(), WrongoDBError> {
-        let mut active_txn = self.active_txn.lock();
-        if active_txn.is_some() {
+    pub(crate) fn begin_transaction(&mut self) -> Result<(), WrongoDBError> {
+        let mut active_transaction = self.active_transaction.lock();
+        if active_transaction.is_some() {
             return Err(WrongoDBError::TransactionAlreadyActive);
         }
         let txn = self.global_txn.begin_snapshot_txn();
-        *active_txn = Some(Arc::new(Mutex::new(txn)));
+        *active_transaction = Some(Arc::new(Mutex::new(txn)));
         Ok(())
     }
 
-    pub(crate) fn commit_transaction_internal(&mut self) -> Result<(), WrongoDBError> {
-        let Some(txn_handle) = self.take_active_txn() else {
+    pub(crate) fn commit_transaction(&mut self) -> Result<(), WrongoDBError> {
+        let Some(txn_handle) = self.active_transaction.lock().take() else {
             return Ok(());
         };
 
         let result = {
             let mut txn = txn_handle.lock();
-            self.commit_txn_with_durability(&mut txn)
+            self.log_and_commit_transaction(&mut txn)
         };
 
         if result.is_err() {
-            self.reset_open_cursors();
+            self.reset_open_cursor_states();
             let mut txn = txn_handle.lock();
             let _ = txn.abort(self.global_txn.as_ref());
         }
@@ -240,21 +165,21 @@ impl Session {
         result
     }
 
-    pub(crate) fn rollback_transaction_internal(&mut self) -> Result<(), WrongoDBError> {
-        let Some(txn_handle) = self.take_active_txn() else {
+    pub(crate) fn rollback_transaction(&mut self) -> Result<(), WrongoDBError> {
+        let Some(txn_handle) = self.active_transaction.lock().take() else {
             return Ok(());
         };
 
-        self.reset_open_cursors();
+        self.reset_open_cursor_states();
         let mut txn = txn_handle.lock();
         txn.abort(self.global_txn.as_ref())
     }
 
-    pub(crate) fn run_cursor_write_operation<R, F>(&self, f: F) -> Result<R, WrongoDBError>
+    pub(crate) fn with_write_transaction<R, F>(&self, f: F) -> Result<R, WrongoDBError>
     where
         F: FnOnce(TxnId, &mut Transaction) -> Result<R, WrongoDBError>,
     {
-        if let Some(txn_handle) = self.active_txn_handle() {
+        if let Some(txn_handle) = self.current_transaction() {
             let mut txn = txn_handle.lock();
             return f(txn.id(), &mut txn);
         }
@@ -265,65 +190,75 @@ impl Session {
         let result = f(txn_id, &mut txn);
         match result {
             Ok(value) => {
-                if let Err(err) = self.commit_txn_with_durability(&mut txn) {
-                    self.reset_open_cursors();
+                if let Err(err) = self.log_and_commit_transaction(&mut txn) {
+                    self.reset_open_cursor_states();
                     let _ = txn.abort(self.global_txn.as_ref());
                     return Err(err);
                 }
                 Ok(value)
             }
             Err(err) => {
-                self.reset_open_cursors();
+                self.reset_open_cursor_states();
                 let _ = txn.abort(self.global_txn.as_ref());
                 Err(err)
             }
         }
     }
 
-    pub(crate) fn raw_insert(
+    // ------------------------------------------------------------------------
+    // Store operations
+    // ------------------------------------------------------------------------
+
+    pub(crate) fn insert_into_store(
         &self,
-        uri: &str,
+        store_uri: &str,
         key: &[u8],
         value: &[u8],
     ) -> Result<(), WrongoDBError> {
-        let txn_id = self.txn_id();
+        let txn_id = self.current_txn_id();
         if txn_id == TXN_NONE {
-            return Err(StorageError("raw_insert requires an active transaction".into()).into());
+            return Err(
+                StorageError("insert_into_store requires an active transaction".into()).into(),
+            );
         }
 
-        let store = self.open_raw_store_for_txn(uri, txn_id)?;
-        let txn_handle = self
-            .active_txn_handle()
-            .ok_or_else(|| StorageError("raw_insert requires an active transaction".into()))?;
+        let store = self.open_store_for_uri(store_uri, txn_id)?;
+        let txn_handle = self.current_transaction().ok_or_else(|| {
+            StorageError("insert_into_store requires an active transaction".into())
+        })?;
         let mut btree = store.write();
         if contains_key(&mut btree, key, txn_id)? {
             return Err(DocumentValidationError("duplicate key error".into()).into());
         }
 
         let mut txn = txn_handle.lock();
-        btree.put(uri, key, value, &mut txn)?;
+        btree.put(store_uri, key, value, &mut txn)?;
         Ok(())
     }
 
-    pub(crate) fn raw_scan_range(
+    pub(crate) fn scan_store_range(
         &self,
-        uri: &str,
+        store_uri: &str,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
-    ) -> Result<RawScanEntries, WrongoDBError> {
-        let txn_id = self.txn_id();
-        let store = self.open_raw_store_for_txn(uri, txn_id)?;
+    ) -> Result<StoreEntries, WrongoDBError> {
+        let txn_id = self.current_txn_id();
+        let store = self.open_store_for_uri(store_uri, txn_id)?;
         let mut btree = store.write();
         scan_range(&mut btree, start, end, txn_id)
     }
 
-    pub(crate) fn register_open_cursor(&self, state: &Arc<Mutex<TableCursorState>>) {
-        self.open_cursors.lock().push(Arc::downgrade(state));
+    // ------------------------------------------------------------------------
+    // Cursor lifecycle
+    // ------------------------------------------------------------------------
+
+    pub(crate) fn track_open_cursor(&self, state: &Arc<Mutex<TableCursorState>>) {
+        self.open_cursor_states.lock().push(Arc::downgrade(state));
     }
 
-    pub(crate) fn reset_open_cursors(&self) {
-        let mut open_cursors = self.open_cursors.lock();
-        open_cursors.retain(|weak_state| {
+    pub(crate) fn reset_open_cursor_states(&self) {
+        let mut open_cursor_states = self.open_cursor_states.lock();
+        open_cursor_states.retain(|weak_state| {
             let Some(state) = weak_state.upgrade() else {
                 return false;
             };
@@ -332,15 +267,59 @@ impl Session {
         });
     }
 
-    pub(crate) fn active_txn_handle(&self) -> Option<ActiveTxnHandle> {
-        self.active_txn.lock().clone()
+    // ------------------------------------------------------------------------
+    // Lookup and commit helpers
+    // ------------------------------------------------------------------------
+
+    fn load_table_metadata(
+        &self,
+        table_uri: &str,
+        txn_id: TxnId,
+    ) -> Result<TableMetadata, WrongoDBError> {
+        if !table_uri.starts_with("table:") {
+            return Err(StorageError(format!(
+                "unsupported URI for public cursor open: {table_uri}; only table:... is supported"
+            ))
+            .into());
+        }
+
+        self.metadata_catalog
+            .table_metadata_for_txn(table_uri, txn_id)?
+            .ok_or_else(|| StorageError(format!("unknown URI: {table_uri}")).into())
     }
 
-    fn take_active_txn(&self) -> Option<ActiveTxnHandle> {
-        self.active_txn.lock().take()
+    fn open_store_for_uri(
+        &self,
+        uri: &str,
+        txn_id: TxnId,
+    ) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
+        if uri != METADATA_URI && !uri.starts_with("table:") && !uri.starts_with("index:") {
+            return Err(StorageError(format!("unsupported URI: {uri}")).into());
+        }
+
+        let store_name = self
+            .metadata_catalog
+            .lookup_source_for_txn(uri, txn_id)?
+            .ok_or_else(|| StorageError(format!("unknown URI: {uri}")))?;
+        self.open_store_by_name(&store_name)
     }
 
-    fn commit_txn_with_durability(&self, txn: &mut Transaction) -> Result<(), WrongoDBError> {
+    fn open_store_by_name(
+        &self,
+        store_name: &str,
+    ) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
+        self.store_handles
+            .get_or_try_insert_with(store_name.to_string(), |store_name| {
+                let path = self.base_path.join(store_name);
+                Ok(RwLock::new(open_or_create_btree(path)?))
+            })
+    }
+
+    fn current_transaction(&self) -> Option<ActiveTransactionHandle> {
+        self.active_transaction.lock().clone()
+    }
+
+    fn log_and_commit_transaction(&self, txn: &mut Transaction) -> Result<(), WrongoDBError> {
         let commit_ts = txn.id();
         self.durability_backend.log_transaction_commit(
             txn.id(),
@@ -355,7 +334,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.rollback_transaction_internal();
+        let _ = self.rollback_transaction();
     }
 }
 
@@ -379,7 +358,7 @@ impl<'a> SessionTransactionGuard<'a> {
         let result = f(self.session);
         match result {
             Ok(value) => {
-                self.session.commit_transaction_internal()?;
+                self.session.commit_transaction()?;
                 self.finished = true;
                 Ok(value)
             }
@@ -394,7 +373,7 @@ impl Drop for SessionTransactionGuard<'_> {
             return;
         }
 
-        let _ = self.session.rollback_transaction_internal();
+        let _ = self.session.rollback_transaction();
     }
 }
 
@@ -499,7 +478,7 @@ mod tests {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), WrongoDBError> {
-        let mut cursor = session.open_cursor(TEST_URI)?;
+        let mut cursor = session.open_table_cursor(TEST_URI)?;
         cursor.insert(key, value)
     }
 
@@ -507,9 +486,9 @@ mod tests {
     fn create_table_allows_non_transactional_cursor_access() {
         let mut session =
             SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
-        session.create(TEST_URI).unwrap();
+        session.create_table(TEST_URI).unwrap();
 
-        let mut cursor = session.open_cursor(TEST_URI).unwrap();
+        let mut cursor = session.open_table_cursor(TEST_URI).unwrap();
         cursor.insert(TEST_KEY, TEST_VALUE).unwrap();
 
         assert_eq!(cursor.get(TEST_KEY).unwrap(), Some(TEST_VALUE.to_vec()));
@@ -520,7 +499,7 @@ mod tests {
         let mut session =
             SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
 
-        let err = session.create("index:test:name").unwrap_err();
+        let err = session.create_table("index:test:name").unwrap_err();
         assert!(err.to_string().contains("only table:... is supported"));
     }
 
@@ -528,14 +507,14 @@ mod tests {
     fn public_open_cursor_rejects_index_and_metadata_uris() {
         let mut session =
             SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
-        session.create(TEST_URI).unwrap();
+        session.create_table(TEST_URI).unwrap();
 
-        let index_err = session.open_cursor("index:items:name").unwrap_err();
+        let index_err = session.open_table_cursor("index:items:name").unwrap_err();
         assert!(index_err
             .to_string()
             .contains("only table:... is supported"));
 
-        let metadata_err = session.open_cursor(METADATA_URI).unwrap_err();
+        let metadata_err = session.open_table_cursor(METADATA_URI).unwrap_err();
         assert!(metadata_err
             .to_string()
             .contains("only table:... is supported"));
@@ -545,16 +524,16 @@ mod tests {
     fn transaction_open_cursor_rejects_index_and_metadata_uris() {
         let mut session =
             SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
-        session.create(TEST_URI).unwrap();
+        session.create_table(TEST_URI).unwrap();
 
         session
             .with_transaction(|session| {
-                let index_err = session.open_cursor("index:items:name").unwrap_err();
+                let index_err = session.open_table_cursor("index:items:name").unwrap_err();
                 assert!(index_err
                     .to_string()
                     .contains("only table:... is supported"));
 
-                let metadata_err = session.open_cursor(METADATA_URI).unwrap_err();
+                let metadata_err = session.open_table_cursor(METADATA_URI).unwrap_err();
                 assert!(metadata_err
                     .to_string()
                     .contains("only table:... is supported"));
@@ -567,12 +546,12 @@ mod tests {
     fn transaction_cursor_reads_its_uncommitted_write() {
         let mut session =
             SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
-        session.create(TEST_URI).unwrap();
+        session.create_table(TEST_URI).unwrap();
 
         session
             .with_transaction(|session| {
                 insert_in_transaction(session, TEST_KEY, TEST_VALUE)?;
-                let mut cursor = session.open_cursor(TEST_URI)?;
+                let mut cursor = session.open_table_cursor(TEST_URI)?;
                 assert_eq!(cursor.get(TEST_KEY)?, Some(TEST_VALUE.to_vec()));
                 Ok(())
             })
@@ -583,13 +562,13 @@ mod tests {
     fn local_mode_commit_makes_transactional_cursor_write_visible() {
         let mut session =
             SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
-        session.create(TEST_URI).unwrap();
+        session.create_table(TEST_URI).unwrap();
 
         session
             .with_transaction(|session| insert_in_transaction(session, TEST_KEY, TEST_VALUE))
             .unwrap();
 
-        let mut cursor = session.open_cursor(TEST_URI).unwrap();
+        let mut cursor = session.open_table_cursor(TEST_URI).unwrap();
         assert_eq!(cursor.get(TEST_KEY).unwrap(), Some(TEST_VALUE.to_vec()));
     }
 
@@ -597,7 +576,7 @@ mod tests {
     fn local_mode_abort_discards_transactional_cursor_write() {
         let mut session =
             SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
-        session.create(TEST_URI).unwrap();
+        session.create_table(TEST_URI).unwrap();
 
         let _ = session.with_transaction(|session| {
             insert_in_transaction(session, TEST_KEY, TEST_VALUE)?;
@@ -606,7 +585,7 @@ mod tests {
             )))
         });
 
-        let mut cursor = session.open_cursor(TEST_URI).unwrap();
+        let mut cursor = session.open_table_cursor(TEST_URI).unwrap();
         assert_eq!(cursor.get(TEST_KEY).unwrap(), None);
     }
 
@@ -614,14 +593,14 @@ mod tests {
     fn dropped_with_transaction_guard_discards_transactional_cursor_write() {
         let mut session =
             SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
-        session.create(TEST_URI).unwrap();
+        session.create_table(TEST_URI).unwrap();
 
         let _ = session.with_transaction(|session| {
             insert_in_transaction(session, TEST_KEY, TEST_VALUE)?;
             Err::<(), WrongoDBError>(WrongoDBError::Storage(StorageError("drop rollback".into())))
         });
 
-        let mut cursor = session.open_cursor(TEST_URI).unwrap();
+        let mut cursor = session.open_table_cursor(TEST_URI).unwrap();
         assert_eq!(cursor.get(TEST_KEY).unwrap(), None);
     }
 
@@ -629,16 +608,16 @@ mod tests {
     fn implicit_write_failure_resets_other_open_cursors() {
         let mut session =
             SessionTestFixture::with_backend(DurabilityBackend::Disabled).into_session();
-        session.create(TEST_URI).unwrap();
+        session.create_table(TEST_URI).unwrap();
 
         {
-            let mut cursor = session.open_cursor(TEST_URI).unwrap();
+            let mut cursor = session.open_table_cursor(TEST_URI).unwrap();
             cursor.insert(b"k1", b"v1").unwrap();
             cursor.insert(b"k2", b"v2").unwrap();
         }
 
-        let mut cursor_a = session.open_cursor(TEST_URI).unwrap();
-        let mut cursor_b = session.open_cursor(TEST_URI).unwrap();
+        let mut cursor_a = session.open_table_cursor(TEST_URI).unwrap();
+        let mut cursor_b = session.open_table_cursor(TEST_URI).unwrap();
 
         let first = cursor_a.next().unwrap().unwrap();
         assert_eq!(first.0, b"k1".to_vec());
@@ -675,9 +654,9 @@ mod tests {
             global_txn,
             backend,
         );
-        session.create(TEST_URI).unwrap();
+        session.create_table(TEST_URI).unwrap();
 
-        session.begin_transaction_internal().unwrap();
+        session.begin_transaction().unwrap();
         insert_in_transaction(&mut session, TEST_KEY, TEST_VALUE).unwrap();
 
         let wal_path = dir.path().join("global.wal");
@@ -696,7 +675,7 @@ mod tests {
     fn checkpoint_truncates_when_no_active_transactions() {
         let dir = tempdir().unwrap();
         let mut session = SessionTestFixture::open_local_wal(dir.path()).into_session();
-        session.create(TEST_URI).unwrap();
+        session.create_table(TEST_URI).unwrap();
 
         session
             .with_transaction(|session| insert_in_transaction(session, TEST_KEY, TEST_VALUE))
@@ -715,13 +694,13 @@ mod tests {
     fn local_wal_mode_records_transactional_cursor_write_and_commit_markers() {
         let dir = tempdir().unwrap();
         let mut session = SessionTestFixture::open_local_wal(dir.path()).into_session();
-        session.create(TEST_URI).unwrap();
+        session.create_table(TEST_URI).unwrap();
 
         let txn_id = {
             let mut txn_id = 0;
             session
                 .with_transaction(|session| {
-                    txn_id = session.txn_id();
+                    txn_id = session.current_txn_id();
                     insert_in_transaction(session, TEST_KEY, TEST_VALUE)
                 })
                 .unwrap();

@@ -11,11 +11,11 @@ fn main() {
     {
         let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
         let mut session = conn.open_session();
-        session.create("table:test").unwrap();
+        session.create_table("table:test").unwrap();
         session
             .with_transaction(|session| {
                 println!("Inserting key0");
-                let mut cursor = session.open_cursor("table:test")?;
+                let mut cursor = session.open_table_cursor("table:test")?;
                 cursor.insert(b"key0", b"value0")?;
                 Ok(())
             })
@@ -28,7 +28,7 @@ fn main() {
         let session = conn.open_session();
 
         println!("Trying to get key0");
-        let mut cursor = session.open_cursor("table:test").unwrap();
+        let mut cursor = session.open_table_cursor("table:test").unwrap();
         let found = cursor.get(b"key0").unwrap();
         println!("Found: {:?}", found);
     }

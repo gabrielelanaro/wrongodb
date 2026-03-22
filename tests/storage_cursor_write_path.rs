@@ -4,8 +4,8 @@ use wrongodb::{Connection, ConnectionConfig, WrongoDBError};
 
 fn insert_kv(conn: &Connection, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
     let mut session = conn.open_session();
-    session.create("table:test")?;
-    let mut cursor = session.open_cursor("table:test")?;
+    session.create_table("table:test")?;
+    let mut cursor = session.open_table_cursor("table:test")?;
     cursor.insert(key, value)?;
     Ok(())
 }
@@ -19,7 +19,7 @@ fn wal_enabled_connection_allows_public_cursor_writes() {
     insert_kv(&conn, b"alice", b"value").unwrap();
 
     let session = conn.open_session();
-    let mut cursor = session.open_cursor("table:test").unwrap();
+    let mut cursor = session.open_table_cursor("table:test").unwrap();
     let value = cursor.get(b"alice").unwrap().unwrap();
     assert_eq!(value, b"value".to_vec());
 }
@@ -33,7 +33,7 @@ fn wal_disabled_connection_allows_public_cursor_writes() {
     insert_kv(&conn, b"alice", b"value").unwrap();
 
     let session = conn.open_session();
-    let mut cursor = session.open_cursor("table:test").unwrap();
+    let mut cursor = session.open_table_cursor("table:test").unwrap();
     let value = cursor.get(b"alice").unwrap().unwrap();
     assert_eq!(value, b"value".to_vec());
 }

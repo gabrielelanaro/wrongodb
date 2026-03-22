@@ -193,7 +193,7 @@ mod tests {
             global_txn,
             Arc::new(DurabilityBackend::Disabled),
         );
-        session.create("table:users").unwrap();
+        session.create_table("table:users").unwrap();
 
         assert_eq!(
             catalog

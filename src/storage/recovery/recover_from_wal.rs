@@ -337,7 +337,7 @@ mod tests {
         let mut session = conn.open_session();
         session
             .with_transaction(|session| {
-                let mut cursor = session.open_cursor("table:items")?;
+                let mut cursor = session.open_table_cursor("table:items")?;
                 assert_eq!(cursor.get(b"k1")?, Some(b"v1".to_vec()));
                 Ok(())
             })

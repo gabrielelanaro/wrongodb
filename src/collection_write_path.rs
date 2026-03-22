@@ -267,7 +267,7 @@ impl CollectionWritePath {
             return Ok(());
         }
 
-        let mut primary_cursor = session.open_cursor(&table_uri(collection))?;
+        let mut primary_cursor = session.open_table_cursor(&table_uri(collection))?;
 
         while let Some((_, bytes)) = primary_cursor.next()? {
             let doc = decode_document(&bytes)?;
@@ -280,7 +280,7 @@ impl CollectionWritePath {
             let Some(key) = encode_index_key(value, id)? else {
                 continue;
             };
-            session.raw_insert(&index_uri, &key, &[])?;
+            session.insert_into_store(&index_uri, &key, &[])?;
         }
 
         Ok(())
@@ -293,7 +293,7 @@ impl CollectionWritePath {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), WrongoDBError> {
-        let mut cursor = session.open_cursor(uri)?;
+        let mut cursor = session.open_table_cursor(uri)?;
         cursor.insert(key, value)
     }
 
@@ -304,7 +304,7 @@ impl CollectionWritePath {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), WrongoDBError> {
-        let mut cursor = session.open_cursor(uri)?;
+        let mut cursor = session.open_table_cursor(uri)?;
         cursor.update(key, value)
     }
 
@@ -314,7 +314,7 @@ impl CollectionWritePath {
         uri: &str,
         key: &[u8],
     ) -> Result<(), WrongoDBError> {
-        let mut cursor = session.open_cursor(uri)?;
+        let mut cursor = session.open_table_cursor(uri)?;
         cursor.delete(key)
     }
 
@@ -526,7 +526,7 @@ mod tests {
 
         session
             .with_transaction(|session| {
-                let rows = session.raw_scan_range("index:users:name", None, None)?;
+                let rows = session.scan_store_range("index:users:name", None, None)?;
                 assert!(!rows.is_empty());
                 Ok(())
             })

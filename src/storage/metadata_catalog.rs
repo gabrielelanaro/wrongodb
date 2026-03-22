@@ -140,7 +140,7 @@ impl MetadataCatalog {
     ) -> Result<String, WrongoDBError> {
         let uri = table_uri(collection);
         if self
-            .lookup_source_for_txn(&uri, session.txn_id())?
+            .lookup_source_for_txn(&uri, session.current_txn_id())?
             .is_some()
         {
             return Ok(uri);
@@ -162,7 +162,7 @@ impl MetadataCatalog {
     ) -> Result<(String, bool), WrongoDBError> {
         let uri = index_uri(collection, name);
         if self
-            .lookup_source_for_txn(&uri, session.txn_id())?
+            .lookup_source_for_txn(&uri, session.current_txn_id())?
             .is_some()
         {
             return Ok((uri, false));
@@ -183,7 +183,7 @@ impl MetadataCatalog {
         entry: MetadataEntry,
     ) -> Result<bool, WrongoDBError> {
         if self
-            .lookup_source_for_txn(&entry.uri, session.txn_id())?
+            .lookup_source_for_txn(&entry.uri, session.current_txn_id())?
             .is_some()
         {
             return Ok(false);
@@ -191,7 +191,7 @@ impl MetadataCatalog {
 
         let key = encode_metadata_key(&entry.uri);
         let value = encode_metadata_value(&entry)?;
-        session.raw_insert(METADATA_URI, &key, &value)?;
+        session.insert_into_store(METADATA_URI, &key, &value)?;
         Ok(true)
     }
 
@@ -568,7 +568,7 @@ mod tests {
 
                 table = fixture
                     .catalog
-                    .table_metadata_for_txn("table:users", session.txn_id())?;
+                    .table_metadata_for_txn("table:users", session.current_txn_id())?;
                 Ok(())
             })
             .unwrap();

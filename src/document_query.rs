@@ -75,7 +75,7 @@ impl DocumentQuery {
     ) -> Result<Vec<Document>, WrongoDBError> {
         if !self
             .schema_catalog
-            .collection_exists_in_txn(collection, session.txn_id())?
+            .collection_exists_in_txn(collection, session.current_txn_id())?
         {
             return Ok(Vec::new());
         }
@@ -88,7 +88,7 @@ impl DocumentQuery {
             }
         };
 
-        let mut table_cursor = session.open_cursor(&format!("table:{collection}"))?;
+        let mut table_cursor = session.open_table_cursor(&format!("table:{collection}"))?;
 
         if filter_doc.is_empty() {
             return scan_with_cursor(&mut table_cursor, |doc| {
@@ -126,14 +126,14 @@ impl DocumentQuery {
 
         let schema = self
             .schema_catalog
-            .collection_schema_for_txn(collection, session.txn_id())?;
+            .collection_schema_for_txn(collection, session.current_txn_id())?;
         let indexed_field = filter_doc.keys().find(|key| schema.has_index(key)).cloned();
         if let Some(field) = indexed_field {
             let value = filter_doc.get(&field).expect("field selected from filter");
             let Some((start_key, end_key)) = encode_range_bounds(value) else {
                 return Ok(Vec::new());
             };
-            let index_entries = session.raw_scan_range(
+            let index_entries = session.scan_store_range(
                 &format!("index:{collection}:{field}"),
                 Some(&start_key),
                 Some(&end_key),

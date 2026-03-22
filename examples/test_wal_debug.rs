@@ -12,10 +12,10 @@ fn main() {
     {
         let conn = Connection::open(&db_path, ConnectionConfig::default()).unwrap();
         let mut session = conn.open_session();
-        session.create("table:test").unwrap();
+        session.create_table("table:test").unwrap();
 
         for i in 0..10 {
-            let mut cursor = session.open_cursor("table:test").unwrap();
+            let mut cursor = session.open_table_cursor("table:test").unwrap();
             let key = format!("k{i}");
             let value = format!("v{i}");
             cursor.insert(key.as_bytes(), value.as_bytes()).unwrap();

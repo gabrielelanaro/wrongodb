@@ -1,5 +1,30 @@
 # Decisions
 
+## 2026-03-21: Make `Session` read as a table-focused request API
+
+**Decision**
+- Rename the public table-oriented `Session` methods to explicit names:
+  - `create` -> `create_table`
+  - `open_cursor` -> `open_table_cursor`
+- Rename crate-private helpers to describe intent instead of plumbing:
+  - `txn_id` -> `current_txn_id`
+  - `run_cursor_write_operation` -> `with_write_transaction`
+  - `raw_insert` -> `insert_into_store`
+  - `raw_scan_range` -> `scan_store_range`
+- Inline or merge thin `Session` helpers that only forwarded table-cursor and
+  store-opening calls.
+- Reorder `src/storage/api/session.rs` so the file reads from public API, to
+  transaction lifecycle, to lower-level lookup and commit helpers.
+
+**Why**
+- The old `Session` surface mixed public operations, transaction plumbing, and
+  raw-store details under generic names that were harder to read than the
+  actual behavior.
+- `Session` only exposes table creation and table cursors publicly, so the API
+  should say that directly.
+- Keeping the important domain concepts named while removing thin wrappers
+  makes the module read more like English without changing storage behavior.
+
 ## 2026-03-21: Remove `TransactionManager` and wire shared transaction state directly
 
 **Decision**

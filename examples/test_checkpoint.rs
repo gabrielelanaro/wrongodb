@@ -5,16 +5,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let conn = Connection::open("test_checkpoint", ConnectionConfig::default())?;
     let mut session = conn.open_session();
-    session.create("table:test")?;
+    session.create_table("table:test")?;
 
     for i in 0..10 {
-        let mut cursor = session.open_cursor("table:test")?;
+        let mut cursor = session.open_table_cursor("table:test")?;
         let key = format!("doc:{i}");
         let value = format!("value:{i}");
         cursor.insert(key.as_bytes(), value.as_bytes())?;
     }
 
-    let mut cursor = session.open_cursor("table:test")?;
+    let mut cursor = session.open_table_cursor("table:test")?;
     let mut count = 0;
     while cursor.next()?.is_some() {
         count += 1;

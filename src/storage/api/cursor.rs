@@ -82,7 +82,7 @@ impl<'session> TableCursor<'session> {
         }
 
         let state = Arc::new(Mutex::new(TableCursorState::default()));
-        session.register_open_cursor(&state);
+        session.track_open_cursor(&state);
 
         Ok(Self {
             session,
@@ -117,7 +117,7 @@ impl<'session> TableCursor<'session> {
         self.ensure_writable()?;
         let index_entries = self.collect_index_entries(key, value)?;
 
-        self.session.run_cursor_write_operation(|txn_id, txn| {
+        self.session.with_write_transaction(|txn_id, txn| {
             {
                 let mut primary = self.primary.write();
                 if contains_key(&mut primary, key, txn_id)? {
@@ -138,7 +138,7 @@ impl<'session> TableCursor<'session> {
         self.ensure_writable()?;
         let new_index_entries = self.collect_index_entries(key, value)?;
 
-        self.session.run_cursor_write_operation(|txn_id, txn| {
+        self.session.with_write_transaction(|txn_id, txn| {
             let old_value = self.visible_primary_value(key, txn_id)?.ok_or_else(|| {
                 WrongoDBError::Storage(StorageError("key not found for update".to_string()))
             })?;
@@ -162,7 +162,7 @@ impl<'session> TableCursor<'session> {
     pub fn delete(&mut self, key: &[u8]) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
 
-        self.session.run_cursor_write_operation(|txn_id, txn| {
+        self.session.with_write_transaction(|txn_id, txn| {
             let old_value = self.visible_primary_value(key, txn_id)?.ok_or_else(|| {
                 WrongoDBError::Storage(StorageError("key not found for delete".to_string()))
             })?;
@@ -250,7 +250,7 @@ impl<'session> TableCursor<'session> {
     }
 
     fn current_txn_id(&self) -> TxnId {
-        self.session.txn_id()
+        self.session.current_txn_id()
     }
 
     // ------------------------------------------------------------------------
@@ -698,8 +698,8 @@ mod tests {
     fn transaction_bound_cursor_commit_persists_primary_and_secondary() {
         let (_tmp, primary, index, mut session, _global_txn, table) =
             open_table_with_secondary_index();
-        session.begin_transaction_internal().unwrap();
-        let txn_id = session.txn_id();
+        session.begin_transaction().unwrap();
+        let txn_id = session.current_txn_id();
         let key = encode_id_value(&json!(1)).unwrap();
         let value = make_document_bytes(1, "alice");
         {
@@ -724,7 +724,7 @@ mod tests {
             Some(Vec::new())
         );
 
-        session.commit_transaction_internal().unwrap();
+        session.commit_transaction().unwrap();
 
         assert_eq!(
             get_version(&mut primary.write(), &key, TXN_NONE).unwrap(),
@@ -745,8 +745,8 @@ mod tests {
     fn transaction_bound_cursor_abort_discards_primary_and_secondary() {
         let (_tmp, primary, index, mut session, _global_txn, table) =
             open_table_with_secondary_index();
-        session.begin_transaction_internal().unwrap();
-        let txn_id = session.txn_id();
+        session.begin_transaction().unwrap();
+        let txn_id = session.current_txn_id();
         let key = encode_id_value(&json!(1)).unwrap();
         let value = make_document_bytes(1, "alice");
         {
@@ -767,7 +767,7 @@ mod tests {
             Some(value)
         );
 
-        session.rollback_transaction_internal().unwrap();
+        session.rollback_transaction().unwrap();
 
         assert_eq!(
             get_version(&mut primary.write(), &key, TXN_NONE).unwrap(),
