@@ -8,9 +8,10 @@ use crate::storage::api::cursor::{TableCursor, TableCursorState, TableCursorWrit
 use crate::storage::btree::BTreeCursor;
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::log_manager::LogManager;
-use crate::storage::metadata_catalog::{MetadataCatalog, METADATA_STORE_NAME, METADATA_URI};
+use crate::storage::metadata_store::{MetadataStore, INDEX_URI_PREFIX, TABLE_URI_PREFIX};
+use crate::storage::reserved_store::{reserved_store_names, METADATA_URI};
 use crate::storage::table::{
-    checkpoint_store, contains_key, open_or_create_btree, scan_range, TableMetadata,
+    checkpoint_store, contains_key, get_version, open_or_create_btree, scan_range, TableMetadata,
 };
 use crate::txn::{GlobalTxnState, Transaction, TxnId, TXN_NONE};
 use crate::WrongoDBError;
@@ -26,7 +27,7 @@ type StoreEntries = Vec<(Vec<u8>, Vec<u8>)>;
 pub struct Session {
     base_path: PathBuf,
     store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
-    metadata_catalog: Arc<MetadataCatalog>,
+    metadata_store: Arc<MetadataStore>,
     global_txn: Arc<GlobalTxnState>,
     log_manager: Arc<LogManager>,
     active_transaction: Mutex<Option<ActiveTransactionHandle>>,
@@ -41,14 +42,14 @@ impl Session {
     pub(crate) fn new(
         base_path: PathBuf,
         store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
-        metadata_catalog: Arc<MetadataCatalog>,
+        metadata_store: Arc<MetadataStore>,
         global_txn: Arc<GlobalTxnState>,
         log_manager: Arc<LogManager>,
     ) -> Self {
         Self {
             base_path,
             store_handles,
-            metadata_catalog,
+            metadata_store,
             log_manager,
             global_txn,
             active_transaction: Mutex::new(None),
@@ -62,10 +63,10 @@ impl Session {
 
     /// Ensure that `table:<name>` exists.
     pub fn create_table(&mut self, table_uri: &str) -> Result<(), WrongoDBError> {
-        if let Some(collection) = table_uri.strip_prefix("table:") {
-            let metadata_catalog = self.metadata_catalog.clone();
+        if let Some(collection) = table_uri.strip_prefix(TABLE_URI_PREFIX) {
+            let metadata_store = self.metadata_store.clone();
             return self.with_transaction(|session| {
-                let _ = metadata_catalog.ensure_table_uri_in_transaction(session, collection)?;
+                let _ = metadata_store.ensure_table_uri_in_transaction(session, collection)?;
                 Ok(())
             });
         }
@@ -107,8 +108,12 @@ impl Session {
 
     /// Flush all known stores to a stable checkpoint.
     pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
-        let mut store_names = self.metadata_catalog.all_store_names()?;
-        store_names.push(METADATA_STORE_NAME.to_string());
+        let mut store_names = self.metadata_store.all_store_names()?;
+        store_names.extend(
+            reserved_store_names()
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
         store_names.sort();
         store_names.dedup();
 
@@ -235,6 +240,50 @@ impl Session {
         Ok(())
     }
 
+    pub(crate) fn ensure_named_store(&self, store_name: &str) -> Result<(), WrongoDBError> {
+        let _ = self.open_store_by_name(store_name)?;
+        Ok(())
+    }
+
+    pub(crate) fn put_into_named_store(
+        &self,
+        store_name: &str,
+        store_uri: &str,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), WrongoDBError> {
+        let txn_handle = self.current_transaction().ok_or_else(|| {
+            StorageError("put_into_named_store requires an active transaction".into())
+        })?;
+        let store = self.open_store_by_name(store_name)?;
+        let mut txn = txn_handle.lock();
+        store.write().put(store_uri, key, value, &mut txn)?;
+        Ok(())
+    }
+
+    pub(crate) fn read_from_named_store(
+        &self,
+        store_name: &str,
+        key: &[u8],
+        txn_id: TxnId,
+    ) -> Result<Option<Vec<u8>>, WrongoDBError> {
+        let store = self.open_store_by_name(store_name)?;
+        let result = get_version(&mut store.write(), key, txn_id);
+        result
+    }
+
+    pub(crate) fn scan_named_store_range(
+        &self,
+        store_name: &str,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        txn_id: TxnId,
+    ) -> Result<StoreEntries, WrongoDBError> {
+        let store = self.open_store_by_name(store_name)?;
+        let mut btree = store.write();
+        scan_range(&mut btree, start, end, txn_id)
+    }
+
     pub(crate) fn scan_store_range(
         &self,
         store_uri: &str,
@@ -275,14 +324,14 @@ impl Session {
         table_uri: &str,
         txn_id: TxnId,
     ) -> Result<TableMetadata, WrongoDBError> {
-        if !table_uri.starts_with("table:") {
+        if !table_uri.starts_with(TABLE_URI_PREFIX) {
             return Err(StorageError(format!(
                 "unsupported URI for public cursor open: {table_uri}; only table:... is supported"
             ))
             .into());
         }
 
-        self.metadata_catalog
+        self.metadata_store
             .table_metadata_for_txn(table_uri, txn_id)?
             .ok_or_else(|| StorageError(format!("unknown URI: {table_uri}")).into())
     }
@@ -292,12 +341,15 @@ impl Session {
         uri: &str,
         txn_id: TxnId,
     ) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
-        if uri != METADATA_URI && !uri.starts_with("table:") && !uri.starts_with("index:") {
+        if uri != METADATA_URI
+            && !uri.starts_with(TABLE_URI_PREFIX)
+            && !uri.starts_with(INDEX_URI_PREFIX)
+        {
             return Err(StorageError(format!("unsupported URI: {uri}")).into());
         }
 
         let store_name = self
-            .metadata_catalog
+            .metadata_store
             .lookup_store_name_for_txn(uri, txn_id)?
             .ok_or_else(|| StorageError(format!("unknown URI: {uri}")))?;
         self.open_store_by_name(&store_name)
@@ -386,7 +438,7 @@ mod tests {
     use crate::storage::btree::BTreeCursor;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::log_manager::{open_recovery_reader_if_present, LogManager, LoggingConfig};
-    use crate::storage::metadata_catalog::MetadataCatalog;
+    use crate::storage::metadata_store::MetadataStore;
     use crate::storage::recovery::recover_from_wal;
     use crate::storage::wal::{WalFileReader, WalReader, WalRecord};
     use crate::txn::GlobalTxnState;
@@ -412,13 +464,11 @@ mod tests {
             std::fs::create_dir_all(&base_path).unwrap();
             let global_txn = Arc::new(GlobalTxnState::new());
             let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
-            let metadata_catalog = Arc::new(MetadataCatalog::new(
-                base_path.clone(),
-                store_handles.clone(),
-            ));
+            let metadata_store =
+                Arc::new(MetadataStore::new(base_path.clone(), store_handles.clone()));
             recover_existing_wal_if_present(
                 &base_path,
-                metadata_catalog.as_ref(),
+                metadata_store.as_ref(),
                 store_handles.as_ref(),
                 global_txn.as_ref(),
             );
@@ -434,14 +484,12 @@ mod tests {
         fn build(base_path: PathBuf, log_manager: Arc<LogManager>) -> Self {
             let global_txn = Arc::new(GlobalTxnState::new());
             let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
-            let metadata_catalog = Arc::new(MetadataCatalog::new(
-                base_path.clone(),
-                store_handles.clone(),
-            ));
+            let metadata_store =
+                Arc::new(MetadataStore::new(base_path.clone(), store_handles.clone()));
             let session = Session::new(
                 base_path,
                 store_handles,
-                metadata_catalog,
+                metadata_store,
                 global_txn,
                 log_manager,
             );
@@ -452,21 +500,14 @@ mod tests {
 
     fn recover_existing_wal_if_present(
         base_path: &Path,
-        metadata_catalog: &MetadataCatalog,
+        metadata_store: &MetadataStore,
         store_handles: &HandleCache<String, RwLock<BTreeCursor>>,
         global_txn: &GlobalTxnState,
     ) {
         let Some(reader) = open_recovery_reader_if_present(base_path) else {
             return;
         };
-        recover_from_wal(
-            base_path,
-            metadata_catalog,
-            store_handles,
-            global_txn,
-            reader,
-        )
-        .unwrap();
+        recover_from_wal(base_path, metadata_store, store_handles, global_txn, reader).unwrap();
     }
 
     fn read_wal_records(db_dir: &std::path::Path) -> Vec<WalRecord> {
@@ -643,21 +684,18 @@ mod tests {
         let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
         let log_manager =
             Arc::new(LogManager::open(&base_path, &LoggingConfig::default()).unwrap());
-        let metadata_catalog = Arc::new(MetadataCatalog::new(
-            base_path.clone(),
-            store_handles.clone(),
-        ));
+        let metadata_store = Arc::new(MetadataStore::new(base_path.clone(), store_handles.clone()));
         let mut session = Session::new(
             base_path.clone(),
             store_handles.clone(),
-            metadata_catalog.clone(),
+            metadata_store.clone(),
             global_txn.clone(),
             log_manager.clone(),
         );
         let mut checkpoint_session = Session::new(
             base_path,
             store_handles,
-            metadata_catalog,
+            metadata_store,
             global_txn,
             log_manager,
         );

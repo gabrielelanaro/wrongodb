@@ -1,9 +1,9 @@
 mod api;
+mod catalog;
 mod collection_write_path;
 mod core;
 mod document_query;
 mod index;
-mod schema;
 mod server;
 mod storage;
 mod txn;

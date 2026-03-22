@@ -1,4 +1,5 @@
 use crate::api::DatabaseContext;
+use crate::catalog::CreateIndexRequest;
 use crate::server::commands::Command;
 use crate::WrongoDBError;
 use bson::{doc, Bson, Document};
@@ -13,17 +14,20 @@ impl Command for ListIndexesCommand {
 
     fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("listIndexes").unwrap_or("test");
-        let indexes = db.document_query().list_indexes(coll_name)?;
+        let indexes = db.list_indexes(coll_name)?;
 
         let indexes_bson: Vec<Bson> = indexes
             .into_iter()
-            .map(|field| {
-                let mut key_doc = Document::new();
-                key_doc.insert(field.clone(), Bson::Int32(1));
+            .map(|index| {
+                let key_doc = index
+                    .spec()
+                    .get_document("key")
+                    .cloned()
+                    .unwrap_or_default();
                 Bson::Document(doc! {
                     "v": Bson::Int32(2),
                     "key": key_doc,
-                    "name": format!("{}_1", field),
+                    "name": index.name(),
                     "ns": format!("test.{}", coll_name),
                 })
             })
@@ -60,25 +64,23 @@ impl Command for CreateIndexesCommand {
         let coll_name = doc.get_str("createIndexes").unwrap_or("test");
         let mut session = db.connection().open_session();
         let mut created = 0i32;
+        let mut requests = Vec::new();
 
         if let Ok(indexes) = doc.get_array("indexes") {
             for index_spec in indexes {
                 if let Bson::Document(spec) = index_spec {
-                    if let Ok(key_doc) = spec.get_document("key") {
-                        for (field, _) in key_doc {
-                            let _ = db.collection_write_path().create_index(
-                                &mut session,
-                                coll_name,
-                                field,
-                            );
-                            created += 1;
-                        }
-                    }
+                    requests.push(CreateIndexRequest::from_bson_spec(spec)?);
                 }
             }
         }
 
-        let total_indexes = db.document_query().list_indexes(coll_name)?.len() as i32 + 1;
+        for request in requests {
+            db.collection_write_path()
+                .create_index(&mut session, coll_name, request)?;
+            created += 1;
+        }
+
+        let total_indexes = db.list_indexes(coll_name)?.len() as i32 + 1;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),

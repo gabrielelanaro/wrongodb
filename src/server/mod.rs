@@ -58,7 +58,7 @@ pub async fn start_server(
     for source in &catalog_report.unreferenced_sources {
         eprintln!("Catalog recovery found unreferenced source file: {source}");
     }
-    let db = Arc::new(DatabaseContext::new(conn));
+    let db = Arc::new(DatabaseContext::new(conn)?);
     let registry = Arc::new(CommandRegistry::new());
     println!("Server listening on {}", addr);
 

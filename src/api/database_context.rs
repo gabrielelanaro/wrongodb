@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use crate::catalog::{CatalogStore, CollectionCatalog, DurableCatalog, IndexDefinition};
 use crate::collection_write_path::CollectionWritePath;
 use crate::document_query::DocumentQuery;
-use crate::schema::SchemaCatalog;
 use crate::{Connection, WrongoDBError};
 
 /// Internal database-layer container above the WT-like storage connection.
@@ -13,31 +13,35 @@ use crate::{Connection, WrongoDBError};
 /// orchestration through this crate-private container.
 pub(crate) struct DatabaseContext {
     connection: Arc<Connection>,
-    schema_catalog: Arc<SchemaCatalog>,
+    collection_catalog: Arc<CollectionCatalog>,
     document_query: DocumentQuery,
     collection_write_path: CollectionWritePath,
 }
 
 impl DatabaseContext {
-    pub(crate) fn new(connection: Arc<Connection>) -> Self {
-        let metadata_catalog = connection.metadata_catalog();
-        let schema_catalog = Arc::new(SchemaCatalog::new(
-            connection.base_path().to_path_buf(),
-            metadata_catalog.clone(),
-        ));
-        let document_query = DocumentQuery::new(schema_catalog.clone());
+    /// Builds the server-side services layered above one storage connection.
+    pub(crate) fn new(connection: Arc<Connection>) -> Result<Self, WrongoDBError> {
+        let metadata_store = connection.metadata_store();
+        let durable_catalog = Arc::new(DurableCatalog::new(CatalogStore::new()));
+        let collection_catalog = Arc::new(CollectionCatalog::new());
+        let session = connection.open_session();
+        durable_catalog.ensure_store_exists(&session)?;
+        collection_catalog.load_from_durable(&session, durable_catalog.as_ref())?;
+
+        let document_query = DocumentQuery::new(durable_catalog.clone());
         let collection_write_path = CollectionWritePath::new(
-            metadata_catalog,
-            schema_catalog.clone(),
+            metadata_store,
+            durable_catalog.clone(),
+            collection_catalog.clone(),
             document_query.clone(),
         );
 
-        Self {
+        Ok(Self {
             connection,
-            schema_catalog,
+            collection_catalog,
             document_query,
             collection_write_path,
-        }
+        })
     }
 
     pub(crate) fn connection(&self) -> &Connection {
@@ -57,6 +61,22 @@ impl DatabaseContext {
     }
 
     pub(crate) fn list_collections(&self) -> Result<Vec<String>, WrongoDBError> {
-        self.schema_catalog.list_collections()
+        Ok(self.collection_catalog.list_collection_names())
+    }
+
+    /// Returns the committed collection definition if the collection exists.
+    pub(crate) fn collection_definition(
+        &self,
+        collection: &str,
+    ) -> Result<Option<crate::catalog::CollectionDefinition>, WrongoDBError> {
+        Ok(self.collection_catalog.lookup_collection(collection))
+    }
+
+    /// Returns the committed secondary index definitions for `collection`.
+    pub(crate) fn list_indexes(
+        &self,
+        collection: &str,
+    ) -> Result<Vec<IndexDefinition>, WrongoDBError> {
+        Ok(self.collection_catalog.list_index_definitions(collection))
     }
 }

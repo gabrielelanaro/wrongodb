@@ -1,5 +1,56 @@
 # Decisions
 
+## 2026-03-22: Split WT-style storage metadata from the Mongo-style collection catalog
+
+**Decision**
+- Rename `MetadataCatalog` to `MetadataStore` and keep it storage-only.
+- Keep `metadata.wt` as the WT-like storage metadata store for `table:` and `index:` rows:
+  - `table:<collection>` persists `{ source }`
+  - `index:<collection>:<index_name>` persists `{ source, columns }`
+- Remove persisted `kind` and index `name` from `metadata.wt`; derive both from the URI key.
+- Introduce a separate server-side durable catalog in `_catalog.wt` with one row per collection,
+  loaded through:
+  - `CatalogStore` for raw rows
+  - `DurableCatalog` for parsed transaction-visible collection metadata
+  - `CollectionCatalog` for the committed in-memory collection registry
+- Make Mongo-visible index names canonical across the split. Server index specs like `name_1`
+  persist as:
+  - durable catalog key in `index_uris`
+  - storage URI suffix in `index:users:name_1`
+  - backing file name in `users.name_1.idx.wt`
+- Keep `Session`, `TableCursor`, `TableMetadata`, and `IndexMetadata` in the storage layer.
+  `TableCursor` continues to maintain secondary indexes on writes.
+- Keep `_catalog.wt` outside `MetadataStore`. Reserved-store bootstrap and recovery know about
+  `_catalog.wt`, but `MetadataStore` only special-cases `metadata:`.
+
+**Why**
+- WiredTiger storage metadata and MongoDB collection catalog solve different problems and should
+  not be collapsed into one persistence plane.
+- The previous `SchemaCatalog` was only reinterpreting storage metadata, which made collection
+  identity, UUIDs, and user-facing index specs leak into the storage metadata layer.
+- This split preserves the WT-style table-aware storage API while giving the server a real MongoDB-
+  style durable catalog with committed collection metadata.
+
+## 2026-03-22: Make `metadata.wt` the only schema source for secondary indexes
+
+**Decision**
+- Remove `*.meta.json` sidecar schema files from `SchemaCatalog`.
+- Make `metadata.wt` the single source of truth for secondary index definitions used by:
+  - query planning/index selection
+  - `listIndexes`
+  - collection schema reconstruction
+- Build `SchemaCatalog` state directly from `MetadataCatalog::table_metadata_for_txn(...)`.
+- Accept a one-time compatibility break for databases that only carry legacy `*.meta.json` schema
+  state.
+
+**Why**
+- Secondary index metadata was already persisted in `metadata.wt`, so keeping a second schema
+  representation in sidecar JSON files created duplicate sources of truth.
+- Reads and writes were already drifting apart: index creation wrote metadata rows and then mirrored
+  the same logical information into `*.meta.json`.
+- Collapsing to one schema source is the smallest safe step toward a WT-like metadata split without
+  changing handle ownership or metadata visibility semantics yet.
+
 ## 2026-03-21: Make `Session` read as a table-focused request API
 
 **Decision**

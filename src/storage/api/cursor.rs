@@ -421,7 +421,7 @@ mod tests {
     use crate::storage::api::Session;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::log_manager::LogManager;
-    use crate::storage::metadata_catalog::MetadataCatalog;
+    use crate::storage::metadata_store::MetadataStore;
     use crate::storage::table::open_or_create_btree;
     use crate::txn::{GlobalTxnState, TXN_NONE};
 
@@ -431,14 +431,14 @@ mod tests {
         log_manager: Arc<LogManager>,
     ) -> Session {
         let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
-        let metadata_catalog = Arc::new(MetadataCatalog::new(
+        let metadata_store = Arc::new(MetadataStore::new(
             base_path.to_path_buf(),
             store_handles.clone(),
         ));
         Session::new(
             base_path.to_path_buf(),
             store_handles,
-            metadata_catalog,
+            metadata_store,
             global_txn,
             log_manager,
         )

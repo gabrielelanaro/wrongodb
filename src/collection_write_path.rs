@@ -2,53 +2,70 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::catalog::{CollectionCatalog, CreateIndexRequest, DurableCatalog, IndexDefinition};
 use crate::core::bson::{decode_document, encode_document, encode_id_value};
 use crate::core::document::{normalize_document_in_place, validate_is_object};
 use crate::core::errors::DocumentValidationError;
 use crate::document_query::DocumentQuery;
 use crate::index::encode_index_key;
-use crate::schema::SchemaCatalog;
 use crate::storage::api::Session;
-use crate::storage::metadata_catalog::{table_uri, MetadataCatalog};
+use crate::storage::metadata_store::MetadataStore;
 use crate::{Document, WrongoDBError};
 
+/// Summary of an update command result.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UpdateResult {
     pub(crate) matched: usize,
     pub(crate) modified: usize,
 }
 
+/// Write path for collection CRUD and index registration.
+///
+/// This service coordinates the storage metadata in [`MetadataStore`], the
+/// durable server-side collection catalog, and the WT-like `TableCursor`
+/// implementation used for actual record and secondary-index updates.
 #[derive(Clone)]
 pub(crate) struct CollectionWritePath {
-    metadata_catalog: Arc<MetadataCatalog>,
-    schema_catalog: Arc<SchemaCatalog>,
+    metadata_store: Arc<MetadataStore>,
+    durable_catalog: Arc<DurableCatalog>,
+    collection_catalog: Arc<CollectionCatalog>,
     document_query: DocumentQuery,
 }
 
 impl CollectionWritePath {
+    /// Creates the collection write service.
     pub(crate) fn new(
-        metadata_catalog: Arc<MetadataCatalog>,
-        schema_catalog: Arc<SchemaCatalog>,
+        metadata_store: Arc<MetadataStore>,
+        durable_catalog: Arc<DurableCatalog>,
+        collection_catalog: Arc<CollectionCatalog>,
         document_query: DocumentQuery,
     ) -> Self {
         Self {
-            metadata_catalog,
-            schema_catalog,
+            metadata_store,
+            durable_catalog,
+            collection_catalog,
             document_query,
         }
     }
 
+    /// Inserts one document, auto-creating the collection metadata when needed.
     pub(crate) fn insert_one(
         &self,
         session: &mut Session,
         collection: &str,
         doc: Value,
     ) -> Result<Document, WrongoDBError> {
-        self.run_in_transaction(session, |this, session| {
-            this.insert_one_in_transaction(session, collection, doc)
-        })
+        let (document, created_collection) = self
+            .run_in_transaction(session, |this, session| {
+                this.insert_one_in_transaction(session, collection, doc)
+            })?;
+        if created_collection {
+            self.refresh_collection_cache(session, collection)?;
+        }
+        Ok(document)
     }
 
+    /// Updates the first document matching `filter`.
     pub(crate) fn update_one(
         &self,
         session: &mut Session,
@@ -61,6 +78,7 @@ impl CollectionWritePath {
         })
     }
 
+    /// Updates every document matching `filter`.
     pub(crate) fn update_many(
         &self,
         session: &mut Session,
@@ -73,6 +91,7 @@ impl CollectionWritePath {
         })
     }
 
+    /// Deletes the first document matching `filter`.
     pub(crate) fn delete_one(
         &self,
         session: &mut Session,
@@ -84,6 +103,7 @@ impl CollectionWritePath {
         })
     }
 
+    /// Deletes every document matching `filter`.
     pub(crate) fn delete_many(
         &self,
         session: &mut Session,
@@ -95,27 +115,29 @@ impl CollectionWritePath {
         })
     }
 
+    /// Creates one secondary index from the normalized server-side request.
     pub(crate) fn create_index(
         &self,
         session: &mut Session,
         collection: &str,
-        field: &str,
+        request: CreateIndexRequest,
     ) -> Result<(), WrongoDBError> {
-        self.run_in_transaction(session, |this, session| {
-            this.create_index_in_transaction(session, collection, field)
+        let created = self.run_in_transaction(session, |this, session| {
+            this.create_index_in_transaction(session, collection, &request)
         })?;
-        let _ = self
-            .schema_catalog
-            .add_index(collection, field, vec![field.to_string()])?;
+        if created {
+            self.refresh_collection_cache(session, collection)?;
+        }
         Ok(())
     }
 
+    /// Inserts one document inside the caller's active transaction.
     pub(crate) fn insert_one_in_transaction(
         &self,
         session: &mut Session,
         collection: &str,
         doc: Value,
-    ) -> Result<Document, WrongoDBError> {
+    ) -> Result<(Document, bool), WrongoDBError> {
         validate_is_object(&doc)?;
         let mut obj = doc.as_object().expect("validated object").clone();
         normalize_document_in_place(&mut obj)?;
@@ -125,11 +147,13 @@ impl CollectionWritePath {
             .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
         let key = encode_id_value(id)?;
         let value = encode_document(&obj)?;
-        let primary_uri = self.ensure_table_registered_in_transaction(session, collection)?;
-        self.insert_record(session, &primary_uri, &key, &value)?;
-        Ok(obj)
+        let (table_uri, created_collection) =
+            self.ensure_collection_registered_in_transaction(session, collection)?;
+        self.insert_record(session, &table_uri, &key, &value)?;
+        Ok((obj, created_collection))
     }
 
+    /// Updates the first matching document inside the caller's active transaction.
     pub(crate) fn update_one_in_transaction(
         &self,
         session: &mut Session,
@@ -154,8 +178,9 @@ impl CollectionWritePath {
             .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
         let key = encode_id_value(id)?;
         let value = encode_document(&updated_doc)?;
-        let primary_uri = self.ensure_table_registered_in_transaction(session, collection)?;
-        self.update_record(session, &primary_uri, &key, &value)?;
+        let (table_uri, _) =
+            self.ensure_collection_registered_in_transaction(session, collection)?;
+        self.update_record(session, &table_uri, &key, &value)?;
 
         Ok(UpdateResult {
             matched: 1,
@@ -163,6 +188,7 @@ impl CollectionWritePath {
         })
     }
 
+    /// Updates every matching document inside the caller's active transaction.
     pub(crate) fn update_many_in_transaction(
         &self,
         session: &mut Session,
@@ -180,7 +206,8 @@ impl CollectionWritePath {
             });
         }
 
-        let primary_uri = self.ensure_table_registered_in_transaction(session, collection)?;
+        let (table_uri, _) =
+            self.ensure_collection_registered_in_transaction(session, collection)?;
         let mut modified = 0;
         for doc in docs {
             let updated_doc = apply_update(&doc, &update)?;
@@ -189,7 +216,7 @@ impl CollectionWritePath {
                 .ok_or_else(|| DocumentValidationError("missing _id".into()))?;
             let key = encode_id_value(id)?;
             let value = encode_document(&updated_doc)?;
-            self.update_record(session, &primary_uri, &key, &value)?;
+            self.update_record(session, &table_uri, &key, &value)?;
             modified += 1;
         }
 
@@ -199,6 +226,7 @@ impl CollectionWritePath {
         })
     }
 
+    /// Deletes the first matching document inside the caller's active transaction.
     pub(crate) fn delete_one_in_transaction(
         &self,
         session: &mut Session,
@@ -217,11 +245,13 @@ impl CollectionWritePath {
             return Ok(0);
         };
         let key = encode_id_value(id)?;
-        let primary_uri = self.ensure_table_registered_in_transaction(session, collection)?;
-        self.delete_record(session, &primary_uri, &key)?;
+        let (table_uri, _) =
+            self.ensure_collection_registered_in_transaction(session, collection)?;
+        self.delete_record(session, &table_uri, &key)?;
         Ok(1)
     }
 
+    /// Deletes every matching document inside the caller's active transaction.
     pub(crate) fn delete_many_in_transaction(
         &self,
         session: &mut Session,
@@ -235,46 +265,58 @@ impl CollectionWritePath {
             return Ok(0);
         }
 
-        let primary_uri = self.ensure_table_registered_in_transaction(session, collection)?;
+        let (table_uri, _) =
+            self.ensure_collection_registered_in_transaction(session, collection)?;
         let mut deleted = 0;
         for doc in docs {
             let Some(id) = doc.get("_id") else {
                 continue;
             };
             let key = encode_id_value(id)?;
-            self.delete_record(session, &primary_uri, &key)?;
+            self.delete_record(session, &table_uri, &key)?;
             deleted += 1;
         }
 
         Ok(deleted)
     }
 
+    /// Registers and backfills one secondary index inside the caller's active
+    /// transaction.
     pub(crate) fn create_index_in_transaction(
         &self,
         session: &mut Session,
         collection: &str,
-        field: &str,
-    ) -> Result<(), WrongoDBError> {
-        self.ensure_table_registered_in_transaction(session, collection)?;
+        request: &CreateIndexRequest,
+    ) -> Result<bool, WrongoDBError> {
+        let (table_uri, _) =
+            self.ensure_collection_registered_in_transaction(session, collection)?;
+        let indexed_field = request.indexed_field()?;
 
-        let (index_uri, inserted) = self.metadata_catalog.ensure_index_uri_in_transaction(
+        let (index_uri, _created_storage_entry) =
+            self.metadata_store.ensure_index_uri_in_transaction(
+                session,
+                collection,
+                request.name(),
+                vec![indexed_field.clone()],
+            )?;
+        // The durable catalog owns the Mongo-visible index definition; the
+        // storage metadata only owns the raw `index:` URI and backing source.
+        let inserted = self.durable_catalog.ensure_index_in_transaction(
             session,
             collection,
-            field,
-            vec![field.to_string()],
+            IndexDefinition::from_request(request, index_uri.clone()),
         )?;
         if !inserted {
-            return Ok(());
+            return Ok(false);
         }
 
-        let mut primary_cursor = session.open_table_cursor(&table_uri(collection))?;
-
+        let mut primary_cursor = session.open_table_cursor(&table_uri)?;
         while let Some((_, bytes)) = primary_cursor.next()? {
             let doc = decode_document(&bytes)?;
             let Some(id) = doc.get("_id") else {
                 continue;
             };
-            let Some(value) = doc.get(field) else {
+            let Some(value) = doc.get(&indexed_field) else {
                 continue;
             };
             let Some(key) = encode_index_key(value, id)? else {
@@ -283,7 +325,7 @@ impl CollectionWritePath {
             session.insert_into_store(&index_uri, &key, &[])?;
         }
 
-        Ok(())
+        Ok(true)
     }
 
     fn insert_record(
@@ -318,13 +360,43 @@ impl CollectionWritePath {
         cursor.delete(key)
     }
 
-    fn ensure_table_registered_in_transaction(
+    fn ensure_collection_registered_in_transaction(
         &self,
         session: &mut Session,
         collection: &str,
-    ) -> Result<String, WrongoDBError> {
-        self.metadata_catalog
-            .ensure_table_uri_in_transaction(session, collection)
+    ) -> Result<(String, bool), WrongoDBError> {
+        // Collection creation touches both stores: `metadata.wt` owns the raw
+        // `table:` binding while `_catalog.wt` owns the server-facing
+        // collection definition.
+        if let Some(definition) = self.durable_catalog.collection_for_txn(
+            session,
+            collection,
+            session.current_txn_id(),
+        )? {
+            return Ok((definition.table_uri().to_string(), false));
+        }
+
+        let table_uri = self
+            .metadata_store
+            .ensure_table_uri_in_transaction(session, collection)?;
+        let (_, created_collection) = self
+            .durable_catalog
+            .insert_collection_if_missing_in_transaction(session, collection, &table_uri)?;
+        Ok((table_uri, created_collection))
+    }
+
+    // The committed collection catalog is only refreshed after the outer write
+    // transaction succeeds. Failed transactions must not publish catalog state.
+    fn refresh_collection_cache(
+        &self,
+        session: &Session,
+        collection: &str,
+    ) -> Result<(), WrongoDBError> {
+        self.collection_catalog.refresh_collection(
+            session,
+            self.durable_catalog.as_ref(),
+            collection,
+        )
     }
 
     fn run_in_transaction<R, F>(&self, session: &mut Session, f: F) -> Result<R, WrongoDBError>
@@ -413,47 +485,52 @@ mod tests {
     use tempfile::tempdir;
 
     use super::apply_update;
+    use crate::catalog::{CatalogStore, CollectionCatalog, CreateIndexRequest, DurableCatalog};
     use crate::collection_write_path::CollectionWritePath;
     use crate::document_query::DocumentQuery;
-    use crate::schema::SchemaCatalog;
     use crate::storage::api::Session;
     use crate::storage::btree::BTreeCursor;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::log_manager::LogManager;
-    use crate::storage::metadata_catalog::MetadataCatalog;
+    use crate::storage::metadata_store::MetadataStore;
     use crate::txn::GlobalTxnState;
     use crate::WrongoDBError;
 
     fn test_services(
         base_path: std::path::PathBuf,
         log_manager: LogManager,
-    ) -> (CollectionWritePath, DocumentQuery, Session) {
+    ) -> (
+        CollectionWritePath,
+        DocumentQuery,
+        Arc<CollectionCatalog>,
+        Session,
+    ) {
         let global_txn = Arc::new(GlobalTxnState::new());
         let store_handles =
             Arc::new(HandleCache::<String, parking_lot::RwLock<BTreeCursor>>::new());
-        let metadata_catalog = Arc::new(MetadataCatalog::new(
-            base_path.clone(),
-            store_handles.clone(),
-        ));
-        let schema_catalog = Arc::new(SchemaCatalog::new(
-            base_path.clone(),
-            metadata_catalog.clone(),
-        ));
+        let metadata_store = Arc::new(MetadataStore::new(base_path.clone(), store_handles.clone()));
+        let durable_catalog = Arc::new(DurableCatalog::new(CatalogStore::new()));
+        let collection_catalog = Arc::new(CollectionCatalog::new());
         let log_manager = Arc::new(log_manager);
-        let document_query = DocumentQuery::new(schema_catalog.clone());
-        let service = CollectionWritePath::new(
-            metadata_catalog.clone(),
-            schema_catalog.clone(),
-            document_query.clone(),
-        );
         let session = Session::new(
             base_path,
             store_handles,
-            metadata_catalog,
+            metadata_store.clone(),
             global_txn,
             log_manager,
         );
-        (service, document_query, session)
+        durable_catalog.ensure_store_exists(&session).unwrap();
+        collection_catalog
+            .load_from_durable(&session, durable_catalog.as_ref())
+            .unwrap();
+        let document_query = DocumentQuery::new(durable_catalog.clone());
+        let service = CollectionWritePath::new(
+            metadata_store,
+            durable_catalog,
+            collection_catalog.clone(),
+            document_query.clone(),
+        );
+        (service, document_query, collection_catalog, session)
     }
 
     #[test]
@@ -516,17 +593,23 @@ mod tests {
     #[test]
     fn create_index_backfills_existing_documents() {
         let tmp = tempdir().unwrap();
-        let (service, _query, mut session) =
+        let (service, _query, _collection_catalog, mut session) =
             test_services(tmp.path().to_path_buf(), LogManager::disabled());
 
         service
             .insert_one(&mut session, "users", json!({"_id": 1, "name": "alice"}))
             .unwrap();
-        service.create_index(&mut session, "users", "name").unwrap();
+        service
+            .create_index(
+                &mut session,
+                "users",
+                CreateIndexRequest::single_field_ascending("name"),
+            )
+            .unwrap();
 
         session
             .with_transaction(|session| {
-                let rows = session.scan_store_range("index:users:name", None, None)?;
+                let rows = session.scan_store_range("index:users:name_1", None, None)?;
                 assert!(!rows.is_empty());
                 Ok(())
             })
@@ -536,7 +619,7 @@ mod tests {
     #[test]
     fn crud_roundtrip() {
         let tmp = tempdir().unwrap();
-        let (service, query, mut session) =
+        let (service, query, _collection_catalog, mut session) =
             test_services(tmp.path().to_path_buf(), LogManager::disabled());
 
         let inserted = service
@@ -584,27 +667,38 @@ mod tests {
     #[test]
     fn create_index_registers_index_name() {
         let tmp = tempdir().unwrap();
-        let (service, query, mut session) =
+        let (service, _query, collection_catalog, mut session) =
             test_services(tmp.path().to_path_buf(), LogManager::disabled());
 
         service
             .insert_one(&mut session, "users", json!({"_id": 1, "name": "alice"}))
             .unwrap();
-        service.create_index(&mut session, "users", "name").unwrap();
+        service
+            .create_index(
+                &mut session,
+                "users",
+                CreateIndexRequest::single_field_ascending("name"),
+            )
+            .unwrap();
 
-        let indexes = query.list_indexes("users").unwrap();
-        assert!(indexes.iter().any(|index| index == "name"));
+        let indexes = collection_catalog
+            .list_index_definitions("users")
+            .into_iter()
+            .map(|index| index.name().to_string())
+            .collect::<Vec<_>>();
+        assert!(indexes.iter().any(|index| index == "name_1"));
+        assert!(!tmp.path().join("users.meta.json").exists());
     }
 
     #[test]
     fn failing_transaction_aborts_changes() {
         let tmp = tempdir().unwrap();
-        let (service, query, mut session) =
+        let (service, query, _collection_catalog, mut session) =
             test_services(tmp.path().to_path_buf(), LogManager::disabled());
 
         let err = service
             .run_in_transaction(&mut session, |this, session| {
-                this.insert_one_in_transaction(
+                let _ = this.insert_one_in_transaction(
                     session,
                     "items",
                     json!({"_id": "abort-me", "value": "v1"}),

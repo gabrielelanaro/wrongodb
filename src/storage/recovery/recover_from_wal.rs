@@ -6,7 +6,8 @@ use parking_lot::RwLock;
 use crate::core::errors::StorageError;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::handle_cache::HandleCache;
-use crate::storage::metadata_catalog::MetadataCatalog;
+use crate::storage::metadata_store::MetadataStore;
+use crate::storage::reserved_store::reserved_store_name_for_uri;
 use crate::storage::table::{checkpoint_store, open_or_create_btree};
 use crate::storage::wal::{RecoveryError, WalReader, WalRecord};
 use crate::txn::{GlobalTxnState, Transaction, TxnId, TxnLogOp};
@@ -27,7 +28,7 @@ struct CommittedTransaction {
 /// interrupted the last append.
 pub(crate) fn recover_from_wal(
     base_path: &Path,
-    metadata_catalog: &MetadataCatalog,
+    metadata_store: &MetadataStore,
     store_handles: &StoreHandleCache,
     global_txn: &GlobalTxnState,
     mut reader: impl WalReader,
@@ -35,7 +36,7 @@ pub(crate) fn recover_from_wal(
     while let Some(txn) = next_committed_transaction(&mut reader)? {
         apply_committed_transaction(
             base_path,
-            metadata_catalog,
+            metadata_store,
             store_handles,
             global_txn,
             txn.txn_id,
@@ -49,7 +50,7 @@ pub(crate) fn recover_from_wal(
 
 fn apply_committed_transaction(
     base_path: &Path,
-    metadata_catalog: &MetadataCatalog,
+    metadata_store: &MetadataStore,
     store_handles: &StoreHandleCache,
     global_txn: &GlobalTxnState,
     txn_id: TxnId,
@@ -60,7 +61,7 @@ fn apply_committed_transaction(
     for op in ops {
         apply_replayed_operation(
             base_path,
-            metadata_catalog,
+            metadata_store,
             store_handles,
             &mut txn,
             txn_id,
@@ -126,7 +127,7 @@ fn read_next_record_or_stop_at_corrupt_tail(
 
 fn apply_replayed_operation(
     base_path: &Path,
-    metadata_catalog: &MetadataCatalog,
+    metadata_store: &MetadataStore,
     store_handles: &StoreHandleCache,
     txn: &mut Transaction,
     txn_id: TxnId,
@@ -134,23 +135,13 @@ fn apply_replayed_operation(
 ) -> Result<(), WrongoDBError> {
     match op {
         TxnLogOp::Put { uri, key, value } => {
-            let store = open_store_for_recovery_uri(
-                base_path,
-                metadata_catalog,
-                store_handles,
-                uri,
-                txn_id,
-            )?;
+            let store =
+                open_store_for_recovery_uri(base_path, metadata_store, store_handles, uri, txn_id)?;
             store.write().put(uri, key, value, txn)?;
         }
         TxnLogOp::Delete { uri, key } => {
-            let store = open_store_for_recovery_uri(
-                base_path,
-                metadata_catalog,
-                store_handles,
-                uri,
-                txn_id,
-            )?;
+            let store =
+                open_store_for_recovery_uri(base_path, metadata_store, store_handles, uri, txn_id)?;
             let _ = store.write().delete(uri, key, txn)?;
         }
     }
@@ -160,13 +151,14 @@ fn apply_replayed_operation(
 
 fn open_store_for_recovery_uri(
     base_path: &Path,
-    metadata_catalog: &MetadataCatalog,
+    metadata_store: &MetadataStore,
     store_handles: &StoreHandleCache,
     uri: &str,
     txn_id: TxnId,
 ) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
-    let store_name = metadata_catalog
-        .lookup_store_name_for_txn(uri, txn_id)?
+    let store_name = reserved_store_name_for_uri(uri)
+        .map(str::to_string)
+        .or(metadata_store.lookup_store_name_for_txn(uri, txn_id)?)
         .ok_or_else(|| StorageError(format!("unknown URI during recovery: {uri}")))?;
     open_store_by_name(base_path, store_handles, &store_name)
 }
@@ -194,8 +186,9 @@ mod tests {
     use crate::storage::api::{Connection, ConnectionConfig};
     use crate::storage::btree::BTreeCursor;
     use crate::storage::handle_cache::HandleCache;
-    use crate::storage::metadata_catalog::{MetadataCatalog, METADATA_URI};
+    use crate::storage::metadata_store::MetadataStore;
     use crate::storage::recovery::recover_from_wal;
+    use crate::storage::reserved_store::METADATA_URI;
     use crate::storage::table::{get_version, open_or_create_btree};
     use crate::storage::wal::{
         LogFile, Lsn, RecoveryError, WalFileReader, WalReader, WalRecord, WalRecordHeader,
@@ -209,14 +202,7 @@ mod tests {
     }
 
     #[derive(Serialize)]
-    #[serde(rename_all = "lowercase")]
-    enum EncodedMetadataKind {
-        Table,
-    }
-
-    #[derive(Serialize)]
     struct EncodedMetadataRecord {
-        kind: EncodedMetadataKind,
         source: String,
     }
 
@@ -251,7 +237,6 @@ mod tests {
 
     fn encode_metadata_value(source: &str) -> Vec<u8> {
         bson::to_vec(&EncodedMetadataRecord {
-            kind: EncodedMetadataKind::Table,
             source: source.to_string(),
         })
         .unwrap()
@@ -261,14 +246,14 @@ mod tests {
         let global_txn = Arc::new(GlobalTxnState::new());
         let store_handles =
             Arc::new(HandleCache::<String, parking_lot::RwLock<BTreeCursor>>::new());
-        let metadata_catalog = Arc::new(MetadataCatalog::new(
+        let metadata_store = Arc::new(MetadataStore::new(
             base_path.to_path_buf(),
             store_handles.clone(),
         ));
         let reader = WalFileReader::open(base_path.join("global.wal")).unwrap();
         recover_from_wal(
             base_path,
-            metadata_catalog.as_ref(),
+            metadata_store.as_ref(),
             store_handles.as_ref(),
             global_txn.as_ref(),
             reader,
@@ -399,7 +384,7 @@ mod tests {
         let conn = Connection::open(dir.path(), ConnectionConfig::new()).unwrap();
 
         assert_eq!(
-            conn.metadata_catalog()
+            conn.metadata_store()
                 .lookup_store_name("table:items")
                 .unwrap(),
             Some("items.main.wt".to_string())

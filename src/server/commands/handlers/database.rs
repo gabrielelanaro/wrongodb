@@ -39,29 +39,25 @@ impl Command for ListCollectionsCommand {
         let collections = db.list_collections()?;
         let collections_bson: Vec<Bson> = collections
             .into_iter()
-            .enumerate()
-            .map(|(i, name)| {
-                let mut uuid_bytes = [0u8; 16];
-                let name_bytes = name.as_bytes();
-                for (j, &b) in name_bytes.iter().take(16).enumerate() {
-                    uuid_bytes[j] = b;
-                }
-                uuid_bytes[0] = (i as u8).wrapping_add(uuid_bytes[0]);
-
-                Bson::Document(doc! {
+            .filter_map(|name| {
+                let definition = db.collection_definition(&name).ok()??;
+                Some(Bson::Document(doc! {
                     "name": name.clone(),
                     "type": "collection",
-                    "options": Bson::Document(Document::new()),
+                    "options": Bson::Document(definition.options().clone()),
                     "info": {
                         "readOnly": Bson::Boolean(false),
-                        "uuid": Bson::Binary(Binary { subtype: BinarySubtype::Uuid, bytes: uuid_bytes.to_vec() }),
+                        "uuid": Bson::Binary(Binary {
+                            subtype: BinarySubtype::Uuid,
+                            bytes: definition.uuid().bytes.clone(),
+                        }),
                     },
                     "idIndex": {
                         "v": Bson::Int32(2),
                         "key": { "_id": Bson::Int32(1) },
                         "name": "_id_",
                     },
-                })
+                }))
             })
             .collect();
 
@@ -92,7 +88,7 @@ impl Command for DbStatsCommand {
         for name in &collections {
             let mut session = db.connection().open_session();
             document_count += db.document_query().count(&mut session, name, None)?;
-            index_count += db.document_query().list_indexes(name)?.len();
+            index_count += db.list_indexes(name)?.len();
         }
 
         Ok(doc! {
@@ -121,6 +117,7 @@ impl Command for CollStatsCommand {
         let coll_name = doc.get_str("collStats").unwrap_or("test");
         let mut session = db.connection().open_session();
         let count = db.document_query().count(&mut session, coll_name, None)?;
+        let index_count = db.list_indexes(coll_name)?.len() as i32 + 1;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),
@@ -129,7 +126,7 @@ impl Command for CollStatsCommand {
             "size": Bson::Int64(0),
             "avgObjSize": Bson::Double(0.0),
             "storageSize": Bson::Int64(0),
-            "nindexes": Bson::Int32(1),
+            "nindexes": Bson::Int32(index_count),
             "totalIndexSize": Bson::Int64(0),
         })
     }

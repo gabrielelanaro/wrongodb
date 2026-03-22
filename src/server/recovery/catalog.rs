@@ -1,9 +1,11 @@
 use std::fs;
 use std::path::Path;
 
+use crate::catalog::{CatalogStore, DurableCatalog};
 use crate::core::errors::StorageError;
 use crate::storage::api::connection::Connection;
-use crate::storage::metadata_catalog::METADATA_STORE_NAME;
+use crate::storage::reserved_store::reserved_store_names;
+use crate::txn::TXN_NONE;
 use crate::WrongoDBError;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -17,9 +19,21 @@ impl CatalogRecovery {
     pub(crate) fn reconcile(
         connection: &Connection,
     ) -> Result<CatalogRecoveryReport, WrongoDBError> {
-        let metadata_catalog = connection.metadata_catalog();
-        let mut referenced_store_names = metadata_catalog.all_store_names()?;
-        referenced_store_names.push(METADATA_STORE_NAME.to_string());
+        let metadata_store = connection.metadata_store();
+        let session = connection.open_session();
+        for store_name in reserved_store_names() {
+            session.ensure_named_store(store_name)?;
+        }
+
+        let durable_catalog = DurableCatalog::new(CatalogStore::new());
+        durable_catalog.validate_storage_references(&session, metadata_store.as_ref(), TXN_NONE)?;
+
+        let mut referenced_store_names = metadata_store.all_store_names()?;
+        referenced_store_names.extend(
+            reserved_store_names()
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
         referenced_store_names.sort();
         referenced_store_names.dedup();
 

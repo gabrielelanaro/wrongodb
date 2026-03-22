@@ -10,7 +10,7 @@ use crate::storage::btree::BTreeCursor;
 use crate::storage::handle_cache::HandleCache;
 use crate::storage::log_manager::{open_recovery_reader_if_present, LogManager};
 pub use crate::storage::log_manager::{LogSyncMethod, LoggingConfig, TransactionSyncConfig};
-use crate::storage::metadata_catalog::MetadataCatalog;
+use crate::storage::metadata_store::MetadataStore;
 use crate::storage::recovery::recover_from_wal;
 use crate::txn::GlobalTxnState;
 use crate::WrongoDBError;
@@ -83,7 +83,7 @@ impl ConnectionConfig {
 /// owns request-local state.
 pub struct Connection {
     base_path: PathBuf,
-    metadata_catalog: Arc<MetadataCatalog>,
+    metadata_store: Arc<MetadataStore>,
     store_handles: Arc<HandleCache<String, RwLock<BTreeCursor>>>,
     global_txn: Arc<GlobalTxnState>,
     log_manager: Arc<LogManager>,
@@ -114,14 +114,11 @@ impl Connection {
 
         let global_txn = Arc::new(GlobalTxnState::new());
         let store_handles = Arc::new(HandleCache::new());
-        let metadata_catalog = Arc::new(MetadataCatalog::new(
-            base_path.clone(),
-            store_handles.clone(),
-        ));
+        let metadata_store = Arc::new(MetadataStore::new(base_path.clone(), store_handles.clone()));
         if let Some(recovery_reader) = open_recovery_reader_if_present(&base_path) {
             recover_from_wal(
                 &base_path,
-                metadata_catalog.as_ref(),
+                metadata_store.as_ref(),
                 store_handles.as_ref(),
                 global_txn.as_ref(),
                 recovery_reader,
@@ -132,7 +129,7 @@ impl Connection {
 
         Ok(Self {
             base_path,
-            metadata_catalog,
+            metadata_store,
             store_handles,
             global_txn,
             log_manager,
@@ -151,14 +148,14 @@ impl Connection {
         Session::new(
             self.base_path.clone(),
             self.store_handles.clone(),
-            self.metadata_catalog.clone(),
+            self.metadata_store.clone(),
             self.global_txn.clone(),
             self.log_manager.clone(),
         )
     }
 
-    pub(crate) fn metadata_catalog(&self) -> Arc<MetadataCatalog> {
-        self.metadata_catalog.clone()
+    pub(crate) fn metadata_store(&self) -> Arc<MetadataStore> {
+        self.metadata_store.clone()
     }
 
     pub(crate) fn base_path(&self) -> &Path {

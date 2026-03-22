@@ -3,21 +3,27 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::catalog::DurableCatalog;
 use crate::core::bson::{decode_document, encode_id_value};
 use crate::core::document::validate_is_object;
 use crate::index::{decode_index_id, encode_range_bounds};
-use crate::schema::SchemaCatalog;
 use crate::storage::api::{Session, TableCursor};
 use crate::{Document, WrongoDBError};
 
+/// Read path for collection queries over the WT-like storage API.
+///
+/// `DocumentQuery` resolves collection definitions from the durable catalog,
+/// opens the storage-layer table cursor, and applies simple filter planning on
+/// top of the available primary and secondary indexes.
 #[derive(Clone)]
 pub(crate) struct DocumentQuery {
-    schema_catalog: Arc<SchemaCatalog>,
+    durable_catalog: Arc<DurableCatalog>,
 }
 
 impl DocumentQuery {
-    pub(crate) fn new(schema_catalog: Arc<SchemaCatalog>) -> Self {
-        Self { schema_catalog }
+    /// Creates the document query service.
+    pub(crate) fn new(durable_catalog: Arc<DurableCatalog>) -> Self {
+        Self { durable_catalog }
     }
 
     pub(crate) fn find(
@@ -26,11 +32,10 @@ impl DocumentQuery {
         collection: &str,
         filter: Option<Value>,
     ) -> Result<Vec<Document>, WrongoDBError> {
-        self.run_in_transaction(session, |this, session| {
-            this.find_in_transaction(session, collection, filter)
-        })
+        session.with_transaction(|session| self.find_in_transaction(session, collection, filter))
     }
 
+    /// Counts the documents matching `filter`.
     pub(crate) fn count(
         &self,
         session: &mut Session,
@@ -40,6 +45,7 @@ impl DocumentQuery {
         Ok(self.find(session, collection, filter)?.len())
     }
 
+    /// Returns the distinct values of `key` among the matching documents.
     pub(crate) fn distinct(
         &self,
         session: &mut Session,
@@ -63,22 +69,21 @@ impl DocumentQuery {
         Ok(values)
     }
 
-    pub(crate) fn list_indexes(&self, collection: &str) -> Result<Vec<String>, WrongoDBError> {
-        self.schema_catalog.list_indexes(collection)
-    }
-
+    /// Executes a read inside the caller's active transaction.
     pub(crate) fn find_in_transaction(
         &self,
         session: &mut Session,
         collection: &str,
         filter: Option<Value>,
     ) -> Result<Vec<Document>, WrongoDBError> {
-        if !self
-            .schema_catalog
-            .collection_exists_in_txn(collection, session.current_txn_id())?
-        {
+        let Some(collection_definition) = self.durable_catalog.collection_for_txn(
+            session,
+            collection,
+            session.current_txn_id(),
+        )?
+        else {
             return Ok(Vec::new());
-        }
+        };
 
         let filter_doc = match filter {
             None => Document::new(),
@@ -88,7 +93,7 @@ impl DocumentQuery {
             }
         };
 
-        let mut table_cursor = session.open_table_cursor(&format!("table:{collection}"))?;
+        let mut table_cursor = session.open_table_cursor(collection_definition.table_uri())?;
 
         if filter_doc.is_empty() {
             return scan_with_cursor(&mut table_cursor, |doc| {
@@ -124,20 +129,19 @@ impl DocumentQuery {
             });
         }
 
-        let schema = self
-            .schema_catalog
-            .collection_schema_for_txn(collection, session.current_txn_id())?;
-        let indexed_field = filter_doc.keys().find(|key| schema.has_index(key)).cloned();
-        if let Some(field) = indexed_field {
+        if let Some(index) = collection_definition.indexes().values().find(|index| {
+            index
+                .indexed_field()
+                .map(|field| filter_doc.contains_key(&field))
+                .unwrap_or(false)
+        }) {
+            let field = index.indexed_field()?;
             let value = filter_doc.get(&field).expect("field selected from filter");
             let Some((start_key, end_key)) = encode_range_bounds(value) else {
                 return Ok(Vec::new());
             };
-            let index_entries = session.scan_store_range(
-                &format!("index:{collection}:{field}"),
-                Some(&start_key),
-                Some(&end_key),
-            )?;
+            let index_entries =
+                session.scan_store_range(index.uri(), Some(&start_key), Some(&end_key))?;
 
             let mut results = Vec::new();
             for (key, _) in index_entries {
@@ -156,13 +160,6 @@ impl DocumentQuery {
         }
 
         scan_with_cursor(&mut table_cursor, matches_filter)
-    }
-
-    fn run_in_transaction<R, F>(&self, session: &mut Session, f: F) -> Result<R, WrongoDBError>
-    where
-        F: FnOnce(&Self, &mut Session) -> Result<R, WrongoDBError>,
-    {
-        session.with_transaction(|session| f(self, session))
     }
 }
 
@@ -191,12 +188,12 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::catalog::{CatalogStore, CollectionCatalog, CreateIndexRequest};
     use crate::collection_write_path::CollectionWritePath;
-    use crate::schema::SchemaCatalog;
     use crate::storage::btree::BTreeCursor;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::log_manager::LogManager;
-    use crate::storage::metadata_catalog::MetadataCatalog;
+    use crate::storage::metadata_store::MetadataStore;
     use crate::txn::GlobalTxnState;
 
     struct QueryTestFixture {
@@ -214,27 +211,28 @@ mod tests {
             let global_txn = Arc::new(GlobalTxnState::new());
             let store_handles =
                 Arc::new(HandleCache::<String, parking_lot::RwLock<BTreeCursor>>::new());
-            let metadata_catalog = Arc::new(MetadataCatalog::new(
-                base_path.clone(),
-                store_handles.clone(),
-            ));
-            let schema_catalog = Arc::new(SchemaCatalog::new(
-                base_path.clone(),
-                metadata_catalog.clone(),
-            ));
+            let metadata_store =
+                Arc::new(MetadataStore::new(base_path.clone(), store_handles.clone()));
+            let durable_catalog = Arc::new(DurableCatalog::new(CatalogStore::new()));
+            let collection_catalog = Arc::new(CollectionCatalog::new());
             let log_manager = Arc::new(LogManager::disabled());
-            let query = DocumentQuery::new(schema_catalog.clone());
-            let write_path = CollectionWritePath::new(
-                metadata_catalog.clone(),
-                schema_catalog.clone(),
-                query.clone(),
-            );
             let session = Session::new(
                 base_path,
                 store_handles,
-                metadata_catalog,
+                metadata_store.clone(),
                 global_txn,
                 log_manager,
+            );
+            durable_catalog.ensure_store_exists(&session).unwrap();
+            collection_catalog
+                .load_from_durable(&session, durable_catalog.as_ref())
+                .unwrap();
+            let query = DocumentQuery::new(durable_catalog.clone());
+            let write_path = CollectionWritePath::new(
+                metadata_store,
+                durable_catalog,
+                collection_catalog,
+                query.clone(),
             );
 
             Self {
@@ -254,7 +252,11 @@ mod tests {
         let (query, write_path, mut session) = QueryTestFixture::new().into_parts();
 
         write_path
-            .create_index(&mut session, "test", "name")
+            .create_index(
+                &mut session,
+                "test",
+                CreateIndexRequest::single_field_ascending("name"),
+            )
             .unwrap();
         write_path
             .insert_one(&mut session, "test", json!({"_id": 1, "name": "alice"}))
