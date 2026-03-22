@@ -14,6 +14,7 @@ use crate::storage::metadata_store::{
 use crate::storage::reserved_store::{
     reserved_store_identity_for_uri, reserved_store_names, StoreId,
 };
+use crate::storage::row::{index_key_from_row, validate_storage_columns};
 use crate::storage::table::{
     checkpoint_store, get_version, open_or_create_btree, scan_range, TableMetadata,
 };
@@ -80,16 +81,40 @@ impl Session {
 
     /// Ensure that `table:<name>` exists.
     pub fn create_table(&mut self, table_uri: &str) -> Result<(), WrongoDBError> {
+        self.create_table_with_columns(table_uri, Vec::new())
+    }
+
+    pub(crate) fn create_table_with_columns(
+        &mut self,
+        table_uri: &str,
+        value_columns: Vec<String>,
+    ) -> Result<(), WrongoDBError> {
         if let Some(collection) = table_uri.strip_prefix(TABLE_URI_PREFIX) {
             if self.current_transaction().is_some() {
                 return Err(WrongoDBError::TransactionAlreadyActive);
             }
 
-            if self.metadata_store.get(table_uri)?.is_some() {
-                return Ok(());
+            validate_storage_columns(&value_columns)?;
+
+            if let Some(existing) = self.metadata_store.get(table_uri)? {
+                if existing.is_table()
+                    && existing.value_columns() == value_columns.as_slice()
+                    && existing.key_columns().len() == 1
+                    && existing.key_columns()[0] == "_id"
+                {
+                    return Ok(());
+                }
+
+                return Err(WrongoDBError::Storage(StorageError(format!(
+                    "table metadata for {table_uri} does not match the requested storage schema"
+                ))));
             }
 
-            let entry = MetadataEntry::table(collection, self.metadata_store.allocate_store_id());
+            let entry = MetadataEntry::table(
+                collection,
+                value_columns,
+                self.metadata_store.allocate_store_id(),
+            );
             self.ensure_named_store(entry.source())?;
             self.metadata_store.insert(&entry)?;
             return Ok(());
@@ -103,6 +128,7 @@ impl Session {
     /// Ensure that a storage-layer `index:` row and backing store exist.
     pub(crate) fn create_index(
         &mut self,
+        table_uri: &str,
         index_entry: &MetadataEntry,
     ) -> Result<(), WrongoDBError> {
         if self.current_transaction().is_some() {
@@ -116,20 +142,32 @@ impl Session {
             ))));
         }
 
-        let table_uri = Self::table_uri_for_index(index_entry.uri())?;
-        if self.metadata_store.get(&table_uri)?.is_none() {
+        if table_uri != Self::table_uri_for_index(index_entry.uri())?.as_str() {
             return Err(WrongoDBError::Storage(StorageError(format!(
-                "unknown URI: {table_uri}"
+                "index {} does not belong to table {table_uri}",
+                index_entry.uri()
             ))));
         }
 
-        if self.metadata_store.get(index_entry.uri())?.is_some() {
-            return Ok(());
-        }
+        let loaded = self.load_table_runtime(table_uri)?;
+        let stored_index = self.ensure_index_store_exists(&loaded.table, index_entry)?;
+        let index_metadata = stored_index.clone().into_index_metadata()?;
+        let store_name = stored_index.source().to_string();
+        let store_id = stored_index.store_id();
+        let table = loaded.table.clone();
 
-        self.ensure_named_store(index_entry.source())?;
-        self.metadata_store.insert(index_entry)?;
-        Ok(())
+        self.with_transaction(|session| {
+            let mut primary_cursor = session.open_table_cursor(table_uri)?;
+            while let Some((primary_key, primary_value)) = primary_cursor.next()? {
+                let Some(index_key) =
+                    index_key_from_row(&table, &index_metadata, &primary_key, &primary_value)?
+                else {
+                    continue;
+                };
+                session.put_into_named_store(&store_name, store_id, &index_key, &[])?;
+            }
+            Ok(())
+        })
     }
 
     /// Open a cursor for `table:<name>` in the current transaction context.
@@ -374,9 +412,10 @@ impl Session {
             .into_iter()
             .map(MetadataEntry::into_index_metadata)
             .collect::<Result<Vec<_>, _>>()?;
+        let table = table_entry.into_table_metadata(index_metadata)?;
 
         Ok(LoadedTable {
-            table: TableMetadata::with_indexes(table_uri, table_entry.store_id(), index_metadata),
+            table,
             primary,
             indexes,
         })
@@ -409,6 +448,49 @@ impl Session {
             return Err(StorageError(format!("invalid index URI: {index_uri}")).into());
         };
         Ok(format!("{TABLE_URI_PREFIX}{collection}"))
+    }
+
+    fn ensure_index_store_exists(
+        &self,
+        table: &TableMetadata,
+        index_entry: &MetadataEntry,
+    ) -> Result<MetadataEntry, WrongoDBError> {
+        if index_entry.columns().len() != 1 {
+            return Err(StorageError(format!(
+                "index {} must declare exactly one indexed column",
+                index_entry.uri()
+            ))
+            .into());
+        }
+
+        let indexed_column = &index_entry.columns()[0];
+        if table.value_column_position(indexed_column).is_none() {
+            return Err(StorageError(format!(
+                "table {} does not declare storage column {} required by {}",
+                table.uri(),
+                indexed_column,
+                index_entry.uri()
+            ))
+            .into());
+        }
+
+        let stored_entry = if let Some(existing) = self.metadata_store.get(index_entry.uri())? {
+            if existing.columns() != index_entry.columns() {
+                return Err(StorageError(format!(
+                    "index metadata for {} does not match the requested columns",
+                    index_entry.uri()
+                ))
+                .into());
+            }
+            existing
+        } else {
+            self.ensure_named_store(index_entry.source())?;
+            self.metadata_store.insert(index_entry)?;
+            index_entry.clone()
+        };
+
+        self.ensure_named_store(stored_entry.source())?;
+        Ok(stored_entry)
     }
 
     fn open_store_by_name(
@@ -615,7 +697,9 @@ mod tests {
     fn create_index_creates_backing_store_and_metadata() {
         let mut session =
             SessionTestFixture::with_log_manager(LogManager::disabled()).into_session();
-        session.create_table(TEST_URI).unwrap();
+        session
+            .create_table_with_columns(TEST_URI, vec!["name".to_string()])
+            .unwrap();
 
         let entry = MetadataEntry::index(
             "items",
@@ -625,8 +709,8 @@ mod tests {
         );
         let source = entry.source().to_string();
 
-        session.create_index(&entry).unwrap();
-        session.create_index(&entry).unwrap();
+        session.create_index(TEST_URI, &entry).unwrap();
+        session.create_index(TEST_URI, &entry).unwrap();
 
         let stored = session.metadata_store.get(entry.uri()).unwrap().unwrap();
         assert_eq!(stored.source(), source);
@@ -654,7 +738,7 @@ mod tests {
             session.metadata_store.allocate_store_id(),
         );
 
-        let err = session.create_index(&entry).unwrap_err();
+        let err = session.create_index(TEST_URI, &entry).unwrap_err();
         assert!(err.to_string().contains("unknown URI: table:items"));
     }
 

@@ -1,5 +1,41 @@
 # Decisions
 
+## 2026-03-22: Switch collection storage to explicit WT-style row schemas and move index fill into `Session`
+
+**Decision**
+- Stop auto-creating collections on first write. Collections must be created explicitly through
+  `createCollection` / `create` with `storageColumns`.
+- Persist WT-style table schema in `metadata.wt` table rows:
+  - `row_format=wt_row_v1`
+  - `key_columns=["_id"]`
+  - `value_columns=[...]`
+- Store primary rows as structured typed tuples in declared column order instead of opaque BSON
+  blobs.
+- Keep collection concepts above storage:
+  - `DurableCatalog` stores collection identity, UUIDs, options, and index readiness
+  - `MetadataStore` stores table/index row schemas and physical store bindings
+- Make `Session::create_index(table_uri, index_entry)` mirror WiredTiger's schema split more
+  closely:
+  - ensure/repair the physical `index:` store and `metadata.wt` row
+  - scan the source table
+  - derive index keys from structured row bytes
+  - backfill the index inside the storage layer
+- Remove `CollectionWritePath::backfill_index_committed`. `CollectionWritePath` now only:
+  - creates collections with explicit storage schema
+  - validates writes against declared columns
+  - coordinates durable index registration and `ready`
+  - calls `Session::create_index` for build/repair
+- Accept a storage compatibility break for existing databases that still store opaque BSON primary
+  values or old-style table metadata rows.
+
+**Why**
+- WiredTiger's session/schema layer owns table/index schema and the fill phase because it works from
+  declared columns and structured row formats, not from application-specific document codecs.
+- WrongoDB could not move index fill into `Session` cleanly while primary rows were `_id` plus
+  opaque BSON and collections were created implicitly on first write.
+- Declared storage columns give the storage layer enough information to derive secondary index keys
+  without leaking BSON-specific projection logic into `Session`.
+
 ## 2026-03-22: Move low-level index creation into `Session` and keep collection readiness above it
 
 **Decision**

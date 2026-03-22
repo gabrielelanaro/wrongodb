@@ -51,6 +51,7 @@ impl CommandRegistry {
         self.register(Box::new(handlers::ConnectionStatusCommand));
         self.register(Box::new(handlers::ListDatabasesCommand));
         self.register(Box::new(handlers::ListCollectionsCommand));
+        self.register(Box::new(handlers::CreateCollectionCommand));
         self.register(Box::new(handlers::DbStatsCommand));
         self.register(Box::new(handlers::CollStatsCommand));
         self.register(Box::new(handlers::InsertCommand));

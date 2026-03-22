@@ -6,6 +6,7 @@ use crate::storage::btree::BTreeCursor;
 use crate::storage::mvcc::ReconcileStats;
 use crate::storage::page_store::{BlockFilePageStore, Page, PageStore};
 use crate::storage::reserved_store::StoreId;
+use crate::storage::row::RowFormat;
 use crate::txn::{GlobalTxnState, ReadVisibility, TxnId};
 use crate::WrongoDBError;
 
@@ -71,6 +72,9 @@ impl IndexMetadata {
 pub struct TableMetadata {
     uri: String,
     store_id: StoreId,
+    row_format: RowFormat,
+    key_columns: Vec<String>,
+    value_columns: Vec<String>,
     indexes: Vec<IndexMetadata>,
 }
 
@@ -80,12 +84,15 @@ impl TableMetadata {
     // ------------------------------------------------------------------------
 
     #[cfg(test)]
-    pub(crate) fn new(uri: impl Into<String>) -> Self {
+    pub(crate) fn new(uri: impl Into<String>, value_columns: Vec<String>) -> Self {
         use crate::storage::reserved_store::FIRST_DYNAMIC_STORE_ID;
 
         Self {
             uri: uri.into(),
             store_id: FIRST_DYNAMIC_STORE_ID,
+            row_format: RowFormat::WtRowV1,
+            key_columns: vec!["_id".to_string()],
+            value_columns,
             indexes: Vec::new(),
         }
     }
@@ -93,11 +100,17 @@ impl TableMetadata {
     pub(crate) fn with_indexes(
         uri: impl Into<String>,
         store_id: StoreId,
+        row_format: RowFormat,
+        key_columns: Vec<String>,
+        value_columns: Vec<String>,
         indexes: Vec<IndexMetadata>,
     ) -> Self {
         Self {
             uri: uri.into(),
             store_id,
+            row_format,
+            key_columns,
+            value_columns,
             indexes,
         }
     }
@@ -113,6 +126,20 @@ impl TableMetadata {
 
     pub(crate) fn store_id(&self) -> StoreId {
         self.store_id
+    }
+
+    pub(crate) fn row_format(&self) -> RowFormat {
+        self.row_format
+    }
+
+    pub fn value_columns(&self) -> &[String] {
+        &self.value_columns
+    }
+
+    pub(crate) fn value_column_position(&self, column: &str) -> Option<usize> {
+        self.value_columns
+            .iter()
+            .position(|candidate| candidate == column)
     }
 
     pub fn indexes(&self) -> &[IndexMetadata] {

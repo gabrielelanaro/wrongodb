@@ -135,17 +135,23 @@ pub(crate) struct CollectionDefinition {
     table_uri: String,
     uuid: Binary,
     options: Document,
+    storage_columns: Vec<String>,
     indexes: BTreeMap<String, IndexDefinition>,
 }
 
 impl CollectionDefinition {
     /// Creates a new collection definition with an empty index set.
-    pub(crate) fn new(name: impl Into<String>, table_uri: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        name: impl Into<String>,
+        table_uri: impl Into<String>,
+        storage_columns: Vec<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             table_uri: table_uri.into(),
             uuid: uuid_binary(),
-            options: Document::new(),
+            options: collection_options(&storage_columns),
+            storage_columns,
             indexes: BTreeMap::new(),
         }
     }
@@ -167,6 +173,10 @@ impl CollectionDefinition {
     /// Returns the persisted collection options document.
     pub(crate) fn options(&self) -> &Document {
         &self.options
+    }
+
+    pub(crate) fn storage_columns(&self) -> &[String] {
+        &self.storage_columns
     }
 
     /// Returns the durable secondary indexes keyed by index name.
@@ -254,6 +264,7 @@ impl DurableCatalog {
         session: &Session,
         collection: &str,
         table_uri: &str,
+        storage_columns: &[String],
     ) -> Result<(CollectionDefinition, bool), WrongoDBError> {
         if let Some(existing) =
             self.collection_for_txn(session, collection, session.current_txn_id())?
@@ -261,7 +272,7 @@ impl DurableCatalog {
             return Ok((existing, false));
         }
 
-        let definition = CollectionDefinition::new(collection, table_uri);
+        let definition = CollectionDefinition::new(collection, table_uri, storage_columns.to_vec());
         let record = catalog_record_from_collection_definition(&definition)?;
         self.store
             .put_record_in_transaction(session, collection, &record)?;
@@ -273,9 +284,15 @@ impl DurableCatalog {
         session: &mut Session,
         collection: &str,
         table_uri: &str,
+        storage_columns: &[String],
     ) -> Result<(CollectionDefinition, bool), WrongoDBError> {
         session.with_transaction(|session| {
-            self.insert_collection_if_missing_in_transaction(session, collection, table_uri)
+            self.insert_collection_if_missing_in_transaction(
+                session,
+                collection,
+                table_uri,
+                storage_columns,
+            )
         })
     }
 
@@ -370,6 +387,7 @@ struct DurableMetadataRecord {
     uuid: Binary,
     #[serde(default)]
     options: Document,
+    storage_columns: Vec<String>,
     #[serde(default)]
     indexes: Vec<DurableIndexMetadata>,
 }
@@ -434,6 +452,7 @@ fn collection_definition_from_record(
         table_uri: record.table_uri,
         uuid: metadata.uuid,
         options: metadata.options,
+        storage_columns: metadata.storage_columns,
         indexes,
     })
 }
@@ -444,6 +463,7 @@ fn catalog_record_from_collection_definition(
     let metadata = DurableMetadataRecord {
         uuid: definition.uuid.clone(),
         options: definition.options.clone(),
+        storage_columns: definition.storage_columns.clone(),
         indexes: definition
             .indexes
             .values()
@@ -507,6 +527,20 @@ fn index_spec_name(spec: &Document) -> Result<String, WrongoDBError> {
 
 fn default_index_name(field: &str) -> String {
     format!("{field}_1")
+}
+
+fn collection_options(storage_columns: &[String]) -> Document {
+    let mut options = Document::new();
+    options.insert(
+        "storageColumns",
+        Bson::Array(
+            storage_columns
+                .iter()
+                .map(|column| Bson::String(column.clone()))
+                .collect(),
+        ),
+    );
+    options
 }
 
 fn single_field_ascending_key_field(key: &Document) -> Result<String, WrongoDBError> {

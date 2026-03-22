@@ -4,10 +4,11 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::catalog::DurableCatalog;
-use crate::core::bson::{decode_document, encode_id_value};
+use crate::core::bson::encode_id_value;
 use crate::core::document::validate_is_object;
 use crate::index::{decode_index_id, encode_range_bounds};
 use crate::storage::api::{Session, TableCursor};
+use crate::storage::row::decode_row_value;
 use crate::{Document, WrongoDBError};
 
 /// Read path for collection queries over the WT-like storage API.
@@ -118,7 +119,7 @@ impl DocumentQuery {
             let doc_bytes = table_cursor.get(&key)?;
             return Ok(match doc_bytes {
                 Some(bytes) => {
-                    let doc = decode_document(&bytes)?;
+                    let doc = decode_row_value(table_cursor.table(), &key, &bytes)?;
                     if matches_filter(&doc) {
                         vec![doc]
                     } else {
@@ -151,7 +152,7 @@ impl DocumentQuery {
                 };
                 let primary_key = encode_id_value(&id)?;
                 if let Some(bytes) = table_cursor.get(&primary_key)? {
-                    let doc = decode_document(&bytes)?;
+                    let doc = decode_row_value(table_cursor.table(), &primary_key, &bytes)?;
                     if matches_filter(&doc) {
                         results.push(doc);
                     }
@@ -172,8 +173,8 @@ where
     F: Fn(&Document) -> bool,
 {
     let mut results = Vec::new();
-    while let Some((_, bytes)) = cursor.next()? {
-        let doc = decode_document(&bytes)?;
+    while let Some((key, bytes)) = cursor.next()? {
+        let doc = decode_row_value(cursor.table(), &key, &bytes)?;
         if matches_filter(&doc) {
             results.push(doc);
         }
@@ -259,6 +260,9 @@ mod tests {
     fn indexed_lookup_survives_checkpoint_reconciliation() {
         let (query, write_path, mut session) = QueryTestFixture::new().into_parts();
 
+        write_path
+            .create_collection(&mut session, "test", vec!["name".to_string()])
+            .unwrap();
         write_path
             .create_index(
                 &mut session,

@@ -2,14 +2,13 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
-use crate::core::bson::{decode_document, decode_id_value};
 use crate::core::errors::{DocumentValidationError, StorageError};
-use crate::index::encode_index_key;
 use crate::storage::api::session::Session;
 use crate::storage::btree::BTreeCursor;
+use crate::storage::row::{index_key_from_decoded_row, DecodedRow};
 use crate::storage::table::{contains_key, get_version, scan_range, IndexMetadata, TableMetadata};
 use crate::txn::{Transaction, TxnId};
-use crate::{Document, WrongoDBError};
+use crate::WrongoDBError;
 
 /// A single key/value entry returned by [`TableCursor::next`].
 ///
@@ -236,6 +235,10 @@ impl<'session> TableCursor<'session> {
         self.state.lock().reset_runtime();
     }
 
+    pub(crate) fn table(&self) -> &TableMetadata {
+        &self.table
+    }
+
     // ------------------------------------------------------------------------
     // Transaction helpers
     // ------------------------------------------------------------------------
@@ -326,12 +329,15 @@ impl<'session> TableCursor<'session> {
             return Ok(Vec::new());
         }
 
-        let doc = decode_document(primary_value)?;
-        let id = decode_id_value(primary_key)?;
+        let row = DecodedRow::from_bytes(
+            self.table.row_format(),
+            self.table.value_columns(),
+            primary_value,
+        )?;
         let mut entries = Vec::new();
 
         for (index_pos, metadata) in self.table.indexes().iter().enumerate() {
-            let Some(index_key) = self.index_key_for_document(metadata, &doc, &id)? else {
+            let Some(index_key) = self.index_key_for_row(metadata, primary_key, &row)? else {
                 continue;
             };
             entries.push((index_pos, index_key));
@@ -340,31 +346,13 @@ impl<'session> TableCursor<'session> {
         Ok(entries)
     }
 
-    fn index_key_for_document(
+    fn index_key_for_row(
         &self,
         metadata: &IndexMetadata,
-        doc: &Document,
-        id: &serde_json::Value,
+        primary_key: &[u8],
+        row: &DecodedRow,
     ) -> Result<Option<Vec<u8>>, WrongoDBError> {
-        let field = metadata.columns().first().ok_or_else(|| {
-            StorageError(format!(
-                "index {} is missing indexed columns",
-                metadata.uri()
-            ))
-        })?;
-        if metadata.columns().len() != 1 {
-            return Err(StorageError(format!(
-                "index {} has unsupported composite definition with {} columns",
-                metadata.uri(),
-                metadata.columns().len()
-            ))
-            .into());
-        }
-
-        let Some(value) = doc.get(field) else {
-            return Ok(None);
-        };
-        encode_index_key(value, id)
+        index_key_from_decoded_row(&self.table, metadata, primary_key, row)
     }
 
     fn insert_secondary_indexes(
@@ -417,14 +405,17 @@ mod tests {
     use tempfile::{tempdir, TempDir};
 
     use super::*;
-    use crate::core::bson::{encode_document, encode_id_value};
+    use crate::core::bson::encode_id_value;
+    use crate::index::encode_index_key;
     use crate::storage::api::Session;
     use crate::storage::handle_cache::HandleCache;
     use crate::storage::log_manager::LogManager;
     use crate::storage::metadata_store::MetadataStore;
     use crate::storage::reserved_store::FIRST_DYNAMIC_STORE_ID;
+    use crate::storage::row::{encode_row_value, RowFormat};
     use crate::storage::table::open_or_create_btree;
     use crate::txn::{GlobalTxnState, TXN_NONE};
+    use crate::Document;
 
     const PRIMARY_STORE_ID: u64 = FIRST_DYNAMIC_STORE_ID;
     const INDEX_STORE_ID: u64 = FIRST_DYNAMIC_STORE_ID + 1;
@@ -467,7 +458,13 @@ mod tests {
         let global_txn = Arc::new(GlobalTxnState::new());
         let btree = Arc::new(RwLock::new(open_or_create_btree(path).unwrap()));
         let session = build_test_session(tmp.path(), global_txn.clone(), disabled_log_manager());
-        (tmp, btree, session, global_txn, TableMetadata::new(uri))
+        (
+            tmp,
+            btree,
+            session,
+            global_txn,
+            TableMetadata::new(uri, Vec::new()),
+        )
     }
 
     fn open_table_with_secondary_index() -> (
@@ -487,6 +484,9 @@ mod tests {
         let table = TableMetadata::with_indexes(
             "table:users",
             PRIMARY_STORE_ID,
+            RowFormat::WtRowV1,
+            vec!["_id".to_string()],
+            vec!["name".to_string()],
             vec![IndexMetadata::new(
                 "name",
                 "index:users:name",
@@ -499,7 +499,8 @@ mod tests {
     }
 
     fn make_document_bytes(id: i64, name: &str) -> Vec<u8> {
-        encode_document(&serde_json::from_value(json!({"_id": id, "name": name})).unwrap()).unwrap()
+        let doc: Document = serde_json::from_value(json!({"_id": id, "name": name})).unwrap();
+        encode_row_value(RowFormat::WtRowV1, &["name".to_string()], &doc).unwrap()
     }
 
     fn index_key_for_name(id: i64, name: &str) -> Vec<u8> {

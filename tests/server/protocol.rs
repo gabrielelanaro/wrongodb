@@ -34,8 +34,12 @@ async fn test_mongo_client_connection() {
     // List collections (should have the default "test" collection)
     let coll_cursor = db_client.list_collections().await.unwrap();
     let collections: Vec<_> = coll_cursor.try_collect().await.unwrap();
-    // Now correctly returns collections (at least "test")
-    assert!(!collections.is_empty() || collections.is_empty()); // Accept both for compatibility
+    assert!(collections.is_empty());
+
+    db_client
+        .run_command(doc! { "createCollection": "test", "storageColumns": ["name"] })
+        .await
+        .unwrap();
 
     // Insert
     let coll = db_client.collection("test");
@@ -134,7 +138,13 @@ async fn test_supported_mongosh_commands() {
 
     let coll_cursor = db_client.list_collections().await.unwrap();
     let _collections: Vec<_> = coll_cursor.try_collect().await.unwrap();
-    // Collections may include "test" by default, which is correct behavior
+
+    assert_ok(
+        &db_client
+            .run_command(doc! { "createCollection": "test", "storageColumns": ["name"] })
+            .await
+            .unwrap(),
+    );
 
     assert_ok(
         &db_client

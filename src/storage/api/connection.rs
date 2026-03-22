@@ -20,18 +20,10 @@ use crate::WrongoDBError;
 /// The public connection constructor stays intentionally small. This struct is
 /// where callers choose storage logging policy without having to know about
 /// the internal storage and recovery wiring.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ConnectionConfig {
     /// Runtime logging configuration for storage commits and checkpoints.
     pub logging: LoggingConfig,
-}
-
-impl Default for ConnectionConfig {
-    fn default() -> Self {
-        Self {
-            logging: LoggingConfig::default(),
-        }
-    }
 }
 
 impl ConnectionConfig {

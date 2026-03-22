@@ -8,5 +8,6 @@ pub mod mvcc;
 pub mod page_store;
 pub(crate) mod recovery;
 pub(crate) mod reserved_store;
+pub(crate) mod row;
 pub mod table;
 pub mod wal;

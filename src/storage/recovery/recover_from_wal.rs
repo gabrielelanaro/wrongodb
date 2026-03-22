@@ -281,6 +281,10 @@ mod tests {
     struct EncodedMetadataRecord {
         source: String,
         store_id: StoreId,
+        row_format: &'static str,
+        key_columns: Vec<String>,
+        value_columns: Vec<String>,
+        columns: Vec<String>,
     }
 
     impl TestWalReader {
@@ -316,6 +320,10 @@ mod tests {
         bson::to_vec(&EncodedMetadataRecord {
             source: source.to_string(),
             store_id,
+            row_format: "wt_row_v1",
+            key_columns: vec!["_id".to_string()],
+            value_columns: Vec::new(),
+            columns: Vec::new(),
         })
         .unwrap()
     }

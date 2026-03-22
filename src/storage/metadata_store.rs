@@ -12,7 +12,10 @@ use crate::storage::log_manager::LogManager;
 use crate::storage::reserved_store::{
     StoreId, FIRST_DYNAMIC_STORE_ID, METADATA_STORE_ID, METADATA_STORE_NAME,
 };
-use crate::storage::table::{get_version, open_or_create_btree, scan_range, IndexMetadata};
+use crate::storage::row::RowFormat;
+use crate::storage::table::{
+    get_version, open_or_create_btree, scan_range, IndexMetadata, TableMetadata,
+};
 use crate::txn::{GlobalTxnState, TXN_NONE};
 use crate::WrongoDBError;
 
@@ -52,6 +55,9 @@ pub(crate) struct MetadataEntry {
     uri: String,
     source: String,
     store_id: StoreId,
+    row_format: Option<RowFormat>,
+    key_columns: Vec<String>,
+    value_columns: Vec<String>,
     columns: Vec<String>,
 }
 
@@ -60,11 +66,14 @@ impl MetadataEntry {
     // Constructors
     // ------------------------------------------------------------------------
 
-    pub(crate) fn table(collection: &str, store_id: StoreId) -> Self {
+    pub(crate) fn table(collection: &str, value_columns: Vec<String>, store_id: StoreId) -> Self {
         Self {
             uri: table_uri(collection),
             source: table_store_name(collection),
             store_id,
+            row_format: Some(RowFormat::WtRowV1),
+            key_columns: vec!["_id".to_string()],
+            value_columns,
             columns: Vec::new(),
         }
     }
@@ -79,6 +88,9 @@ impl MetadataEntry {
             uri: index_uri(collection, name),
             source: index_store_name(collection, name),
             store_id,
+            row_format: None,
+            key_columns: Vec::new(),
+            value_columns: Vec::new(),
             columns,
         }
     }
@@ -89,6 +101,9 @@ impl MetadataEntry {
             uri,
             source: record.source,
             store_id: record.store_id,
+            row_format: record.row_format,
+            key_columns: record.key_columns,
+            value_columns: record.value_columns,
             columns: record.columns,
         })
     }
@@ -107,6 +122,18 @@ impl MetadataEntry {
 
     pub(crate) fn store_id(&self) -> StoreId {
         self.store_id
+    }
+
+    pub(crate) fn row_format(&self) -> Option<RowFormat> {
+        self.row_format
+    }
+
+    pub(crate) fn key_columns(&self) -> &[String] {
+        &self.key_columns
+    }
+
+    pub(crate) fn value_columns(&self) -> &[String] {
+        &self.value_columns
     }
 
     #[allow(dead_code)]
@@ -143,12 +170,49 @@ impl MetadataEntry {
             self.columns,
         ))
     }
+
+    pub(crate) fn into_table_metadata(
+        self,
+        indexes: Vec<IndexMetadata>,
+    ) -> Result<TableMetadata, WrongoDBError> {
+        if !self.is_table() {
+            return Err(StorageError(format!("metadata row is not a table: {}", self.uri)).into());
+        }
+
+        let row_format = self.row_format.ok_or_else(|| {
+            StorageError(format!(
+                "table metadata row is missing row_format: {}",
+                self.uri
+            ))
+        })?;
+        if self.key_columns.is_empty() {
+            return Err(StorageError(format!(
+                "table metadata row is missing key_columns: {}",
+                self.uri
+            ))
+            .into());
+        }
+
+        Ok(TableMetadata::with_indexes(
+            self.uri,
+            self.store_id,
+            row_format,
+            self.key_columns,
+            self.value_columns,
+            indexes,
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MetadataRecord {
     source: String,
     store_id: StoreId,
+    row_format: Option<RowFormat>,
+    #[serde(default)]
+    key_columns: Vec<String>,
+    #[serde(default)]
+    value_columns: Vec<String>,
     #[serde(default)]
     columns: Vec<String>,
 }
@@ -158,6 +222,9 @@ impl From<&MetadataEntry> for MetadataRecord {
         Self {
             source: entry.source.clone(),
             store_id: entry.store_id,
+            row_format: entry.row_format,
+            key_columns: entry.key_columns.clone(),
+            value_columns: entry.value_columns.clone(),
             columns: entry.columns.clone(),
         }
     }
@@ -451,7 +518,7 @@ mod tests {
     #[test]
     fn metadata_store_crud_roundtrip() {
         let fixture = MetadataFixture::new();
-        let entry = MetadataEntry::table("users", 2);
+        let entry = MetadataEntry::table("users", vec!["name".to_string()], 2);
         fixture.store.insert(&entry).unwrap();
 
         assert_eq!(fixture.store.get(entry.uri()).unwrap(), Some(entry.clone()));
@@ -465,7 +532,7 @@ mod tests {
         let fixture = MetadataFixture::new();
         fixture
             .store
-            .insert(&MetadataEntry::table("users", 2))
+            .insert(&MetadataEntry::table("users", vec!["name".to_string()], 2))
             .unwrap();
         fixture
             .store
@@ -489,7 +556,7 @@ mod tests {
     #[test]
     fn metadata_store_remove_deletes_entry() {
         let fixture = MetadataFixture::new();
-        let entry = MetadataEntry::table("users", 2);
+        let entry = MetadataEntry::table("users", vec!["name".to_string()], 2);
         fixture.store.insert(&entry).unwrap();
 
         assert!(fixture.store.remove(entry.uri()).unwrap());
@@ -512,7 +579,9 @@ mod tests {
         )
         .unwrap();
 
-        store.insert(&MetadataEntry::table("users", 7)).unwrap();
+        store
+            .insert(&MetadataEntry::table("users", vec!["name".to_string()], 7))
+            .unwrap();
 
         let reopened =
             MetadataStore::new(base_path, store_handles, global_txn, log_manager).unwrap();

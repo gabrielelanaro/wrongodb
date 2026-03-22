@@ -1,4 +1,5 @@
 use crate::api::DatabaseContext;
+use crate::core::errors::DocumentValidationError;
 use crate::server::commands::Command;
 use crate::WrongoDBError;
 use bson::{doc, spec::BinarySubtype, Binary, Bson, Document};
@@ -72,6 +73,35 @@ impl Command for ListCollectionsCommand {
     }
 }
 
+/// Handles: createCollection, create
+pub struct CreateCollectionCommand;
+
+impl Command for CreateCollectionCommand {
+    fn names(&self) -> &[&str] {
+        &["createCollection", "create"]
+    }
+
+    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
+        let collection = doc
+            .get_str("createCollection")
+            .or_else(|_| doc.get_str("create"))
+            .map_err(|_| {
+                WrongoDBError::DocumentValidation(DocumentValidationError(
+                    "createCollection requires a collection name".into(),
+                ))
+            })?;
+
+        let storage_columns = parse_storage_columns(doc)?;
+        let mut session = db.connection().open_session();
+        db.collection_write_path()
+            .create_collection(&mut session, collection, storage_columns)?;
+
+        Ok(doc! {
+            "ok": Bson::Double(1.0),
+        })
+    }
+}
+
 /// Handles: dbStats
 pub struct DbStatsCommand;
 
@@ -130,4 +160,23 @@ impl Command for CollStatsCommand {
             "totalIndexSize": Bson::Int64(0),
         })
     }
+}
+
+fn parse_storage_columns(doc: &Document) -> Result<Vec<String>, WrongoDBError> {
+    let values = doc.get_array("storageColumns").map_err(|_| {
+        WrongoDBError::DocumentValidation(DocumentValidationError(
+            "createCollection requires a storageColumns array".into(),
+        ))
+    })?;
+
+    values
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                WrongoDBError::DocumentValidation(DocumentValidationError(
+                    "storageColumns entries must be strings".into(),
+                ))
+            })
+        })
+        .collect()
 }
