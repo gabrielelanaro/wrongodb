@@ -18,7 +18,7 @@ use crate::storage::reserved_store::{
     reserved_store_identity_for_uri, reserved_store_names, StoreId,
 };
 use crate::storage::row::{index_key_from_row, validate_storage_columns};
-use crate::storage::table::{checkpoint_store, open_or_create_btree, scan_range, TableMetadata};
+use crate::storage::table::{checkpoint_store, open_or_create_btree, TableMetadata};
 use crate::txn::{GlobalTxnState, Transaction, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
@@ -27,7 +27,6 @@ use crate::storage::reserved_store::METADATA_URI;
 
 pub(crate) type ActiveTransactionHandle = Arc<Mutex<Transaction>>;
 
-type StoreEntries = Vec<(Vec<u8>, Vec<u8>)>;
 
 struct ResolvedStore {
     store_id: StoreId,
@@ -228,6 +227,23 @@ impl Session {
         )
     }
 
+    /// Open a cursor for `index:<collection>:<name>` in the current transaction context.
+    ///
+    /// Returns a [`FileCursor`] for raw key/value access to the index store.
+    /// Index cursors return `(index_key, primary_key)` tuples that can be used
+    /// to fetch full documents from the main table.
+    pub fn open_index_cursor(&self, index_uri: &str) -> Result<FileCursor<'_>, WrongoDBError> {
+        let resolved = self.resolve_store(index_uri)?;
+
+        FileCursor::new(
+            self,
+            index_uri,
+            resolved.store_id,
+            resolved.handle,
+            TableCursorWriteAccess::ReadWrite,
+        )
+    }
+
     /// Run `f` inside a session transaction.
     pub fn with_transaction<R>(
         &mut self,
@@ -339,22 +355,6 @@ impl Session {
                 Err(err)
             }
         }
-    }
-
-    // ------------------------------------------------------------------------
-    // Store operations
-    // ------------------------------------------------------------------------
-
-    pub(crate) fn scan_store_range(
-        &self,
-        store_uri: &str,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-    ) -> Result<StoreEntries, WrongoDBError> {
-        let txn_id = self.current_txn_id();
-        let resolved = self.resolve_store(store_uri)?;
-        let mut btree = resolved.handle.write();
-        scan_range(&mut btree, start, end, txn_id)
     }
 
     // ------------------------------------------------------------------------

@@ -795,8 +795,9 @@ mod tests {
 
         session
             .with_transaction(|session| {
-                let rows = session.scan_store_range("index:users:name_1", None, None)?;
-                assert!(!rows.is_empty());
+                let mut cursor = session.open_index_cursor("index:users:name_1")?;
+                let has_entries = cursor.next()?.is_some();
+                assert!(has_entries);
                 Ok(())
             })
             .unwrap();

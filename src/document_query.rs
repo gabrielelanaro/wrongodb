@@ -140,11 +140,12 @@ impl DocumentQuery {
             let Some((start_key, end_key)) = encode_range_bounds(value) else {
                 return Ok(Vec::new());
             };
-            let index_entries =
-                session.scan_store_range(index.uri(), Some(&start_key), Some(&end_key))?;
+
+            let mut index_cursor = session.open_index_cursor(index.uri())?;
+            index_cursor.set_range(Some(start_key), Some(end_key));
 
             let mut results = Vec::new();
-            for (key, _) in index_entries {
+            while let Some((key, _)) = index_cursor.next()? {
                 let Some(id) = decode_index_id(&key)? else {
                     continue;
                 };
