@@ -365,7 +365,7 @@ impl Session {
         self.open_cursor_states.lock().push(Arc::downgrade(state));
     }
 
-    pub(crate) fn reset_open_cursor_states(&self) {
+    fn reset_open_cursor_states(&self) {
         let mut open_cursor_states = self.open_cursor_states.lock();
         open_cursor_states.retain(|weak_state| {
             let Some(state) = weak_state.upgrade() else {
