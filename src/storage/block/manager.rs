@@ -9,10 +9,10 @@ use crate::core::errors::{StorageError, WrongoDBError};
 /// Extents represent allocated or free regions in the block file. The generation
 /// field enables COW semantics by tracking which checkpoint allocated the extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::storage) struct Extent {
-    pub(in crate::storage) offset: u64,
-    pub(in crate::storage) size: u64,
-    pub(in crate::storage) generation: u64,
+pub(super) struct Extent {
+    pub(super) offset: u64,
+    pub(super) size: u64,
+    pub(super) generation: u64,
 }
 
 /// Collection of extent lists tracking allocation state.
@@ -22,10 +22,10 @@ pub(in crate::storage) struct Extent {
 /// - **avail**: Free extents available for immediate allocation
 /// - **discard**: Extents freed after the checkpoint, awaiting safe reclaim
 #[derive(Debug, Clone, Default)]
-pub(in crate::storage) struct ExtentLists {
-    pub(in crate::storage) alloc: Vec<Extent>,
-    pub(in crate::storage) avail: Vec<Extent>,
-    pub(in crate::storage) discard: Vec<Extent>,
+pub(super) struct ExtentLists {
+    pub(super) alloc: Vec<Extent>,
+    pub(super) avail: Vec<Extent>,
+    pub(super) discard: Vec<Extent>,
 }
 
 // ============================================================================
@@ -42,7 +42,7 @@ pub(in crate::storage) struct ExtentLists {
 /// Uses skip lists for efficient offset-based and size-based lookups during
 /// allocation and coalescing operations.
 #[derive(Debug, Clone)]
-pub(in crate::storage) struct BlockManager {
+pub(super) struct BlockManager {
     alloc: ExtentIndex,
     avail: ExtentIndex,
     discard: ExtentIndex,
@@ -199,25 +199,11 @@ impl BlockManager {
     // ------------------------------------------------------------------------
 
     fn insert_alloc(&mut self, extent: Extent) {
-        let (prev, next, merged) = coalesce_with_neighbors(&self.alloc, extent);
-        if let Some(prev) = prev {
-            self.alloc.remove_extent(prev);
-        }
-        if let Some(next) = next {
-            self.alloc.remove_extent(next);
-        }
-        self.alloc.insert(merged);
+        insert_with_coalescing(&mut self.alloc, extent);
     }
 
     fn insert_avail(&mut self, extent: Extent) {
-        let (prev, next, merged) = coalesce_with_neighbors(&self.avail, extent);
-        if let Some(prev) = prev {
-            self.avail.remove_extent(prev);
-        }
-        if let Some(next) = next {
-            self.avail.remove_extent(next);
-        }
-        self.avail.insert(merged);
+        insert_with_coalescing(&mut self.avail, extent);
     }
 
     fn remove_alloc_range(&mut self, offset: u64, size: u64) -> Option<Extent> {
@@ -586,7 +572,18 @@ fn coalesce_extents(mut extents: Vec<Extent>, generation: u64) -> Vec<Extent> {
     merged
 }
 
-fn coalesce_with_neighbors(
+fn insert_with_coalescing(index: &mut ExtentIndex, extent: Extent) {
+    let (prev, next, merged) = compute_coalesced_extent(index, extent);
+    if let Some(prev) = prev {
+        index.remove_extent(prev);
+    }
+    if let Some(next) = next {
+        index.remove_extent(next);
+    }
+    index.insert(merged);
+}
+
+fn compute_coalesced_extent(
     index: &ExtentIndex,
     extent: Extent,
 ) -> (Option<Extent>, Option<Extent>, Extent) {

@@ -438,7 +438,7 @@ impl BlockFile {
     ///
     /// First tries to satisfy the request from the avail list. If no suitable
     /// extent is available, grows the file to allocate new blocks.
-    pub(in crate::storage) fn allocate_extent(&mut self, blocks: u64) -> Result<Extent, WrongoDBError> {
+    pub(super) fn allocate_extent(&mut self, blocks: u64) -> Result<Extent, WrongoDBError> {
         if blocks == 0 {
             return Err(StorageError("cannot allocate zero-length extent".into()).into());
         }

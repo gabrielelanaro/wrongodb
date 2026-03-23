@@ -48,6 +48,10 @@ Review whether the file belongs in its current module and directory at all. Insp
 Do not put logic in mod.rs, use that just to organize the exports.
 </improvement>
 
+<improvement id="tighten-visibility" applies-to="class,function,method,module">
+Use the minimum visibility required. Search for external usages of each type/function, then set visibility to the narrowest scope that covers all callers. A type cannot be less visible than the interfaces that expose it.
+</improvement>
+
 The outcome is simple, easy to grasp code, where the excess has been removed, terminology is consistent, and the intent is obvious.
 
 Identify the list of module, classes, functions, filenames, directory analize each one of them individually for the improvements that applies to them.
