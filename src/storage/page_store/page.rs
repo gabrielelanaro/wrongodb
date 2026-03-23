@@ -25,7 +25,7 @@ const INTERNAL_HEADER_SIZE: usize = 16;
 // ============================================================================
 
 #[derive(Debug, Error, PartialEq, Eq)]
-pub enum PageError {
+pub(crate) enum PageError {
     #[error("page corrupt: {0}")]
     Corrupt(String),
 }
@@ -35,7 +35,7 @@ pub enum PageError {
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PageType {
+pub(crate) enum PageType {
     Leaf,
     Internal,
 }
@@ -67,13 +67,13 @@ impl PageType {
 
 /// Cached header fields for an in-memory page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PageHeader {
-    pub page_type: PageType,
-    pub flags: u8,
-    pub slot_count: u16,
-    pub lower: u16,
-    pub upper: u16,
-    pub first_child: u64,
+pub(crate) struct PageHeader {
+    pub(crate) page_type: PageType,
+    pub(crate) flags: u8,
+    pub(crate) slot_count: u16,
+    pub(crate) lower: u16,
+    pub(crate) upper: u16,
+    pub(crate) first_child: u64,
 }
 
 impl PageHeader {
@@ -81,7 +81,7 @@ impl PageHeader {
     // Constructors
     // ------------------------------------------------------------------------
 
-    pub fn parse(data: &[u8]) -> Result<Self, PageError> {
+    pub(crate) fn parse(data: &[u8]) -> Result<Self, PageError> {
         if data.len() < LEAF_HEADER_SIZE {
             return Err(PageError::Corrupt(format!(
                 "page too small for header: {}",
@@ -122,14 +122,14 @@ impl PageHeader {
     // ------------------------------------------------------------------------
 
     #[cfg(test)]
-    pub fn header_size(&self) -> usize {
+    pub(crate) fn header_size(&self) -> usize {
         match self.page_type {
             PageType::Leaf => LEAF_HEADER_SIZE,
             PageType::Internal => INTERNAL_HEADER_SIZE,
         }
     }
 
-    pub fn free_contiguous(&self) -> usize {
+    pub(crate) fn free_contiguous(&self) -> usize {
         usize::from(self.upper).saturating_sub(usize::from(self.lower))
     }
 }
@@ -144,7 +144,7 @@ impl PageHeader {
 /// holds the visible versions for that inserted row until a later reconciliation
 /// writes it into the serialized page format.
 #[derive(Debug, Clone)]
-pub struct RowInsert {
+pub(crate) struct RowInsert {
     key: Vec<u8>,
     updates: UpdateChain,
 }
@@ -162,11 +162,11 @@ impl RowInsert {
     // Public API
     // ------------------------------------------------------------------------
 
-    pub fn key(&self) -> &[u8] {
+    pub(crate) fn key(&self) -> &[u8] {
         &self.key
     }
 
-    pub fn updates(&self) -> &UpdateChain {
+    pub(crate) fn updates(&self) -> &UpdateChain {
         &self.updates
     }
 
@@ -192,7 +192,7 @@ impl RowInsert {
 /// for existing rows. Ordered/search-oriented structures belong to
 /// `row_inserts`, where keys do not yet have an on-page slot.
 #[derive(Debug, Clone)]
-pub struct RowModify {
+pub(crate) struct RowModify {
     row_updates: Vec<Option<UpdateChain>>,
     row_inserts: Vec<Vec<RowInsert>>,
 }
@@ -215,7 +215,7 @@ impl RowModify {
     // Public API
     // ------------------------------------------------------------------------
 
-    pub fn row_updates(&self) -> &[Option<UpdateChain>] {
+    pub(crate) fn row_updates(&self) -> &[Option<UpdateChain>] {
         &self.row_updates
     }
 
@@ -223,7 +223,7 @@ impl RowModify {
         &mut self.row_updates
     }
 
-    pub fn row_inserts(&self) -> &[Vec<RowInsert>] {
+    pub(crate) fn row_inserts(&self) -> &[Vec<RowInsert>] {
         &self.row_inserts
     }
 
@@ -242,7 +242,7 @@ impl RowModify {
 /// block I/O and page-format parsing. It intentionally contains no runtime
 /// MVCC or cache state.
 #[derive(Debug, Clone)]
-pub struct RawPage {
+pub(crate) struct RawPage {
     header: PageHeader,
     data: Vec<u8>,
 }
@@ -288,11 +288,11 @@ impl RawPage {
     // Public API
     // ------------------------------------------------------------------------
 
-    pub fn header(&self) -> &PageHeader {
+    pub(crate) fn header(&self) -> &PageHeader {
         &self.header
     }
 
-    pub fn data(&self) -> &[u8] {
+    pub(crate) fn data(&self) -> &[u8] {
         &self.data
     }
 
@@ -352,7 +352,7 @@ impl RawPage {
 /// bytes remain in [`RawPage`], while page-local row updates and inserts live in
 /// `row_modify`.
 #[derive(Debug)]
-pub struct Page {
+pub(crate) struct Page {
     raw: RawPage,
     row_modify: Option<RowModify>,
 }
@@ -369,15 +369,15 @@ impl Page {
         }
     }
 
-    pub fn from_bytes(data: Vec<u8>) -> Result<Self, PageError> {
+    pub(crate) fn from_bytes(data: Vec<u8>) -> Result<Self, PageError> {
         Ok(Self::from_raw(RawPage::from_bytes(data)?))
     }
 
-    pub fn new_leaf(page_len: usize) -> Result<Self, PageError> {
+    pub(crate) fn new_leaf(page_len: usize) -> Result<Self, PageError> {
         Ok(Self::from_raw(RawPage::new_leaf(page_len)?))
     }
 
-    pub fn new_internal(page_len: usize, first_child: u64) -> Result<Self, PageError> {
+    pub(crate) fn new_internal(page_len: usize, first_child: u64) -> Result<Self, PageError> {
         Ok(Self::from_raw(RawPage::new_internal(
             page_len,
             first_child,
@@ -399,11 +399,11 @@ impl Page {
         &mut self.raw
     }
 
-    pub fn header(&self) -> &PageHeader {
+    pub(crate) fn header(&self) -> &PageHeader {
         self.raw.header()
     }
 
-    pub fn data(&self) -> &[u8] {
+    pub(crate) fn data(&self) -> &[u8] {
         self.raw.data()
     }
 

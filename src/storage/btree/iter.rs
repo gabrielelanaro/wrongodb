@@ -23,7 +23,7 @@ use super::visible_chain_value;
 /// - **Lazy navigation**: Only pins pages as needed, releases internal nodes after descending
 /// - **Leaf-local visibility merge**: Each leaf is materialized into a visible row view that merges
 ///   base rows, `row_updates`, and `row_inserts` before iteration continues
-pub struct BTreeRangeIter<'a> {
+pub(crate) struct BTreeRangeIter<'a> {
     pager: Option<&'a mut (dyn PageRead + 'a)>,
     end: Option<Vec<u8>>,
     visibility: ReadVisibility,

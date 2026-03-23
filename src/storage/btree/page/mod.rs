@@ -1,5 +1,5 @@
-pub mod internal;
-pub mod leaf;
+pub(super) mod internal;
+pub(super) mod leaf;
 
-pub use internal::{InternalPage, InternalPageError, InternalPageMut};
-pub use leaf::{LeafPage, LeafPageError, LeafPageMut};
+pub(super) use internal::{InternalPage, InternalPageError, InternalPageMut};
+pub(super) use leaf::{LeafPage, LeafPageError, LeafPageMut};

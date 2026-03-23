@@ -3,7 +3,7 @@ mod internal_ops;
 mod iter;
 mod layout;
 mod leaf_ops;
-pub mod page;
+mod page;
 mod search;
 
 pub(crate) use cursor::BTreeCursor;

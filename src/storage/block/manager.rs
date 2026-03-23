@@ -9,10 +9,10 @@ use crate::core::errors::{StorageError, WrongoDBError};
 /// Extents represent allocated or free regions in the block file. The generation
 /// field enables COW semantics by tracking which checkpoint allocated the extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Extent {
-    pub offset: u64,
-    pub size: u64,
-    pub generation: u64,
+pub(in crate::storage) struct Extent {
+    pub(in crate::storage) offset: u64,
+    pub(in crate::storage) size: u64,
+    pub(in crate::storage) generation: u64,
 }
 
 /// Collection of extent lists tracking allocation state.
@@ -22,10 +22,10 @@ pub struct Extent {
 /// - **avail**: Free extents available for immediate allocation
 /// - **discard**: Extents freed after the checkpoint, awaiting safe reclaim
 #[derive(Debug, Clone, Default)]
-pub struct ExtentLists {
-    pub alloc: Vec<Extent>,
-    pub avail: Vec<Extent>,
-    pub discard: Vec<Extent>,
+pub(in crate::storage) struct ExtentLists {
+    pub(in crate::storage) alloc: Vec<Extent>,
+    pub(in crate::storage) avail: Vec<Extent>,
+    pub(in crate::storage) discard: Vec<Extent>,
 }
 
 // ============================================================================
@@ -42,7 +42,7 @@ pub struct ExtentLists {
 /// Uses skip lists for efficient offset-based and size-based lookups during
 /// allocation and coalescing operations.
 #[derive(Debug, Clone)]
-pub struct BlockManager {
+pub(in crate::storage) struct BlockManager {
     alloc: ExtentIndex,
     avail: ExtentIndex,
     discard: ExtentIndex,
@@ -55,7 +55,7 @@ impl BlockManager {
     // ------------------------------------------------------------------------
 
     /// Create a new block manager with the given stable generation and initial extent lists.
-    pub fn new(stable_generation: u64, lists: ExtentLists) -> Self {
+    pub(super) fn new(stable_generation: u64, lists: ExtentLists) -> Self {
         let seed = stable_generation ^ 0xC0FFEE;
         let alloc = ExtentIndex::from_extents(seed ^ 0x11, lists.alloc);
         let avail = ExtentIndex::from_extents(seed ^ 0x22, lists.avail);
@@ -72,15 +72,15 @@ impl BlockManager {
     // Getters/Setters
     // ------------------------------------------------------------------------
 
-    pub fn stable_generation(&self) -> u64 {
+    pub(super) fn stable_generation(&self) -> u64 {
         self.stable_generation
     }
 
-    pub fn set_stable_generation(&mut self, generation: u64) {
+    pub(super) fn set_stable_generation(&mut self, generation: u64) {
         self.stable_generation = generation;
     }
 
-    pub fn extent_lists(&self) -> ExtentLists {
+    pub(super) fn extent_lists(&self) -> ExtentLists {
         ExtentLists {
             alloc: self.alloc.values_by_offset(),
             avail: self.avail.values_by_offset(),
@@ -97,7 +97,7 @@ impl BlockManager {
     /// Returns the smallest extent that satisfies the request. If a larger extent
     /// is used, any remainder is returned to the avail list. Returns None if no
     /// suitable extent is available.
-    pub fn allocate_from_avail(&mut self, size: u64) -> Option<Extent> {
+    pub(super) fn allocate_from_avail(&mut self, size: u64) -> Option<Extent> {
         let candidate = self.avail.best_fit(size)?;
         let extent = self.avail.remove_by_offset(candidate.offset)?;
 
@@ -128,11 +128,11 @@ impl BlockManager {
         Some(allocated)
     }
 
-    pub fn add_alloc_extent(&mut self, extent: Extent) {
+    pub(super) fn add_alloc_extent(&mut self, extent: Extent) {
         self.insert_alloc(extent);
     }
 
-    pub fn add_avail_extent(&mut self, extent: Extent) {
+    pub(super) fn add_avail_extent(&mut self, extent: Extent) {
         self.insert_avail(extent);
     }
 
@@ -145,7 +145,7 @@ impl BlockManager {
     /// The extent is not immediately available for reuse; it must wait for
     /// the stable checkpoint to advance beyond its generation before reclaim.
     /// Fails if the specified range is not currently allocated.
-    pub fn free_extent(&mut self, offset: u64, size: u64) -> Result<(), WrongoDBError> {
+    pub(super) fn free_extent(&mut self, offset: u64, size: u64) -> Result<(), WrongoDBError> {
         if size == 0 {
             return Ok(());
         }
@@ -172,7 +172,7 @@ impl BlockManager {
     ///
     /// Moves discard-list extents that are no longer needed for recovery
     /// into the avail list, coalescing adjacent extents to minimize fragmentation.
-    pub fn reclaim_discarded(&mut self) {
+    pub(super) fn reclaim_discarded(&mut self) {
         let mut avail_extents = self.avail.values_by_offset();
         let mut remaining_discard = Vec::new();
 

@@ -12,7 +12,7 @@ use crate::core::errors::{StorageError, WrongoDBError};
 // Constants
 // ============================================================================
 
-pub const NONE_BLOCK_ID: u64 = 0;
+pub(in crate::storage) const NONE_BLOCK_ID: u64 = 0;
 
 const CHECKSUM_SIZE: usize = 4;
 const DEFAULT_PAGE_SIZE: usize = 4096;
@@ -35,14 +35,14 @@ const EXTENT_ENCODED_SIZE: usize = 8 + 8 + 8;
 /// with a checksum to detect corruption. Used for crash recovery
 /// and checkpoint consistency verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CheckpointSlot {
-    pub root_block_id: u64,
-    pub generation: u64,
-    pub crc32: u32,
+struct CheckpointSlot {
+    root_block_id: u64,
+    generation: u64,
+    crc32: u32,
 }
 
 impl CheckpointSlot {
-    pub fn new(root_block_id: u64, generation: u64) -> Self {
+    fn new(root_block_id: u64, generation: u64) -> Self {
         let crc32 = checkpoint_slot_crc(root_block_id, generation);
         Self {
             root_block_id,
@@ -51,11 +51,11 @@ impl CheckpointSlot {
         }
     }
 
-    pub fn is_valid(&self) -> bool {
+    fn is_valid(&self) -> bool {
         self.crc32 == checkpoint_slot_crc(self.root_block_id, self.generation)
     }
 
-    pub fn update(&mut self, root_block_id: u64, generation: u64) {
+    fn update(&mut self, root_block_id: u64, generation: u64) {
         self.root_block_id = root_block_id;
         self.generation = generation;
         self.crc32 = checkpoint_slot_crc(root_block_id, generation);
@@ -77,14 +77,14 @@ impl CheckpointSlot {
 /// Extent lists track which blocks are allocated (reachable from checkpoint),
 /// available for reuse, or discarded (awaiting safe reclaim after checkpoint).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileHeader {
-    pub magic: [u8; 8],
-    pub version: u16,
-    pub page_size: u32,
-    pub alloc_count: u32,
-    pub avail_count: u32,
-    pub discard_count: u32,
-    pub checkpoint_slots: [CheckpointSlot; CHECKPOINT_SLOT_COUNT],
+struct FileHeader {
+    magic: [u8; 8],
+    version: u16,
+    page_size: u32,
+    alloc_count: u32,
+    avail_count: u32,
+    discard_count: u32,
+    checkpoint_slots: [CheckpointSlot; CHECKPOINT_SLOT_COUNT],
 }
 
 impl Default for FileHeader {
@@ -264,10 +264,10 @@ impl FileHeader {
 /// Block 0 is reserved for the file header. All other blocks are available
 /// for data storage and managed through the extent allocation system.
 #[derive(Debug)]
-pub struct BlockFile {
+pub(in crate::storage) struct BlockFile {
     file: File,
-    pub header: FileHeader,
-    pub page_size: usize,
+    header: FileHeader,
+    page_size: usize,
     active_checkpoint_slot: usize,
     block_manager: BlockManager,
 }
@@ -281,7 +281,7 @@ impl BlockFile {
     ///
     /// Creates a new file on disk with a valid header and empty extent lists.
     /// Fails if a non-empty file already exists at the path.
-    pub fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
+    pub(in crate::storage) fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -328,7 +328,7 @@ impl BlockFile {
     /// Reads the file header, validates the magic number, version, and checksum,
     /// then selects the valid checkpoint slot with the highest generation number.
     /// Fails if the file is corrupted, has an unsupported version, or has no valid checkpoints.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, WrongoDBError> {
+    pub(in crate::storage) fn open<P: AsRef<Path>>(path: P) -> Result<Self, WrongoDBError> {
         let path = path.as_ref();
         let mut file = OpenOptions::new()
             .read(true)
@@ -391,7 +391,7 @@ impl BlockFile {
         Ok(())
     }
 
-    pub fn sync_all(&mut self) -> Result<(), WrongoDBError> {
+    pub(in crate::storage) fn sync_all(&mut self) -> Result<(), WrongoDBError> {
         self.file.sync_all()?;
         Ok(())
     }
@@ -401,7 +401,7 @@ impl BlockFile {
     // ------------------------------------------------------------------------
 
     /// Return the root block ID from the active checkpoint slot.
-    pub fn root_block_id(&self) -> u64 {
+    pub(in crate::storage) fn root_block_id(&self) -> u64 {
         self.header.checkpoint_slots[self.active_checkpoint_slot].root_block_id
     }
 
@@ -410,7 +410,7 @@ impl BlockFile {
     /// Advances to the next checkpoint slot with an incremented generation number,
     /// writes the updated header to disk, and updates the block manager's stable
     /// generation to enable reclaim of discarded extents.
-    pub fn set_root_block_id(&mut self, root_block_id: u64) -> Result<(), WrongoDBError> {
+    pub(in crate::storage) fn set_root_block_id(&mut self, root_block_id: u64) -> Result<(), WrongoDBError> {
         let current_slot = self.active_checkpoint_slot;
         let next_slot = (current_slot + 1) % CHECKPOINT_SLOT_COUNT;
         let current_gen = self.header.checkpoint_slots[current_slot].generation;
@@ -430,7 +430,7 @@ impl BlockFile {
     // ------------------------------------------------------------------------
 
     /// Allocate a single block from the avail list or grow the file.
-    pub fn allocate_block(&mut self) -> Result<u64, WrongoDBError> {
+    pub(in crate::storage) fn allocate_block(&mut self) -> Result<u64, WrongoDBError> {
         Ok(self.allocate_extent(1)?.offset)
     }
 
@@ -438,7 +438,7 @@ impl BlockFile {
     ///
     /// First tries to satisfy the request from the avail list. If no suitable
     /// extent is available, grows the file to allocate new blocks.
-    pub fn allocate_extent(&mut self, blocks: u64) -> Result<Extent, WrongoDBError> {
+    pub(in crate::storage) fn allocate_extent(&mut self, blocks: u64) -> Result<Extent, WrongoDBError> {
         if blocks == 0 {
             return Err(StorageError("cannot allocate zero-length extent".into()).into());
         }
@@ -471,7 +471,7 @@ impl BlockFile {
     ///
     /// Grows the file and adds the new blocks as a single extent to the avail
     /// list, avoiding fallocate/ftruncate in the allocation hot path.
-    pub fn preallocate_blocks(&mut self, blocks: u64) -> Result<(), WrongoDBError> {
+    pub(in crate::storage) fn preallocate_blocks(&mut self, blocks: u64) -> Result<(), WrongoDBError> {
         if blocks == 0 {
             return Ok(());
         }
@@ -496,7 +496,7 @@ impl BlockFile {
     }
 
     /// Free a single block, moving it to the discard list.
-    pub fn free_block(&mut self, block_id: u64) -> Result<(), WrongoDBError> {
+    pub(in crate::storage) fn free_block(&mut self, block_id: u64) -> Result<(), WrongoDBError> {
         if block_id == 0 {
             return Err(StorageError("block 0 is reserved for the header".into()).into());
         }
@@ -514,7 +514,7 @@ impl BlockFile {
     }
 
     /// Reclaim discarded extents by moving them to the avail list.
-    pub fn reclaim_discarded(&mut self) -> Result<(), WrongoDBError> {
+    pub(in crate::storage) fn reclaim_discarded(&mut self) -> Result<(), WrongoDBError> {
         self.block_manager.reclaim_discarded();
         self.write_header()?;
         Ok(())
@@ -525,7 +525,7 @@ impl BlockFile {
     // ------------------------------------------------------------------------
 
     /// Read a block from disk, optionally verifying the checksum.
-    pub fn read_block(&mut self, block_id: u64, verify: bool) -> Result<Vec<u8>, WrongoDBError> {
+    pub(in crate::storage) fn read_block(&mut self, block_id: u64, verify: bool) -> Result<Vec<u8>, WrongoDBError> {
         let offset = block_id
             .checked_mul(self.page_size as u64)
             .ok_or_else(|| StorageError("block offset overflow".into()))?;
@@ -548,7 +548,7 @@ impl BlockFile {
     }
 
     /// Write a payload to a block, computing and storing the checksum.
-    pub fn write_block(&mut self, block_id: u64, payload: &[u8]) -> Result<(), WrongoDBError> {
+    pub(in crate::storage) fn write_block(&mut self, block_id: u64, payload: &[u8]) -> Result<(), WrongoDBError> {
         if block_id == 0 {
             return Err(StorageError("block 0 is reserved for the header".into()).into());
         }

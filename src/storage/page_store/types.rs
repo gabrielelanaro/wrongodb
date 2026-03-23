@@ -5,7 +5,7 @@ use super::page::Page;
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReadPin {
+pub(crate) struct ReadPin {
     pub(crate) page_id: u64,
 }
 
@@ -14,7 +14,7 @@ impl ReadPin {
     // Public API
     // ------------------------------------------------------------------------
 
-    pub fn page_id(&self) -> u64 {
+    pub(crate) fn page_id(&self) -> u64 {
         self.page_id
     }
 }
@@ -24,7 +24,7 @@ impl ReadPin {
 // ============================================================================
 
 #[derive(Debug)]
-pub struct PageEdit {
+pub(crate) struct PageEdit {
     pub(crate) page_id: u64,
     pub(crate) original_page_id: Option<u64>,
     pub(crate) page: Page,
@@ -35,15 +35,15 @@ impl PageEdit {
     // Public API
     // ------------------------------------------------------------------------
 
-    pub fn page_id(&self) -> u64 {
+    pub(crate) fn page_id(&self) -> u64 {
         self.page_id
     }
 
-    pub fn page(&self) -> &Page {
+    pub(crate) fn page(&self) -> &Page {
         &self.page
     }
 
-    pub fn page_mut(&mut self) -> &mut Page {
+    pub(crate) fn page_mut(&mut self) -> &mut Page {
         &mut self.page
     }
 }

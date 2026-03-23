@@ -1,13 +1,13 @@
 pub(crate) mod api;
-pub mod block;
-pub mod btree;
+pub(in crate::storage) mod block;
+pub(crate) mod btree;
 pub(crate) mod handle_cache;
 pub(crate) mod log_manager;
 pub(crate) mod metadata_store;
 pub(crate) mod mvcc;
-pub mod page_store;
+pub(in crate::storage) mod page_store;
 pub(crate) mod recovery;
 pub(crate) mod reserved_store;
 pub(crate) mod row;
-pub mod table;
-pub mod wal;
+pub(in crate::storage) mod table;
+pub(in crate::storage) mod wal;

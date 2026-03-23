@@ -5,9 +5,10 @@ mod traits;
 mod types;
 
 #[allow(unused_imports)]
-pub use page::{Page, PageError, PageType, RawPage, RowInsert, RowModify};
-pub use store::BlockFilePageStore;
-pub use traits::{PageRead, PageStore};
-#[allow(unused_imports)]
+pub(in crate::storage) use page::{PageError, PageType, RawPage, RowInsert, RowModify};
+pub(crate) use page::Page;
+pub(in crate::storage) use store::BlockFilePageStore;
+pub(crate) use traits::{PageRead, PageStore};
+#[cfg(test)]
 pub(crate) use traits::{PageWrite, RootStore};
-pub use types::{PageEdit, ReadPin};
+pub(crate) use types::{PageEdit, ReadPin};
