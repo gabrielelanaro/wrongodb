@@ -12,7 +12,7 @@ use crate::core::errors::{StorageError, WrongoDBError};
 // Constants
 // ============================================================================
 
-pub(in crate::storage) const NONE_BLOCK_ID: u64 = 0;
+const NONE_BLOCK_ID: u64 = 0;
 
 const CHECKSUM_SIZE: usize = 4;
 const DEFAULT_PAGE_SIZE: usize = 4096;

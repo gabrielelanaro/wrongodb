@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::core::errors::{StorageError, WrongoDBError};
-use crate::storage::block::file::{BlockFile, NONE_BLOCK_ID};
+use crate::storage::block::file::BlockFile;
 
 use super::page::Page;
 use super::page_cache::{PageCache, PageCacheConfig};
@@ -135,7 +135,7 @@ impl BlockFilePageStore {
     }
 
     fn retire_page(&mut self, page_id: u64) -> Result<(), WrongoDBError> {
-        if page_id == NONE_BLOCK_ID {
+        if page_id == 0 {
             return Ok(());
         }
         self.bf.free_block(page_id)?;

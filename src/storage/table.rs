@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use crate::core::errors::StorageError;
-use crate::storage::block::file::NONE_BLOCK_ID;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::mvcc::ReconcileStats;
 use crate::storage::page_store::{BlockFilePageStore, Page, PageStore};
@@ -266,7 +265,7 @@ pub(crate) fn reconcile_for_checkpoint(
 // ============================================================================
 
 fn init_root_if_missing(page_store: &mut dyn PageStore) -> Result<(), WrongoDBError> {
-    if page_store.root_page_id() != NONE_BLOCK_ID {
+    if page_store.has_root() {
         return Ok(());
     }
 

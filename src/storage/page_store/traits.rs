@@ -19,6 +19,11 @@ pub(crate) trait PageWrite: std::fmt::Debug + Send + Sync {
 }
 
 pub(crate) trait RootStore: std::fmt::Debug + Send + Sync {
+    /// Returns true if the store has a root page.
+    fn has_root(&self) -> bool {
+        self.root_page_id() != 0
+    }
+
     fn root_page_id(&self) -> u64;
     fn set_root_page_id(&mut self, root_page_id: u64) -> Result<(), WrongoDBError>;
 }
