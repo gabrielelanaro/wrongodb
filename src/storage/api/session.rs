@@ -18,7 +18,7 @@ use crate::storage::reserved_store::{
     reserved_store_identity_for_uri, reserved_store_names, StoreId,
 };
 use crate::storage::row::{index_key_from_row, validate_storage_columns};
-use crate::storage::table::{checkpoint_store, open_or_create_btree, TableMetadata};
+use crate::storage::table::{open_or_create_btree, TableMetadata};
 use crate::txn::{GlobalTxnState, Transaction, TxnId, TXN_NONE};
 use crate::WrongoDBError;
 
@@ -281,17 +281,16 @@ impl Session {
         store_names.sort();
         store_names.dedup();
 
-        for store_name in store_names {
-            let store = self.open_store_by_name(&store_name)?;
-            checkpoint_store(&mut store.write(), self.global_txn.as_ref())?;
-        }
+        let stores: Vec<Arc<RwLock<BTreeCursor>>> = store_names
+            .iter()
+            .map(|name| self.open_store_by_name(name))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        if self.global_txn.has_active_transactions() || !self.log_manager.is_enabled() {
-            return Ok(());
-        }
-
-        self.log_manager.log_checkpoint()?;
-        self.log_manager.truncate_to_checkpoint()
+        crate::storage::checkpoint::run_checkpoint(
+            &stores,
+            self.global_txn.as_ref(),
+            &self.log_manager,
+        )
     }
 
     // ------------------------------------------------------------------------

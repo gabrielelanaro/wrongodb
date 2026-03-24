@@ -1,6 +1,7 @@
 pub(crate) mod api;
 pub(in crate::storage) mod block;
 pub(crate) mod btree;
+pub(crate) mod checkpoint;
 pub(crate) mod handle_cache;
 pub(crate) mod log_manager;
 pub(crate) mod metadata_store;
