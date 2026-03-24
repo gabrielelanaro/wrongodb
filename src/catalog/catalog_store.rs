@@ -42,8 +42,8 @@ impl CatalogStore {
         Self
     }
 
-    /// Reads the collection row visible in the session's current transaction context.
-    pub(crate) fn record_visible(
+    /// Reads a single collection record from the catalog file.
+    pub(crate) fn get_record(
         &self,
         session: &Session,
         collection: &str,
@@ -55,8 +55,8 @@ impl CatalogStore {
             .transpose()
     }
 
-    /// Writes the collection row in the caller's transaction.
-    pub(crate) fn put_record_in_transaction(
+    /// Writes a collection record to the catalog file, inserting or updating as needed.
+    pub(crate) fn put_record(
         &self,
         session: &Session,
         collection: &str,
@@ -71,8 +71,8 @@ impl CatalogStore {
         }
     }
 
-    /// Reads every collection row visible in the session's current transaction context.
-    pub(crate) fn list_records_visible(
+    /// Lists all collection records from the catalog file.
+    pub(crate) fn list_records(
         &self,
         session: &Session,
     ) -> Result<Vec<(String, CatalogRecord)>, WrongoDBError> {

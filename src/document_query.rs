@@ -79,7 +79,7 @@ impl DocumentQuery {
     ) -> Result<Vec<Document>, WrongoDBError> {
         let Some(collection_definition) = self
             .durable_catalog
-            .collection_visible(session, collection)?
+            .get_collection(session, collection)?
         else {
             return Ok(Vec::new());
         };
@@ -191,16 +191,12 @@ mod tests {
     use super::*;
     use crate::catalog::{CatalogStore, CollectionCatalog, CreateIndexRequest};
     use crate::collection_write_path::CollectionWritePath;
-    use crate::storage::btree::BTreeCursor;
-    use crate::storage::handle_cache::HandleCache;
-    use crate::storage::log_manager::LogManager;
-    use crate::storage::metadata_store::MetadataStore;
-    use crate::txn::GlobalTxnState;
+    use crate::storage::api::{Connection, ConnectionConfig};
 
     struct QueryTestFixture {
+        connection: Connection,
         query: DocumentQuery,
         write_path: CollectionWritePath,
-        session: Session,
     }
 
     impl QueryTestFixture {
@@ -209,32 +205,18 @@ mod tests {
             let base_path = dir.path().to_path_buf();
             std::mem::forget(dir);
 
-            let global_txn = Arc::new(GlobalTxnState::new());
-            let store_handles =
-                Arc::new(HandleCache::<String, parking_lot::RwLock<BTreeCursor>>::new());
-            let log_manager = Arc::new(LogManager::disabled());
-            let metadata_store = Arc::new(
-                MetadataStore::new(
-                    base_path.clone(),
-                    store_handles.clone(),
-                    global_txn.clone(),
-                    log_manager.clone(),
-                )
-                .unwrap(),
-            );
+            let config = ConnectionConfig::new().logging_enabled(false);
+            let connection = Connection::open(&base_path, config).unwrap();
+            let metadata_store = connection.metadata_store();
             let durable_catalog = Arc::new(DurableCatalog::new(CatalogStore::new()));
             let collection_catalog = Arc::new(CollectionCatalog::new());
-            let mut session = Session::new(
-                base_path,
-                store_handles,
-                metadata_store.clone(),
-                global_txn,
-                log_manager,
-            );
-            durable_catalog.ensure_store_exists(&mut session).unwrap();
-            collection_catalog
-                .load_from_durable(&session, durable_catalog.as_ref())
-                .unwrap();
+            {
+                let mut session = connection.open_session();
+                durable_catalog.ensure_store_exists(&mut session).unwrap();
+                collection_catalog
+                    .load_from_durable(&session, durable_catalog.as_ref())
+                    .unwrap();
+            }
             let query = DocumentQuery::new(durable_catalog.clone());
             let write_path = CollectionWritePath::new(
                 metadata_store,
@@ -244,38 +226,39 @@ mod tests {
             );
 
             Self {
+                connection,
                 query,
                 write_path,
-                session,
             }
-        }
-
-        fn into_parts(self) -> (DocumentQuery, CollectionWritePath, Session) {
-            (self.query, self.write_path, self.session)
         }
     }
 
     #[test]
     fn indexed_lookup_survives_checkpoint_reconciliation() {
-        let (query, write_path, mut session) = QueryTestFixture::new().into_parts();
+        let fixture = QueryTestFixture::new();
+        let mut session = fixture.connection.open_session();
 
-        write_path
+        fixture
+            .write_path
             .create_collection(&mut session, "test", vec!["name".to_string()])
             .unwrap();
-        write_path
+        fixture
+            .write_path
             .create_index(
                 &mut session,
                 "test",
                 CreateIndexRequest::single_field_ascending("name"),
             )
             .unwrap();
-        write_path
+        fixture
+            .write_path
             .insert_one(&mut session, "test", json!({"_id": 1, "name": "alice"}))
             .unwrap();
 
         session.checkpoint().unwrap();
 
-        let docs = query
+        let docs = fixture
+            .query
             .find(&mut session, "test", Some(json!({"name": "alice"})))
             .unwrap();
         assert_eq!(docs.len(), 1);

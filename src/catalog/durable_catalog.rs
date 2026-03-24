@@ -218,76 +218,58 @@ impl DurableCatalog {
     // Read API
     // ------------------------------------------------------------------------
 
-    /// Loads the collection definition visible in the session's current transaction context.
-    pub(crate) fn collection_visible(
+    /// Loads a collection definition from the catalog.
+    pub(crate) fn get_collection(
         &self,
         session: &Session,
         collection: &str,
     ) -> Result<Option<CollectionDefinition>, WrongoDBError> {
         self.store
-            .record_visible(session, collection)?
+            .get_record(session, collection)?
             .map(|record| collection_definition_from_record(collection.to_string(), record))
             .transpose()
     }
 
-    /// Loads the committed collection definition.
-    ///
-    /// Callers should pass a session without an active transaction.
-    pub(crate) fn collection_committed(
-        &self,
-        session: &Session,
-        collection: &str,
-    ) -> Result<Option<CollectionDefinition>, WrongoDBError> {
-        self.collection_visible(session, collection)
-    }
-
-    /// Lists every collection definition visible in the session's current transaction context.
-    pub(crate) fn list_collections_visible(
+    /// Lists all collection definitions from the catalog.
+    pub(crate) fn list_collections(
         &self,
         session: &Session,
     ) -> Result<Vec<CollectionDefinition>, WrongoDBError> {
         self.store
-            .list_records_visible(session)?
+            .list_records(session)?
             .into_iter()
             .map(|(collection, record)| collection_definition_from_record(collection, record))
             .collect()
-    }
-
-    /// Lists every committed collection definition.
-    ///
-    /// Callers should pass a session without an active transaction.
-    pub(crate) fn list_collections_committed(
-        &self,
-        session: &Session,
-    ) -> Result<Vec<CollectionDefinition>, WrongoDBError> {
-        self.list_collections_visible(session)
     }
 
     // ------------------------------------------------------------------------
     // Write API
     // ------------------------------------------------------------------------
 
-    /// Inserts the durable collection row if it is still missing in this
-    /// transaction.
-    pub(crate) fn insert_collection_if_missing_in_transaction(
+    /// Inserts a collection definition if it doesn't already exist.
+    ///
+    /// Returns the definition and a boolean indicating whether it was newly created.
+    pub(crate) fn insert_collection_if_missing(
         &self,
         session: &Session,
         collection: &str,
         table_uri: &str,
         storage_columns: &[String],
     ) -> Result<(CollectionDefinition, bool), WrongoDBError> {
-        if let Some(existing) = self.collection_visible(session, collection)? {
+        if let Some(existing) = self.get_collection(session, collection)? {
             return Ok((existing, false));
         }
 
         let definition = CollectionDefinition::new(collection, table_uri, storage_columns.to_vec());
         let record = catalog_record_from_collection_definition(&definition)?;
-        self.store
-            .put_record_in_transaction(session, collection, &record)?;
+        self.store.put_record(session, collection, &record)?;
         Ok((definition, true))
     }
 
-    pub(crate) fn insert_collection_if_missing_committed(
+    /// Creates a collection in its own transaction.
+    ///
+    /// Returns the definition and a boolean indicating whether it was newly created.
+    pub(crate) fn create_collection(
         &self,
         session: &mut Session,
         collection: &str,
@@ -295,24 +277,21 @@ impl DurableCatalog {
         storage_columns: &[String],
     ) -> Result<(CollectionDefinition, bool), WrongoDBError> {
         session.with_transaction(|session| {
-            self.insert_collection_if_missing_in_transaction(
-                session,
-                collection,
-                table_uri,
-                storage_columns,
-            )
+            self.insert_collection_if_missing(session, collection, table_uri, storage_columns)
         })
     }
 
-    /// Registers `index` on the durable collection row if it is still missing.
-    pub(crate) fn ensure_index_in_transaction(
+    /// Registers an index on a collection if it doesn't already exist.
+    ///
+    /// Returns `true` if the index was newly added.
+    pub(crate) fn ensure_index(
         &self,
         session: &Session,
         collection: &str,
         index: IndexDefinition,
     ) -> Result<bool, WrongoDBError> {
         let mut definition = self
-            .collection_visible(session, collection)?
+            .get_collection(session, collection)?
             .ok_or_else(|| StorageError(format!("unknown collection: {collection}")))?;
         if definition.indexes.contains_key(index.name()) {
             return Ok(false);
@@ -320,23 +299,24 @@ impl DurableCatalog {
 
         definition.indexes.insert(index.name.clone(), index);
         let record = catalog_record_from_collection_definition(&definition)?;
-        self.store
-            .put_record_in_transaction(session, collection, &record)?;
+        self.store.put_record(session, collection, &record)?;
         Ok(true)
     }
 
-    pub(crate) fn ensure_index_committed(
+    /// Creates an index in its own transaction.
+    ///
+    /// Returns `true` if the index was newly added.
+    pub(crate) fn create_index(
         &self,
         session: &mut Session,
         collection: &str,
         index: IndexDefinition,
     ) -> Result<bool, WrongoDBError> {
-        session.with_transaction(|session| {
-            self.ensure_index_in_transaction(session, collection, index)
-        })
+        session.with_transaction(|session| self.ensure_index(session, collection, index))
     }
 
-    pub(crate) fn set_index_ready_committed(
+    /// Sets the ready state of an index in its own transaction.
+    pub(crate) fn set_index_ready(
         &self,
         session: &mut Session,
         collection: &str,
@@ -344,7 +324,7 @@ impl DurableCatalog {
         ready: bool,
     ) -> Result<(), WrongoDBError> {
         session.with_transaction(|session| {
-            self.set_index_ready_in_transaction(session, collection, index_name, ready)
+            self.set_index_ready_inner(session, collection, index_name, ready)
         })
     }
 
@@ -352,20 +332,19 @@ impl DurableCatalog {
     // Validation
     // ------------------------------------------------------------------------
 
-    /// Verifies that every durable catalog reference points at a storage
-    /// metadata row visible to `txn_id`.
+    /// Verifies that every durable catalog reference points at a storage metadata row.
     pub(crate) fn validate_storage_references(
         &self,
         session: &Session,
         metadata_store: &MetadataStore,
     ) -> Result<(), WrongoDBError> {
-        for collection in self.list_collections_committed(session)? {
+        for collection in self.list_collections(session)? {
             validate_collection_references(&collection, metadata_store)?;
         }
         Ok(())
     }
 
-    fn set_index_ready_in_transaction(
+    fn set_index_ready_inner(
         &self,
         session: &Session,
         collection: &str,
@@ -373,7 +352,7 @@ impl DurableCatalog {
         ready: bool,
     ) -> Result<(), WrongoDBError> {
         let mut definition = self
-            .collection_visible(session, collection)?
+            .get_collection(session, collection)?
             .ok_or_else(|| StorageError(format!("unknown collection: {collection}")))?;
         let Some(index) = definition.indexes.get_mut(index_name) else {
             return Err(StorageError(format!(
@@ -384,8 +363,7 @@ impl DurableCatalog {
         index.ready = ready;
 
         let record = catalog_record_from_collection_definition(&definition)?;
-        self.store
-            .put_record_in_transaction(session, collection, &record)?;
+        self.store.put_record(session, collection, &record)?;
         Ok(())
     }
 }
