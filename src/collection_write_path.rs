@@ -3,14 +3,14 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::catalog::{
-    CollectionCatalog, CollectionDefinition, CreateIndexRequest, DurableCatalog, IndexDefinition,
+    CollectionCatalog, CollectionDefinition, CreateIndexRequest, IndexDefinition,
 };
 use crate::core::bson::encode_id_value;
 use crate::core::document::{normalize_document_in_place, validate_is_object};
 use crate::core::errors::{DocumentValidationError, StorageError};
 use crate::document_query::DocumentQuery;
 use crate::storage::api::Session;
-use crate::storage::metadata_store::{index_uri, table_uri, MetadataEntry, MetadataStore};
+use crate::storage::metadata_store::{index_uri, MetadataEntry, MetadataStore};
 use crate::storage::row::{encode_row_value, validate_storage_columns};
 use crate::{Document, WrongoDBError};
 
@@ -24,20 +24,18 @@ pub(crate) struct UpdateResult {
 #[derive(Debug, Clone)]
 struct IndexRegistration {
     entry: MetadataEntry,
-    ready: bool,
     needs_build: bool,
 }
 
 /// Write path for collection CRUD and index registration.
 ///
 /// This service coordinates the storage metadata in [`MetadataStore`], the
-/// durable server-side collection catalog, and the WT-like `TableCursor`
+/// [`CollectionCatalog`] (the unified catalog), and the [`DocumentQuery`]
 /// implementation used for actual record and secondary-index updates.
 #[derive(Clone)]
 pub(crate) struct CollectionWritePath {
     metadata_store: Arc<MetadataStore>,
-    durable_catalog: Arc<DurableCatalog>,
-    collection_catalog: Arc<CollectionCatalog>,
+    catalog: Arc<CollectionCatalog>,
     document_query: DocumentQuery,
 }
 
@@ -45,14 +43,12 @@ impl CollectionWritePath {
     /// Creates the collection write service.
     pub(crate) fn new(
         metadata_store: Arc<MetadataStore>,
-        durable_catalog: Arc<DurableCatalog>,
-        collection_catalog: Arc<CollectionCatalog>,
+        catalog: Arc<CollectionCatalog>,
         document_query: DocumentQuery,
     ) -> Self {
         Self {
             metadata_store,
-            durable_catalog,
-            collection_catalog,
+            catalog,
             document_query,
         }
     }
@@ -66,29 +62,13 @@ impl CollectionWritePath {
     ) -> Result<(), WrongoDBError> {
         validate_storage_columns(&storage_columns)?;
 
-        if self
-            .durable_catalog
-            .get_collection(session, collection)?
-            .is_some()
-        {
-            return Err(StorageError(format!("collection already exists: {collection}")).into());
-        }
+        let (_, created) = self.catalog.create_collection(session, collection, &storage_columns)?;
 
-        let table_uri = table_uri(collection);
-        session.create_table(&table_uri, storage_columns.clone())?;
-        let (_, created) = self
-            .durable_catalog
-            .create_collection(
-                session,
-                collection,
-                &table_uri,
-                &storage_columns,
-            )?;
         if !created {
             return Err(StorageError(format!("collection already exists: {collection}")).into());
         }
 
-        self.refresh_collection_cache(session, collection)
+        Ok(())
     }
 
     /// Inserts one document into an existing collection.
@@ -155,9 +135,8 @@ impl CollectionWritePath {
 
     /// Creates one secondary index from the normalized server-side request.
     ///
-    /// If the durable catalog already knows about the index but it is still
-    /// marked not-ready, this resumes the storage backfill and flips the ready
-    /// bit once the existing rows are copied into the secondary store.
+    /// If the durable catalog already knows about the index but it /// it is still
+    /// marked not-ready, this resumes the storage backfill and flips the    /// ready bit once the existing rows are copied into the secondary store.
     pub(crate) fn create_index(
         &self,
         session: &mut Session,
@@ -181,16 +160,13 @@ impl CollectionWritePath {
         let registration =
             self.ensure_index_registered_committed(session, collection, &request, &indexed_field)?;
         if registration.needs_build {
-            session.create_index(&table_uri, &registration.entry)?;
-        }
-        if !registration.ready {
-            self.durable_catalog.set_index_ready(
+            self.catalog.build_and_mark_index_ready(
                 session,
                 collection,
-                request.name(),
-                true,
+                &table_uri,
+                &request.name(),
+                &registration.entry,
             )?;
-            self.refresh_collection_cache(session, collection)?;
         }
         Ok(())
     }
@@ -390,7 +366,7 @@ impl CollectionWritePath {
         });
 
         if let Some(ready) = self
-            .durable_catalog
+            .catalog
             .get_collection(session, collection)?
             .and_then(|definition| {
                 definition
@@ -401,19 +377,17 @@ impl CollectionWritePath {
         {
             return Ok(IndexRegistration {
                 entry: metadata_entry,
-                ready,
                 needs_build: !ready || stored_entry.is_none(),
             });
         }
 
-        let _ = self.durable_catalog.create_index(
+        let _ = self.catalog.create_index(
             session,
             collection,
             IndexDefinition::from_request_with_ready(request, index_uri.clone(), false),
         )?;
         Ok(IndexRegistration {
             entry: metadata_entry,
-            ready: false,
             needs_build: true,
         })
     }
@@ -423,7 +397,7 @@ impl CollectionWritePath {
         session: &mut Session,
         collection: &str,
     ) -> Result<CollectionDefinition, WrongoDBError> {
-        self.durable_catalog
+        self.catalog
             .get_collection(session, collection)?
             .ok_or_else(|| StorageError(format!("unknown collection: {collection}")).into())
     }
@@ -433,7 +407,7 @@ impl CollectionWritePath {
         session: &mut Session,
         collection: &str,
     ) -> Result<CollectionDefinition, WrongoDBError> {
-        self.durable_catalog
+        self.catalog
             .get_collection(session, collection)?
             .ok_or_else(|| StorageError(format!("unknown collection: {collection}")).into())
     }
@@ -453,18 +427,6 @@ impl CollectionWritePath {
             ))
         })?;
         encode_row_value(row_format, table_entry.value_columns(), doc)
-    }
-
-    fn refresh_collection_cache(
-        &self,
-        session: &Session,
-        collection: &str,
-    ) -> Result<(), WrongoDBError> {
-        self.collection_catalog.refresh_collection(
-            session,
-            self.durable_catalog.as_ref(),
-            collection,
-        )
     }
 
     fn run_in_transaction<R, F>(&self, session: &mut Session, f: F) -> Result<R, WrongoDBError>
@@ -553,7 +515,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::apply_update;
-    use crate::catalog::{CatalogStore, CollectionCatalog, CreateIndexRequest, DurableCatalog};
+    use crate::catalog::{CatalogStore, CollectionCatalog, CreateIndexRequest};
     use crate::collection_write_path::CollectionWritePath;
     use crate::document_query::DocumentQuery;
     use crate::storage::api::{Connection, ConnectionConfig, Session};
@@ -570,23 +532,17 @@ mod tests {
     ) {
         let connection = Connection::open(&base_path, config).unwrap();
         let metadata_store = connection.metadata_store();
-        let durable_catalog = Arc::new(DurableCatalog::new(CatalogStore::new()));
-        let collection_catalog = Arc::new(CollectionCatalog::new());
-        {
-            let mut session = connection.open_session();
-            durable_catalog.ensure_store_exists(&mut session).unwrap();
-            collection_catalog
-                .load_from_durable(&session, durable_catalog.as_ref())
-                .unwrap();
-        }
-        let document_query = DocumentQuery::new(durable_catalog.clone());
+        let catalog = Arc::new(CollectionCatalog::new(CatalogStore::new()));
+        let mut session = connection.open_session();
+        catalog.ensure_store_exists(&mut session).unwrap();
+        catalog.load_cache(&session).unwrap();
+        let document_query = DocumentQuery::new(catalog.clone());
         let service = CollectionWritePath::new(
             metadata_store,
-            durable_catalog,
-            collection_catalog.clone(),
+            catalog.clone(),
             document_query.clone(),
         );
-        (connection, service, document_query, collection_catalog)
+        (connection, service, document_query, catalog)
     }
 
     fn disabled_config() -> ConnectionConfig {
@@ -671,7 +627,7 @@ mod tests {
     #[test]
     fn writes_to_unknown_collection_fail() {
         let tmp = tempdir().unwrap();
-        let (connection, service, _query, _collection_catalog) =
+        let (connection, service, _query, _catalog) =
             test_services(tmp.path().to_path_buf(), disabled_config());
         let mut session = connection.open_session();
 
@@ -684,7 +640,7 @@ mod tests {
     #[test]
     fn insert_rejects_undeclared_fields() {
         let tmp = tempdir().unwrap();
-        let (connection, service, _query, _collection_catalog) =
+        let (connection, service, _query, _catalog) =
             test_services(tmp.path().to_path_buf(), disabled_config());
         let mut session = connection.open_session();
         create_collection(&service, &mut session, "users", &["name"]);
@@ -702,7 +658,7 @@ mod tests {
     #[test]
     fn create_index_rejects_undeclared_field() {
         let tmp = tempdir().unwrap();
-        let (connection, service, _query, _collection_catalog) =
+        let (connection, service, _query, _catalog) =
             test_services(tmp.path().to_path_buf(), disabled_config());
         let mut session = connection.open_session();
         create_collection(&service, &mut session, "users", &["name"]);
@@ -722,7 +678,7 @@ mod tests {
     #[test]
     fn ready_true_index_repairs_missing_storage_metadata() {
         let tmp = tempdir().unwrap();
-        let (connection, service, query, collection_catalog) =
+        let (connection, service, query, catalog) =
             test_services(tmp.path().to_path_buf(), disabled_config());
         let mut session = connection.open_session();
         create_collection(&service, &mut session, "users", &["name"]);
@@ -738,7 +694,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(collection_catalog
+        assert!(catalog
             .list_index_definitions("users")
             .iter()
             .any(|index| index.name() == "name_1" && index.ready()));
@@ -766,7 +722,7 @@ mod tests {
     #[test]
     fn create_index_backfills_existing_documents() {
         let tmp = tempdir().unwrap();
-        let (connection, service, _query, _collection_catalog) =
+        let (connection, service, _query, _catalog) =
             test_services(tmp.path().to_path_buf(), disabled_config());
         let mut session = connection.open_session();
         create_collection(&service, &mut session, "users", &["name"]);
@@ -795,7 +751,7 @@ mod tests {
     #[test]
     fn ready_false_indexes_are_ignored_until_backfill_completes() {
         let tmp = tempdir().unwrap();
-        let (connection, service, query, collection_catalog) =
+        let (connection, service, query, catalog) =
             test_services(tmp.path().to_path_buf(), disabled_config());
         let mut session = connection.open_session();
         create_collection(&service, &mut session, "users", &["name"]);
@@ -808,7 +764,7 @@ mod tests {
         let registration = service
             .ensure_index_registered_committed(&mut session, "users", &request, "name")
             .unwrap();
-        assert!(!registration.ready);
+        assert!(registration.needs_build);
         assert!(service
             .metadata_store
             .get(registration.entry.uri())
@@ -819,7 +775,7 @@ mod tests {
             .create_index(&mut session, "users", request)
             .unwrap();
 
-        let committed_indexes = collection_catalog.list_index_definitions("users");
+        let committed_indexes = catalog.list_index_definitions("users");
         assert!(committed_indexes
             .iter()
             .any(|index| index.name() == "name_1" && index.ready()));
@@ -833,7 +789,7 @@ mod tests {
     #[test]
     fn crud_roundtrip() {
         let tmp = tempdir().unwrap();
-        let (connection, service, query, _collection_catalog) =
+        let (connection, service, query, _catalog) =
             test_services(tmp.path().to_path_buf(), disabled_config());
         let mut session = connection.open_session();
         create_collection(&service, &mut session, "users", &["name", "age"]);
@@ -883,7 +839,7 @@ mod tests {
     #[test]
     fn create_index_registers_index_name() {
         let tmp = tempdir().unwrap();
-        let (connection, service, _query, collection_catalog) =
+        let (connection, service, _query, catalog) =
             test_services(tmp.path().to_path_buf(), disabled_config());
         let mut session = connection.open_session();
         create_collection(&service, &mut session, "users", &["name"]);
@@ -898,20 +854,16 @@ mod tests {
                 CreateIndexRequest::single_field_ascending("name"),
             )
             .unwrap();
-
-        let indexes = collection_catalog
+        assert!(catalog
             .list_index_definitions("users")
-            .into_iter()
-            .map(|index| index.name().to_string())
-            .collect::<Vec<_>>();
-        assert!(indexes.iter().any(|index| index == "name_1"));
-        assert!(!tmp.path().join("users.meta.json").exists());
+            .iter()
+            .any(|index| index.name() == "name_1"));
     }
 
     #[test]
     fn failing_transaction_aborts_changes() {
         let tmp = tempdir().unwrap();
-        let (connection, service, query, collection_catalog) =
+        let (connection, service, query, catalog) =
             test_services(tmp.path().to_path_buf(), disabled_config());
         let mut session = connection.open_session();
         create_collection(&service, &mut session, "items", &["value"]);
@@ -933,6 +885,6 @@ mod tests {
             .find(&mut session, "items", Some(json!({"_id": "abort-me"})))
             .unwrap()
             .is_empty());
-        assert!(collection_catalog.lookup_collection("items").is_some());
+        assert!(catalog.lookup_collection("items").is_some());
     }
 }

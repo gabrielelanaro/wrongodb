@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::catalog::{CatalogStore, DurableCatalog};
+use crate::catalog::{CatalogStore, CollectionCatalog};
 use crate::core::errors::StorageError;
 use crate::storage::api::connection::Connection;
 use crate::storage::reserved_store::reserved_store_names;
@@ -21,9 +21,9 @@ impl CatalogRecovery {
         let metadata_store = connection.metadata_store();
         let mut session = connection.open_session();
 
-        let durable_catalog = DurableCatalog::new(CatalogStore::new());
-        durable_catalog.ensure_store_exists(&mut session)?;
-        durable_catalog.validate_storage_references(&session, metadata_store.as_ref())?;
+        let catalog = CollectionCatalog::new(CatalogStore::new());
+        catalog.ensure_store_exists(&mut session)?;
+        catalog.validate_storage_references(&session, metadata_store.as_ref())?;
 
         let mut referenced_store_names = metadata_store.all_store_names()?;
         referenced_store_names.extend(

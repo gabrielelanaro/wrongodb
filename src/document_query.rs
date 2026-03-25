@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::catalog::DurableCatalog;
+use crate::catalog::CollectionCatalog;
 use crate::core::bson::encode_id_value;
 use crate::core::document::validate_is_object;
 use crate::index::{decode_index_id, encode_range_bounds};
@@ -18,13 +18,13 @@ use crate::{Document, WrongoDBError};
 /// top of the available primary and secondary indexes.
 #[derive(Clone)]
 pub(crate) struct DocumentQuery {
-    durable_catalog: Arc<DurableCatalog>,
+    catalog: Arc<CollectionCatalog>,
 }
 
 impl DocumentQuery {
     /// Creates the document query service.
-    pub(crate) fn new(durable_catalog: Arc<DurableCatalog>) -> Self {
-        Self { durable_catalog }
+    pub(crate) fn new(catalog: Arc<CollectionCatalog>) -> Self {
+        Self { catalog }
     }
 
     pub(crate) fn find(
@@ -78,7 +78,7 @@ impl DocumentQuery {
         filter: Option<Value>,
     ) -> Result<Vec<Document>, WrongoDBError> {
         let Some(collection_definition) = self
-            .durable_catalog
+            .catalog
             .get_collection(session, collection)?
         else {
             return Ok(Vec::new());
@@ -208,20 +208,16 @@ mod tests {
             let config = ConnectionConfig::new().logging_enabled(false);
             let connection = Connection::open(&base_path, config).unwrap();
             let metadata_store = connection.metadata_store();
-            let durable_catalog = Arc::new(DurableCatalog::new(CatalogStore::new()));
-            let collection_catalog = Arc::new(CollectionCatalog::new());
+            let catalog = Arc::new(CollectionCatalog::new(CatalogStore::new()));
             {
                 let mut session = connection.open_session();
-                durable_catalog.ensure_store_exists(&mut session).unwrap();
-                collection_catalog
-                    .load_from_durable(&session, durable_catalog.as_ref())
-                    .unwrap();
+                catalog.ensure_store_exists(&mut session).unwrap();
+                catalog.load_cache(&session).unwrap();
             }
-            let query = DocumentQuery::new(durable_catalog.clone());
+            let query = DocumentQuery::new(catalog.clone());
             let write_path = CollectionWritePath::new(
                 metadata_store,
-                durable_catalog,
-                collection_catalog,
+                catalog.clone(),
                 query.clone(),
             );
 
