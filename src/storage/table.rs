@@ -255,7 +255,7 @@ pub(crate) fn reconcile_for_checkpoint(
     global_txn: &GlobalTxnState,
 ) -> Result<ReconcileStats, WrongoDBError> {
     btree.reconcile_page_local_updates(
-        global_txn.oldest_active_txn_id(),
+        global_txn.gc_threshold(),
         !global_txn.has_active_transactions(),
     )
 }

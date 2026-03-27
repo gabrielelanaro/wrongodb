@@ -136,3 +136,80 @@ fn transaction_commit_preserves_stop_metadata_on_overwritten_updates() {
     assert_eq!(base.time_window.stop_txn, txn.id());
     assert_eq!(base.time_window.stop_ts, txn.id());
 }
+
+#[test]
+fn gc_threshold_uses_checkpoint_pinned_id() {
+    let global = GlobalTxnState::new();
+
+    // Start txn 1 and commit it
+    let mut txn1 = global.begin_snapshot_txn();
+    txn1.commit(&global).unwrap();
+
+    // Start txn 2 (active)
+    let mut txn2 = global.begin_snapshot_txn();
+
+    // Without checkpoint, gc_threshold = oldest_active (txn2's id)
+    let threshold_without_checkpoint = global.gc_threshold();
+
+    // Begin checkpoint - should pin at txn2's id
+    global.begin_checkpoint();
+    assert_eq!(global.gc_threshold(), threshold_without_checkpoint);
+
+    // Commit txn2
+    txn2.commit(&global).unwrap();
+
+    // gc_threshold should still return the checkpoint's pinned value
+    // even though oldest_active has advanced
+    assert_eq!(global.gc_threshold(), threshold_without_checkpoint);
+
+    // End checkpoint
+    global.end_checkpoint();
+
+    // Now gc_threshold should advance past the old checkpoint
+    assert!(global.gc_threshold() > threshold_without_checkpoint);
+}
+
+#[test]
+fn gc_threshold_without_checkpoint_uses_oldest_active() {
+    let global = GlobalTxnState::new();
+
+    // No checkpoint active, gc_threshold should equal oldest_active
+    let mut txn1 = global.begin_snapshot_txn();
+    txn1.commit(&global).unwrap();
+
+    let mut txn2 = global.begin_snapshot_txn();
+    assert_eq!(global.gc_threshold(), global.oldest_active_txn_id());
+
+    txn2.commit(&global).unwrap();
+    assert_eq!(global.gc_threshold(), global.oldest_active_txn_id());
+}
+
+#[test]
+fn gc_threshold_returns_minimum_of_oldest_and_checkpoint() {
+    let global = GlobalTxnState::new();
+
+    // Start txn 1 (will be the checkpoint pinned value)
+    let mut txn1 = global.begin_snapshot_txn();
+
+    // Begin checkpoint - pins at txn1's id
+    global.begin_checkpoint();
+    let checkpoint_pinned = global.gc_threshold();
+
+    // Commit txn1
+    txn1.commit(&global).unwrap();
+
+    // Start txn2 (now the oldest active)
+    let txn2 = global.begin_snapshot_txn();
+
+    // gc_threshold should return the checkpoint's pinned value (lower than oldest_active)
+    assert_eq!(global.gc_threshold(), checkpoint_pinned);
+    assert!(global.oldest_active_txn_id() > checkpoint_pinned);
+
+    // End checkpoint
+    global.end_checkpoint();
+
+    // Now gc_threshold should return the oldest_active
+    assert_eq!(global.gc_threshold(), global.oldest_active_txn_id());
+
+    drop(txn2);
+}

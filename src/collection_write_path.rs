@@ -164,7 +164,7 @@ impl CollectionWritePath {
                 session,
                 collection,
                 &table_uri,
-                &request.name(),
+                request.name(),
                 &registration.entry,
             )?;
         }
