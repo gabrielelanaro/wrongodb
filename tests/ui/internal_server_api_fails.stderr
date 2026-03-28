@@ -1,0 +1,13 @@
+error[E0603]: module `server` is private
+ --> tests/ui/internal_server_api_fails.rs:1:15
+  |
+1 | use wrongodb::server::commands;
+  |               ^^^^^^  -------- module `commands` is not publicly re-exported
+  |               |
+  |               private module
+  |
+note: the module `server` is defined here
+ --> src/lib.rs
+  |
+  | mod server;
+  | ^^^^^^^^^^

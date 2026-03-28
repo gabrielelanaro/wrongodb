@@ -1,74 +1,67 @@
 use tempfile::tempdir;
 
-use wrongodb::{BlockFile, InternalPage, ReadVisibility, TXN_NONE};
-
-use super::{create_tree, open_tree};
+use super::{checkpoint, create_table, insert_table_row, open_connection, scan_table_range};
 
 #[test]
-fn splits_root_leaf_into_internal_root() {
+fn large_insert_set_survives_reopen_with_all_rows_present() {
     let tmp = tempdir().unwrap();
-    let path = tmp.path().join("btree.wt");
+    let db_path = tmp.path().join("db");
 
-    let mut tree = create_tree(&path, 256).unwrap();
+    {
+        let conn = open_connection(&db_path, false);
+        let mut session = conn.open_session();
+        create_table(&mut session);
+        checkpoint(&mut session);
 
-    for i in 0..20u32 {
-        let k = format!("k{i:04}").into_bytes();
-        let v = vec![b'v'; 24];
-        tree.put(&k, &v).unwrap();
+        for i in 0..200u32 {
+            let key = format!("k{i:04}");
+            insert_table_row(&session, key.as_bytes(), &vec![b'v'; 24]);
+        }
+        checkpoint(&mut session);
     }
 
-    for i in 0..20u32 {
-        let k = format!("k{i:04}").into_bytes();
-        let got = tree.get(&k, &ReadVisibility::from_txn_id(TXN_NONE)).unwrap().unwrap();
-        assert_eq!(got, vec![b'v'; 24]);
-    }
-
-    tree.checkpoint().unwrap();
-
-    // Root should now be internal.
-    let mut bf = BlockFile::open(&path).unwrap();
-    let root = bf.root_block_id();
-    assert!(root != 0);
-    let payload = bf.read_block(root, false).unwrap();
-    assert_eq!(payload[0], 2);
-    bf.close().unwrap();
-
-    // Reopen and confirm reads still work.
-    let mut tree2 = open_tree(&path).unwrap();
-    for i in 0..20u32 {
-        let k = format!("k{i:04}").into_bytes();
-        assert!(tree2.get(&k, &ReadVisibility::from_txn_id(TXN_NONE)).unwrap().is_some());
-    }
+    let conn = open_connection(&db_path, false);
+    let session = conn.open_session();
+    let entries = scan_table_range(&session, None, None);
+    assert_eq!(entries.len(), 200);
+    assert!(entries.windows(2).all(|window| window[0].0 < window[1].0));
 }
 
 #[test]
-fn multiple_leaf_splits_update_root_separators() {
+fn multiple_growth_rounds_preserve_range_visibility() {
     let tmp = tempdir().unwrap();
-    let path = tmp.path().join("btree2.wt");
+    let db_path = tmp.path().join("db");
 
-    // Slightly larger pages to ensure the root internal node has room for multiple separators.
-    let mut tree = create_tree(&path, 512).unwrap();
-    for i in 0..60u32 {
-        let k = format!("k{i:04}").into_bytes();
-        let v = vec![b'x'; 16];
-        tree.put(&k, &v).unwrap();
+    {
+        let conn = open_connection(&db_path, false);
+        let mut session = conn.open_session();
+        create_table(&mut session);
+        checkpoint(&mut session);
+
+        for i in 0..60u32 {
+            let key = format!("k{i:04}");
+            insert_table_row(&session, key.as_bytes(), &vec![b'x'; 16]);
+        }
+        checkpoint(&mut session);
+
+        for i in 60..120u32 {
+            let key = format!("k{i:04}");
+            insert_table_row(&session, key.as_bytes(), &vec![b'y'; 16]);
+        }
+        checkpoint(&mut session);
     }
 
-    for i in 0..60u32 {
-        let k = format!("k{i:04}").into_bytes();
-        let got = tree.get(&k, &ReadVisibility::from_txn_id(TXN_NONE)).unwrap().unwrap();
-        assert_eq!(got, vec![b'x'; 16]);
-    }
-
-    tree.checkpoint().unwrap();
-
-    let mut bf = BlockFile::open(&path).unwrap();
-    let root = bf.root_block_id();
-    let mut root_payload = bf.read_block(root, false).unwrap();
-    assert_eq!(root_payload[0], 2);
-
-    let root_page = InternalPage::open(&mut root_payload).unwrap();
-    let slots = root_page.slot_count().unwrap();
-    assert!(slots >= 2);
-    bf.close().unwrap();
+    let conn = open_connection(&db_path, false);
+    let session = conn.open_session();
+    let slice = scan_table_range(&session, Some(b"k0058"), Some(b"k0063"));
+    assert_eq!(
+        slice,
+        vec![
+            (b"k0058".to_vec(), vec![b'x'; 16]),
+            (b"k0059".to_vec(), vec![b'x'; 16]),
+            (b"k0060".to_vec(), vec![b'y'; 16]),
+            (b"k0061".to_vec(), vec![b'y'; 16]),
+            (b"k0062".to_vec(), vec![b'y'; 16]),
+        ]
+    );
 }

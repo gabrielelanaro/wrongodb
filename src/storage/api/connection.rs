@@ -99,6 +99,23 @@ impl Connection {
     ///
     /// The constructor does this eagerly so callers never have to reason about
     /// partially initialized engine state.
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// use uuid::Uuid;
+    /// use wrongodb::{Connection, ConnectionConfig};
+    ///
+    /// let db_path = std::env::temp_dir().join(format!("wrongodb-doc-{}", Uuid::new_v4()));
+    /// let conn = Connection::open(&db_path, ConnectionConfig::new())?;
+    /// let mut session = conn.open_session();
+    /// session.create_table("table:users", Vec::new())?;
+    /// let mut cursor = session.open_table_cursor("table:users")?;
+    /// cursor.insert(b"user:1", b"alice")?;
+    /// assert_eq!(cursor.get(b"user:1")?, Some(b"alice".to_vec()));
+    /// fs::remove_dir_all(&db_path)?;
+    /// # Ok::<(), wrongodb::WrongoDBError>(())
+    /// ```
     pub fn open<P>(path: P, config: ConnectionConfig) -> Result<Self, WrongoDBError>
     where
         P: AsRef<Path>,
@@ -151,6 +168,27 @@ impl Connection {
     ///
     /// This separation is the reason session creation is cheap and why multiple
     /// sessions can share one opened database safely.
+    ///
+    /// ```
+    /// use std::fs;
+    ///
+    /// use uuid::Uuid;
+    /// use wrongodb::{Connection, ConnectionConfig};
+    ///
+    /// let db_path = std::env::temp_dir().join(format!("wrongodb-session-doc-{}", Uuid::new_v4()));
+    /// let conn = Connection::open(&db_path, ConnectionConfig::new().logging_enabled(false))?;
+    /// let mut session = conn.open_session();
+    /// session.create_table("table:users", Vec::new())?;
+    /// session.checkpoint()?;
+    ///
+    /// let reopened = Connection::open(&db_path, ConnectionConfig::new().logging_enabled(false))?;
+    /// let reopened_session = reopened.open_session();
+    /// let mut cursor = reopened_session.open_table_cursor("table:users")?;
+    /// assert_eq!(cursor.next()?, None);
+    ///
+    /// fs::remove_dir_all(&db_path)?;
+    /// # Ok::<(), wrongodb::WrongoDBError>(())
+    /// ```
     pub fn open_session(&self) -> Session {
         Session::new(
             self.base_path.clone(),

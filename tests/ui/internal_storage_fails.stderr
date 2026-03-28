@@ -1,0 +1,13 @@
+error[E0603]: module `storage` is private
+ --> tests/ui/internal_storage_fails.rs:1:15
+  |
+1 | use wrongodb::storage::api::connection::Connection;
+  |               ^^^^^^^       ---------- module `connection` is not publicly re-exported
+  |               |
+  |               private module
+  |
+note: the module `storage` is defined here
+ --> src/lib.rs
+  |
+  | mod storage;
+  | ^^^^^^^^^^^

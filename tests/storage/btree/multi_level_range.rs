@@ -1,113 +1,64 @@
 use tempfile::tempdir;
 
-use wrongodb::{BlockFile, InternalPage, ReadVisibility, NONE_BLOCK_ID, TXN_NONE};
+use super::{checkpoint, create_table, insert_table_row, open_connection, scan_table_range};
 
-use super::{create_tree, open_tree};
+#[test]
+fn ordered_range_scan_is_sorted_and_respects_bounds_after_reopen() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("db");
 
-fn internal_levels(path: &std::path::Path) -> usize {
-    let mut bf = BlockFile::open(path).unwrap();
-    let mut node_id = bf.root_block_id();
-    assert!(node_id != NONE_BLOCK_ID);
+    {
+        let conn = open_connection(&db_path, false);
+        let mut session = conn.open_session();
+        create_table(&mut session);
+        checkpoint(&mut session);
 
-    let mut levels = 0usize;
-    loop {
-        let mut payload = bf.read_block(node_id, false).unwrap();
-        match payload[0] {
-            1 => break,
-            2 => {
-                levels += 1;
-                let page = InternalPage::open(&mut payload).unwrap();
-                node_id = page.first_child().unwrap();
-            }
-            other => panic!("unexpected page type: {other}"),
+        for i in 0..500u32 {
+            let key = format!("k{i:04}");
+            let value = format!("v{i:04}");
+            insert_table_row(&session, key.as_bytes(), value.as_bytes());
         }
-    }
-    bf.close().unwrap();
-    levels
-}
-
-#[test]
-fn grows_tree_height_past_two_levels_and_survives_reopen() {
-    let tmp = tempdir().unwrap();
-    let path = tmp.path().join("btree_multi_level_height.wt");
-
-    let mut tree = create_tree(&path, 256).unwrap();
-    for i in 0..800u32 {
-        let k = format!("k{i:04}").into_bytes();
-        let v = vec![b'v'; 24];
-        tree.put(&k, &v).unwrap();
+        checkpoint(&mut session);
     }
 
-    for i in 0..800u32 {
-        let k = format!("k{i:04}").into_bytes();
-        let got = tree.get(&k, &ReadVisibility::from_txn_id(TXN_NONE)).unwrap().unwrap();
-        assert_eq!(got, vec![b'v'; 24]);
-    }
+    let conn = open_connection(&db_path, false);
+    let session = conn.open_session();
+    let slice = scan_table_range(&session, Some(b"k0100"), Some(b"k0200"));
 
-    tree.checkpoint().unwrap();
-
-    // Height > 2 implies at least two internal levels (root internal + one more).
-    assert!(internal_levels(&path) >= 2);
-
-    drop(tree);
-
-    let mut tree2 = open_tree(&path).unwrap();
-    for i in 0..800u32 {
-        let k = format!("k{i:04}").into_bytes();
-        assert!(tree2.get(&k, &ReadVisibility::from_txn_id(TXN_NONE)).unwrap().is_some());
-    }
-    assert!(internal_levels(&path) >= 2);
-}
-
-#[test]
-fn ordered_range_scan_is_sorted_and_respects_bounds() {
-    let tmp = tempdir().unwrap();
-    let path = tmp.path().join("btree_multi_level_scan.wt");
-
-    let mut tree = create_tree(&path, 384).unwrap();
-    for i in 0..500u32 {
-        let k = format!("k{i:04}").into_bytes();
-        let v = format!("v{i:04}").into_bytes();
-        tree.put(&k, &v).unwrap();
-    }
-
-    let all: Vec<Vec<u8>> = tree
-        .range(None, None, &ReadVisibility::from_txn_id(TXN_NONE))
-        .unwrap()
-        .map(|r| r.unwrap().0)
-        .collect();
-    assert_eq!(all.len(), 500);
-    assert!(all.windows(2).all(|w| w[0] < w[1]));
-    assert_eq!(all.first().unwrap(), b"k0000");
-    assert_eq!(all.last().unwrap(), b"k0499");
-
-    let slice: Vec<Vec<u8>> = tree
-        .range(
-            Some(b"k0100"),
-            Some(b"k0200"),
-            &ReadVisibility::from_txn_id(TXN_NONE),
-        )
-        .unwrap()
-        .map(|r| r.unwrap().0)
-        .collect();
     assert_eq!(slice.len(), 100);
-    assert_eq!(slice.first().unwrap(), b"k0100");
-    assert_eq!(slice.last().unwrap(), b"k0199");
-    assert!(slice.windows(2).all(|w| w[0] < w[1]));
+    assert_eq!(
+        slice.first().unwrap(),
+        &(b"k0100".to_vec(), b"v0100".to_vec())
+    );
+    assert_eq!(
+        slice.last().unwrap(),
+        &(b"k0199".to_vec(), b"v0199".to_vec())
+    );
+    assert!(slice.windows(2).all(|window| window[0].0 < window[1].0));
+}
 
-    tree.checkpoint().unwrap();
+#[test]
+fn large_insert_batch_remains_readable_after_reopen() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("db");
 
-    drop(tree);
+    {
+        let conn = open_connection(&db_path, false);
+        let mut session = conn.open_session();
+        create_table(&mut session);
+        checkpoint(&mut session);
 
-    let mut tree2 = open_tree(&path).unwrap();
-    let slice2: Vec<Vec<u8>> = tree2
-        .range(
-            Some(b"k0100"),
-            Some(b"k0200"),
-            &ReadVisibility::from_txn_id(TXN_NONE),
-        )
-        .unwrap()
-        .map(|r| r.unwrap().0)
-        .collect();
-    assert_eq!(slice2, slice);
+        for i in 0..800u32 {
+            let key = format!("k{i:04}");
+            insert_table_row(&session, key.as_bytes(), &vec![b'v'; 64]);
+        }
+        checkpoint(&mut session);
+    }
+
+    let conn = open_connection(&db_path, false);
+    let session = conn.open_session();
+    let all = scan_table_range(&session, None, None);
+    assert_eq!(all.len(), 800);
+    assert_eq!(all.first().unwrap().0, b"k0000".to_vec());
+    assert_eq!(all.last().unwrap().0, b"k0799".to_vec());
 }

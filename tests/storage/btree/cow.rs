@@ -1,42 +1,49 @@
 use tempfile::tempdir;
 
-use wrongodb::{BlockFile, LeafPage, ReadVisibility, TXN_NONE};
-
-use super::create_tree;
+use super::{
+    checkpoint, create_table, get_table_row, insert_table_row, open_connection, update_table_row,
+};
 
 #[test]
-fn cow_put_preserves_old_root_leaf() {
+fn uncheckpointed_update_does_not_replace_the_stable_value_on_reopen_without_wal() {
     let tmp = tempdir().unwrap();
-    let path = tmp.path().join("btree_cow.wt");
+    let db_path = tmp.path().join("db");
 
-    let mut tree = create_tree(&path, 512).unwrap();
+    {
+        let conn = open_connection(&db_path, false);
+        let mut session = conn.open_session();
+        create_table(&mut session);
+        checkpoint(&mut session);
+        insert_table_row(&session, b"alpha", b"one");
+        checkpoint(&mut session);
 
-    let bf = BlockFile::open(&path).unwrap();
-    let old_root = bf.root_block_id();
-    bf.close().unwrap();
+        update_table_row(&session, b"alpha", b"two");
+        assert_eq!(get_table_row(&session, b"alpha"), Some(b"two".to_vec()));
+    }
 
-    let key = b"alpha";
-    let value = b"value";
-    tree.put(key, value).unwrap();
-    assert_eq!(
-        tree.get(key, &ReadVisibility::from_txn_id(TXN_NONE)).unwrap().unwrap(),
-        value
-    );
+    let conn = open_connection(&db_path, false);
+    let session = conn.open_session();
+    assert_eq!(get_table_row(&session, b"alpha"), Some(b"one".to_vec()));
+}
 
-    let mut bf_before = BlockFile::open(&path).unwrap();
-    let mut old_payload = bf_before.read_block(old_root, true).unwrap();
-    let old_leaf = LeafPage::open(&mut old_payload).unwrap();
-    assert!(old_leaf.get(key).unwrap().is_none());
-    bf_before.close().unwrap();
+#[test]
+fn checkpointed_update_replaces_the_stable_value_on_reopen_without_wal() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("db");
 
-    tree.checkpoint().unwrap();
+    {
+        let conn = open_connection(&db_path, false);
+        let mut session = conn.open_session();
+        create_table(&mut session);
+        checkpoint(&mut session);
+        insert_table_row(&session, b"alpha", b"one");
+        checkpoint(&mut session);
 
-    let mut bf2 = BlockFile::open(&path).unwrap();
-    let new_root = bf2.root_block_id();
-    assert_ne!(new_root, old_root);
+        update_table_row(&session, b"alpha", b"two");
+        checkpoint(&mut session);
+    }
 
-    let mut new_payload = bf2.read_block(new_root, true).unwrap();
-    let new_leaf = LeafPage::open(&mut new_payload).unwrap();
-    assert_eq!(new_leaf.get(key).unwrap().unwrap(), value);
-    bf2.close().unwrap();
+    let conn = open_connection(&db_path, false);
+    let session = conn.open_session();
+    assert_eq!(get_table_row(&session, b"alpha"), Some(b"two".to_vec()));
 }
