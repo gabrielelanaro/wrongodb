@@ -16,7 +16,7 @@ It is a learning resource, a playground, and a documentation of the path from "n
 
 ## Current State
 
-A learning-oriented MongoDB-compatible database in Rust, inspired by WiredTiger's architecture.
+A learning-oriented single-node MongoDB-compatible database in Rust, inspired by WiredTiger's architecture.
 
 ### Storage Engine
 - **B+tree storage**: Fixed-size paged files with slotted leaf/internal pages, arbitrary height, splits, range scans
@@ -25,16 +25,13 @@ A learning-oriented MongoDB-compatible database in Rust, inspired by WiredTiger'
 - **WAL (Write-Ahead Logging)**: Global WAL with LSNs, CRC32 checksums, change-vector logging, recovery replay
 - **MVCC/Transactions**: Global transaction state, snapshot isolation, version chains, commit/abort
 
-### Replication
-- **RAFT**: Multi-node distributed consensus for replicated writes
-
 ### API
-- `Connection`/`Session`/`Cursor` low-level storage API
-- Transaction-scoped reads/writes via `Session::transaction()`
+- `Connection`/`Session`/`TableCursor` low-level storage API
+- Explicit transaction scopes via `Session::with_transaction()`
 - MongoDB wire protocol server (works with `mongosh`)
 
-`Cursor` is intentionally a local/store-level API. In clustered RAFT mode, replicated writes go
-through the server/internal collection write path, not through low-level cursor writes.
+`TableCursor` is intentionally a local/store-level API. Document semantics, collection catalog state,
+and index creation live above it in the server/document layer.
 
 ### Future Work
 - Background maintenance: space reuse, compaction, compression
@@ -42,22 +39,17 @@ through the server/internal collection write path, not through low-level cursor 
 
 ## Source Layout
 
-The codebase is organized by domain to keep storage, server, and replication concerns separate:
+The codebase is organized by domain to keep storage, catalog, and server concerns separate:
 
-- `src/api/`: connection/session/cursor APIs and handle cache
+- `src/storage/`: storage API, metadata store, B+tree, page store, WAL, recovery, and checkpoints
+- `src/catalog/`: durable collection catalog stored above the storage metadata layer
+- `src/api/`: server-side context above the storage API
 - `src/core/`: shared types/utilities (BSON codec, document helpers, errors)
-- `src/storage/`: on-disk storage (block file, B-tree, WAL, main table)
 - `src/index/`: secondary index implementation and key encoding
-- `src/durability/`: WAL and durability backend
-- `src/txn/`: global transaction state, MVCC, recovery units
-- `src/raft/`: RAFT replication implementation
-- `src/recovery/`: recovery manager for crash recovery
-- `src/schema/`: schema catalog and metadata
-- `src/document_ops/`: document-level operations
+- `src/txn/`: global transaction state, snapshot visibility, and transaction runtime
 - `src/collection_write_path.rs`: internal Mongo-style document/index write orchestration
 - `src/document_query.rs`: internal document/query helpers used by the server path
-- `src/store_write_path.rs`: store-level write path
-- `src/server/`: MongoDB wire-protocol server and command handlers
+- `src/server/`: MongoDB wire-protocol server, command handlers, and startup reconciliation
 - `src/bin/`: server binary entry point
 
 Integration tests are grouped under `tests/`:
@@ -71,10 +63,13 @@ See the `examples/` directory for additional standalone programs demonstrating r
 ## Documentation
 
 See the [docs/](docs/) directory for detailed architecture documentation:
-- [Server Usage](docs/server.md): running the MongoDB-compatible server
+- [Documentation Index](docs/README.md): entry point for maintained docs
+- [Architecture Overview](docs/architecture/overview.md): current layer map and subsystem boundaries
+- [Storage Engine](docs/architecture/storage-engine.md): storage metadata, B+tree/page/block stack, checkpointing, and recovery
+- [Server Stack](docs/architecture/server-stack.md): server-layer services, durable catalog, read path, and write path
+- [Command And Query Capabilities](docs/architecture/command-query-capabilities.md): implemented MongoDB commands, query behavior, and current limits
+- [Architecture Guidelines](docs/architecture/guidelines.md): rules for keeping architecture docs current
 - [Design Decisions](docs/decisions.md): recorded architectural decisions
-- [MVCC Proposal](docs/mvcc_proposal.md): multi-version concurrency design
-- [Global WAL Architecture](docs/global_wal_architecture.md): write-ahead logging design
 
 ## Install
 
@@ -96,17 +91,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Open connection (WAL enabled by default)
     let conn = Connection::open("data/db", ConnectionConfig::default())?;
     let mut session = conn.open_session();
-    session.create("table:test")?;
+    session.create_table("table:test", Vec::new())?;
 
     // Execute one transactional write unit
-    let mut write_unit = session.transaction()?;
-    let mut cursor = write_unit.open_cursor("table:test")?;
-    cursor.insert(b"alice", b"age=30")?;
-    cursor.insert(b"bob", b"age=25")?;
-    write_unit.commit()?;
+    session.with_transaction(|session| {
+        let mut cursor = session.open_table_cursor("table:test")?;
+        cursor.insert(b"alice", b"age=30")?;
+        cursor.insert(b"bob", b"age=25")?;
+        Ok(())
+    })?;
 
     // Read back values
-    let mut cursor = session.open_cursor("table:test")?;
+    let mut cursor = session.open_table_cursor("table:test")?;
     println!("{:?}", cursor.get(b"alice")?);
     println!("{:?}", cursor.get(b"bob")?);
     Ok(())
@@ -114,13 +110,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Schema objects are URI-based at the low-level API:
-- `session.create("table:users")?`
+- `session.create_table("table:users", Vec::new())?`
 
 Index creation is handled by the Mongo-style internal write/schema path rather than the
 WT-style public `Session` API.
 
 #### As a Server
-For interactive usage with mongosh, see [Server Documentation](docs/server.md).
+For server architecture and command-layer structure, see [Server Stack](docs/architecture/server-stack.md).
 
 Run the server directly:
 

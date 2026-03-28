@@ -1,5 +1,23 @@
 # Decisions
 
+## 2026-03-28: Make `docs/architecture/` the maintained source of truth for architecture
+
+**Decision**
+- Add `docs/README.md` as the documentation entry point.
+- Add `docs/architecture/` for current-state architecture docs, split into:
+  - overview and layer map
+  - storage engine
+  - server stack
+  - maintenance guidelines
+- Keep `docs/decisions.md` as the dated rationale log.
+- Treat `NOTES.md`, `notebooks/`, and `blog/` as secondary historical or investigative material rather than the maintained architecture source of truth.
+- Remove broken and stale architecture references from `README.md`.
+
+**Why**
+- The repo had useful architecture information, but it was spread across stale README prose, notes, blog posts, and code comments.
+- The README had already drifted enough to reference missing docs and removed module paths.
+- A stable documentation home makes it easier to evolve the architecture without forcing readers to reconstruct the current system from historical material.
+
 ## 2026-03-22: Keep raw catalog storage free of session bootstrap calls
 
 **Decision**
