@@ -1,5 +1,7 @@
 # WrongoDB
 
+Last updated: `2026-03-28`
+
 The database that teaches you how databases work by doing everything wrong first, then fixing it.
 
 <p align="center">
