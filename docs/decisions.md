@@ -1,5 +1,29 @@
 # Decisions
 
+## 2026-03-28: Add a reserved on-disk history store and order version keys newest-first
+
+**Decision**
+- Add `history.wt` as reserved store id `1`, outside `metadata.wt` catalog rows.
+- Write historical versions into `history.wt` during reconciliation through a thin `HistoryStore`
+  wrapper around a normal `BTreeCursor`.
+- Encode history keys as `(store_id, user_key, start_ts)` with the timestamp stored in descending
+  lexical order so a forward scan over one key sees newest history first.
+- Keep history-store writes non-transactional and checkpoint the history store after user-store
+  reconciliation, because reconciliation is already the authority that decides which committed
+  versions become base rows and which become history.
+- Rebuild `history.wt` during WAL recovery by replaying user stores and then running the same
+  reconciliation-driven checkpoint flow, instead of logging history-store writes separately.
+
+**Why**
+- Historical versions were previously lost once reconciliation materialized the newest committed
+  value into the base page and pruned the older chain entries.
+- A reserved store keeps the mechanism internal to storage and avoids leaking history semantics into
+  the session or transaction APIs.
+- Newest-first ordering matches the common lookup path for "most recent older version" and avoids a
+  reverse scan requirement in the initial implementation.
+- Rebuilding history from replayed user-store state keeps one source of truth for version placement
+  while deferring history-store WAL logging to a later phase.
+
 ## 2026-03-28: Make `docs/architecture/` the maintained source of truth for architecture
 
 **Decision**

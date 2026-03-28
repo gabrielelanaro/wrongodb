@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::core::errors::StorageError;
 use crate::storage::btree::BTreeCursor;
+use crate::storage::history::HistoryStore;
 use crate::storage::mvcc::ReconcileStats;
 use crate::storage::page_store::{BlockFilePageStore, Page, PageStore};
 use crate::storage::reserved_store::StoreId;
@@ -245,18 +246,24 @@ pub(crate) fn apply_delete_autocommit(
 pub(crate) fn checkpoint_store(
     btree: &mut BTreeCursor,
     global_txn: &GlobalTxnState,
+    store_id: StoreId,
+    history_store: Option<&mut HistoryStore>,
 ) -> Result<(), WrongoDBError> {
-    let _ = reconcile_for_checkpoint(btree, global_txn)?;
+    let _ = reconcile_for_checkpoint(btree, global_txn, store_id, history_store)?;
     btree.checkpoint()
 }
 
 pub(crate) fn reconcile_for_checkpoint(
     btree: &mut BTreeCursor,
     global_txn: &GlobalTxnState,
+    store_id: StoreId,
+    history_store: Option<&mut HistoryStore>,
 ) -> Result<ReconcileStats, WrongoDBError> {
     btree.reconcile_page_local_updates(
         global_txn.gc_threshold(),
         !global_txn.has_active_transactions(),
+        store_id,
+        history_store,
     )
 }
 
@@ -284,8 +291,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::storage::history::HistoryStore;
     use crate::storage::mvcc::ReconcileStats;
-    use crate::storage::reserved_store::FIRST_DYNAMIC_STORE_ID;
+    use crate::storage::reserved_store::{FIRST_DYNAMIC_STORE_ID, HS_STORE_NAME};
     use crate::txn::{GlobalTxnState, Transaction, TxnLogOp, TXN_NONE};
 
     const TEST_STORE_ID: StoreId = FIRST_DYNAMIC_STORE_ID;
@@ -326,7 +334,8 @@ mod tests {
             Some(b"v1".to_vec())
         );
 
-        let stats = reconcile_for_checkpoint(&mut btree, global_txn.as_ref()).unwrap();
+        let stats =
+            reconcile_for_checkpoint(&mut btree, global_txn.as_ref(), TEST_STORE_ID, None).unwrap();
         assert_eq!(
             stats,
             ReconcileStats {
@@ -340,7 +349,8 @@ mod tests {
             Some(b"v1".to_vec())
         );
 
-        let second_pass = reconcile_for_checkpoint(&mut btree, global_txn.as_ref()).unwrap();
+        let second_pass =
+            reconcile_for_checkpoint(&mut btree, global_txn.as_ref(), TEST_STORE_ID, None).unwrap();
         assert_eq!(second_pass, ReconcileStats::default());
     }
 
@@ -363,7 +373,8 @@ mod tests {
             .unwrap();
         second_writer.commit(global_txn.as_ref()).unwrap();
 
-        let stats = reconcile_for_checkpoint(&mut btree, global_txn.as_ref()).unwrap();
+        let stats =
+            reconcile_for_checkpoint(&mut btree, global_txn.as_ref(), TEST_STORE_ID, None).unwrap();
         assert_eq!(
             stats,
             ReconcileStats {
@@ -383,7 +394,8 @@ mod tests {
 
         reader.commit(global_txn.as_ref()).unwrap();
 
-        let second_pass = reconcile_for_checkpoint(&mut btree, global_txn.as_ref()).unwrap();
+        let second_pass =
+            reconcile_for_checkpoint(&mut btree, global_txn.as_ref(), TEST_STORE_ID, None).unwrap();
         assert_eq!(
             second_pass,
             ReconcileStats {
@@ -409,7 +421,8 @@ mod tests {
         assert!(deleted);
         txn.commit(global_txn.as_ref()).unwrap();
 
-        let stats = reconcile_for_checkpoint(&mut btree, global_txn.as_ref()).unwrap();
+        let stats =
+            reconcile_for_checkpoint(&mut btree, global_txn.as_ref(), TEST_STORE_ID, None).unwrap();
         assert_eq!(
             stats,
             ReconcileStats {
@@ -419,6 +432,131 @@ mod tests {
             }
         );
         assert_eq!(get_version(&mut btree, b"k1", TXN_NONE).unwrap(), None);
+    }
+
+    #[test]
+    fn reconcile_moves_older_committed_versions_into_history_store() {
+        let (tmp, global_txn, mut btree) = open_store("table.idx.wt");
+        let mut history_store =
+            HistoryStore::open_or_create(tmp.path().join(HS_STORE_NAME)).unwrap();
+
+        let mut txn1 = global_txn.begin_snapshot_txn();
+        let ts1 = txn1.id();
+        btree.put(TEST_STORE_ID, b"k1", b"v1", &mut txn1).unwrap();
+        txn1.commit(global_txn.as_ref()).unwrap();
+
+        let mut txn2 = global_txn.begin_snapshot_txn();
+        let ts2 = txn2.id();
+        btree.put(TEST_STORE_ID, b"k1", b"v2", &mut txn2).unwrap();
+        txn2.commit(global_txn.as_ref()).unwrap();
+
+        let mut txn3 = global_txn.begin_snapshot_txn();
+        let ts3 = txn3.id();
+        btree.put(TEST_STORE_ID, b"k1", b"v3", &mut txn3).unwrap();
+        txn3.commit(global_txn.as_ref()).unwrap();
+
+        let stats = reconcile_for_checkpoint(
+            &mut btree,
+            global_txn.as_ref(),
+            TEST_STORE_ID,
+            Some(&mut history_store),
+        )
+        .unwrap();
+
+        assert_eq!(
+            stats,
+            ReconcileStats {
+                materialized_entries: 1,
+                obsolete_updates_removed: 2,
+                chains_dropped: 1,
+            }
+        );
+        assert_eq!(
+            get_version(&mut btree, b"k1", TXN_NONE).unwrap(),
+            Some(b"v3".to_vec())
+        );
+        assert_eq!(
+            history_store
+                .find_version(TEST_STORE_ID, b"k1", ts1)
+                .unwrap(),
+            Some(crate::storage::history::HistoryEntry {
+                store_id: TEST_STORE_ID,
+                key: b"k1".to_vec(),
+                start_ts: ts1,
+                stop_ts: ts2,
+                update_type: crate::storage::mvcc::UpdateType::Standard,
+                data: b"v1".to_vec(),
+            })
+        );
+        assert_eq!(
+            history_store
+                .find_version(TEST_STORE_ID, b"k1", ts2)
+                .unwrap(),
+            Some(crate::storage::history::HistoryEntry {
+                store_id: TEST_STORE_ID,
+                key: b"k1".to_vec(),
+                start_ts: ts2,
+                stop_ts: ts3,
+                update_type: crate::storage::mvcc::UpdateType::Standard,
+                data: b"v2".to_vec(),
+            })
+        );
+        assert_eq!(
+            history_store
+                .find_version(TEST_STORE_ID, b"k1", ts3)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn checkpoint_persists_history_store_entries_on_reopen() {
+        let (tmp, global_txn, mut btree) = open_store("table.idx.wt");
+        let history_path = tmp.path().join(HS_STORE_NAME);
+        let mut history_store = HistoryStore::open_or_create(&history_path).unwrap();
+
+        let mut txn1 = global_txn.begin_snapshot_txn();
+        let ts1 = txn1.id();
+        btree.put(TEST_STORE_ID, b"k1", b"v1", &mut txn1).unwrap();
+        txn1.commit(global_txn.as_ref()).unwrap();
+
+        let mut txn2 = global_txn.begin_snapshot_txn();
+        let ts2 = txn2.id();
+        btree.put(TEST_STORE_ID, b"k1", b"v2", &mut txn2).unwrap();
+        txn2.commit(global_txn.as_ref()).unwrap();
+
+        checkpoint_store(
+            &mut btree,
+            global_txn.as_ref(),
+            TEST_STORE_ID,
+            Some(&mut history_store),
+        )
+        .unwrap();
+        history_store.checkpoint(global_txn.as_ref()).unwrap();
+
+        drop(history_store);
+        drop(btree);
+
+        let mut reopened_history_store = HistoryStore::open_or_create(&history_path).unwrap();
+        let mut reopened_btree = open_or_create_btree(tmp.path().join("table.idx.wt")).unwrap();
+
+        assert_eq!(
+            get_version(&mut reopened_btree, b"k1", TXN_NONE).unwrap(),
+            Some(b"v2".to_vec())
+        );
+        assert_eq!(
+            reopened_history_store
+                .find_version(TEST_STORE_ID, b"k1", ts1)
+                .unwrap(),
+            Some(crate::storage::history::HistoryEntry {
+                store_id: TEST_STORE_ID,
+                key: b"k1".to_vec(),
+                start_ts: ts1,
+                stop_ts: ts2,
+                update_type: crate::storage::mvcc::UpdateType::Standard,
+                data: b"v1".to_vec(),
+            })
+        );
     }
 
     #[test]

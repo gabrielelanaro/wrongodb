@@ -519,13 +519,24 @@ impl MetadataStore {
 
     pub(crate) fn all_store_names(&self) -> Result<Vec<String>, WrongoDBError> {
         let mut store_names = self
-            .scan_prefix(FILE_URI_PREFIX)?
+            .all_stores_with_id()?
             .into_iter()
-            .map(|entry| entry.file_name().map(str::to_string))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|(_, store_name)| store_name)
+            .collect::<Vec<_>>();
         store_names.sort();
         store_names.dedup();
         Ok(store_names)
+    }
+
+    pub(crate) fn all_stores_with_id(&self) -> Result<Vec<(StoreId, String)>, WrongoDBError> {
+        let mut stores = self
+            .scan_prefix(FILE_URI_PREFIX)?
+            .into_iter()
+            .map(|entry| Ok((entry.store_id()?, entry.file_name()?.to_string())))
+            .collect::<Result<Vec<_>, WrongoDBError>>()?;
+        stores.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
+        stores.dedup();
+        Ok(stores)
     }
 
     // ------------------------------------------------------------------------

@@ -7,8 +7,11 @@ use parking_lot::RwLock;
 use crate::core::errors::StorageError;
 use crate::storage::btree::BTreeCursor;
 use crate::storage::handle_cache::HandleCache;
+use crate::storage::history::HistoryStore;
 use crate::storage::metadata_store::{MetadataStore, FILE_URI_PREFIX};
-use crate::storage::reserved_store::{reserved_store_name_for_id, StoreId, METADATA_STORE_ID};
+use crate::storage::reserved_store::{
+    reserved_store_name_for_id, StoreId, METADATA_STORE_ID, METADATA_STORE_NAME,
+};
 use crate::storage::table::{checkpoint_store, open_or_create_btree};
 use crate::storage::wal::{RecoveryError, WalReader, WalRecord};
 use crate::txn::{GlobalTxnState, Transaction, TxnId, TxnLogOp};
@@ -28,10 +31,11 @@ struct CommittedTransaction {
 /// Recovery stops when it reaches a corrupted tail record. That treats a torn
 /// final WAL write as end-of-log, which lets startup proceed after a crash that
 /// interrupted the last append.
-pub(crate) fn recover_from_wal(
+pub(in crate::storage) fn recover_from_wal(
     base_path: &Path,
     metadata_store: &MetadataStore,
     store_handles: &StoreHandleCache,
+    history_store: &mut HistoryStore,
     global_txn: &GlobalTxnState,
     mut reader: impl WalReader,
 ) -> Result<(), WrongoDBError> {
@@ -47,7 +51,13 @@ pub(crate) fn recover_from_wal(
         &transactions,
     )?;
 
-    checkpoint_recovered_stores(store_handles, global_txn)?;
+    checkpoint_recovered_stores(
+        base_path,
+        metadata_store,
+        store_handles,
+        history_store,
+        global_txn,
+    )?;
     Ok(())
 }
 
@@ -134,13 +144,50 @@ fn apply_committed_transaction(
 }
 
 fn checkpoint_recovered_stores(
+    base_path: &Path,
+    metadata_store: &MetadataStore,
     store_handles: &StoreHandleCache,
+    history_store: &mut HistoryStore,
     global_txn: &GlobalTxnState,
 ) -> Result<(), WrongoDBError> {
-    for store in store_handles.all_handles() {
-        checkpoint_store(&mut store.write(), global_txn)?;
+    global_txn.begin_checkpoint();
+
+    let checkpoint_result = checkpoint_recovered_store_handles(
+        base_path,
+        metadata_store,
+        store_handles,
+        history_store,
+        global_txn,
+    );
+
+    global_txn.end_checkpoint();
+    checkpoint_result
+}
+
+fn checkpoint_recovered_store_handles(
+    base_path: &Path,
+    metadata_store: &MetadataStore,
+    store_handles: &StoreHandleCache,
+    history_store: &mut HistoryStore,
+    global_txn: &GlobalTxnState,
+) -> Result<(), WrongoDBError> {
+    checkpoint_store(
+        &mut open_store_by_name(base_path, store_handles, METADATA_STORE_NAME)?.write(),
+        global_txn,
+        METADATA_STORE_ID,
+        None,
+    )?;
+
+    for (store_id, store_name) in metadata_store.all_stores_with_id()? {
+        checkpoint_store(
+            &mut open_store_by_name(base_path, store_handles, &store_name)?.write(),
+            global_txn,
+            store_id,
+            Some(&mut *history_store),
+        )?;
     }
-    Ok(())
+
+    history_store.checkpoint(global_txn)
 }
 
 fn next_committed_transaction(
@@ -261,10 +308,13 @@ mod tests {
     use crate::storage::api::{Connection, ConnectionConfig};
     use crate::storage::btree::BTreeCursor;
     use crate::storage::handle_cache::HandleCache;
+    use crate::storage::history::HistoryStore;
     use crate::storage::log_manager::LogManager;
     use crate::storage::metadata_store::MetadataStore;
     use crate::storage::recovery::recover_from_wal;
-    use crate::storage::reserved_store::{StoreId, FIRST_DYNAMIC_STORE_ID, METADATA_STORE_ID};
+    use crate::storage::reserved_store::{
+        StoreId, FIRST_DYNAMIC_STORE_ID, HS_STORE_NAME, METADATA_STORE_ID,
+    };
     use crate::storage::table::{get_version, open_or_create_btree};
     use crate::storage::wal::{
         LogFile, Lsn, RecoveryError, WalFileReader, WalReader, WalRecord, WalRecordHeader,
@@ -354,11 +404,14 @@ mod tests {
             )
             .unwrap(),
         );
+        let mut history_store =
+            HistoryStore::open_or_create(base_path.join(HS_STORE_NAME)).unwrap();
         let reader = WalFileReader::open(base_path.join("global.wal")).unwrap();
         recover_from_wal(
             base_path,
             metadata_store.as_ref(),
             store_handles.as_ref(),
+            &mut history_store,
             global_txn.as_ref(),
             reader,
         )

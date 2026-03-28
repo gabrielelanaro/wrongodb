@@ -1,11 +1,5 @@
-use crate::core::errors::{StorageError, WrongoDBError};
-use crate::storage::mvcc::{
-    ReconcileStats, Update, UpdateChain, UpdateHandle, UpdateType,
-};
-use crate::storage::page_store::{Page, PageEdit, PageRead, PageStore, PageType, RowInsert};
-use crate::storage::reserved_store::StoreId;
-use crate::txn::{ReadVisibility, Transaction, TxnId};
 use super::internal_ops::put_separator as put_internal_separator;
+use super::iter::BTreeRangeIter;
 use super::layout::{
     build_internal_page, internal_entries, leaf_entries, map_leaf_err, split_internal_entries,
     split_leaf_entries,
@@ -15,8 +9,13 @@ use super::leaf_ops::{
 };
 use super::page::{InternalPage, LeafPage, LeafPageError};
 use super::search::{child_for_key, search_leaf};
-use super::iter::BTreeRangeIter;
-use super::{visible_chain_value, LeafEntries, KeyChildId};
+use super::{visible_chain_value, KeyChildId, LeafEntries};
+use crate::core::errors::{StorageError, WrongoDBError};
+use crate::storage::history::{HistoryEntry, HistoryStore};
+use crate::storage::mvcc::{ReconcileStats, Update, UpdateChain, UpdateHandle, UpdateType};
+use crate::storage::page_store::{Page, PageEdit, PageRead, PageStore, PageType, RowInsert};
+use crate::storage::reserved_store::StoreId;
+use crate::txn::{ReadVisibility, Transaction, TxnId};
 
 // ============================================================================
 // Type Aliases (local to cursor module)
@@ -70,6 +69,19 @@ struct LeafPosition {
     page_id: u64,
     index: usize,
     found: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReconcileContext {
+    oldest_active_txn_id: TxnId,
+    no_active_txns: bool,
+    store_id: StoreId,
+}
+
+#[derive(Debug, Default)]
+struct ReconcileAccumulator {
+    entries: ReconcileEntries,
+    stats: ReconcileStats,
 }
 
 // ============================================================================
@@ -308,27 +320,27 @@ impl BTreeCursor {
         Ok(update_handle)
     }
 
-    pub(crate) fn reconcile_page_local_updates(
+    pub(in crate::storage) fn reconcile_page_local_updates(
         &mut self,
         oldest_active_txn_id: TxnId,
         no_active_txns: bool,
+        store_id: StoreId,
+        history_store: Option<&mut HistoryStore>,
     ) -> Result<ReconcileStats, WrongoDBError> {
         let root = self.page_store.root_page_id();
         if root == NONE_PAGE_ID {
             return Ok(ReconcileStats::default());
         }
 
-        let mut entries = Vec::new();
-        let mut stats = ReconcileStats::default();
-        self.collect_page_local_entries(
-            root,
+        let context = ReconcileContext {
             oldest_active_txn_id,
             no_active_txns,
-            &mut entries,
-            &mut stats,
-        )?;
+            store_id,
+        };
+        let mut reconcile = ReconcileAccumulator::default();
+        self.collect_page_local_entries(root, context, history_store, &mut reconcile)?;
 
-        for (key, update_type, data) in entries {
+        for (key, update_type, data) in reconcile.entries {
             match update_type {
                 UpdateType::Standard => self.write_base_row(&key, &data)?,
                 UpdateType::Tombstone => {
@@ -338,7 +350,7 @@ impl BTreeCursor {
             }
         }
 
-        Ok(stats)
+        Ok(reconcile.stats)
     }
 
     fn find_leaf_position(&mut self, key: &[u8]) -> Result<LeafPosition, WrongoDBError> {
@@ -387,10 +399,9 @@ impl BTreeCursor {
     fn collect_page_local_entries(
         &mut self,
         node_id: u64,
-        oldest_active_txn_id: TxnId,
-        no_active_txns: bool,
-        entries: &mut ReconcileEntries,
-        stats: &mut ReconcileStats,
+        context: ReconcileContext,
+        mut history_store: Option<&mut HistoryStore>,
+        reconcile: &mut ReconcileAccumulator,
     ) -> Result<(), WrongoDBError> {
         let pin = self.page_store.pin_page(node_id)?;
         let children = {
@@ -400,10 +411,9 @@ impl BTreeCursor {
                     let page = self.page_store.get_page_mut(&pin);
                     collect_leaf_page_local_entries(
                         page,
-                        oldest_active_txn_id,
-                        no_active_txns,
-                        entries,
-                        stats,
+                        context,
+                        history_store.as_deref_mut(),
+                        reconcile,
                     )?;
                     Vec::new()
                 }
@@ -427,10 +437,9 @@ impl BTreeCursor {
         for child_id in children {
             self.collect_page_local_entries(
                 child_id,
-                oldest_active_txn_id,
-                no_active_txns,
-                entries,
-                stats,
+                context,
+                history_store.as_deref_mut(),
+                reconcile,
             )?;
         }
 
@@ -715,10 +724,9 @@ fn prepend_update(chain: &mut UpdateChain, update: Update) -> UpdateHandle {
 
 fn collect_leaf_page_local_entries(
     page: &mut Page,
-    oldest_active_txn_id: TxnId,
-    no_active_txns: bool,
-    entries: &mut ReconcileEntries,
-    stats: &mut ReconcileStats,
+    context: ReconcileContext,
+    mut history_store: Option<&mut HistoryStore>,
+    reconcile: &mut ReconcileAccumulator,
 ) -> Result<(), WrongoDBError> {
     let leaf = LeafPage::open(page).map_err(|e| StorageError(format!("corrupt leaf page: {e}")))?;
     let slot_keys = (0..leaf.slot_count())
@@ -738,16 +746,15 @@ fn collect_leaf_page_local_entries(
             continue;
         };
         record_chain_reconcile(
-            slot_keys[index].clone(),
+            &slot_keys[index],
             chain,
-            oldest_active_txn_id,
-            no_active_txns,
-            entries,
-            stats,
-        );
+            context,
+            history_store.as_deref_mut(),
+            reconcile,
+        )?;
         if chain.is_empty() {
             *slot = None;
-            stats.chains_dropped += 1;
+            reconcile.stats.chains_dropped += 1;
         }
     }
 
@@ -757,16 +764,15 @@ fn collect_leaf_page_local_entries(
             let key = bucket[index].key().to_vec();
             let chain = bucket[index].updates_mut();
             record_chain_reconcile(
-                key,
+                &key,
                 chain,
-                oldest_active_txn_id,
-                no_active_txns,
-                entries,
-                stats,
-            );
+                context,
+                history_store.as_deref_mut(),
+                reconcile,
+            )?;
             if chain.is_empty() {
                 bucket.remove(index);
-                stats.chains_dropped += 1;
+                reconcile.stats.chains_dropped += 1;
             } else {
                 index += 1;
             }
@@ -783,20 +789,78 @@ fn collect_leaf_page_local_entries(
 }
 
 fn record_chain_reconcile(
-    key: Vec<u8>,
+    key: &[u8],
     chain: &mut UpdateChain,
-    oldest_active_txn_id: TxnId,
-    no_active_txns: bool,
-    entries: &mut ReconcileEntries,
-    stats: &mut ReconcileStats,
-) {
+    context: ReconcileContext,
+    history_store: Option<&mut HistoryStore>,
+    reconcile: &mut ReconcileAccumulator,
+) -> Result<(), WrongoDBError> {
     if let Some((update_type, data)) = chain.latest_committed_entry() {
-        entries.push((key, update_type, data));
-        stats.materialized_entries += 1;
+        reconcile.entries.push((key.to_vec(), update_type, data));
+        reconcile.stats.materialized_entries += 1;
     }
 
-    stats.obsolete_updates_removed += chain.truncate_obsolete(oldest_active_txn_id);
-    let _ = chain.clear_if_materialized_current(no_active_txns);
+    if let Some(history_store) = history_store {
+        let _ = save_obsolete_to_history(
+            chain,
+            context.store_id,
+            key,
+            context.oldest_active_txn_id,
+            history_store,
+        )?;
+    }
+
+    reconcile.stats.obsolete_updates_removed +=
+        chain.truncate_obsolete(context.oldest_active_txn_id);
+    let _ = chain.clear_if_materialized_current(context.no_active_txns);
+    Ok(())
+}
+
+/// Save committed versions that are older than the reconciled base image.
+///
+/// The first committed entry in the chain becomes the reconciled base row and
+/// is therefore excluded here. Every later committed entry is persisted into
+/// the history store before reconciliation prunes the in-memory chain. That
+/// preserves the invariant that each committed version lives in exactly one
+/// place after reconciliation finishes.
+fn save_obsolete_to_history(
+    chain: &UpdateChain,
+    store_id: StoreId,
+    key: &[u8],
+    _oldest_active_txn_id: TxnId,
+    history_store: &mut HistoryStore,
+) -> Result<usize, WrongoDBError> {
+    let mut saved = 0;
+    let mut skipped_latest_committed = false;
+
+    for update_ref in chain.iter() {
+        let update = update_ref.read();
+        if !update.is_committed() {
+            continue;
+        }
+
+        match update.type_ {
+            UpdateType::Reserve => continue,
+            UpdateType::Standard | UpdateType::Tombstone => {
+                if !skipped_latest_committed {
+                    skipped_latest_committed = true;
+                    continue;
+                }
+
+                history_store.save_version(&HistoryEntry {
+                    store_id,
+                    key: key.to_vec(),
+                    start_ts: update.time_window.start_ts,
+                    stop_ts: update.time_window.stop_ts,
+                    update_type: update.type_,
+                    data: update.data.clone(),
+                })?;
+                saved += 1;
+            }
+        }
+    }
+
+    Ok(saved)
 }
 
 fn upsert_entry(entries: &mut LeafEntries, key: &[u8], value: &[u8]) {

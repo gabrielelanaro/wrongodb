@@ -54,8 +54,4 @@ where
         handles.insert(key, handle.clone());
         Ok(handle)
     }
-
-    pub(crate) fn all_handles(&self) -> Vec<Arc<V>> {
-        self.handles_by_key.read().values().cloned().collect()
-    }
 }
