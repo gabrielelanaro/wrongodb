@@ -132,7 +132,7 @@ Current behavior:
 
 ## Query capabilities
 
-The read path is implemented in [`src/document_query.rs`](/Users/gabrielelanaro/workspace/wrongodb/src/document_query.rs).
+The read path is implemented in [`src/document_query.rs`](../../src/document_query.rs).
 
 ### Supported filter shape
 

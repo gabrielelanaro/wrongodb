@@ -85,7 +85,7 @@ Current behavior:
 - encodes storage rows
 - performs insert, update, and delete through the storage API
 - registers secondary indexes in both storage metadata and the durable collection catalog
-- triggers index build/backfill through `Session::create_index`
+- delegates index build/backfill to `CollectionCatalog::build_and_mark_index_ready`, which calls `Session::create_index`
 
 ## Current write layering
 

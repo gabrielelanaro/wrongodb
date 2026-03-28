@@ -135,8 +135,12 @@ impl CollectionWritePath {
 
     /// Creates one secondary index from the normalized server-side request.
     ///
-    /// If the durable catalog already knows about the index but it /// it is still
-    /// marked not-ready, this resumes the storage backfill and flips the    /// ready bit once the existing rows are copied into the secondary store.
+    /// If the durable catalog already knows about the index but it is still
+    /// marked not-ready, this resumes storage backfill and flips the ready bit
+    /// once the existing rows are copied into the secondary store.
+    ///
+    /// The actual backfill is delegated to
+    /// [`CollectionCatalog::build_and_mark_index_ready`].
     pub(crate) fn create_index(
         &self,
         session: &mut Session,

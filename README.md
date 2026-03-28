@@ -55,9 +55,9 @@ The codebase is organized by domain to keep storage, catalog, and server concern
 - `src/bin/`: server binary entry point
 
 Integration tests are grouped under `tests/`:
-- `tests/storage_suite.rs`: storage layer tests (`tests/storage/`)
-- `tests/connection_suite.rs`: connection API tests (`tests/connection/`)
-- `tests/public_api_*.rs`: public API surface tests and trybuild UI tests (`tests/ui/`)
+- `tests/storage_suite.rs`, `tests/connection_suite.rs`, and `tests/server_suite.rs`: suite entry points for `tests/storage/`, `tests/connection/`, and `tests/server/`
+- `tests/storage_cursor_write_path.rs`: focused storage cursor/write-path coverage
+- `tests/public_api_surface.rs`: public API surface checks
 - `tests/bench_wire_ab_smoke.rs`: wire protocol benchmark smoke tests
 
 See the `examples/` directory for additional standalone programs demonstrating recovery, checkpointing, and WAL behavior.
