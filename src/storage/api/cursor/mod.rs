@@ -4,7 +4,6 @@ mod table_cursor;
 pub use file_cursor::FileCursor;
 pub use table_cursor::TableCursor;
 
-
 /// A single key/value entry returned by [`TableCursor::next`].
 ///
 /// The public table cursor surface is deliberately key/value-shaped because it is the

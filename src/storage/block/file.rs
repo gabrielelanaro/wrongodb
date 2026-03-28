@@ -281,7 +281,10 @@ impl BlockFile {
     ///
     /// Creates a new file on disk with a valid header and empty extent lists.
     /// Fails if a non-empty file already exists at the path.
-    pub(in crate::storage) fn create<P: AsRef<Path>>(path: P, page_size: usize) -> Result<Self, WrongoDBError> {
+    pub(in crate::storage) fn create<P: AsRef<Path>>(
+        path: P,
+        page_size: usize,
+    ) -> Result<Self, WrongoDBError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -410,7 +413,10 @@ impl BlockFile {
     /// Advances to the next checkpoint slot with an incremented generation number,
     /// writes the updated header to disk, and updates the block manager's stable
     /// generation to enable reclaim of discarded extents.
-    pub(in crate::storage) fn set_root_block_id(&mut self, root_block_id: u64) -> Result<(), WrongoDBError> {
+    pub(in crate::storage) fn set_root_block_id(
+        &mut self,
+        root_block_id: u64,
+    ) -> Result<(), WrongoDBError> {
         let current_slot = self.active_checkpoint_slot;
         let next_slot = (current_slot + 1) % CHECKPOINT_SLOT_COUNT;
         let current_gen = self.header.checkpoint_slots[current_slot].generation;
@@ -471,7 +477,10 @@ impl BlockFile {
     ///
     /// Grows the file and adds the new blocks as a single extent to the avail
     /// list, avoiding fallocate/ftruncate in the allocation hot path.
-    pub(in crate::storage) fn preallocate_blocks(&mut self, blocks: u64) -> Result<(), WrongoDBError> {
+    pub(in crate::storage) fn preallocate_blocks(
+        &mut self,
+        blocks: u64,
+    ) -> Result<(), WrongoDBError> {
         if blocks == 0 {
             return Ok(());
         }
@@ -525,7 +534,11 @@ impl BlockFile {
     // ------------------------------------------------------------------------
 
     /// Read a block from disk, optionally verifying the checksum.
-    pub(in crate::storage) fn read_block(&mut self, block_id: u64, verify: bool) -> Result<Vec<u8>, WrongoDBError> {
+    pub(in crate::storage) fn read_block(
+        &mut self,
+        block_id: u64,
+        verify: bool,
+    ) -> Result<Vec<u8>, WrongoDBError> {
         let offset = block_id
             .checked_mul(self.page_size as u64)
             .ok_or_else(|| StorageError("block offset overflow".into()))?;
@@ -548,7 +561,11 @@ impl BlockFile {
     }
 
     /// Write a payload to a block, computing and storing the checksum.
-    pub(in crate::storage) fn write_block(&mut self, block_id: u64, payload: &[u8]) -> Result<(), WrongoDBError> {
+    pub(in crate::storage) fn write_block(
+        &mut self,
+        block_id: u64,
+        payload: &[u8],
+    ) -> Result<(), WrongoDBError> {
         if block_id == 0 {
             return Err(StorageError("block 0 is reserved for the header".into()).into());
         }

@@ -62,7 +62,9 @@ impl CollectionWritePath {
     ) -> Result<(), WrongoDBError> {
         validate_storage_columns(&storage_columns)?;
 
-        let (_, created) = self.catalog.create_collection(session, collection, &storage_columns)?;
+        let (_, created) = self
+            .catalog
+            .create_collection(session, collection, &storage_columns)?;
 
         if !created {
             return Err(StorageError(format!("collection already exists: {collection}")).into());
@@ -369,15 +371,15 @@ impl CollectionWritePath {
             MetadataEntry::index(collection, request.name(), vec![indexed_field.to_string()])
         });
 
-        if let Some(ready) = self
-            .catalog
-            .get_collection(session, collection)?
-            .and_then(|definition| {
-                definition
-                    .indexes()
-                    .get(request.name())
-                    .map(|index| index.ready())
-            })
+        if let Some(ready) =
+            self.catalog
+                .get_collection(session, collection)?
+                .and_then(|definition| {
+                    definition
+                        .indexes()
+                        .get(request.name())
+                        .map(|index| index.ready())
+                })
         {
             return Ok(IndexRegistration {
                 entry: metadata_entry,
@@ -541,11 +543,8 @@ mod tests {
         catalog.ensure_store_exists(&mut session).unwrap();
         catalog.load_cache(&session).unwrap();
         let document_query = DocumentQuery::new(catalog.clone());
-        let service = CollectionWritePath::new(
-            metadata_store,
-            catalog.clone(),
-            document_query.clone(),
-        );
+        let service =
+            CollectionWritePath::new(metadata_store, catalog.clone(), document_query.clone());
         (connection, service, document_query, catalog)
     }
 

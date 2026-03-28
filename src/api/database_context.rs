@@ -28,11 +28,8 @@ impl DatabaseContext {
         catalog.load_cache(&session)?;
 
         let document_query = DocumentQuery::new(catalog.clone());
-        let collection_write_path = CollectionWritePath::new(
-            metadata_store,
-            catalog.clone(),
-            document_query.clone(),
-        );
+        let collection_write_path =
+            CollectionWritePath::new(metadata_store, catalog.clone(), document_query.clone());
 
         Ok(Self {
             connection,

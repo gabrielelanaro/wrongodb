@@ -77,10 +77,7 @@ impl DocumentQuery {
         collection: &str,
         filter: Option<Value>,
     ) -> Result<Vec<Document>, WrongoDBError> {
-        let Some(collection_definition) = self
-            .catalog
-            .get_collection(session, collection)?
-        else {
+        let Some(collection_definition) = self.catalog.get_collection(session, collection)? else {
             return Ok(Vec::new());
         };
 
@@ -215,11 +212,8 @@ mod tests {
                 catalog.load_cache(&session).unwrap();
             }
             let query = DocumentQuery::new(catalog.clone());
-            let write_path = CollectionWritePath::new(
-                metadata_store,
-                catalog.clone(),
-                query.clone(),
-            );
+            let write_path =
+                CollectionWritePath::new(metadata_store, catalog.clone(), query.clone());
 
             Self {
                 connection,

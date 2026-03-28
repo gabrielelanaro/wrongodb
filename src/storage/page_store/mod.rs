@@ -4,8 +4,8 @@ mod store;
 mod traits;
 mod types;
 
-pub(in crate::storage) use page::{PageError, PageType, RowInsert};
 pub(crate) use page::Page;
+pub(in crate::storage) use page::{PageError, PageType, RowInsert};
 pub(in crate::storage) use store::BlockFilePageStore;
 pub(crate) use traits::{PageRead, PageStore};
 #[cfg(test)]

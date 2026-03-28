@@ -8,7 +8,9 @@ use uuid::Uuid;
 use crate::catalog::{CatalogRecord, CatalogStore, CATALOG_FILE_URI};
 use crate::core::errors::StorageError;
 use crate::storage::api::Session;
-use crate::storage::metadata_store::{MetadataEntry, MetadataStore, INDEX_URI_PREFIX, TABLE_URI_PREFIX, table_uri};
+use crate::storage::metadata_store::{
+    table_uri, MetadataEntry, MetadataStore, INDEX_URI_PREFIX, TABLE_URI_PREFIX,
+};
 use crate::WrongoDBError;
 
 /// Normalized `createIndexes` request supported by the durable catalog.
@@ -235,7 +237,11 @@ impl CollectionCatalog {
     }
 
     /// Refreshes one cache entry after a successful write.
-    fn refresh_cache_entry(&self, session: &Session, collection: &str) -> Result<(), WrongoDBError> {
+    fn refresh_cache_entry(
+        &self,
+        session: &Session,
+        collection: &str,
+    ) -> Result<(), WrongoDBError> {
         let mut cache = self.collections.write();
         match self.get_collection(session, collection)? {
             Some(definition) => {
