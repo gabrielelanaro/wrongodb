@@ -97,12 +97,12 @@ Recovery is split into two related pieces.
 
 Replay uses the normal low-level B+tree write path in replay mode rather than a separate bespoke mutator.
 
-### Startup catalog reconciliation
+### Startup catalog consistency check
 
-`src/server/recovery/catalog.rs` checks that:
+`src/server/recovery/catalog.rs` provides `audit_catalog()`, which checks that:
 
 - referenced store files actually exist on disk
-- unexpected `*.wt` files are reported as unreferenced sources
+- unexpected `*.wt` files are reported as orphaned stores
 
 That keeps the server-facing catalog and the physical storage layout from silently drifting apart.
 

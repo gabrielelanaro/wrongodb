@@ -1,3 +1,3 @@
 mod catalog;
 
-pub(crate) use catalog::CatalogRecovery;
+pub(crate) use catalog::audit_catalog;

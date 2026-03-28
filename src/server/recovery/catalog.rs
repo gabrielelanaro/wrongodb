@@ -8,57 +8,49 @@ use crate::storage::reserved_store::reserved_store_names;
 use crate::WrongoDBError;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct CatalogRecoveryReport {
-    pub(crate) unreferenced_sources: Vec<String>,
+pub(crate) struct ConsistencyReport {
+    pub(crate) orphaned_stores: Vec<String>,
 }
 
-pub(crate) struct CatalogRecovery;
+pub(crate) fn audit_catalog(connection: &Connection) -> Result<ConsistencyReport, WrongoDBError> {
+    let metadata_store = connection.metadata_store();
+    let mut session = connection.open_session();
 
-impl CatalogRecovery {
-    pub(crate) fn reconcile(
-        connection: &Connection,
-    ) -> Result<CatalogRecoveryReport, WrongoDBError> {
-        let metadata_store = connection.metadata_store();
-        let mut session = connection.open_session();
+    let catalog = CollectionCatalog::new(CatalogStore::new());
+    catalog.ensure_store_exists(&mut session)?;
+    catalog.validate_storage_references(&session, metadata_store.as_ref())?;
 
-        let catalog = CollectionCatalog::new(CatalogStore::new());
-        catalog.ensure_store_exists(&mut session)?;
-        catalog.validate_storage_references(&session, metadata_store.as_ref())?;
-
-        let mut referenced_store_names = metadata_store.all_store_names()?;
-        referenced_store_names.extend(
-            reserved_store_names()
-                .iter()
-                .map(|name| (*name).to_string()),
-        );
-        referenced_store_names.sort();
-        referenced_store_names.dedup();
-
-        let mut on_disk_sources = list_store_files(connection.base_path())?;
-        on_disk_sources.sort();
-        on_disk_sources.dedup();
-
-        let missing_sources = referenced_store_names
+    let mut referenced_store_names = metadata_store.all_store_names()?;
+    referenced_store_names.extend(
+        reserved_store_names()
             .iter()
-            .filter(|source| !on_disk_sources.contains(source))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing_sources.is_empty() {
-            return Err(StorageError(format!(
-                "catalog recovery found missing referenced sources: {}",
-                missing_sources.join(", ")
-            ))
-            .into());
-        }
+            .map(|name| (*name).to_string()),
+    );
+    referenced_store_names.sort();
+    referenced_store_names.dedup();
 
-        let unreferenced_sources = on_disk_sources
-            .into_iter()
-            .filter(|source| !referenced_store_names.contains(source))
-            .collect();
-        Ok(CatalogRecoveryReport {
-            unreferenced_sources,
-        })
+    let mut on_disk_sources = list_store_files(connection.base_path())?;
+    on_disk_sources.sort();
+    on_disk_sources.dedup();
+
+    let missing_sources = referenced_store_names
+        .iter()
+        .filter(|source| !on_disk_sources.contains(source))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_sources.is_empty() {
+        return Err(StorageError(format!(
+            "catalog consistency check found missing referenced stores: {}",
+            missing_sources.join(", ")
+        ))
+        .into());
     }
+
+    let orphaned_stores = on_disk_sources
+        .into_iter()
+        .filter(|source| !referenced_store_names.contains(source))
+        .collect();
+    Ok(ConsistencyReport { orphaned_stores })
 }
 
 fn list_store_files(base_path: &Path) -> Result<Vec<String>, WrongoDBError> {
@@ -88,20 +80,17 @@ mod tests {
     use crate::storage::api::{Connection, ConnectionConfig};
 
     #[test]
-    fn reconcile_reports_unreferenced_store_files() {
+    fn audit_reports_orphaned_store_files() {
         let dir = tempdir().unwrap();
         let conn = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
         std::fs::write(dir.path().join("dangling.main.wt"), b"").unwrap();
 
-        let report = CatalogRecovery::reconcile(&conn).unwrap();
-        assert_eq!(
-            report.unreferenced_sources,
-            vec!["dangling.main.wt".to_string()]
-        );
+        let report = audit_catalog(&conn).unwrap();
+        assert_eq!(report.orphaned_stores, vec!["dangling.main.wt".to_string()]);
     }
 
     #[test]
-    fn reconcile_fails_when_metadata_references_missing_store() {
+    fn audit_fails_when_metadata_references_missing_store() {
         let dir = tempdir().unwrap();
         let conn = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
         let mut session = conn.open_session();
@@ -109,7 +98,7 @@ mod tests {
         drop(session);
         std::fs::remove_file(dir.path().join("users.main.wt")).unwrap();
 
-        let err = CatalogRecovery::reconcile(&conn).unwrap_err();
-        assert!(err.to_string().contains("missing referenced sources"));
+        let err = audit_catalog(&conn).unwrap_err();
+        assert!(err.to_string().contains("missing referenced stores"));
     }
 }

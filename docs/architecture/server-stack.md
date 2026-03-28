@@ -7,7 +7,7 @@ This document describes the current architecture above the storage API.
 Server startup currently looks like this:
 
 1. open a `Connection`
-2. run `CatalogRecovery::reconcile`
+2. run `audit_catalog`
 3. build a `DatabaseContext`
 4. accept MongoDB wire-protocol requests
 5. dispatch each command through `CommandRegistry`

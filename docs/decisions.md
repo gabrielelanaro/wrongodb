@@ -2479,7 +2479,7 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
   `storage::recovery_unit`.
 - Make `Connection::open()` the only active entrypoint that performs global WAL recovery, using a
   storage-local recovery executor.
-- Move `CatalogRecovery` under `server::recovery` so startup catalog reconciliation is no longer
+- Move startup catalog consistency check (`audit_catalog`) under `server::recovery` so it is no longer
   mixed into storage crash recovery.
 - Remove the active crate wiring for `raft`, `replication`, top-level `durability`, top-level
   `recovery`, and `store_write_path`.

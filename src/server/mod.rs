@@ -14,7 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use self::commands::handlers::crud::{bson_to_value, value_to_bson};
 use self::commands::CommandRegistry;
 use crate::api::DatabaseContext;
-use crate::server::recovery::CatalogRecovery;
+use crate::server::recovery::audit_catalog;
 use crate::{Connection, WrongoDBError};
 
 const OP_MSG: i32 = 2013;
@@ -54,9 +54,9 @@ pub async fn start_server(
     conn: Arc<Connection>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
-    let catalog_report = CatalogRecovery::reconcile(conn.as_ref())?;
-    for source in &catalog_report.unreferenced_sources {
-        eprintln!("Catalog recovery found unreferenced source file: {source}");
+    let report = audit_catalog(conn.as_ref())?;
+    for store in &report.orphaned_stores {
+        eprintln!("orphaned store file: {store}");
     }
     let db = Arc::new(DatabaseContext::new(conn)?);
     let registry = Arc::new(CommandRegistry::new());
