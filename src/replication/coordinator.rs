@@ -88,3 +88,38 @@ impl ReplicationCoordinator {
             .store(next_op_index.max(1), Ordering::SeqCst);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ReplicationConfig, ReplicationCoordinator};
+    use crate::WrongoDBError;
+
+    // EARS: When the coordinator uses default replication state, it shall report
+    // the node as writable primary and start at term `1`.
+    #[test]
+    fn default_replication_state_is_writable() {
+        let coordinator = ReplicationCoordinator::new(ReplicationConfig::default());
+
+        assert_eq!(coordinator.hello_state(), (true, None));
+        assert_eq!(coordinator.current_term(), 1);
+    }
+
+    // EARS: When the coordinator marks the node as non-primary, it shall reject
+    // writes and surface the configured leader hint.
+    #[test]
+    fn non_primary_rejects_writes_with_leader_hint() {
+        let coordinator = ReplicationCoordinator::new(ReplicationConfig {
+            is_writable_primary: false,
+            primary_hint: Some("node-2".to_string()),
+            term: 9,
+        });
+
+        let err = coordinator.require_writable_primary().unwrap_err();
+        assert!(matches!(
+            err,
+            WrongoDBError::NotLeader {
+                leader_hint: Some(ref leader_hint)
+            } if leader_hint == "node-2"
+        ));
+    }
+}

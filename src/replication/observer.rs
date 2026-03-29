@@ -112,3 +112,41 @@ fn document_key(id: &Value) -> Document {
     key.insert("_id".to_string(), id.clone());
     key
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::ReplicationObserver;
+    use crate::replication::{OplogMode, OplogStore, ReplicationConfig, ReplicationCoordinator};
+    use crate::storage::api::{Connection, ConnectionConfig};
+
+    // EARS: When the observer runs in suppress-oplog mode, it shall not append any
+    // oplog rows.
+    #[test]
+    fn observer_skips_writes_in_suppress_mode() {
+        let dir = tempdir().unwrap();
+        let base_path = dir.path().to_path_buf();
+        std::mem::forget(dir);
+
+        let connection = Connection::open(&base_path, ConnectionConfig::new()).unwrap();
+        let oplog_store = OplogStore::new(connection.metadata_store());
+        let coordinator = ReplicationCoordinator::new(ReplicationConfig::default());
+        let observer = ReplicationObserver::new(coordinator, oplog_store.clone());
+        let document = json!({"_id": 1, "name": "alice"})
+            .as_object()
+            .unwrap()
+            .clone();
+
+        let mut session = connection.open_session();
+        oplog_store.ensure_table_exists(&mut session).unwrap();
+        session
+            .with_transaction(|session| {
+                observer.on_insert(session, "users", &document, OplogMode::SuppressOplog)
+            })
+            .unwrap();
+
+        assert!(oplog_store.list_entries(&mut session).unwrap().is_empty());
+    }
+}

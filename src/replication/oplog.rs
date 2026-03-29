@@ -103,8 +103,7 @@ impl OplogStore {
         cursor.insert(&key, &value)
     }
 
-    // TODO: why dead code? if this is truly dead code we should get rid of it.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn list_entries(
         &self,
         session: &mut Session,
@@ -251,4 +250,56 @@ fn required_json_document_field(doc: &Document, field: &str) -> Result<Document,
         .cloned()
         .ok_or_else(|| StorageError(format!("oplog field {field} is not a JSON document")))?;
     Ok(object)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::{OpTime, OplogEntry, OplogOperation, OplogStore};
+    use crate::storage::api::{Connection, ConnectionConfig};
+
+    fn open_store() -> (Connection, OplogStore) {
+        let dir = tempdir().unwrap();
+        let base_path = dir.path().to_path_buf();
+        std::mem::forget(dir);
+
+        let connection = Connection::open(&base_path, ConnectionConfig::new()).unwrap();
+        let oplog_store = OplogStore::new(connection.metadata_store());
+        let mut session = connection.open_session();
+        oplog_store.ensure_table_exists(&mut session).unwrap();
+
+        (connection, oplog_store)
+    }
+
+    // EARS: When an oplog entry is appended and later reloaded, the oplog store
+    // shall preserve both the logical operation and its replication position.
+    #[test]
+    fn oplog_store_roundtrips_entries() {
+        let (connection, oplog_store) = open_store();
+        let entry = OplogEntry {
+            op_time: OpTime { term: 3, index: 42 },
+            operation: OplogOperation::Update {
+                ns: "test.users".to_string(),
+                document: json!({"_id": 7, "name": "alice"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                document_key: json!({"_id": 7}).as_object().unwrap().clone(),
+            },
+        };
+
+        let mut session = connection.open_session();
+        session
+            .with_transaction(|session| oplog_store.append(session, &entry))
+            .unwrap();
+
+        let entries = oplog_store.list_entries(&mut session).unwrap();
+        assert_eq!(entries, vec![entry]);
+        assert_eq!(
+            oplog_store.load_last_op_time(&mut session).unwrap(),
+            Some(OpTime { term: 3, index: 42 })
+        );
+    }
 }
