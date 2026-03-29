@@ -1,5 +1,20 @@
 # Decisions
 
+## 2026-03-29: Make namespaces first-class and key the catalog by full namespace
+
+**Decision**
+- Add crate-private `DatabaseName` and `Namespace` types and require command execution to carry the request database explicitly.
+- Key the durable collection catalog and its in-memory cache by full namespace (`db.collection`), not by collection name alone.
+- Generate opaque storage idents for collection tables and secondary indexes instead of deriving storage URIs from namespace strings.
+- Reserve `local.oplog.rs` as the replication-owned oplog namespace and resolve its backing storage through the catalog like any other internal collection.
+- Treat this change as a fresh-start format change; no legacy single-database migration path is provided.
+
+**Why**
+- MongoDB carries `DatabaseName` and `NamespaceString` from request parsing through command execution, catalog lookup, and oplog generation. WrongoDB needed the same boundary to remove the hardcoded `test` fallback cleanly.
+- A namespace-keyed catalog is the minimum correct model for allowing `foo.users` and `bar.users` to coexist without aliasing to the same catalog entry.
+- Separating logical namespace from physical storage ident keeps future rename and replication work from depending on file-name-derived identities.
+- Treating `local.oplog.rs` as a reserved internal namespace matches MongoDB's architecture more closely than hiding the oplog behind an unnamed storage table.
+
 ## 2026-03-29: Align primary writes to a Mongo-style `write_ops -> collection_write_path -> oplog observer` stack
 
 **Decision**
@@ -12,8 +27,8 @@
   - `reserve_next_op_index()`
   - `seed_next_op_index()`
 - Add a Mongo-style `ReplicationObserver` that appends logical oplog rows from the document layer.
-- Persist the oplog through a replication-owned internal storage table, `table:__oplog`, rather than through `storage/wal`.
-- Initialize the oplog table and reseed the next oplog index in `DatabaseContext`.
+- Persist the oplog through the reserved `local.oplog.rs` namespace rather than through `storage/wal`.
+- Initialize the oplog namespace and reseed the next oplog index in `DatabaseContext`.
 
 **Why**
 - MongoDB does not have separate "local write" and "replicated write" stacks on the primary. It has one replication-aware primary write path, plus a separate future oplog-apply path for followers.

@@ -12,8 +12,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use self::commands::handlers::crud::{bson_to_value, value_to_bson};
-use self::commands::CommandRegistry;
+use self::commands::{CommandContext, CommandRegistry};
 use crate::api::DatabaseContext;
+use crate::core::{DatabaseName, Namespace};
 use crate::replication::{ReplicationConfig, ReplicationCoordinator};
 use crate::server::recovery::audit_catalog;
 use crate::{Connection, WrongoDBError};
@@ -167,13 +168,14 @@ async fn handle_op_msg(
     }
 
     if let Some(mut doc) = command_doc {
+        let ctx = CommandContext::new(command_database_name(&doc)?);
         if let Some(seq_docs) = doc_sequences.get("documents") {
             if doc.get("documents").is_none() {
                 let docs_bson = seq_docs.iter().cloned().map(Bson::Document).collect();
                 doc.insert("documents", Bson::Array(docs_bson));
             }
         }
-        return Ok(match registry.execute(&doc, db.as_ref()) {
+        return Ok(match registry.execute(&ctx, &doc, db.as_ref()) {
             Ok(response) => response,
             Err(err) => command_error_document(&err),
         });
@@ -199,6 +201,7 @@ async fn handle_op_query(
         coll_name.push(byte);
     }
     let full_coll_name = String::from_utf8(coll_name).unwrap_or_default();
+    let namespace = Namespace::parse(&full_coll_name)?;
 
     let _number_to_skip = ReadBytesExt::read_i32::<LittleEndian>(&mut cursor)?;
     let _number_to_return = ReadBytesExt::read_i32::<LittleEndian>(&mut cursor)?;
@@ -210,22 +213,19 @@ async fn handle_op_query(
 
     let query_doc: Document = bson::from_slice(&query_buf).map_err(WrongoDBError::BsonDe)?;
 
-    if full_coll_name == "admin.$cmd" {
-        return Ok(match registry.execute(&query_doc, db.as_ref()) {
+    if namespace.is_command_namespace() {
+        let ctx = CommandContext::new(namespace.db_name().clone());
+        return Ok(match registry.execute(&ctx, &query_doc, db.as_ref()) {
             Ok(response) => response,
             Err(err) => command_error_document(&err),
         });
     }
 
     let filter_json = bson_to_value(&query_doc);
-    let coll_name = full_coll_name
-        .split_once('.')
-        .map(|(_, coll)| coll)
-        .unwrap_or(full_coll_name.as_str());
     let mut session = db.connection().open_session();
     let results = match db
         .document_query()
-        .find(&mut session, coll_name, Some(filter_json))
+        .find(&mut session, &namespace, Some(filter_json))
     {
         Ok(results) => results,
         Err(err) => return Ok(command_error_document(&err)),
@@ -239,10 +239,17 @@ async fn handle_op_query(
         "ok": Bson::Double(1.0),
         "cursor": {
             "id": Bson::Int64(0),
-            "ns": full_coll_name,
+            "ns": namespace.full_name(),
             "firstBatch": Bson::Array(results_bson),
         }
     })
+}
+
+fn command_database_name(doc: &Document) -> Result<DatabaseName, WrongoDBError> {
+    let db_name = doc
+        .get_str("$db")
+        .map_err(|_| WrongoDBError::Protocol("command document is missing $db".into()))?;
+    DatabaseName::new(db_name)
 }
 
 fn command_error_document(err: &WrongoDBError) -> Document {

@@ -1,5 +1,6 @@
+use super::crud::namespace_from_field;
 use crate::api::DatabaseContext;
-use crate::server::commands::Command;
+use crate::server::commands::{Command, CommandContext};
 use crate::WrongoDBError;
 use bson::{doc, Bson, Document};
 
@@ -12,8 +13,13 @@ impl Command for GetMoreCommand {
         &["getMore"]
     }
 
-    fn execute(&self, doc: &Document, _db: &DatabaseContext) -> Result<Document, WrongoDBError> {
-        let coll_name = doc.get_str("collection").unwrap_or("test");
+    fn execute(
+        &self,
+        ctx: &CommandContext,
+        doc: &Document,
+        _db: &DatabaseContext,
+    ) -> Result<Document, WrongoDBError> {
+        let namespace = namespace_from_field(ctx, doc, "collection")?;
 
         // Since cursor ID is always 0 and we return all results in firstBatch,
         // getMore always returns an empty nextBatch
@@ -21,7 +27,7 @@ impl Command for GetMoreCommand {
             "ok": Bson::Double(1.0),
             "cursor": {
                 "id": Bson::Int64(0),
-                "ns": format!("test.{}", coll_name),
+                "ns": namespace.full_name(),
                 "nextBatch": Bson::Array(vec![]),
             },
         })
@@ -37,7 +43,12 @@ impl Command for KillCursorsCommand {
         &["killCursors"]
     }
 
-    fn execute(&self, doc: &Document, _db: &DatabaseContext) -> Result<Document, WrongoDBError> {
+    fn execute(
+        &self,
+        _ctx: &CommandContext,
+        doc: &Document,
+        _db: &DatabaseContext,
+    ) -> Result<Document, WrongoDBError> {
         let cursors = doc.get_array("cursors").cloned().unwrap_or_else(|_| vec![]);
 
         Ok(doc! {

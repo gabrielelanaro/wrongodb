@@ -3,8 +3,9 @@ use std::sync::Arc;
 use crate::api::DdlPath;
 use crate::catalog::{CatalogStore, CollectionCatalog, IndexDefinition};
 use crate::collection_write_path::CollectionWritePath;
+use crate::core::{DatabaseName, Namespace};
 use crate::document_query::DocumentQuery;
-use crate::replication::{OplogStore, ReplicationCoordinator, ReplicationObserver};
+use crate::replication::{bootstrap_oplog, ReplicationCoordinator, ReplicationObserver};
 use crate::write_ops::WriteOps;
 use crate::{Connection, WrongoDBError};
 
@@ -30,16 +31,14 @@ impl DatabaseContext {
         replication: ReplicationCoordinator,
     ) -> Result<Self, WrongoDBError> {
         let metadata_store = connection.metadata_store();
-        let oplog_store = OplogStore::new(metadata_store.clone());
         let catalog = Arc::new(CollectionCatalog::new(CatalogStore::new()));
         let mut session = connection.open_session();
-        oplog_store.ensure_table_exists(&mut session)?;
-        let next_op_index = oplog_store
-            .load_last_op_time(&mut session)?
-            .map(|op_time| op_time.index + 1)
-            .unwrap_or(1);
-        replication.seed_next_op_index(next_op_index);
         catalog.ensure_store_exists(&mut session)?;
+        drop(session);
+
+        let oplog_store = bootstrap_oplog(connection.as_ref(), catalog.as_ref(), &replication)?;
+
+        let session = connection.open_session();
         catalog.load_cache(&session)?;
 
         let document_query = DocumentQuery::new(catalog.clone());
@@ -92,24 +91,31 @@ impl DatabaseContext {
         self.replication.hello_state()
     }
 
-    pub(crate) fn list_collections(&self) -> Result<Vec<String>, WrongoDBError> {
-        Ok(self.catalog.list_collection_names())
+    pub(crate) fn list_databases(&self) -> Vec<DatabaseName> {
+        self.catalog.list_database_names()
+    }
+
+    pub(crate) fn list_collections(
+        &self,
+        db_name: &DatabaseName,
+    ) -> Result<Vec<String>, WrongoDBError> {
+        Ok(self.catalog.list_collection_names(db_name))
     }
 
     /// Returns the committed collection definition if the collection exists.
     pub(crate) fn collection_definition(
         &self,
-        collection: &str,
+        namespace: &Namespace,
     ) -> Result<Option<crate::catalog::CollectionDefinition>, WrongoDBError> {
-        Ok(self.catalog.lookup_collection(collection))
+        Ok(self.catalog.lookup_collection(namespace))
     }
 
     /// Returns the committed secondary index definitions for `collection`.
     pub(crate) fn list_indexes(
         &self,
-        collection: &str,
+        namespace: &Namespace,
     ) -> Result<Vec<IndexDefinition>, WrongoDBError> {
-        Ok(self.catalog.list_index_definitions(collection))
+        Ok(self.catalog.list_index_definitions(namespace))
     }
 }
 
@@ -121,8 +127,17 @@ mod tests {
     use tempfile::tempdir;
 
     use super::DatabaseContext;
-    use crate::replication::{OplogStore, ReplicationConfig, ReplicationCoordinator};
+    use crate::core::{DatabaseName, Namespace};
+    use crate::replication::{
+        oplog_namespace, OplogStore, ReplicationConfig, ReplicationCoordinator,
+    };
     use crate::storage::api::{Connection, ConnectionConfig};
+
+    const FIXTURE_DATABASE: &str = "app";
+
+    fn fixture_namespace(collection: &str) -> Namespace {
+        Namespace::new(DatabaseName::new(FIXTURE_DATABASE).unwrap(), collection).unwrap()
+    }
 
     // EARS: When the database context restarts after a committed oplog entry,
     // startup shall reseed the next oplog index from the durable oplog tail.
@@ -139,10 +154,13 @@ mod tests {
             )
             .unwrap();
             db.ddl_path()
-                .create_collection("users", vec!["name".to_string()])
+                .create_collection(&fixture_namespace("users"), vec!["name".to_string()])
                 .unwrap();
             db.write_ops()
-                .insert_one("users", json!({"_id": 1, "name": "alice"}))
+                .insert_one(
+                    &fixture_namespace("users"),
+                    json!({"_id": 1, "name": "alice"}),
+                )
                 .unwrap();
         }
 
@@ -153,15 +171,60 @@ mod tests {
         )
         .unwrap();
         db.write_ops()
-            .insert_one("users", json!({"_id": 2, "name": "bob"}))
+            .insert_one(
+                &fixture_namespace("users"),
+                json!({"_id": 2, "name": "bob"}),
+            )
             .unwrap();
 
-        let oplog_store = OplogStore::new(reopened.metadata_store());
+        let oplog_table_uri = db
+            .collection_definition(&oplog_namespace())
+            .unwrap()
+            .unwrap()
+            .table_uri()
+            .to_string();
+        let oplog_store = OplogStore::new(reopened.metadata_store(), oplog_table_uri);
         let mut session = reopened.open_session();
         let entries = oplog_store.list_entries(&mut session).unwrap();
 
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].op_time.index, 1);
         assert_eq!(entries[1].op_time.index, 2);
+    }
+
+    // EARS: When two databases define collections with the same collection
+    // name, the database context shall keep their catalog entries and storage
+    // idents separate.
+    #[test]
+    fn namespace_scoped_catalog_keeps_same_named_collections_separate() {
+        let dir = tempdir().unwrap();
+        let connection =
+            Arc::new(Connection::open(dir.path(), ConnectionConfig::default()).unwrap());
+        let db = DatabaseContext::new(
+            connection,
+            ReplicationCoordinator::new(ReplicationConfig::default()),
+        )
+        .unwrap();
+
+        let foo_users = Namespace::new(DatabaseName::new("foo").unwrap(), "users").unwrap();
+        let bar_users = Namespace::new(DatabaseName::new("bar").unwrap(), "users").unwrap();
+
+        db.ddl_path()
+            .create_collection(&foo_users, vec!["name".to_string()])
+            .unwrap();
+        db.ddl_path()
+            .create_collection(&bar_users, vec!["name".to_string()])
+            .unwrap();
+
+        let database_names = db
+            .list_databases()
+            .into_iter()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(database_names, vec!["bar", "foo", "local"]);
+
+        let foo_definition = db.collection_definition(&foo_users).unwrap().unwrap();
+        let bar_definition = db.collection_definition(&bar_users).unwrap().unwrap();
+        assert_ne!(foo_definition.table_uri(), bar_definition.table_uri());
     }
 }

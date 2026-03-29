@@ -3,13 +3,14 @@ use std::sync::Arc;
 use serde_json::{Number, Value};
 
 use crate::core::bson::encode_id_value;
+use crate::core::{DatabaseName, Namespace};
 use crate::storage::api::Session;
 use crate::storage::metadata_store::{MetadataEntry, MetadataStore};
 use crate::storage::row::{decode_row_value_from_metadata, encode_row_value};
 use crate::{Document, StorageError, WrongoDBError};
 
-pub(crate) const OPLOG_COLLECTION: &str = "__oplog";
-pub(crate) const OPLOG_TABLE_URI: &str = "table:__oplog";
+const OPLOG_DATABASE: &str = "local";
+const OPLOG_COLLECTION: &str = "oplog.rs";
 const OPLOG_COLUMNS: [&str; 5] = ["term", "op", "ns", "o", "o2"];
 
 /// Replication position assigned to one oplog entry.
@@ -55,18 +56,23 @@ pub(crate) struct OplogEntry {
 #[derive(Debug, Clone)]
 pub(crate) struct OplogStore {
     metadata_store: Arc<MetadataStore>,
+    table_uri: String,
 }
 
 impl OplogStore {
     /// Build an oplog store handle over the storage metadata plane.
-    pub(crate) fn new(metadata_store: Arc<MetadataStore>) -> Self {
-        Self { metadata_store }
+    pub(crate) fn new(metadata_store: Arc<MetadataStore>, table_uri: impl Into<String>) -> Self {
+        Self {
+            metadata_store,
+            table_uri: table_uri.into(),
+        }
     }
 
     /// Ensure the internal oplog table exists.
+    #[cfg(test)]
     pub(crate) fn ensure_table_exists(&self, session: &mut Session) -> Result<(), WrongoDBError> {
         session.create_table(
-            OPLOG_TABLE_URI,
+            &self.table_uri,
             OPLOG_COLUMNS
                 .iter()
                 .map(|column| (*column).to_string())
@@ -79,7 +85,7 @@ impl OplogStore {
         &self,
         session: &mut Session,
     ) -> Result<Option<OpTime>, WrongoDBError> {
-        let mut cursor = session.open_table_cursor(OPLOG_TABLE_URI)?;
+        let mut cursor = session.open_table_cursor(&self.table_uri)?;
         let oplog_metadata = self.oplog_metadata()?;
         let mut last_op_time = None;
 
@@ -99,7 +105,7 @@ impl OplogStore {
     ) -> Result<(), WrongoDBError> {
         let key = encode_id_value(&Value::Number(Number::from(entry.op_time.index)))?;
         let value = self.encode_row(entry)?;
-        let mut cursor = session.open_table_cursor(OPLOG_TABLE_URI)?;
+        let mut cursor = session.open_table_cursor(&self.table_uri)?;
         cursor.insert(&key, &value)
     }
 
@@ -108,7 +114,7 @@ impl OplogStore {
         &self,
         session: &mut Session,
     ) -> Result<Vec<OplogEntry>, WrongoDBError> {
-        let mut cursor = session.open_table_cursor(OPLOG_TABLE_URI)?;
+        let mut cursor = session.open_table_cursor(&self.table_uri)?;
         let oplog_metadata = self.oplog_metadata()?;
         let mut entries = Vec::new();
 
@@ -123,7 +129,8 @@ impl OplogStore {
         let oplog_metadata = self.oplog_metadata()?;
         let row_format = oplog_metadata.row_format().ok_or_else(|| {
             StorageError(format!(
-                "table metadata row is missing row_format: {OPLOG_TABLE_URI}"
+                "table metadata row is missing row_format: {}",
+                self.table_uri
             ))
         })?;
         let row = oplog_row_from_entry(entry)?;
@@ -132,9 +139,32 @@ impl OplogStore {
 
     fn oplog_metadata(&self) -> Result<MetadataEntry, WrongoDBError> {
         self.metadata_store
-            .get(OPLOG_TABLE_URI)?
-            .ok_or_else(|| StorageError(format!("unknown table URI: {OPLOG_TABLE_URI}")).into())
+            .get(&self.table_uri)?
+            .ok_or_else(|| StorageError(format!("unknown table URI: {}", self.table_uri)).into())
     }
+}
+
+
+// TODO: why does the caller needs to know this information? It seems that there is a leaky abstraction here.
+/// Return the reserved Mongo-style oplog namespace.
+pub(crate) fn oplog_namespace() -> Namespace {
+    Namespace::new(
+        DatabaseName::new(OPLOG_DATABASE).expect("local is a valid database name"),
+        OPLOG_COLLECTION,
+    )
+    .expect("local.oplog.rs is a valid namespace")
+}
+
+/// Return whether a namespace is reserved for replication-owned oplog state.
+pub(crate) fn is_reserved_namespace(namespace: &Namespace) -> bool {
+    namespace.db_name().is_local() && namespace.collection_name() == OPLOG_COLLECTION
+}
+
+pub(in crate::replication) fn oplog_storage_columns() -> Vec<String> {
+    OPLOG_COLUMNS
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
 }
 
 fn oplog_row_from_entry(entry: &OplogEntry) -> Result<Document, WrongoDBError> {
@@ -258,7 +288,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{OpTime, OplogEntry, OplogOperation, OplogStore};
+    use crate::core::{DatabaseName, Namespace};
     use crate::storage::api::{Connection, ConnectionConfig};
+
+    const TEST_OPLOG_TABLE_URI: &str = "table:test_oplog";
 
     fn open_store() -> (Connection, OplogStore) {
         let dir = tempdir().unwrap();
@@ -266,11 +299,15 @@ mod tests {
         std::mem::forget(dir);
 
         let connection = Connection::open(&base_path, ConnectionConfig::new()).unwrap();
-        let oplog_store = OplogStore::new(connection.metadata_store());
+        let oplog_store = OplogStore::new(connection.metadata_store(), TEST_OPLOG_TABLE_URI);
         let mut session = connection.open_session();
         oplog_store.ensure_table_exists(&mut session).unwrap();
 
         (connection, oplog_store)
+    }
+
+    fn namespace(collection: &str) -> Namespace {
+        Namespace::new(DatabaseName::new("test").unwrap(), collection).unwrap()
     }
 
     // EARS: When an oplog entry is appended and later reloaded, the oplog store
@@ -281,7 +318,7 @@ mod tests {
         let entry = OplogEntry {
             op_time: OpTime { term: 3, index: 42 },
             operation: OplogOperation::Update {
-                ns: "test.users".to_string(),
+                ns: namespace("users").full_name(),
                 document: json!({"_id": 7, "name": "alice"})
                     .as_object()
                     .unwrap()

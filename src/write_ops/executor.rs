@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::collection_write_path::{CollectionWritePath, UpdateResult};
+use crate::core::Namespace;
 use crate::replication::{OplogMode, ReplicationCoordinator};
 use crate::storage::api::Session;
 use crate::{Connection, Document, WrongoDBError};
@@ -32,13 +33,13 @@ impl WriteOps {
     /// Insert one document through the primary-side write path.
     pub(crate) fn insert_one(
         &self,
-        collection: &str,
+        namespace: &Namespace,
         doc: Value,
     ) -> Result<Document, WrongoDBError> {
         self.run_on_primary(|collection_write_path, session| {
             collection_write_path.insert_one_in_transaction(
                 session,
-                collection,
+                namespace,
                 doc,
                 OplogMode::GenerateOplog,
             )
@@ -48,14 +49,14 @@ impl WriteOps {
     /// Update the first matching document through the primary-side write path.
     pub(crate) fn update_one(
         &self,
-        collection: &str,
+        namespace: &Namespace,
         filter: Option<Value>,
         update: Value,
     ) -> Result<UpdateResult, WrongoDBError> {
         self.run_on_primary(|collection_write_path, session| {
             collection_write_path.update_one_in_transaction(
                 session,
-                collection,
+                namespace,
                 filter,
                 update,
                 OplogMode::GenerateOplog,
@@ -66,14 +67,14 @@ impl WriteOps {
     /// Update every matching document through the primary-side write path.
     pub(crate) fn update_many(
         &self,
-        collection: &str,
+        namespace: &Namespace,
         filter: Option<Value>,
         update: Value,
     ) -> Result<UpdateResult, WrongoDBError> {
         self.run_on_primary(|collection_write_path, session| {
             collection_write_path.update_many_in_transaction(
                 session,
-                collection,
+                namespace,
                 filter,
                 update,
                 OplogMode::GenerateOplog,
@@ -84,13 +85,13 @@ impl WriteOps {
     /// Delete the first matching document through the primary-side write path.
     pub(crate) fn delete_one(
         &self,
-        collection: &str,
+        namespace: &Namespace,
         filter: Option<Value>,
     ) -> Result<usize, WrongoDBError> {
         self.run_on_primary(|collection_write_path, session| {
             collection_write_path.delete_one_in_transaction(
                 session,
-                collection,
+                namespace,
                 filter,
                 OplogMode::GenerateOplog,
             )
@@ -100,13 +101,13 @@ impl WriteOps {
     /// Delete every matching document through the primary-side write path.
     pub(crate) fn delete_many(
         &self,
-        collection: &str,
+        namespace: &Namespace,
         filter: Option<Value>,
     ) -> Result<usize, WrongoDBError> {
         self.run_on_primary(|collection_write_path, session| {
             collection_write_path.delete_many_in_transaction(
                 session,
-                collection,
+                namespace,
                 filter,
                 OplogMode::GenerateOplog,
             )

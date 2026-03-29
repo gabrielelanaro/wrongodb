@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
+use uuid::Uuid;
+
 use crate::catalog::{CollectionCatalog, CreateIndexRequest, IndexDefinition};
 use crate::core::errors::StorageError;
-use crate::replication::{ReplicationCoordinator, OPLOG_COLLECTION};
+use crate::core::Namespace;
+use crate::replication::{is_reserved_namespace, ReplicationCoordinator};
 use crate::storage::metadata_store::{index_uri, MetadataEntry, MetadataStore};
 use crate::storage::row::validate_storage_columns;
 use crate::{Connection, WrongoDBError};
@@ -41,20 +44,24 @@ impl DdlPath {
     /// Creates one collection with an explicit storage schema.
     pub(crate) fn create_collection(
         &self,
-        collection: &str,
+        namespace: &Namespace,
         storage_columns: Vec<String>,
     ) -> Result<(), WrongoDBError> {
         self.replication.require_writable_primary()?;
-        validate_user_collection_name(collection)?;
+        validate_user_namespace(namespace)?;
         validate_storage_columns(&storage_columns)?;
 
         let mut session = self.connection.open_session();
         let (_, created) =
             self.catalog
-                .create_collection(&mut session, collection, &storage_columns)?;
+                .create_collection(&mut session, namespace, &storage_columns)?;
 
         if !created {
-            return Err(StorageError(format!("collection already exists: {collection}")).into());
+            return Err(StorageError(format!(
+                "collection already exists: {}",
+                namespace.full_name()
+            ))
+            .into());
         }
 
         Ok(())
@@ -63,14 +70,14 @@ impl DdlPath {
     /// Creates one secondary index from the normalized server-side request.
     pub(crate) fn create_index(
         &self,
-        collection: &str,
+        namespace: &Namespace,
         request: CreateIndexRequest,
     ) -> Result<(), WrongoDBError> {
         self.replication.require_writable_primary()?;
-        validate_user_collection_name(collection)?;
+        validate_user_namespace(namespace)?;
 
         let mut session = self.connection.open_session();
-        let definition = self.load_collection_definition(&mut session, collection)?;
+        let definition = self.load_collection_definition(&mut session, namespace)?;
         let table_uri = definition.table_uri().to_string();
         let indexed_field = request.indexed_field()?;
         if !definition
@@ -79,18 +86,30 @@ impl DdlPath {
             .any(|column| column == &indexed_field)
         {
             return Err(StorageError(format!(
-                "index field {indexed_field} is not declared in storageColumns for {collection}"
+                "index field {indexed_field} is not declared in storageColumns for {}",
+                namespace.full_name()
             ))
             .into());
         }
 
-        // TODO: Why do we need to plan index build, also build and mark index ready seems like it should go inside of catalog?
-        let build_plan =
-            self.plan_index_build(&mut session, collection, &request, &indexed_field)?;
+        // `createIndexes` is orchestration, not a pure catalog write. The DDL
+        // layer must decide whether this request is creating a new index,
+        // resuming an unfinished one, or repairing missing storage metadata
+        // for an already-ready catalog entry. That planning belongs above the
+        // catalog. The catalog should stay focused on durable metadata
+        // transitions (`ready=false`, `ready=true`, lookup), while the DDL
+        // layer coordinates physical index creation through `Session`.
+        let build_plan = self.plan_index_build(
+            &mut session,
+            namespace,
+            &definition,
+            &request,
+            &indexed_field,
+        )?;
         if build_plan.needs_build {
             self.catalog.build_and_mark_index_ready(
                 &mut session,
-                collection,
+                namespace,
                 &table_uri,
                 request.name(),
                 &build_plan.entry,
@@ -104,39 +123,44 @@ impl DdlPath {
     fn plan_index_build(
         &self,
         session: &mut crate::storage::api::Session,
-        collection: &str,
+        namespace: &Namespace,
+        definition: &crate::catalog::CollectionDefinition,
         request: &CreateIndexRequest,
         indexed_field: &str,
     ) -> Result<IndexBuildPlan, WrongoDBError> {
-        let index_uri = index_uri(collection, request.name());
-        let stored_entry = self.metadata_store.get(&index_uri)?;
-        let metadata_entry = stored_entry.clone().unwrap_or_else(|| {
-            MetadataEntry::index(collection, request.name(), vec![indexed_field.to_string()])
-        });
-
-        if let Some(ready) =
-            self.catalog
-                .get_collection(session, collection)?
-                .and_then(|definition| {
-                    definition
-                        .indexes()
-                        .get(request.name())
-                        .map(|index| index.ready())
-                })
-        {
+        if let Some(index) = definition.indexes().get(request.name()) {
+            let stored_entry = self.metadata_store.get(index.uri())?;
+            let metadata_entry = stored_entry.clone().unwrap_or_else(|| {
+                MetadataEntry::index(
+                    table_ident_from_uri(definition.table_uri()),
+                    index_ident_from_uri(index.uri()),
+                    vec![indexed_field.to_string()],
+                )
+            });
             return Ok(IndexBuildPlan {
                 entry: metadata_entry,
-                needs_build: !ready || stored_entry.is_none(),
+                needs_build: !index.ready() || stored_entry.is_none(),
             });
         }
 
+        let index_uri = index_uri(
+            table_ident_from_uri(definition.table_uri()),
+            &new_index_ident(),
+        );
         let _ = self.catalog.create_index(
             session,
-            collection,
+            namespace,
             IndexDefinition::from_request_with_ready(request, index_uri.clone(), false),
         )?;
         Ok(IndexBuildPlan {
-            entry: metadata_entry,
+            entry: MetadataEntry::index(
+                table_ident_from_uri(definition.table_uri()),
+                index_uri
+                    .rsplit(':')
+                    .next()
+                    .expect("new index URI always has an ident suffix"),
+                vec![indexed_field.to_string()],
+            ),
             needs_build: true,
         })
     }
@@ -144,25 +168,43 @@ impl DdlPath {
     fn load_collection_definition(
         &self,
         session: &mut crate::storage::api::Session,
-        collection: &str,
+        namespace: &Namespace,
     ) -> Result<crate::catalog::CollectionDefinition, WrongoDBError> {
         self.catalog
-            .get_collection(session, collection)?
-            .ok_or_else(|| StorageError(format!("unknown collection: {collection}")).into())
+            .get_collection(session, namespace)?
+            .ok_or_else(|| {
+                StorageError(format!("unknown collection: {}", namespace.full_name())).into()
+            })
     }
 }
 
-fn validate_user_collection_name(collection: &str) -> Result<(), WrongoDBError> {
-    // The replication layer owns `__oplog`; user DDL must not claim it.
-    // TODO: instead of exporting the constant we should have a "check_reserved_collection_name", so that we encapsulate the check.
-    if collection == OPLOG_COLLECTION {
+fn validate_user_namespace(namespace: &Namespace) -> Result<(), WrongoDBError> {
+    if is_reserved_namespace(namespace) {
         return Err(StorageError(format!(
-            "collection name {collection} is reserved for internal replication state"
+            "collection name {} is reserved for internal replication state",
+            namespace.full_name()
         ))
         .into());
     }
 
     Ok(())
+}
+
+fn new_index_ident() -> String {
+    format!("i_{}", Uuid::new_v4().simple())
+}
+
+fn table_ident_from_uri(table_uri: &str) -> &str {
+    table_uri
+        .strip_prefix("table:")
+        .expect("catalog table URI always has the table: prefix")
+}
+
+fn index_ident_from_uri(index_uri: &str) -> &str {
+    index_uri
+        .rsplit(':')
+        .next()
+        .expect("catalog index URI always has an ident suffix")
 }
 
 #[cfg(test)]
@@ -172,16 +214,21 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{DdlPath, OPLOG_COLLECTION};
+    use super::DdlPath;
     use crate::catalog::{CatalogStore, CollectionCatalog, CreateIndexRequest};
     use crate::collection_write_path::CollectionWritePath;
     use crate::core::errors::StorageError;
+    use crate::core::{DatabaseName, Namespace};
     use crate::document_query::DocumentQuery;
     use crate::replication::{
-        OplogMode, OplogStore, ReplicationConfig, ReplicationCoordinator, ReplicationObserver,
+        oplog_namespace, OplogMode, OplogStore, ReplicationConfig, ReplicationCoordinator,
+        ReplicationObserver,
     };
     use crate::storage::api::{Connection, ConnectionConfig, Session};
     use crate::WrongoDBError;
+
+    const TEST_DB: &str = "test";
+    const TEST_OPLOG_TABLE_URI: &str = "table:test_oplog";
 
     struct TestServices {
         _dir: TempDir,
@@ -200,7 +247,7 @@ mod tests {
                     .unwrap(),
             );
             let metadata_store = connection.metadata_store();
-            let oplog_store = OplogStore::new(metadata_store.clone());
+            let oplog_store = OplogStore::new(metadata_store.clone(), TEST_OPLOG_TABLE_URI);
             let catalog = Arc::new(CollectionCatalog::new(CatalogStore::new()));
             let replication = ReplicationCoordinator::new(replication_config);
             let mut session = connection.open_session();
@@ -239,6 +286,10 @@ mod tests {
         }
     }
 
+    fn namespace(collection: &str) -> Namespace {
+        Namespace::new(DatabaseName::new(TEST_DB).unwrap(), collection).unwrap()
+    }
+
     fn insert_one(
         write_path: &CollectionWritePath,
         session: &mut Session,
@@ -249,7 +300,7 @@ mod tests {
             .with_transaction(|session| {
                 write_path.insert_one_in_transaction(
                     session,
-                    collection,
+                    &namespace(collection),
                     doc,
                     OplogMode::GenerateOplog,
                 )?;
@@ -266,7 +317,7 @@ mod tests {
 
         let err = services
             .ddl_path
-            .create_collection(OPLOG_COLLECTION, vec!["term".to_string()])
+            .create_collection(&oplog_namespace(), vec!["term".to_string()])
             .unwrap_err();
 
         assert!(err
@@ -286,7 +337,7 @@ mod tests {
 
         let err = services
             .ddl_path
-            .create_collection("users", vec!["name".to_string()])
+            .create_collection(&namespace("users"), vec!["name".to_string()])
             .unwrap_err();
 
         assert!(matches!(
@@ -304,12 +355,15 @@ mod tests {
         let services = TestServices::new(ReplicationConfig::default());
         services
             .ddl_path
-            .create_collection("users", vec!["name".to_string()])
+            .create_collection(&namespace("users"), vec!["name".to_string()])
             .unwrap();
 
         let err = services
             .ddl_path
-            .create_index("users", CreateIndexRequest::single_field_ascending("age"))
+            .create_index(
+                &namespace("users"),
+                CreateIndexRequest::single_field_ascending("age"),
+            )
             .unwrap_err();
 
         assert!(err
@@ -324,7 +378,7 @@ mod tests {
         let services = TestServices::new(ReplicationConfig::default());
         services
             .ddl_path
-            .create_collection("users", vec!["name".to_string()])
+            .create_collection(&namespace("users"), vec!["name".to_string()])
             .unwrap();
 
         let mut session = services.connection.open_session();
@@ -337,18 +391,22 @@ mod tests {
 
         services
             .ddl_path
-            .create_index("users", CreateIndexRequest::single_field_ascending("name"))
+            .create_index(
+                &namespace("users"),
+                CreateIndexRequest::single_field_ascending("name"),
+            )
             .unwrap();
 
-        assert!(services
+        let users = services
             .catalog
-            .list_index_definitions("users")
-            .iter()
-            .any(|index| index.name() == "name_1" && index.ready()));
+            .lookup_collection(&namespace("users"))
+            .unwrap();
+        let name_index = users.indexes().get("name_1").unwrap();
+        assert!(name_index.ready());
 
         session
             .with_transaction(|session| {
-                let mut cursor = session.open_index_cursor("index:users:name_1")?;
+                let mut cursor = session.open_index_cursor(name_index.uri())?;
                 assert!(cursor.next()?.is_some());
                 Ok(())
             })
@@ -356,7 +414,11 @@ mod tests {
 
         let docs = services
             .query
-            .find(&mut session, "users", Some(json!({"name": "alice"})))
+            .find(
+                &mut session,
+                &namespace("users"),
+                Some(json!({"name": "alice"})),
+            )
             .unwrap();
         assert_eq!(docs.len(), 1);
     }
@@ -368,7 +430,7 @@ mod tests {
         let services = TestServices::new(ReplicationConfig::default());
         services
             .ddl_path
-            .create_collection("users", vec!["name".to_string()])
+            .create_collection(&namespace("users"), vec!["name".to_string()])
             .unwrap();
 
         let mut session = services.connection.open_session();
@@ -381,29 +443,48 @@ mod tests {
 
         services
             .ddl_path
-            .create_index("users", CreateIndexRequest::single_field_ascending("name"))
+            .create_index(
+                &namespace("users"),
+                CreateIndexRequest::single_field_ascending("name"),
+            )
             .unwrap();
 
+        let initial_index_uri = services
+            .catalog
+            .lookup_collection(&namespace("users"))
+            .unwrap()
+            .indexes()
+            .get("name_1")
+            .unwrap()
+            .uri()
+            .to_string();
         assert!(services
             .ddl_path
             .metadata_store
-            .remove("index:users:name_1")
+            .remove(&initial_index_uri)
             .unwrap());
 
         services
             .ddl_path
-            .create_index("users", CreateIndexRequest::single_field_ascending("name"))
+            .create_index(
+                &namespace("users"),
+                CreateIndexRequest::single_field_ascending("name"),
+            )
             .unwrap();
 
         assert!(services
             .ddl_path
             .metadata_store
-            .get("index:users:name_1")
+            .get(&initial_index_uri)
             .unwrap()
             .is_some());
         let docs = services
             .query
-            .find(&mut session, "users", Some(json!({"name": "alice"})))
+            .find(
+                &mut session,
+                &namespace("users"),
+                Some(json!({"name": "alice"})),
+            )
             .unwrap();
         assert_eq!(docs.len(), 1);
     }
@@ -415,12 +496,12 @@ mod tests {
         let services = TestServices::new(ReplicationConfig::default());
         services
             .ddl_path
-            .create_collection("users", vec!["name".to_string()])
+            .create_collection(&namespace("users"), vec!["name".to_string()])
             .unwrap();
 
         let err = services
             .ddl_path
-            .create_collection("users", vec!["name".to_string()])
+            .create_collection(&namespace("users"), vec!["name".to_string()])
             .unwrap_err();
 
         assert!(matches!(err, WrongoDBError::Storage(StorageError(_))));

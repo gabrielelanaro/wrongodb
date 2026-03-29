@@ -54,11 +54,14 @@ Use the minimum visibility required. Search for external usages of each type/fun
 
 The outcome is simple, easy to grasp code, where the excess has been removed, terminology is consistent, and the intent is obvious.
 
+
 Identify the list of module, classes, functions, filenames, directory analize each one of them individually for the improvements that applies to them.
 
 Review the directory layout of the file's current module and its parent module before making changes. Be explicit about whether the file still belongs in the current module or should be repositioned somewhere else.
 
 Work thorugh this checklist and summarize for each item the improvement you intend to make (or None, but be explicit with each one of these.)
+
+CRITICAL: You must analyze the items INDIVIDUALLY and produce a COMPLETE and ACCURATE list of ALL violations for ALL the items. Skipping items will diverge and spiral in an inconsistend and unmaintainable codebase.
 
 Example summary:
 

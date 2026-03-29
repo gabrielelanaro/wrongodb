@@ -8,12 +8,16 @@ use super::WriteOps;
 use crate::api::DdlPath;
 use crate::catalog::{CatalogStore, CollectionCatalog};
 use crate::collection_write_path::CollectionWritePath;
+use crate::core::{DatabaseName, Namespace};
 use crate::document_query::DocumentQuery;
 use crate::replication::{
     OplogOperation, OplogStore, ReplicationConfig, ReplicationCoordinator, ReplicationObserver,
 };
 use crate::storage::api::{Connection, ConnectionConfig};
 use crate::WrongoDBError;
+
+const TEST_DB: &str = "test";
+const TEST_OPLOG_TABLE_URI: &str = "table:test_oplog";
 
 struct TestServices {
     connection: Arc<Connection>,
@@ -31,7 +35,7 @@ fn open_services(
 ) -> TestServices {
     let connection = Arc::new(Connection::open(base_path, connection_config).unwrap());
     let metadata_store = connection.metadata_store();
-    let oplog_store = OplogStore::new(metadata_store.clone());
+    let oplog_store = OplogStore::new(metadata_store.clone(), TEST_OPLOG_TABLE_URI);
     let catalog = Arc::new(CollectionCatalog::new(CatalogStore::new()));
     let ddl_replication = ReplicationCoordinator::new(ddl_replication_config);
     let write_replication = ReplicationCoordinator::new(write_replication_config);
@@ -66,6 +70,10 @@ fn open_services(
     }
 }
 
+fn namespace(collection: &str) -> Namespace {
+    Namespace::new(DatabaseName::new(TEST_DB).unwrap(), collection).unwrap()
+}
+
 // EARS: When the node is not writable primary, the top-level write executor
 // shall reject the write before changing user data or appending oplog rows.
 #[test]
@@ -83,12 +91,12 @@ fn non_primary_write_is_rejected_before_mutation_and_oplog_append() {
     );
     services
         .ddl_path
-        .create_collection("users", vec!["name".to_string()])
+        .create_collection(&namespace("users"), vec!["name".to_string()])
         .unwrap();
 
     let err = services
         .write_ops
-        .insert_one("users", json!({"_id": 1, "name": "alice"}))
+        .insert_one(&namespace("users"), json!({"_id": 1, "name": "alice"}))
         .unwrap_err();
 
     assert!(matches!(
@@ -101,7 +109,7 @@ fn non_primary_write_is_rejected_before_mutation_and_oplog_append() {
     let mut session = services.connection.open_session();
     assert!(services
         .query
-        .find(&mut session, "users", Some(json!({"_id": 1})))
+        .find(&mut session, &namespace("users"), Some(json!({"_id": 1})))
         .unwrap()
         .is_empty());
     assert!(services
@@ -124,21 +132,30 @@ fn update_many_emits_one_oplog_row_per_affected_document_in_order() {
     );
     services
         .ddl_path
-        .create_collection("users", vec!["name".to_string(), "age".to_string()])
+        .create_collection(
+            &namespace("users"),
+            vec!["name".to_string(), "age".to_string()],
+        )
         .unwrap();
 
     services
         .write_ops
-        .insert_one("users", json!({"_id": 1, "name": "alice", "age": 30}))
+        .insert_one(
+            &namespace("users"),
+            json!({"_id": 1, "name": "alice", "age": 30}),
+        )
         .unwrap();
     services
         .write_ops
-        .insert_one("users", json!({"_id": 2, "name": "bob", "age": 40}))
+        .insert_one(
+            &namespace("users"),
+            json!({"_id": 2, "name": "bob", "age": 40}),
+        )
         .unwrap();
 
     let result = services
         .write_ops
-        .update_many("users", None, json!({"$set": {"age": 50}}))
+        .update_many(&namespace("users"), None, json!({"$set": {"age": 50}}))
         .unwrap();
     assert_eq!(result.matched, 2);
     assert_eq!(result.modified, 2);
@@ -174,19 +191,22 @@ fn delete_many_emits_one_oplog_row_per_affected_document() {
     );
     services
         .ddl_path
-        .create_collection("users", vec!["name".to_string()])
+        .create_collection(&namespace("users"), vec!["name".to_string()])
         .unwrap();
 
     services
         .write_ops
-        .insert_one("users", json!({"_id": 1, "name": "alice"}))
+        .insert_one(&namespace("users"), json!({"_id": 1, "name": "alice"}))
         .unwrap();
     services
         .write_ops
-        .insert_one("users", json!({"_id": 2, "name": "bob"}))
+        .insert_one(&namespace("users"), json!({"_id": 2, "name": "bob"}))
         .unwrap();
 
-    let deleted = services.write_ops.delete_many("users", None).unwrap();
+    let deleted = services
+        .write_ops
+        .delete_many(&namespace("users"), None)
+        .unwrap();
     assert_eq!(deleted, 2);
 
     let mut session = services.connection.open_session();
@@ -201,7 +221,7 @@ fn delete_many_emits_one_oplog_row_per_affected_document() {
     assert_eq!(delete_ids, vec![1, 2]);
     assert!(services
         .query
-        .find(&mut session, "users", None)
+        .find(&mut session, &namespace("users"), None)
         .unwrap()
         .is_empty());
 }
@@ -220,23 +240,23 @@ fn oplog_survives_restart_through_storage_wal_recovery() {
         );
         services
             .ddl_path
-            .create_collection("users", vec!["name".to_string()])
+            .create_collection(&namespace("users"), vec!["name".to_string()])
             .unwrap();
         services
             .write_ops
-            .insert_one("users", json!({"_id": 1, "name": "alice"}))
+            .insert_one(&namespace("users"), json!({"_id": 1, "name": "alice"}))
             .unwrap();
     }
 
     let reopened = Arc::new(Connection::open(dir.path(), ConnectionConfig::default()).unwrap());
-    let oplog_store = OplogStore::new(reopened.metadata_store());
+    let oplog_store = OplogStore::new(reopened.metadata_store(), TEST_OPLOG_TABLE_URI);
     let mut session = reopened.open_session();
     let entries = oplog_store.list_entries(&mut session).unwrap();
 
     assert_eq!(entries.len(), 1);
     match &entries[0].operation {
         OplogOperation::Insert { ns, document } => {
-            assert_eq!(ns, "test.users");
+            assert_eq!(ns, &namespace("users").full_name());
             assert_eq!(document["name"], json!("alice"));
         }
         other => panic!("expected insert oplog entry, found {other:?}"),

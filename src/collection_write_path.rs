@@ -6,6 +6,7 @@ use crate::catalog::{CollectionCatalog, CollectionDefinition};
 use crate::core::bson::encode_id_value;
 use crate::core::document::{normalize_document_in_place, validate_is_object};
 use crate::core::errors::{DocumentValidationError, StorageError};
+use crate::core::Namespace;
 use crate::document_query::DocumentQuery;
 use crate::replication::{OplogMode, ReplicationObserver};
 use crate::storage::api::Session;
@@ -54,7 +55,7 @@ impl CollectionWritePath {
     pub(crate) fn insert_one_in_transaction(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
         doc: Value,
         oplog_mode: OplogMode,
     ) -> Result<Document, WrongoDBError> {
@@ -62,7 +63,7 @@ impl CollectionWritePath {
         let mut obj = doc.as_object().expect("validated object").clone();
         normalize_document_in_place(&mut obj)?;
 
-        let definition = self.registered_collection_definition(session, collection)?;
+        let definition = self.registered_collection_definition(session, namespace)?;
         let table_uri = definition.table_uri().to_string();
         let id = obj
             .get("_id")
@@ -71,7 +72,7 @@ impl CollectionWritePath {
         let value = self.encode_row_for_table(&table_uri, &obj)?;
         self.insert_record(session, &table_uri, &key, &value)?;
         self.replication_observer
-            .on_insert(session, collection, &obj, oplog_mode)?;
+            .on_insert(session, namespace, &obj, oplog_mode)?;
         Ok(obj)
     }
 
@@ -79,16 +80,16 @@ impl CollectionWritePath {
     pub(crate) fn update_one_in_transaction(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
         filter: Option<Value>,
         update: Value,
         oplog_mode: OplogMode,
     ) -> Result<UpdateResult, WrongoDBError> {
-        let definition = self.registered_collection_definition(session, collection)?;
+        let definition = self.registered_collection_definition(session, namespace)?;
         let table_uri = definition.table_uri().to_string();
         let docs = self
             .document_query
-            .find_in_transaction(session, collection, filter)?;
+            .find_in_transaction(session, namespace, filter)?;
         if docs.is_empty() {
             return Ok(UpdateResult {
                 matched: 0,
@@ -105,7 +106,7 @@ impl CollectionWritePath {
         let value = self.encode_row_for_table(&table_uri, &updated_doc)?;
         self.update_record(session, &table_uri, &key, &value)?;
         self.replication_observer
-            .on_update(session, collection, &updated_doc, oplog_mode)?;
+            .on_update(session, namespace, &updated_doc, oplog_mode)?;
 
         Ok(UpdateResult {
             matched: 1,
@@ -117,16 +118,16 @@ impl CollectionWritePath {
     pub(crate) fn update_many_in_transaction(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
         filter: Option<Value>,
         update: Value,
         oplog_mode: OplogMode,
     ) -> Result<UpdateResult, WrongoDBError> {
-        let definition = self.registered_collection_definition(session, collection)?;
+        let definition = self.registered_collection_definition(session, namespace)?;
         let table_uri = definition.table_uri().to_string();
         let docs = self
             .document_query
-            .find_in_transaction(session, collection, filter)?;
+            .find_in_transaction(session, namespace, filter)?;
         if docs.is_empty() {
             return Ok(UpdateResult {
                 matched: 0,
@@ -144,7 +145,7 @@ impl CollectionWritePath {
             let value = self.encode_row_for_table(&table_uri, &updated_doc)?;
             self.update_record(session, &table_uri, &key, &value)?;
             self.replication_observer
-                .on_update(session, collection, &updated_doc, oplog_mode)?;
+                .on_update(session, namespace, &updated_doc, oplog_mode)?;
             modified += 1;
         }
 
@@ -158,15 +159,15 @@ impl CollectionWritePath {
     pub(crate) fn delete_one_in_transaction(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
         filter: Option<Value>,
         oplog_mode: OplogMode,
     ) -> Result<usize, WrongoDBError> {
-        let definition = self.registered_collection_definition(session, collection)?;
+        let definition = self.registered_collection_definition(session, namespace)?;
         let table_uri = definition.table_uri().to_string();
         let docs = self
             .document_query
-            .find_in_transaction(session, collection, filter)?;
+            .find_in_transaction(session, namespace, filter)?;
         if docs.is_empty() {
             return Ok(0);
         }
@@ -178,7 +179,7 @@ impl CollectionWritePath {
         let key = encode_id_value(id)?;
         self.delete_record(session, &table_uri, &key)?;
         self.replication_observer
-            .on_delete(session, collection, id, oplog_mode)?;
+            .on_delete(session, namespace, id, oplog_mode)?;
         Ok(1)
     }
 
@@ -186,15 +187,15 @@ impl CollectionWritePath {
     pub(crate) fn delete_many_in_transaction(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
         filter: Option<Value>,
         oplog_mode: OplogMode,
     ) -> Result<usize, WrongoDBError> {
-        let definition = self.registered_collection_definition(session, collection)?;
+        let definition = self.registered_collection_definition(session, namespace)?;
         let table_uri = definition.table_uri().to_string();
         let docs = self
             .document_query
-            .find_in_transaction(session, collection, filter)?;
+            .find_in_transaction(session, namespace, filter)?;
         if docs.is_empty() {
             return Ok(0);
         }
@@ -207,7 +208,7 @@ impl CollectionWritePath {
             let key = encode_id_value(id)?;
             self.delete_record(session, &table_uri, &key)?;
             self.replication_observer
-                .on_delete(session, collection, id, oplog_mode)?;
+                .on_delete(session, namespace, id, oplog_mode)?;
             deleted += 1;
         }
 
@@ -249,11 +250,13 @@ impl CollectionWritePath {
     fn registered_collection_definition(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
     ) -> Result<CollectionDefinition, WrongoDBError> {
         self.catalog
-            .get_collection(session, collection)?
-            .ok_or_else(|| StorageError(format!("unknown collection: {collection}")).into())
+            .get_collection(session, namespace)?
+            .ok_or_else(|| {
+                StorageError(format!("unknown collection: {}", namespace.full_name())).into()
+            })
     }
 
     fn encode_row_for_table(
@@ -355,12 +358,16 @@ mod tests {
     use crate::api::DdlPath;
     use crate::catalog::{CatalogStore, CollectionCatalog};
     use crate::collection_write_path::CollectionWritePath;
+    use crate::core::{DatabaseName, Namespace};
     use crate::document_query::DocumentQuery;
     use crate::replication::{
         OplogMode, OplogStore, ReplicationConfig, ReplicationCoordinator, ReplicationObserver,
     };
     use crate::storage::api::{Connection, ConnectionConfig, Session};
     use crate::WrongoDBError;
+
+    const TEST_DB: &str = "test";
+    const TEST_OPLOG_TABLE_URI: &str = "table:test_oplog";
 
     struct TestServices {
         connection: Arc<Connection>,
@@ -374,7 +381,7 @@ mod tests {
     fn test_services(base_path: std::path::PathBuf, config: ConnectionConfig) -> TestServices {
         let connection = Arc::new(Connection::open(&base_path, config).unwrap());
         let metadata_store = connection.metadata_store();
-        let oplog_store = OplogStore::new(metadata_store.clone());
+        let oplog_store = OplogStore::new(metadata_store.clone(), TEST_OPLOG_TABLE_URI);
         let catalog = Arc::new(CollectionCatalog::new(CatalogStore::new()));
         let replication = ReplicationCoordinator::new(ReplicationConfig::default());
         let mut session = connection.open_session();
@@ -411,6 +418,10 @@ mod tests {
         }
     }
 
+    fn namespace(collection: &str) -> Namespace {
+        Namespace::new(DatabaseName::new(TEST_DB).unwrap(), collection).unwrap()
+    }
+
     fn disabled_config() -> ConnectionConfig {
         ConnectionConfig::new().logging_enabled(false)
     }
@@ -418,7 +429,7 @@ mod tests {
     fn create_collection(ddl_path: &DdlPath, name: &str, storage_columns: &[&str]) {
         ddl_path
             .create_collection(
-                name,
+                &namespace(name),
                 storage_columns
                     .iter()
                     .map(|column| (*column).to_string())
@@ -434,7 +445,12 @@ mod tests {
         doc: serde_json::Value,
     ) -> Result<crate::Document, WrongoDBError> {
         session.with_transaction(|session| {
-            service.insert_one_in_transaction(session, collection, doc, OplogMode::GenerateOplog)
+            service.insert_one_in_transaction(
+                session,
+                &namespace(collection),
+                doc,
+                OplogMode::GenerateOplog,
+            )
         })
     }
 
@@ -448,7 +464,7 @@ mod tests {
         session.with_transaction(|session| {
             service.update_one_in_transaction(
                 session,
-                collection,
+                &namespace(collection),
                 filter,
                 update,
                 OplogMode::GenerateOplog,
@@ -463,7 +479,12 @@ mod tests {
         filter: Option<serde_json::Value>,
     ) -> Result<usize, WrongoDBError> {
         session.with_transaction(|session| {
-            service.delete_one_in_transaction(session, collection, filter, OplogMode::GenerateOplog)
+            service.delete_one_in_transaction(
+                session,
+                &namespace(collection),
+                filter,
+                OplogMode::GenerateOplog,
+            )
         })
     }
 
@@ -551,7 +572,10 @@ mod tests {
             json!({"_id": 1, "name": "alice"}),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("unknown collection: users"));
+        assert!(err.to_string().contains(&format!(
+            "unknown collection: {}",
+            namespace("users").full_name()
+        )));
     }
 
     // EARS: When an inserted document contains fields outside the declared
@@ -593,7 +617,11 @@ mod tests {
 
         let fetched = services
             .query
-            .find(&mut session, "users", Some(json!({"_id": id.clone()})))
+            .find(
+                &mut session,
+                &namespace("users"),
+                Some(json!({"_id": id.clone()})),
+            )
             .unwrap()
             .into_iter()
             .next()
@@ -613,7 +641,11 @@ mod tests {
 
         let fetched = services
             .query
-            .find(&mut session, "users", Some(json!({"_id": id.clone()})))
+            .find(
+                &mut session,
+                &namespace("users"),
+                Some(json!({"_id": id.clone()})),
+            )
             .unwrap()
             .into_iter()
             .next()
@@ -630,7 +662,11 @@ mod tests {
         assert_eq!(deleted, 1);
         assert!(services
             .query
-            .find(&mut session, "users", Some(json!({"name": "alice"})))
+            .find(
+                &mut session,
+                &namespace("users"),
+                Some(json!({"name": "alice"}))
+            )
             .unwrap()
             .is_empty());
     }
@@ -648,7 +684,7 @@ mod tests {
             .with_transaction(|session| {
                 let _ = services.write_path.insert_one_in_transaction(
                     session,
-                    "items",
+                    &namespace("items"),
                     json!({"_id": "abort-me", "value": "v1"}),
                     OplogMode::GenerateOplog,
                 )?;
@@ -660,7 +696,11 @@ mod tests {
         assert!(err.to_string().contains("force abort"));
         assert!(services
             .query
-            .find(&mut session, "items", Some(json!({"_id": "abort-me"})))
+            .find(
+                &mut session,
+                &namespace("items"),
+                Some(json!({"_id": "abort-me"}))
+            )
             .unwrap()
             .is_empty());
         assert!(services
@@ -668,7 +708,10 @@ mod tests {
             .list_entries(&mut session)
             .unwrap()
             .is_empty());
-        assert!(services.catalog.lookup_collection("items").is_some());
+        assert!(services
+            .catalog
+            .lookup_collection(&namespace("items"))
+            .is_some());
     }
 
     // EARS: When a collection mutation is applied in suppress-oplog mode, the
@@ -684,7 +727,7 @@ mod tests {
             .with_transaction(|session| {
                 services.write_path.insert_one_in_transaction(
                     session,
-                    "items",
+                    &namespace("items"),
                     json!({"_id": "no-oplog", "value": "v1"}),
                     OplogMode::SuppressOplog,
                 )?;
@@ -694,7 +737,11 @@ mod tests {
 
         let docs = services
             .query
-            .find(&mut session, "items", Some(json!({"_id": "no-oplog"})))
+            .find(
+                &mut session,
+                &namespace("items"),
+                Some(json!({"_id": "no-oplog"})),
+            )
             .unwrap();
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].get("value"), Some(&json!("v1")));

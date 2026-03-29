@@ -1,5 +1,6 @@
 use crate::api::DatabaseContext;
-use crate::server::commands::Command;
+use crate::core::Namespace;
+use crate::server::commands::{Command, CommandContext};
 use crate::WrongoDBError;
 use bson::{doc, oid::ObjectId, Bson, Document};
 use serde_json::{Map, Value};
@@ -72,8 +73,13 @@ impl Command for InsertCommand {
         &["insert"]
     }
 
-    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
-        let coll_name = doc.get_str("insert").unwrap_or("test");
+    fn execute(
+        &self,
+        ctx: &CommandContext,
+        doc: &Document,
+        db: &DatabaseContext,
+    ) -> Result<Document, WrongoDBError> {
+        let namespace = namespace_from_field(ctx, doc, "insert")?;
 
         let inserted_ids: Vec<ObjectId> = if let Ok(docs) = doc.get_array("documents") {
             let mut ids = Vec::new();
@@ -89,7 +95,7 @@ impl Command for InsertCommand {
                     };
                     let json_doc = bson_to_json_document(&doc_with_id);
                     db.write_ops()
-                        .insert_one(coll_name, Value::Object(json_doc))?;
+                        .insert_one(&namespace, Value::Object(json_doc))?;
                     ids.push(id);
                 }
             }
@@ -118,8 +124,13 @@ impl Command for FindCommand {
         &["find"]
     }
 
-    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
-        let coll_name = doc.get_str("find").unwrap_or("test");
+    fn execute(
+        &self,
+        ctx: &CommandContext,
+        doc: &Document,
+        db: &DatabaseContext,
+    ) -> Result<Document, WrongoDBError> {
+        let namespace = namespace_from_field(ctx, doc, "find")?;
         let mut session = db.connection().open_session();
 
         let filter = doc.get("filter").and_then(|f| f.as_document()).cloned();
@@ -127,7 +138,7 @@ impl Command for FindCommand {
 
         let mut results = db
             .document_query()
-            .find(&mut session, coll_name, filter_json)?;
+            .find(&mut session, &namespace, filter_json)?;
 
         let skip = doc.get("skip").and_then(|v| v.as_i64()).unwrap_or(0);
         if skip > 0 {
@@ -161,7 +172,7 @@ impl Command for FindCommand {
             "ok": Bson::Double(1.0),
             "cursor": {
                 "id": Bson::Int64(0),
-                "ns": format!("test.{}", coll_name),
+                "ns": namespace.full_name(),
                 "firstBatch": Bson::Array(results_bson),
             },
         })
@@ -175,8 +186,13 @@ impl Command for UpdateCommand {
         &["update"]
     }
 
-    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
-        let coll_name = doc.get_str("update").unwrap_or("test");
+    fn execute(
+        &self,
+        ctx: &CommandContext,
+        doc: &Document,
+        db: &DatabaseContext,
+    ) -> Result<Document, WrongoDBError> {
+        let namespace = namespace_from_field(ctx, doc, "update")?;
         let mut n_matched = 0i32;
         let mut n_modified = 0i32;
 
@@ -195,10 +211,10 @@ impl Command for UpdateCommand {
 
                     let result = if multi {
                         db.write_ops()
-                            .update_many(coll_name, filter_json, update_json)?
+                            .update_many(&namespace, filter_json, update_json)?
                     } else {
                         db.write_ops()
-                            .update_one(coll_name, filter_json, update_json)?
+                            .update_one(&namespace, filter_json, update_json)?
                     };
 
                     n_matched += result.matched as i32;
@@ -222,8 +238,13 @@ impl Command for DeleteCommand {
         &["delete"]
     }
 
-    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
-        let coll_name = doc.get_str("delete").unwrap_or("test");
+    fn execute(
+        &self,
+        ctx: &CommandContext,
+        doc: &Document,
+        db: &DatabaseContext,
+    ) -> Result<Document, WrongoDBError> {
+        let namespace = namespace_from_field(ctx, doc, "delete")?;
         let mut n_deleted = 0i32;
 
         if let Ok(deletes) = doc.get_array("deletes") {
@@ -235,9 +256,9 @@ impl Command for DeleteCommand {
                     let limit = delete_doc.get_i32("limit").unwrap_or(0);
 
                     if limit == 1 {
-                        n_deleted += db.write_ops().delete_one(coll_name, filter_json)? as i32;
+                        n_deleted += db.write_ops().delete_one(&namespace, filter_json)? as i32;
                     } else {
-                        n_deleted += db.write_ops().delete_many(coll_name, filter_json)? as i32;
+                        n_deleted += db.write_ops().delete_many(&namespace, filter_json)? as i32;
                     }
                 }
             }
@@ -248,4 +269,19 @@ impl Command for DeleteCommand {
             "n": Bson::Int32(n_deleted),
         })
     }
+}
+
+pub(crate) fn namespace_from_field(
+    ctx: &CommandContext,
+    doc: &Document,
+    field: &str,
+) -> Result<Namespace, WrongoDBError> {
+    let collection = required_string_field(doc, field)?;
+    Namespace::new(ctx.db_name().clone(), collection)
+}
+
+fn required_string_field(doc: &Document, field: &str) -> Result<String, WrongoDBError> {
+    doc.get_str(field)
+        .map(str::to_string)
+        .map_err(|_| WrongoDBError::Protocol(format!("command requires string field {field}")))
 }

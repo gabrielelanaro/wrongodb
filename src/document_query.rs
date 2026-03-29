@@ -6,6 +6,7 @@ use serde_json::Value;
 use crate::catalog::CollectionCatalog;
 use crate::core::bson::encode_id_value;
 use crate::core::document::validate_is_object;
+use crate::core::Namespace;
 use crate::index::{decode_index_id, encode_range_bounds};
 use crate::storage::api::{Session, TableCursor};
 use crate::storage::row::decode_row_value;
@@ -30,31 +31,31 @@ impl DocumentQuery {
     pub(crate) fn find(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
         filter: Option<Value>,
     ) -> Result<Vec<Document>, WrongoDBError> {
-        session.with_transaction(|session| self.find_in_transaction(session, collection, filter))
+        session.with_transaction(|session| self.find_in_transaction(session, namespace, filter))
     }
 
     /// Counts the documents matching `filter`.
     pub(crate) fn count(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
         filter: Option<Value>,
     ) -> Result<usize, WrongoDBError> {
-        Ok(self.find(session, collection, filter)?.len())
+        Ok(self.find(session, namespace, filter)?.len())
     }
 
     /// Returns the distinct values of `key` among the matching documents.
     pub(crate) fn distinct(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
         key: &str,
         filter: Option<Value>,
     ) -> Result<Vec<Value>, WrongoDBError> {
-        let docs = self.find(session, collection, filter)?;
+        let docs = self.find(session, namespace, filter)?;
         let mut seen = HashSet::new();
         let mut values = Vec::new();
 
@@ -74,10 +75,10 @@ impl DocumentQuery {
     pub(crate) fn find_in_transaction(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
         filter: Option<Value>,
     ) -> Result<Vec<Document>, WrongoDBError> {
-        let Some(collection_definition) = self.catalog.get_collection(session, collection)? else {
+        let Some(collection_definition) = self.catalog.get_collection(session, namespace)? else {
             return Ok(Vec::new());
         };
 
@@ -189,10 +190,13 @@ mod tests {
     use crate::api::DdlPath;
     use crate::catalog::{CatalogStore, CollectionCatalog, CreateIndexRequest};
     use crate::collection_write_path::CollectionWritePath;
+    use crate::core::{DatabaseName, Namespace};
     use crate::replication::{
         OplogMode, OplogStore, ReplicationConfig, ReplicationCoordinator, ReplicationObserver,
     };
     use crate::storage::api::{Connection, ConnectionConfig};
+
+    const TEST_OPLOG_TABLE_URI: &str = "table:test_oplog";
 
     struct QueryTestFixture {
         connection: Arc<Connection>,
@@ -210,7 +214,7 @@ mod tests {
             let config = ConnectionConfig::new().logging_enabled(false);
             let connection = Arc::new(Connection::open(&base_path, config).unwrap());
             let metadata_store = connection.metadata_store();
-            let oplog_store = OplogStore::new(metadata_store.clone());
+            let oplog_store = OplogStore::new(metadata_store.clone(), TEST_OPLOG_TABLE_URI);
             let catalog = Arc::new(CollectionCatalog::new(CatalogStore::new()));
             let replication = ReplicationCoordinator::new(ReplicationConfig::default());
             {
@@ -243,6 +247,13 @@ mod tests {
         }
     }
 
+    fn namespace(collection: &str) -> Namespace {
+        Namespace::new(DatabaseName::new("test").unwrap(), collection).unwrap()
+    }
+
+    // EARS: When an indexed lookup runs after checkpoint reconciliation, the
+    // query layer shall still find the matching document through the durable
+    // index definition.
     #[test]
     fn indexed_lookup_survives_checkpoint_reconciliation() {
         let fixture = QueryTestFixture::new();
@@ -250,17 +261,20 @@ mod tests {
 
         fixture
             .ddl_path
-            .create_collection("test", vec!["name".to_string()])
+            .create_collection(&namespace("test"), vec!["name".to_string()])
             .unwrap();
         fixture
             .ddl_path
-            .create_index("test", CreateIndexRequest::single_field_ascending("name"))
+            .create_index(
+                &namespace("test"),
+                CreateIndexRequest::single_field_ascending("name"),
+            )
             .unwrap();
         session
             .with_transaction(|session| {
                 fixture.write_path.insert_one_in_transaction(
                     session,
-                    "test",
+                    &namespace("test"),
                     json!({"_id": 1, "name": "alice"}),
                     OplogMode::GenerateOplog,
                 )?;
@@ -272,7 +286,11 @@ mod tests {
 
         let docs = fixture
             .query
-            .find(&mut session, "test", Some(json!({"name": "alice"})))
+            .find(
+                &mut session,
+                &namespace("test"),
+                Some(json!({"name": "alice"})),
+            )
             .unwrap();
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].get("name"), Some(&json!("alice")));

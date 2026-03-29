@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use bson::{doc, Bson, Document};
 
-use super::{handlers, Command};
+use super::{handlers, Command, CommandContext};
 use crate::api::DatabaseContext;
 use crate::WrongoDBError;
 
@@ -32,12 +32,13 @@ impl CommandRegistry {
 
     pub(crate) fn execute(
         &self,
+        ctx: &CommandContext,
         doc: &Document,
         db: &DatabaseContext,
     ) -> Result<Document, WrongoDBError> {
         for key in doc.keys() {
             if let Some(&idx) = self.name_to_handler.get(&key.to_lowercase()) {
-                return self.handlers[idx].execute(doc, db);
+                return self.handlers[idx].execute(ctx, doc, db);
             }
         }
         Ok(doc! { "ok": Bson::Double(0.0), "errmsg": "Command not found" })

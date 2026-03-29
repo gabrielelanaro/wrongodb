@@ -128,7 +128,7 @@ Role:
 
 Current behavior:
 
-- stores oplog entries in the internal table `table:__oplog`
+- stores oplog entries in the reserved internal namespace `local.oplog.rs`
 - reserves `OpTime { term, index }` through `ReplicationCoordinator`
 - writes oplog rows inside the same storage transaction as the user-data mutation
 - supports `GenerateOplog` and `SuppressOplog` modes so a future follower-apply path can reuse `CollectionWritePath` without recursively re-oplogging
@@ -170,7 +170,7 @@ The server layer never reads raw files directly.
 - storage metadata and collection catalog must remain distinct persistence planes
 - index readiness is a server-level concern even though index stores are built through `Session`
 - collection creation is explicit; writes do not auto-create collections
-- the oplog is logical replication state in `table:__oplog`, not part of `storage/wal`
+- the oplog is logical replication state in `local.oplog.rs`, not part of `storage/wal`
 - `CollectionWritePath` should not open its own top-level transactions
 
 ## Extension guidelines

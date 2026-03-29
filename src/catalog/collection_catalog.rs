@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::catalog::{CatalogRecord, CatalogStore, CATALOG_FILE_URI};
 use crate::core::errors::StorageError;
+use crate::core::{DatabaseName, Namespace};
 use crate::storage::api::Session;
 use crate::storage::metadata_store::{
     table_uri, MetadataEntry, MetadataStore, INDEX_URI_PREFIX, TABLE_URI_PREFIX,
@@ -133,7 +134,7 @@ impl IndexDefinition {
 /// pointing back to the storage-layer `table:` and `index:` URIs.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CollectionDefinition {
-    name: String,
+    namespace: Namespace,
     table_uri: String,
     uuid: Binary,
     options: Document,
@@ -144,12 +145,12 @@ pub(crate) struct CollectionDefinition {
 impl CollectionDefinition {
     /// Creates a new collection definition with an empty index set.
     pub(crate) fn new(
-        name: impl Into<String>,
+        namespace: Namespace,
         table_uri: impl Into<String>,
         storage_columns: Vec<String>,
     ) -> Self {
         Self {
-            name: name.into(),
+            namespace,
             table_uri: table_uri.into(),
             uuid: uuid_binary(),
             options: collection_options(&storage_columns),
@@ -158,8 +159,16 @@ impl CollectionDefinition {
         }
     }
 
-    pub(crate) fn name(&self) -> &str {
-        &self.name
+    pub(crate) fn namespace(&self) -> &Namespace {
+        &self.namespace
+    }
+
+    pub(crate) fn db_name(&self) -> &DatabaseName {
+        self.namespace.db_name()
+    }
+
+    pub(crate) fn collection_name(&self) -> &str {
+        self.namespace.collection_name()
     }
 
     /// Returns the primary storage-layer `table:` URI for the collection.
@@ -196,7 +205,7 @@ impl CollectionDefinition {
 #[derive(Debug, Default)]
 pub(crate) struct CollectionCatalog {
     store: CatalogStore,
-    collections: RwLock<BTreeMap<String, CollectionDefinition>>,
+    collections: RwLock<BTreeMap<Namespace, CollectionDefinition>>,
 }
 
 impl CollectionCatalog {
@@ -230,7 +239,7 @@ impl CollectionCatalog {
         let collections = self
             .list_collections(session)?
             .into_iter()
-            .map(|collection| (collection.name().to_string(), collection))
+            .map(|collection| (collection.namespace().clone(), collection))
             .collect();
         *self.collections.write() = collections;
         Ok(())
@@ -240,37 +249,55 @@ impl CollectionCatalog {
     fn refresh_cache_entry(
         &self,
         session: &Session,
-        collection: &str,
+        namespace: &Namespace,
     ) -> Result<(), WrongoDBError> {
         let mut cache = self.collections.write();
-        match self.get_collection(session, collection)? {
+        match self.get_collection(session, namespace)? {
             Some(definition) => {
-                cache.insert(collection.to_string(), definition);
+                cache.insert(namespace.clone(), definition);
             }
             None => {
-                cache.remove(collection);
+                cache.remove(namespace);
             }
         }
         Ok(())
     }
 
-    /// Lists the collection names from cache.
-    pub(crate) fn list_collection_names(&self) -> Vec<String> {
-        self.collections.read().keys().cloned().collect()
+    /// Lists the collection names from cache for one database.
+    pub(crate) fn list_collection_names(&self, db_name: &DatabaseName) -> Vec<String> {
+        self.collections
+            .read()
+            .values()
+            .filter(|definition| definition.db_name() == db_name)
+            .map(|definition| definition.collection_name().to_string())
+            .collect()
     }
 
     /// Looks up a collection definition from cache.
-    pub(crate) fn lookup_collection(&self, collection: &str) -> Option<CollectionDefinition> {
-        self.collections.read().get(collection).cloned()
+    pub(crate) fn lookup_collection(&self, namespace: &Namespace) -> Option<CollectionDefinition> {
+        self.collections.read().get(namespace).cloned()
     }
 
     /// Returns the index definitions for a collection from cache.
-    pub(crate) fn list_index_definitions(&self, collection: &str) -> Vec<IndexDefinition> {
+    pub(crate) fn list_index_definitions(&self, namespace: &Namespace) -> Vec<IndexDefinition> {
         self.collections
             .read()
-            .get(collection)
+            .get(namespace)
             .map(|definition| definition.indexes().values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Lists the known databases from cache.
+    pub(crate) fn list_database_names(&self) -> Vec<DatabaseName> {
+        let mut names = self
+            .collections
+            .read()
+            .keys()
+            .map(|namespace| namespace.db_name().clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names
     }
 
     // ------------------------------------------------------------------------
@@ -281,11 +308,11 @@ impl CollectionCatalog {
     pub(crate) fn get_collection(
         &self,
         session: &Session,
-        collection: &str,
+        namespace: &Namespace,
     ) -> Result<Option<CollectionDefinition>, WrongoDBError> {
         self.store
-            .get_record(session, collection)?
-            .map(|record| collection_definition_from_record(collection.to_string(), record))
+            .get_record(session, &namespace.full_name())?
+            .map(|record| collection_definition_from_record(namespace.full_name(), record))
             .transpose()
     }
 
@@ -305,30 +332,6 @@ impl CollectionCatalog {
     // Write API
     // ------------------------------------------------------------------------
 
-    /// Inserts a collection definition if it doesn't already exist.
-    ///
-    /// Returns the definition and a boolean indicating whether it was newly created.
-    pub(crate) fn insert_collection_if_missing(
-        &self,
-        session: &Session,
-        collection: &str,
-        table_uri: &str,
-        storage_columns: &[String],
-    ) -> Result<(CollectionDefinition, bool), WrongoDBError> {
-        if let Some(existing) = self.get_collection(session, collection)? {
-            return Ok((existing, false));
-        }
-
-        let definition = CollectionDefinition::new(collection, table_uri, storage_columns.to_vec());
-        let record = catalog_record_from_collection_definition(&definition)?;
-        self.store.put_record(session, collection, &record)?;
-
-        // Auto-refresh cache after successful write
-        self.refresh_cache_entry(session, collection)?;
-
-        Ok((definition, true))
-    }
-
     /// Creates a collection with storage in its own transaction flow.
     ///
     /// This handles both storage creation and catalog entry insertion.
@@ -336,14 +339,22 @@ impl CollectionCatalog {
     pub(crate) fn create_collection(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
         storage_columns: &[String],
     ) -> Result<(CollectionDefinition, bool), WrongoDBError> {
-        let uri = table_uri(collection);
-        session.create_table(&uri, storage_columns.to_vec())?;
+        let definition = new_collection_definition(namespace.clone(), storage_columns.to_vec());
+        session.create_table(definition.table_uri(), storage_columns.to_vec())?;
 
         session.with_transaction(|session| {
-            self.insert_collection_if_missing(session, collection, &uri, storage_columns)
+            if let Some(existing) = self.get_collection(session, namespace)? {
+                return Ok((existing, false));
+            }
+
+            let record = catalog_record_from_collection_definition(&definition)?;
+            self.store
+                .put_record(session, &namespace.full_name(), &record)?;
+            self.refresh_cache_entry(session, namespace)?;
+            Ok((definition.clone(), true))
         })
     }
 
@@ -353,22 +364,23 @@ impl CollectionCatalog {
     pub(crate) fn ensure_index(
         &self,
         session: &Session,
-        collection: &str,
+        namespace: &Namespace,
         index: IndexDefinition,
     ) -> Result<bool, WrongoDBError> {
-        let mut definition = self
-            .get_collection(session, collection)?
-            .ok_or_else(|| StorageError(format!("unknown collection: {collection}")))?;
+        let mut definition = self.get_collection(session, namespace)?.ok_or_else(|| {
+            StorageError(format!("unknown collection: {}", namespace.full_name()))
+        })?;
         if definition.indexes.contains_key(index.name()) {
             return Ok(false);
         }
 
         definition.indexes.insert(index.name.clone(), index);
         let record = catalog_record_from_collection_definition(&definition)?;
-        self.store.put_record(session, collection, &record)?;
+        self.store
+            .put_record(session, &namespace.full_name(), &record)?;
 
         // Auto-refresh cache after successful write
-        self.refresh_cache_entry(session, collection)?;
+        self.refresh_cache_entry(session, namespace)?;
 
         Ok(true)
     }
@@ -379,10 +391,10 @@ impl CollectionCatalog {
     pub(crate) fn create_index(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
         index: IndexDefinition,
     ) -> Result<bool, WrongoDBError> {
-        session.with_transaction(|session| self.ensure_index(session, collection, index))
+        session.with_transaction(|session| self.ensure_index(session, namespace, index))
     }
 
     /// Builds index storage and marks the index as ready.
@@ -393,7 +405,7 @@ impl CollectionCatalog {
     pub(crate) fn build_and_mark_index_ready(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
         table_uri: &str,
         index_name: &str,
         metadata_entry: &MetadataEntry,
@@ -402,19 +414,19 @@ impl CollectionCatalog {
         session.create_index(table_uri, metadata_entry)?;
 
         // Step 2: Mark ready
-        self.set_index_ready(session, collection, index_name, true)
+        self.set_index_ready(session, namespace, index_name, true)
     }
 
     /// Sets the ready state of an index in its own transaction.
     pub(crate) fn set_index_ready(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
         index_name: &str,
         ready: bool,
     ) -> Result<(), WrongoDBError> {
         session.with_transaction(|session| {
-            self.set_index_ready_inner(session, collection, index_name, ready)
+            self.set_index_ready_inner(session, namespace, index_name, ready)
         })
     }
 
@@ -437,26 +449,28 @@ impl CollectionCatalog {
     fn set_index_ready_inner(
         &self,
         session: &Session,
-        collection: &str,
+        namespace: &Namespace,
         index_name: &str,
         ready: bool,
     ) -> Result<(), WrongoDBError> {
-        let mut definition = self
-            .get_collection(session, collection)?
-            .ok_or_else(|| StorageError(format!("unknown collection: {collection}")))?;
+        let mut definition = self.get_collection(session, namespace)?.ok_or_else(|| {
+            StorageError(format!("unknown collection: {}", namespace.full_name()))
+        })?;
         let Some(index) = definition.indexes.get_mut(index_name) else {
             return Err(StorageError(format!(
-                "unknown index {index_name} on collection {collection}"
+                "unknown index {index_name} on collection {}",
+                namespace.full_name()
             ))
             .into());
         };
         index.ready = ready;
 
         let record = catalog_record_from_collection_definition(&definition)?;
-        self.store.put_record(session, collection, &record)?;
+        self.store
+            .put_record(session, &namespace.full_name(), &record)?;
 
         // Auto-refresh cache after successful write
-        self.refresh_cache_entry(session, collection)?;
+        self.refresh_cache_entry(session, namespace)?;
 
         Ok(())
     }
@@ -480,12 +494,13 @@ struct DurableIndexMetadata {
 }
 
 fn collection_definition_from_record(
-    collection: String,
+    namespace_key: String,
     record: CatalogRecord,
 ) -> Result<CollectionDefinition, WrongoDBError> {
+    let namespace = Namespace::parse(&namespace_key)?;
     if !record.table_uri.starts_with(TABLE_URI_PREFIX) {
         return Err(StorageError(format!(
-            "catalog row for {collection} has invalid table URI: {}",
+            "catalog row for {namespace_key} has invalid table URI: {}",
             record.table_uri
         ))
         .into());
@@ -497,12 +512,12 @@ fn collection_definition_from_record(
         let name = index_spec_name(&index_metadata.spec)?;
         let uri = record.index_uris.get(&name).cloned().ok_or_else(|| {
             StorageError(format!(
-                "catalog row for {collection} is missing index URI for {name}"
+                "catalog row for {namespace_key} is missing index URI for {name}"
             ))
         })?;
         if !uri.starts_with(INDEX_URI_PREFIX) {
             return Err(StorageError(format!(
-                "catalog row for {collection} has invalid index URI: {uri}"
+                "catalog row for {namespace_key} has invalid index URI: {uri}"
             ))
             .into());
         }
@@ -515,20 +530,20 @@ fn collection_definition_from_record(
     for (name, uri) in &record.index_uris {
         if !uri.starts_with(INDEX_URI_PREFIX) {
             return Err(StorageError(format!(
-                "catalog row for {collection} has invalid index URI: {uri}"
+                "catalog row for {namespace_key} has invalid index URI: {uri}"
             ))
             .into());
         }
         if !indexes.contains_key(name) {
             return Err(StorageError(format!(
-                "catalog row for {collection} has orphan index URI mapping for {name}"
+                "catalog row for {namespace_key} has orphan index URI mapping for {name}"
             ))
             .into());
         }
     }
 
     Ok(CollectionDefinition {
-        name: collection,
+        namespace,
         table_uri: record.table_uri,
         uuid: metadata.uuid,
         options: metadata.options,
@@ -572,7 +587,7 @@ fn validate_collection_references(
     if metadata_store.get(collection.table_uri())?.is_none() {
         return Err(StorageError(format!(
             "catalog collection {} references missing table URI {}",
-            collection.name(),
+            collection.namespace().full_name(),
             collection.table_uri()
         ))
         .into());
@@ -582,7 +597,7 @@ fn validate_collection_references(
         if metadata_store.get(index.uri())?.is_none() {
             return Err(StorageError(format!(
                 "catalog collection {} references missing index URI {}",
-                collection.name(),
+                collection.namespace().full_name(),
                 index.uri()
             ))
             .into());
@@ -607,6 +622,14 @@ fn index_spec_name(spec: &Document) -> Result<String, WrongoDBError> {
 
 fn default_index_name(field: &str) -> String {
     format!("{field}_1")
+}
+
+fn new_collection_definition(
+    namespace: Namespace,
+    storage_columns: Vec<String>,
+) -> CollectionDefinition {
+    let table_ident = format!("c_{}", Uuid::new_v4().simple());
+    CollectionDefinition::new(namespace, table_uri(&table_ident), storage_columns)
 }
 
 fn collection_options(storage_columns: &[String]) -> Document {
@@ -657,6 +680,8 @@ mod tests {
 
     use super::*;
 
+    // EARS: When `createIndexes` omits the index name, catalog normalization
+    // shall synthesize MongoDB's default `<field>_1` index name.
     #[test]
     fn create_index_request_normalizes_missing_name() {
         let request = CreateIndexRequest::from_bson_spec(&doc! { "key": { "name": 1 } }).unwrap();
@@ -665,6 +690,8 @@ mod tests {
         assert_eq!(request.spec.get_str("name").unwrap(), "name_1");
     }
 
+    // EARS: When `createIndexes` requests an unsupported key shape, catalog
+    // normalization shall reject the request.
     #[test]
     fn create_index_request_rejects_unsupported_specs() {
         let err =

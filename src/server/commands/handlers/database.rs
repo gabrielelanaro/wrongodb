@@ -1,6 +1,8 @@
+use super::crud::namespace_from_field;
 use crate::api::DatabaseContext;
 use crate::core::errors::DocumentValidationError;
-use crate::server::commands::Command;
+use crate::core::Namespace;
+use crate::server::commands::{Command, CommandContext};
 use crate::WrongoDBError;
 use bson::{doc, spec::BinarySubtype, Binary, Bson, Document};
 
@@ -12,16 +14,32 @@ impl Command for ListDatabasesCommand {
         &["listDatabases"]
     }
 
-    fn execute(&self, _doc: &Document, _db: &DatabaseContext) -> Result<Document, WrongoDBError> {
+    fn execute(
+        &self,
+        ctx: &CommandContext,
+        _doc: &Document,
+        db: &DatabaseContext,
+    ) -> Result<Document, WrongoDBError> {
+        if ctx.db_name().as_str() != "admin" {
+            return Err(WrongoDBError::Protocol(
+                "listDatabases must run against the admin database".into(),
+            ));
+        }
+
         Ok(doc! {
             "ok": Bson::Double(1.0),
-            "databases": Bson::Array(vec![
-                Bson::Document(doc! {
-                    "name": "test",
-                    "sizeOnDisk": Bson::Int64(0),
-                    "empty": Bson::Boolean(false),
-                })
-            ]),
+            "databases": Bson::Array(
+                db.list_databases()
+                    .into_iter()
+                    .map(|name| {
+                        Bson::Document(doc! {
+                            "name": name.as_str(),
+                            "sizeOnDisk": Bson::Int64(0),
+                            "empty": Bson::Boolean(false),
+                        })
+                    })
+                    .collect()
+            ),
             "totalSize": Bson::Int64(0),
             "totalSizeMb": Bson::Int64(0),
         })
@@ -36,12 +54,18 @@ impl Command for ListCollectionsCommand {
         &["listCollections"]
     }
 
-    fn execute(&self, _doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
-        let collections = db.list_collections()?;
+    fn execute(
+        &self,
+        ctx: &CommandContext,
+        _doc: &Document,
+        db: &DatabaseContext,
+    ) -> Result<Document, WrongoDBError> {
+        let collections = db.list_collections(ctx.db_name())?;
         let collections_bson: Vec<Bson> = collections
             .into_iter()
             .filter_map(|name| {
-                let definition = db.collection_definition(&name).ok()??;
+                let namespace = Namespace::new(ctx.db_name().clone(), name.clone()).ok()?;
+                let definition = db.collection_definition(&namespace).ok()??;
                 Some(Bson::Document(doc! {
                     "name": name.clone(),
                     "type": "collection",
@@ -62,11 +86,12 @@ impl Command for ListCollectionsCommand {
             })
             .collect();
 
+        let cursor_namespace = Namespace::list_collections_cursor(ctx.db_name().clone())?;
         Ok(doc! {
             "ok": Bson::Double(1.0),
             "cursor": {
                 "id": Bson::Int64(0),
-                "ns": "test.$cmd.listCollections",
+                "ns": cursor_namespace.full_name(),
                 "firstBatch": Bson::Array(collections_bson),
             },
         })
@@ -81,7 +106,12 @@ impl Command for CreateCollectionCommand {
         &["createCollection", "create"]
     }
 
-    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
+    fn execute(
+        &self,
+        ctx: &CommandContext,
+        doc: &Document,
+        db: &DatabaseContext,
+    ) -> Result<Document, WrongoDBError> {
         let collection = doc
             .get_str("createCollection")
             .or_else(|_| doc.get_str("create"))
@@ -92,8 +122,9 @@ impl Command for CreateCollectionCommand {
             })?;
 
         let storage_columns = parse_storage_columns(doc)?;
+        let namespace = Namespace::new(ctx.db_name().clone(), collection)?;
         db.ddl_path()
-            .create_collection(collection, storage_columns)?;
+            .create_collection(&namespace, storage_columns)?;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),
@@ -109,20 +140,26 @@ impl Command for DbStatsCommand {
         &["dbStats"]
     }
 
-    fn execute(&self, _doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
-        let collections = db.list_collections()?;
+    fn execute(
+        &self,
+        ctx: &CommandContext,
+        _doc: &Document,
+        db: &DatabaseContext,
+    ) -> Result<Document, WrongoDBError> {
+        let collections = db.list_collections(ctx.db_name())?;
         let mut document_count = 0usize;
         let mut index_count = 0usize;
 
         for name in &collections {
+            let namespace = Namespace::new(ctx.db_name().clone(), name.clone())?;
             let mut session = db.connection().open_session();
-            document_count += db.document_query().count(&mut session, name, None)?;
-            index_count += db.list_indexes(name)?.len();
+            document_count += db.document_query().count(&mut session, &namespace, None)?;
+            index_count += db.list_indexes(&namespace)?.len();
         }
 
         Ok(doc! {
             "ok": Bson::Double(1.0),
-            "db": "test",
+            "db": ctx.db_name().as_str(),
             "collections": Bson::Int32(collections.len() as i32),
             "objects": Bson::Int64(document_count as i64),
             "avgObjSize": Bson::Double(0.0),
@@ -142,15 +179,20 @@ impl Command for CollStatsCommand {
         &["collStats"]
     }
 
-    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
-        let coll_name = doc.get_str("collStats").unwrap_or("test");
+    fn execute(
+        &self,
+        ctx: &CommandContext,
+        doc: &Document,
+        db: &DatabaseContext,
+    ) -> Result<Document, WrongoDBError> {
+        let namespace = namespace_from_field(ctx, doc, "collStats")?;
         let mut session = db.connection().open_session();
-        let count = db.document_query().count(&mut session, coll_name, None)?;
-        let index_count = db.list_indexes(coll_name)?.len() as i32 + 1;
+        let count = db.document_query().count(&mut session, &namespace, None)?;
+        let index_count = db.list_indexes(&namespace)?.len() as i32 + 1;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),
-            "ns": format!("test.{}", coll_name),
+            "ns": namespace.full_name(),
             "count": Bson::Int64(count as i64),
             "size": Bson::Int64(0),
             "avgObjSize": Bson::Double(0.0),

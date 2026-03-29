@@ -55,6 +55,9 @@ The test directory structure should mirror the product's domains and public surf
 <improvement id="check-runner-ergonomics" applies-to="directory,module,filename">
 Make it easy to run focused subsets of the suite. Call out confusing suite entrypoints, hidden tests, or layouts that fight Cargo's model.
 </improvement>
+<improvement id="ears-requirement-comment" applies-to="function,method,module,class">
+Add a comment for each test with the EARS format requirement that this test is supposed to be testing. This keeps tests readable and focused
+</improvement>
 
 Follow this workflow:
 

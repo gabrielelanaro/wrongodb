@@ -1,5 +1,6 @@
 use serde_json::Value;
 
+use crate::core::Namespace;
 use crate::{Document, StorageError, WrongoDBError};
 
 use super::{OpTime, OplogEntry, OplogMode, OplogOperation, OplogStore, ReplicationCoordinator};
@@ -25,7 +26,7 @@ impl ReplicationObserver {
     pub(crate) fn on_insert(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
         document: &Document,
         oplog_mode: OplogMode,
     ) -> Result<Option<OpTime>, WrongoDBError> {
@@ -33,7 +34,7 @@ impl ReplicationObserver {
             session,
             oplog_mode,
             OplogOperation::Insert {
-                ns: collection_namespace(collection),
+                ns: namespace.full_name(),
                 document: document.clone(),
             },
         )
@@ -43,7 +44,7 @@ impl ReplicationObserver {
     pub(crate) fn on_update(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
         document: &Document,
         oplog_mode: OplogMode,
     ) -> Result<Option<OpTime>, WrongoDBError> {
@@ -55,7 +56,7 @@ impl ReplicationObserver {
             session,
             oplog_mode,
             OplogOperation::Update {
-                ns: collection_namespace(collection),
+                ns: namespace.full_name(),
                 document: document.clone(),
                 document_key: document_key(id),
             },
@@ -66,7 +67,7 @@ impl ReplicationObserver {
     pub(crate) fn on_delete(
         &self,
         session: &mut Session,
-        collection: &str,
+        namespace: &Namespace,
         id: &Value,
         oplog_mode: OplogMode,
     ) -> Result<Option<OpTime>, WrongoDBError> {
@@ -74,7 +75,7 @@ impl ReplicationObserver {
             session,
             oplog_mode,
             OplogOperation::Delete {
-                ns: collection_namespace(collection),
+                ns: namespace.full_name(),
                 document_key: document_key(id),
             },
         )
@@ -102,11 +103,6 @@ impl ReplicationObserver {
     }
 }
 
-// TODO: why test? Something seems awfill off here? What are you trying to do?
-fn collection_namespace(collection: &str) -> String {
-    format!("test.{collection}")
-}
-
 fn document_key(id: &Value) -> Document {
     let mut key = Document::new();
     key.insert("_id".to_string(), id.clone());
@@ -119,8 +115,15 @@ mod tests {
     use tempfile::tempdir;
 
     use super::ReplicationObserver;
+    use crate::core::{DatabaseName, Namespace};
     use crate::replication::{OplogMode, OplogStore, ReplicationConfig, ReplicationCoordinator};
     use crate::storage::api::{Connection, ConnectionConfig};
+
+    const TEST_OPLOG_TABLE_URI: &str = "table:test_oplog";
+
+    fn namespace(collection: &str) -> Namespace {
+        Namespace::new(DatabaseName::new("test").unwrap(), collection).unwrap()
+    }
 
     // EARS: When the observer runs in suppress-oplog mode, it shall not append any
     // oplog rows.
@@ -131,7 +134,7 @@ mod tests {
         std::mem::forget(dir);
 
         let connection = Connection::open(&base_path, ConnectionConfig::new()).unwrap();
-        let oplog_store = OplogStore::new(connection.metadata_store());
+        let oplog_store = OplogStore::new(connection.metadata_store(), TEST_OPLOG_TABLE_URI);
         let coordinator = ReplicationCoordinator::new(ReplicationConfig::default());
         let observer = ReplicationObserver::new(coordinator, oplog_store.clone());
         let document = json!({"_id": 1, "name": "alice"})
@@ -143,7 +146,12 @@ mod tests {
         oplog_store.ensure_table_exists(&mut session).unwrap();
         session
             .with_transaction(|session| {
-                observer.on_insert(session, "users", &document, OplogMode::SuppressOplog)
+                observer.on_insert(
+                    session,
+                    &namespace("users"),
+                    &document,
+                    OplogMode::SuppressOplog,
+                )
             })
             .unwrap();
 

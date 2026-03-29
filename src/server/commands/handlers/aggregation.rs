@@ -1,6 +1,6 @@
-use super::crud::{bson_to_value, value_to_bson_value};
+use super::crud::{bson_to_value, namespace_from_field, value_to_bson_value};
 use crate::api::DatabaseContext;
-use crate::server::commands::Command;
+use crate::server::commands::{Command, CommandContext};
 use crate::WrongoDBError;
 use bson::{doc, Bson, Document};
 use serde_json::Value;
@@ -13,15 +13,20 @@ impl Command for CountCommand {
         &["count"]
     }
 
-    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
-        let coll_name = doc.get_str("count").unwrap_or("test");
+    fn execute(
+        &self,
+        ctx: &CommandContext,
+        doc: &Document,
+        db: &DatabaseContext,
+    ) -> Result<Document, WrongoDBError> {
+        let namespace = namespace_from_field(ctx, doc, "count")?;
         let mut session = db.connection().open_session();
         let query = doc.get("query").and_then(|q| q.as_document()).cloned();
         let filter_json = query.map(|d| bson_to_value(&d));
 
         let count = db
             .document_query()
-            .count(&mut session, coll_name, filter_json)?;
+            .count(&mut session, &namespace, filter_json)?;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),
@@ -38,8 +43,13 @@ impl Command for DistinctCommand {
         &["distinct"]
     }
 
-    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
-        let coll_name = doc.get_str("distinct").unwrap_or("test");
+    fn execute(
+        &self,
+        ctx: &CommandContext,
+        doc: &Document,
+        db: &DatabaseContext,
+    ) -> Result<Document, WrongoDBError> {
+        let namespace = namespace_from_field(ctx, doc, "distinct")?;
         let mut session = db.connection().open_session();
         let key = doc.get_str("key").unwrap_or("_id");
         let query = doc.get("query").and_then(|q| q.as_document()).cloned();
@@ -47,7 +57,7 @@ impl Command for DistinctCommand {
 
         let values = db
             .document_query()
-            .distinct(&mut session, coll_name, key, filter_json)?;
+            .distinct(&mut session, &namespace, key, filter_json)?;
         let values_bson: Vec<Bson> = values
             .into_iter()
             .map(|v| value_to_bson_value(&v))
@@ -69,12 +79,17 @@ impl Command for AggregateCommand {
         &["aggregate"]
     }
 
-    fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
-        let coll_name = doc.get_str("aggregate").unwrap_or("test");
+    fn execute(
+        &self,
+        ctx: &CommandContext,
+        doc: &Document,
+        db: &DatabaseContext,
+    ) -> Result<Document, WrongoDBError> {
+        let namespace = namespace_from_field(ctx, doc, "aggregate")?;
         let mut session = db.connection().open_session();
         let pipeline = doc.get_array("pipeline").cloned().unwrap_or_default();
 
-        let mut results = db.document_query().find(&mut session, coll_name, None)?;
+        let mut results = db.document_query().find(&mut session, &namespace, None)?;
 
         for stage in pipeline {
             if let Bson::Document(stage_doc) = stage {
@@ -91,7 +106,7 @@ impl Command for AggregateCommand {
             "ok": Bson::Double(1.0),
             "cursor": {
                 "id": Bson::Int64(0),
-                "ns": format!("test.{}", coll_name),
+                "ns": namespace.full_name(),
                 "firstBatch": Bson::Array(results_bson),
             },
         })
