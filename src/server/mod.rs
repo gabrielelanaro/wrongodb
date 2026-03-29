@@ -14,6 +14,7 @@ use tokio::net::{TcpListener, TcpStream};
 use self::commands::handlers::crud::{bson_to_value, value_to_bson};
 use self::commands::CommandRegistry;
 use crate::api::DatabaseContext;
+use crate::replication::{ReplicationConfig, ReplicationCoordinator};
 use crate::server::recovery::audit_catalog;
 use crate::{Connection, WrongoDBError};
 
@@ -58,7 +59,8 @@ pub async fn start_server(
     for store in &report.orphaned_stores {
         eprintln!("orphaned store file: {store}");
     }
-    let db = Arc::new(DatabaseContext::new(conn)?);
+    let replication = ReplicationCoordinator::new(ReplicationConfig::default());
+    let db = Arc::new(DatabaseContext::new(conn, replication)?);
     let registry = Arc::new(CommandRegistry::new());
     println!("Server listening on {}", addr);
 

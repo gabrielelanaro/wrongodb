@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::catalog::{CatalogStore, CollectionCatalog, IndexDefinition};
 use crate::collection_write_path::CollectionWritePath;
 use crate::document_query::DocumentQuery;
+use crate::replication::ReplicationCoordinator;
 use crate::{Connection, WrongoDBError};
 
 /// Internal database-layer container above the WT-like storage connection.
@@ -16,11 +17,15 @@ pub(crate) struct DatabaseContext {
     catalog: Arc<CollectionCatalog>,
     document_query: DocumentQuery,
     collection_write_path: CollectionWritePath,
+    replication: ReplicationCoordinator,
 }
 
 impl DatabaseContext {
     /// Builds the server-side services layered above one storage connection.
-    pub(crate) fn new(connection: Arc<Connection>) -> Result<Self, WrongoDBError> {
+    pub(crate) fn new(
+        connection: Arc<Connection>,
+        replication: ReplicationCoordinator,
+    ) -> Result<Self, WrongoDBError> {
         let metadata_store = connection.metadata_store();
         let catalog = Arc::new(CollectionCatalog::new(CatalogStore::new()));
         let mut session = connection.open_session();
@@ -36,6 +41,7 @@ impl DatabaseContext {
             catalog,
             document_query,
             collection_write_path,
+            replication,
         })
     }
 
@@ -52,7 +58,7 @@ impl DatabaseContext {
     }
 
     pub(crate) fn hello_state(&self) -> (bool, Option<String>) {
-        (true, None)
+        self.replication.hello_state()
     }
 
     pub(crate) fn list_collections(&self) -> Result<Vec<String>, WrongoDBError> {

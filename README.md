@@ -52,6 +52,7 @@ The codebase is organized by domain to keep storage, catalog, and server concern
 - `src/collection_write_path.rs`: internal Mongo-style document/index write orchestration
 - `src/document_query.rs`: internal document/query helpers used by the server path
 - `src/server/`: MongoDB wire-protocol server, command handlers, and startup reconciliation
+- `src/replication/`: server-layer replication state above the storage connection
 - `src/bin/`: server binary entry point
 
 Integration tests are grouped under `tests/`:

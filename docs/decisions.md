@@ -1,5 +1,19 @@
 # Decisions
 
+## 2026-03-28: Add a top-level replication module above `Connection`
+
+**Decision**
+- Add `src/replication/` as a crate-root module owned above the WT-like storage connection.
+- Keep the replication coordinator in `DatabaseContext`, not in `storage/wal`.
+- Let `Connection` remain storage-only and continue to expose no replication runtime state.
+- Keep the initial coordinator intentionally small; it only supplies server-layer `hello` state for now.
+
+**Why**
+- Replication policy is a server/database concern, not a storage durability concern.
+- The WAL should stay focused on local durability and recovery.
+- Putting the coordinator above `Connection` preserves the architecture boundary that separates
+  storage from protocol-facing topology state.
+
 ## 2026-03-28: Add a reserved on-disk history store and order version keys newest-first
 
 **Decision**

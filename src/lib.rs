@@ -4,6 +4,7 @@ mod collection_write_path;
 mod core;
 mod document_query;
 mod index;
+mod replication;
 mod server;
 mod storage;
 mod txn;
