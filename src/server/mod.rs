@@ -49,6 +49,11 @@ impl MsgHeader {
     }
 }
 
+/// Start the MongoDB wire-protocol server on `addr`.
+///
+/// Startup audits the durable catalog before the listener begins accepting
+/// requests so missing referenced stores fail fast and orphaned store files
+/// are reported up front.
 pub async fn start_server(
     addr: &str,
     conn: Arc<Connection>,
