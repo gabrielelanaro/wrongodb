@@ -1,6 +1,6 @@
 # WrongoDB
 
-Last updated: `2026-03-28`
+Last updated: `2026-03-29`
 
 The database that teaches you how databases work by doing everything wrong first, then fixing it.
 
@@ -31,6 +31,7 @@ A learning-oriented single-node MongoDB-compatible database in Rust, inspired by
 - `Connection`/`Session`/`TableCursor` low-level storage API
 - Explicit transaction scopes via `Session::with_transaction()`
 - MongoDB wire protocol server (works with `mongosh`)
+- Internal Mongo-style write stack with `write_ops`, `CollectionWritePath`, and a storage-backed logical oplog in `table:__oplog`
 
 `TableCursor` is intentionally a local/store-level API. Document semantics, collection catalog state,
 and index creation live above it in the server/document layer.
@@ -49,10 +50,12 @@ The codebase is organized by domain to keep storage, catalog, and server concern
 - `src/core/`: shared types/utilities (BSON codec, document helpers, errors)
 - `src/index/`: secondary index implementation and key encoding
 - `src/txn/`: global transaction state, snapshot visibility, and transaction runtime
-- `src/collection_write_path.rs`: internal Mongo-style document/index write orchestration
+- `src/api/ddl_path.rs`: top-level `createCollection` / `createIndexes` path above storage
+- `src/write_ops/`: top-level Mongo-style CRUD executor above the collection mutator
+- `src/collection_write_path.rs`: low-level in-transaction collection document mutator
 - `src/document_query.rs`: internal document/query helpers used by the server path
 - `src/server/`: MongoDB wire-protocol server, command handlers, and startup reconciliation
-- `src/replication/`: server-layer replication state above the storage connection
+- `src/replication/`: server-layer replication state, oplog observer, and internal oplog table management above the storage connection
 - `src/bin/`: server binary entry point
 
 Integration tests are grouped under `tests/`:

@@ -317,3 +317,25 @@ async fn send_op_msg_response(
     socket.write_all(&buf).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::command_error_document;
+    use crate::WrongoDBError;
+
+    // EARS: When a write fails because the node is not writable primary, the
+    // server command error surface shall map it to `NotWritablePrimary`.
+    #[test]
+    fn not_leader_errors_map_to_not_writable_primary_command_error() {
+        let error = WrongoDBError::NotLeader {
+            leader_hint: Some("node-2".to_string()),
+        };
+
+        let doc = command_error_document(&error);
+
+        assert_eq!(doc.get_f64("ok").unwrap(), 0.0);
+        assert_eq!(doc.get_i32("code").unwrap(), 10107);
+        assert_eq!(doc.get_str("codeName").unwrap(), "NotWritablePrimary");
+        assert_eq!(doc.get_str("primary").unwrap(), "node-2");
+    }
+}

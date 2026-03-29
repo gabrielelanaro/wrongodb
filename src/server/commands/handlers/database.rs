@@ -92,9 +92,8 @@ impl Command for CreateCollectionCommand {
             })?;
 
         let storage_columns = parse_storage_columns(doc)?;
-        let mut session = db.connection().open_session();
-        db.collection_write_path()
-            .create_collection(&mut session, collection, storage_columns)?;
+        db.ddl_path()
+            .create_collection(collection, storage_columns)?;
 
         Ok(doc! {
             "ok": Bson::Double(1.0),

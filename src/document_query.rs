@@ -186,12 +186,17 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::api::DdlPath;
     use crate::catalog::{CatalogStore, CollectionCatalog, CreateIndexRequest};
     use crate::collection_write_path::CollectionWritePath;
+    use crate::replication::{
+        OplogMode, OplogStore, ReplicationConfig, ReplicationCoordinator, ReplicationObserver,
+    };
     use crate::storage::api::{Connection, ConnectionConfig};
 
     struct QueryTestFixture {
-        connection: Connection,
+        connection: Arc<Connection>,
+        ddl_path: DdlPath,
         query: DocumentQuery,
         write_path: CollectionWritePath,
     }
@@ -203,20 +208,35 @@ mod tests {
             std::mem::forget(dir);
 
             let config = ConnectionConfig::new().logging_enabled(false);
-            let connection = Connection::open(&base_path, config).unwrap();
+            let connection = Arc::new(Connection::open(&base_path, config).unwrap());
             let metadata_store = connection.metadata_store();
+            let oplog_store = OplogStore::new(metadata_store.clone());
             let catalog = Arc::new(CollectionCatalog::new(CatalogStore::new()));
+            let replication = ReplicationCoordinator::new(ReplicationConfig::default());
             {
                 let mut session = connection.open_session();
+                oplog_store.ensure_table_exists(&mut session).unwrap();
+                let next_op_index = oplog_store
+                    .load_last_op_time(&mut session)
+                    .unwrap()
+                    .map(|op_time| op_time.index + 1)
+                    .unwrap_or(1);
+                replication.seed_next_op_index(next_op_index);
                 catalog.ensure_store_exists(&mut session).unwrap();
                 catalog.load_cache(&session).unwrap();
             }
             let query = DocumentQuery::new(catalog.clone());
-            let write_path =
-                CollectionWritePath::new(metadata_store, catalog.clone(), query.clone());
+            let write_path = CollectionWritePath::new(
+                metadata_store.clone(),
+                catalog.clone(),
+                query.clone(),
+                ReplicationObserver::new(replication.clone(), oplog_store),
+            );
+            let ddl_path = DdlPath::new(connection.clone(), metadata_store, catalog, replication);
 
             Self {
                 connection,
+                ddl_path,
                 query,
                 write_path,
             }
@@ -229,20 +249,23 @@ mod tests {
         let mut session = fixture.connection.open_session();
 
         fixture
-            .write_path
-            .create_collection(&mut session, "test", vec!["name".to_string()])
+            .ddl_path
+            .create_collection("test", vec!["name".to_string()])
             .unwrap();
         fixture
-            .write_path
-            .create_index(
-                &mut session,
-                "test",
-                CreateIndexRequest::single_field_ascending("name"),
-            )
+            .ddl_path
+            .create_index("test", CreateIndexRequest::single_field_ascending("name"))
             .unwrap();
-        fixture
-            .write_path
-            .insert_one(&mut session, "test", json!({"_id": 1, "name": "alice"}))
+        session
+            .with_transaction(|session| {
+                fixture.write_path.insert_one_in_transaction(
+                    session,
+                    "test",
+                    json!({"_id": 1, "name": "alice"}),
+                    OplogMode::GenerateOplog,
+                )?;
+                Ok(())
+            })
             .unwrap();
 
         session.checkpoint().unwrap();

@@ -2,16 +2,15 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::catalog::{
-    CollectionCatalog, CollectionDefinition, CreateIndexRequest, IndexDefinition,
-};
+use crate::catalog::{CollectionCatalog, CollectionDefinition};
 use crate::core::bson::encode_id_value;
 use crate::core::document::{normalize_document_in_place, validate_is_object};
 use crate::core::errors::{DocumentValidationError, StorageError};
 use crate::document_query::DocumentQuery;
+use crate::replication::{OplogMode, ReplicationObserver};
 use crate::storage::api::Session;
-use crate::storage::metadata_store::{index_uri, MetadataEntry, MetadataStore};
-use crate::storage::row::{encode_row_value, validate_storage_columns};
+use crate::storage::metadata_store::MetadataStore;
+use crate::storage::row::encode_row_value;
 use crate::{Document, WrongoDBError};
 
 /// Summary of an update command result.
@@ -21,22 +20,18 @@ pub(crate) struct UpdateResult {
     pub(crate) modified: usize,
 }
 
-#[derive(Debug, Clone)]
-struct IndexRegistration {
-    entry: MetadataEntry,
-    needs_build: bool,
-}
-
-/// Write path for collection CRUD and index registration.
+/// Low-level in-transaction collection mutator.
 ///
-/// This service coordinates the storage metadata in [`MetadataStore`], the
-/// [`CollectionCatalog`] (the unified catalog), and the [`DocumentQuery`]
-/// implementation used for actual record and secondary-index updates.
+/// This module mirrors MongoDB's `collection_write_path` role more closely than
+/// the old WrongoDB service shape: it owns document validation, row encoding,
+/// and collection-local mutations, but it does not own top-level transaction
+/// scope, write admission, or DDL orchestration.
 #[derive(Clone)]
 pub(crate) struct CollectionWritePath {
     metadata_store: Arc<MetadataStore>,
     catalog: Arc<CollectionCatalog>,
     document_query: DocumentQuery,
+    replication_observer: ReplicationObserver,
 }
 
 impl CollectionWritePath {
@@ -45,136 +40,14 @@ impl CollectionWritePath {
         metadata_store: Arc<MetadataStore>,
         catalog: Arc<CollectionCatalog>,
         document_query: DocumentQuery,
+        replication_observer: ReplicationObserver,
     ) -> Self {
         Self {
             metadata_store,
             catalog,
             document_query,
+            replication_observer,
         }
-    }
-
-    /// Creates one collection with an explicit storage schema.
-    pub(crate) fn create_collection(
-        &self,
-        session: &mut Session,
-        collection: &str,
-        storage_columns: Vec<String>,
-    ) -> Result<(), WrongoDBError> {
-        validate_storage_columns(&storage_columns)?;
-
-        let (_, created) = self
-            .catalog
-            .create_collection(session, collection, &storage_columns)?;
-
-        if !created {
-            return Err(StorageError(format!("collection already exists: {collection}")).into());
-        }
-
-        Ok(())
-    }
-
-    /// Inserts one document into an existing collection.
-    pub(crate) fn insert_one(
-        &self,
-        session: &mut Session,
-        collection: &str,
-        doc: Value,
-    ) -> Result<Document, WrongoDBError> {
-        self.run_in_transaction(session, |this, session| {
-            this.insert_one_in_transaction(session, collection, doc)
-        })
-    }
-
-    /// Updates the first document matching `filter`.
-    pub(crate) fn update_one(
-        &self,
-        session: &mut Session,
-        collection: &str,
-        filter: Option<Value>,
-        update: Value,
-    ) -> Result<UpdateResult, WrongoDBError> {
-        self.run_in_transaction(session, |this, session| {
-            this.update_one_in_transaction(session, collection, filter, update)
-        })
-    }
-
-    /// Updates every document matching `filter`.
-    pub(crate) fn update_many(
-        &self,
-        session: &mut Session,
-        collection: &str,
-        filter: Option<Value>,
-        update: Value,
-    ) -> Result<UpdateResult, WrongoDBError> {
-        self.run_in_transaction(session, |this, session| {
-            this.update_many_in_transaction(session, collection, filter, update)
-        })
-    }
-
-    /// Deletes the first document matching `filter`.
-    pub(crate) fn delete_one(
-        &self,
-        session: &mut Session,
-        collection: &str,
-        filter: Option<Value>,
-    ) -> Result<usize, WrongoDBError> {
-        self.run_in_transaction(session, |this, session| {
-            this.delete_one_in_transaction(session, collection, filter)
-        })
-    }
-
-    /// Deletes every document matching `filter`.
-    pub(crate) fn delete_many(
-        &self,
-        session: &mut Session,
-        collection: &str,
-        filter: Option<Value>,
-    ) -> Result<usize, WrongoDBError> {
-        self.run_in_transaction(session, |this, session| {
-            this.delete_many_in_transaction(session, collection, filter)
-        })
-    }
-
-    /// Creates one secondary index from the normalized server-side request.
-    ///
-    /// If the durable catalog already knows about the index but it is still
-    /// marked not-ready, this resumes storage backfill and flips the ready bit
-    /// once the existing rows are copied into the secondary store.
-    ///
-    /// The actual backfill is delegated to
-    /// [`CollectionCatalog::build_and_mark_index_ready`].
-    pub(crate) fn create_index(
-        &self,
-        session: &mut Session,
-        collection: &str,
-        request: CreateIndexRequest,
-    ) -> Result<(), WrongoDBError> {
-        let definition = self.registered_collection_definition_committed(session, collection)?;
-        let table_uri = definition.table_uri().to_string();
-        let indexed_field = request.indexed_field()?;
-        if !definition
-            .storage_columns()
-            .iter()
-            .any(|column| column == &indexed_field)
-        {
-            return Err(StorageError(format!(
-                "index field {indexed_field} is not declared in storageColumns for {collection}"
-            ))
-            .into());
-        }
-
-        let registration =
-            self.ensure_index_registered_committed(session, collection, &request, &indexed_field)?;
-        if registration.needs_build {
-            self.catalog.build_and_mark_index_ready(
-                session,
-                collection,
-                &table_uri,
-                request.name(),
-                &registration.entry,
-            )?;
-        }
-        Ok(())
     }
 
     /// Inserts one document inside the caller's active transaction.
@@ -183,6 +56,7 @@ impl CollectionWritePath {
         session: &mut Session,
         collection: &str,
         doc: Value,
+        oplog_mode: OplogMode,
     ) -> Result<Document, WrongoDBError> {
         validate_is_object(&doc)?;
         let mut obj = doc.as_object().expect("validated object").clone();
@@ -196,6 +70,8 @@ impl CollectionWritePath {
         let key = encode_id_value(id)?;
         let value = self.encode_row_for_table(&table_uri, &obj)?;
         self.insert_record(session, &table_uri, &key, &value)?;
+        self.replication_observer
+            .on_insert(session, collection, &obj, oplog_mode)?;
         Ok(obj)
     }
 
@@ -206,6 +82,7 @@ impl CollectionWritePath {
         collection: &str,
         filter: Option<Value>,
         update: Value,
+        oplog_mode: OplogMode,
     ) -> Result<UpdateResult, WrongoDBError> {
         let definition = self.registered_collection_definition(session, collection)?;
         let table_uri = definition.table_uri().to_string();
@@ -227,6 +104,8 @@ impl CollectionWritePath {
         let key = encode_id_value(id)?;
         let value = self.encode_row_for_table(&table_uri, &updated_doc)?;
         self.update_record(session, &table_uri, &key, &value)?;
+        self.replication_observer
+            .on_update(session, collection, &updated_doc, oplog_mode)?;
 
         Ok(UpdateResult {
             matched: 1,
@@ -241,6 +120,7 @@ impl CollectionWritePath {
         collection: &str,
         filter: Option<Value>,
         update: Value,
+        oplog_mode: OplogMode,
     ) -> Result<UpdateResult, WrongoDBError> {
         let definition = self.registered_collection_definition(session, collection)?;
         let table_uri = definition.table_uri().to_string();
@@ -263,6 +143,8 @@ impl CollectionWritePath {
             let key = encode_id_value(id)?;
             let value = self.encode_row_for_table(&table_uri, &updated_doc)?;
             self.update_record(session, &table_uri, &key, &value)?;
+            self.replication_observer
+                .on_update(session, collection, &updated_doc, oplog_mode)?;
             modified += 1;
         }
 
@@ -278,6 +160,7 @@ impl CollectionWritePath {
         session: &mut Session,
         collection: &str,
         filter: Option<Value>,
+        oplog_mode: OplogMode,
     ) -> Result<usize, WrongoDBError> {
         let definition = self.registered_collection_definition(session, collection)?;
         let table_uri = definition.table_uri().to_string();
@@ -294,6 +177,8 @@ impl CollectionWritePath {
         };
         let key = encode_id_value(id)?;
         self.delete_record(session, &table_uri, &key)?;
+        self.replication_observer
+            .on_delete(session, collection, id, oplog_mode)?;
         Ok(1)
     }
 
@@ -303,6 +188,7 @@ impl CollectionWritePath {
         session: &mut Session,
         collection: &str,
         filter: Option<Value>,
+        oplog_mode: OplogMode,
     ) -> Result<usize, WrongoDBError> {
         let definition = self.registered_collection_definition(session, collection)?;
         let table_uri = definition.table_uri().to_string();
@@ -320,6 +206,8 @@ impl CollectionWritePath {
             };
             let key = encode_id_value(id)?;
             self.delete_record(session, &table_uri, &key)?;
+            self.replication_observer
+                .on_delete(session, collection, id, oplog_mode)?;
             deleted += 1;
         }
 
@@ -358,56 +246,6 @@ impl CollectionWritePath {
         cursor.delete(key)
     }
 
-    fn ensure_index_registered_committed(
-        &self,
-        session: &mut Session,
-        collection: &str,
-        request: &CreateIndexRequest,
-        indexed_field: &str,
-    ) -> Result<IndexRegistration, WrongoDBError> {
-        let index_uri = index_uri(collection, request.name());
-        let stored_entry = self.metadata_store.get(&index_uri)?;
-        let metadata_entry = stored_entry.clone().unwrap_or_else(|| {
-            MetadataEntry::index(collection, request.name(), vec![indexed_field.to_string()])
-        });
-
-        if let Some(ready) =
-            self.catalog
-                .get_collection(session, collection)?
-                .and_then(|definition| {
-                    definition
-                        .indexes()
-                        .get(request.name())
-                        .map(|index| index.ready())
-                })
-        {
-            return Ok(IndexRegistration {
-                entry: metadata_entry,
-                needs_build: !ready || stored_entry.is_none(),
-            });
-        }
-
-        let _ = self.catalog.create_index(
-            session,
-            collection,
-            IndexDefinition::from_request_with_ready(request, index_uri.clone(), false),
-        )?;
-        Ok(IndexRegistration {
-            entry: metadata_entry,
-            needs_build: true,
-        })
-    }
-
-    fn registered_collection_definition_committed(
-        &self,
-        session: &mut Session,
-        collection: &str,
-    ) -> Result<CollectionDefinition, WrongoDBError> {
-        self.catalog
-            .get_collection(session, collection)?
-            .ok_or_else(|| StorageError(format!("unknown collection: {collection}")).into())
-    }
-
     fn registered_collection_definition(
         &self,
         session: &mut Session,
@@ -433,13 +271,6 @@ impl CollectionWritePath {
             ))
         })?;
         encode_row_value(row_format, table_entry.value_columns(), doc)
-    }
-
-    fn run_in_transaction<R, F>(&self, session: &mut Session, f: F) -> Result<R, WrongoDBError>
-    where
-        F: FnOnce(&Self, &mut Session) -> Result<R, WrongoDBError>,
-    {
-        session.with_transaction(|session| f(self, session))
     }
 }
 
@@ -521,46 +352,72 @@ mod tests {
     use tempfile::tempdir;
 
     use super::apply_update;
-    use crate::catalog::{CatalogStore, CollectionCatalog, CreateIndexRequest};
+    use crate::api::DdlPath;
+    use crate::catalog::{CatalogStore, CollectionCatalog};
     use crate::collection_write_path::CollectionWritePath;
     use crate::document_query::DocumentQuery;
+    use crate::replication::{
+        OplogMode, OplogStore, ReplicationConfig, ReplicationCoordinator, ReplicationObserver,
+    };
     use crate::storage::api::{Connection, ConnectionConfig, Session};
     use crate::WrongoDBError;
 
-    fn test_services(
-        base_path: std::path::PathBuf,
-        config: ConnectionConfig,
-    ) -> (
-        Connection,
-        CollectionWritePath,
-        DocumentQuery,
-        Arc<CollectionCatalog>,
-    ) {
-        let connection = Connection::open(&base_path, config).unwrap();
+    struct TestServices {
+        connection: Arc<Connection>,
+        ddl_path: DdlPath,
+        write_path: CollectionWritePath,
+        query: DocumentQuery,
+        catalog: Arc<CollectionCatalog>,
+        oplog_store: OplogStore,
+    }
+
+    fn test_services(base_path: std::path::PathBuf, config: ConnectionConfig) -> TestServices {
+        let connection = Arc::new(Connection::open(&base_path, config).unwrap());
         let metadata_store = connection.metadata_store();
+        let oplog_store = OplogStore::new(metadata_store.clone());
         let catalog = Arc::new(CollectionCatalog::new(CatalogStore::new()));
+        let replication = ReplicationCoordinator::new(ReplicationConfig::default());
         let mut session = connection.open_session();
+        oplog_store.ensure_table_exists(&mut session).unwrap();
+        let next_op_index = oplog_store
+            .load_last_op_time(&mut session)
+            .unwrap()
+            .map(|op_time| op_time.index + 1)
+            .unwrap_or(1);
+        replication.seed_next_op_index(next_op_index);
         catalog.ensure_store_exists(&mut session).unwrap();
         catalog.load_cache(&session).unwrap();
         let document_query = DocumentQuery::new(catalog.clone());
-        let service =
-            CollectionWritePath::new(metadata_store, catalog.clone(), document_query.clone());
-        (connection, service, document_query, catalog)
+        let service = CollectionWritePath::new(
+            metadata_store.clone(),
+            catalog.clone(),
+            document_query.clone(),
+            ReplicationObserver::new(replication.clone(), oplog_store.clone()),
+        );
+        let ddl_path = DdlPath::new(
+            connection.clone(),
+            metadata_store,
+            catalog.clone(),
+            replication,
+        );
+
+        TestServices {
+            connection,
+            ddl_path,
+            write_path: service,
+            query: document_query,
+            catalog,
+            oplog_store,
+        }
     }
 
     fn disabled_config() -> ConnectionConfig {
         ConnectionConfig::new().logging_enabled(false)
     }
 
-    fn create_collection(
-        service: &CollectionWritePath,
-        session: &mut Session,
-        name: &str,
-        storage_columns: &[&str],
-    ) {
-        service
+    fn create_collection(ddl_path: &DdlPath, name: &str, storage_columns: &[&str]) {
+        ddl_path
             .create_collection(
-                session,
                 name,
                 storage_columns
                     .iter()
@@ -570,6 +427,48 @@ mod tests {
             .unwrap();
     }
 
+    fn insert_one(
+        service: &CollectionWritePath,
+        session: &mut Session,
+        collection: &str,
+        doc: serde_json::Value,
+    ) -> Result<crate::Document, WrongoDBError> {
+        session.with_transaction(|session| {
+            service.insert_one_in_transaction(session, collection, doc, OplogMode::GenerateOplog)
+        })
+    }
+
+    fn update_one(
+        service: &CollectionWritePath,
+        session: &mut Session,
+        collection: &str,
+        filter: Option<serde_json::Value>,
+        update: serde_json::Value,
+    ) -> Result<super::UpdateResult, WrongoDBError> {
+        session.with_transaction(|session| {
+            service.update_one_in_transaction(
+                session,
+                collection,
+                filter,
+                update,
+                OplogMode::GenerateOplog,
+            )
+        })
+    }
+
+    fn delete_one(
+        service: &CollectionWritePath,
+        session: &mut Session,
+        collection: &str,
+        filter: Option<serde_json::Value>,
+    ) -> Result<usize, WrongoDBError> {
+        session.with_transaction(|session| {
+            service.delete_one_in_transaction(session, collection, filter, OplogMode::GenerateOplog)
+        })
+    }
+
+    // EARS: When a `$set` update is applied, the updater shall replace the
+    // targeted field and preserve unrelated fields.
     #[test]
     fn test_apply_update_set() {
         let doc = serde_json::from_value(json!({"_id": 1, "name": "alice", "age": 30})).unwrap();
@@ -579,6 +478,8 @@ mod tests {
         assert_eq!(result.get("name").unwrap().as_str().unwrap(), "alice");
     }
 
+    // EARS: When a `$unset` update is applied, the updater shall remove the
+    // targeted field and preserve unrelated fields.
     #[test]
     fn test_apply_update_unset() {
         let doc = serde_json::from_value(json!({"_id": 1, "name": "alice", "age": 30})).unwrap();
@@ -588,6 +489,8 @@ mod tests {
         assert!(result.contains_key("name"));
     }
 
+    // EARS: When a `$inc` update is applied to a numeric field, the updater
+    // shall store the incremented numeric value.
     #[test]
     fn test_apply_update_inc() {
         let doc = serde_json::from_value(json!({"_id": 1, "counter": 10})).unwrap();
@@ -596,6 +499,8 @@ mod tests {
         assert_eq!(result.get("counter").unwrap().as_f64().unwrap(), 15.0);
     }
 
+    // EARS: When a `$push` update targets an array field, the updater shall
+    // append the new value to the end of the array.
     #[test]
     fn test_apply_update_push() {
         let doc = serde_json::from_value(json!({"_id": 1, "tags": ["a", "b"]})).unwrap();
@@ -606,6 +511,8 @@ mod tests {
         assert_eq!(tags[2].as_str().unwrap(), "c");
     }
 
+    // EARS: When a `$pull` update targets an array field, the updater shall
+    // remove matching values and preserve non-matching ones.
     #[test]
     fn test_apply_update_pull() {
         let doc = serde_json::from_value(json!({"_id": 1, "tags": ["a", "b", "c"]})).unwrap();
@@ -616,6 +523,8 @@ mod tests {
         assert!(!tags.iter().any(|t| t.as_str() == Some("b")));
     }
 
+    // EARS: When a replacement update is applied, the updater shall replace
+    // user fields while preserving the existing `_id`.
     #[test]
     fn test_apply_update_replacement() {
         let doc = serde_json::from_value(json!({"_id": 1, "name": "alice", "age": 30})).unwrap();
@@ -627,182 +536,63 @@ mod tests {
         assert!(result.contains_key("_id"));
     }
 
+    // EARS: When a write targets an unknown collection, the collection write
+    // path shall reject the operation.
     #[test]
     fn writes_to_unknown_collection_fail() {
         let tmp = tempdir().unwrap();
-        let (connection, service, _query, _catalog) =
-            test_services(tmp.path().to_path_buf(), disabled_config());
-        let mut session = connection.open_session();
+        let services = test_services(tmp.path().to_path_buf(), disabled_config());
+        let mut session = services.connection.open_session();
 
-        let err = service
-            .insert_one(&mut session, "users", json!({"_id": 1, "name": "alice"}))
-            .unwrap_err();
+        let err = insert_one(
+            &services.write_path,
+            &mut session,
+            "users",
+            json!({"_id": 1, "name": "alice"}),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("unknown collection: users"));
     }
 
+    // EARS: When an inserted document contains fields outside the declared
+    // storage schema, the collection write path shall reject the document.
     #[test]
     fn insert_rejects_undeclared_fields() {
         let tmp = tempdir().unwrap();
-        let (connection, service, _query, _catalog) =
-            test_services(tmp.path().to_path_buf(), disabled_config());
-        let mut session = connection.open_session();
-        create_collection(&service, &mut session, "users", &["name"]);
+        let services = test_services(tmp.path().to_path_buf(), disabled_config());
+        let mut session = services.connection.open_session();
+        create_collection(&services.ddl_path, "users", &["name"]);
 
-        let err = service
-            .insert_one(
-                &mut session,
-                "users",
-                json!({"_id": 1, "name": "alice", "age": 30}),
-            )
-            .unwrap_err();
+        let err = insert_one(
+            &services.write_path,
+            &mut session,
+            "users",
+            json!({"_id": 1, "name": "alice", "age": 30}),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("field age is not declared"));
     }
 
-    #[test]
-    fn create_index_rejects_undeclared_field() {
-        let tmp = tempdir().unwrap();
-        let (connection, service, _query, _catalog) =
-            test_services(tmp.path().to_path_buf(), disabled_config());
-        let mut session = connection.open_session();
-        create_collection(&service, &mut session, "users", &["name"]);
-
-        let err = service
-            .create_index(
-                &mut session,
-                "users",
-                CreateIndexRequest::single_field_ascending("age"),
-            )
-            .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("index field age is not declared in storageColumns"));
-    }
-
-    #[test]
-    fn ready_true_index_repairs_missing_storage_metadata() {
-        let tmp = tempdir().unwrap();
-        let (connection, service, query, catalog) =
-            test_services(tmp.path().to_path_buf(), disabled_config());
-        let mut session = connection.open_session();
-        create_collection(&service, &mut session, "users", &["name"]);
-
-        service
-            .insert_one(&mut session, "users", json!({"_id": 1, "name": "alice"}))
-            .unwrap();
-        service
-            .create_index(
-                &mut session,
-                "users",
-                CreateIndexRequest::single_field_ascending("name"),
-            )
-            .unwrap();
-
-        assert!(catalog
-            .list_index_definitions("users")
-            .iter()
-            .any(|index| index.name() == "name_1" && index.ready()));
-        assert!(service.metadata_store.remove("index:users:name_1").unwrap());
-
-        service
-            .create_index(
-                &mut session,
-                "users",
-                CreateIndexRequest::single_field_ascending("name"),
-            )
-            .unwrap();
-
-        assert!(service
-            .metadata_store
-            .get("index:users:name_1")
-            .unwrap()
-            .is_some());
-        let docs = query
-            .find(&mut session, "users", Some(json!({"name": "alice"})))
-            .unwrap();
-        assert_eq!(docs.len(), 1);
-    }
-
-    #[test]
-    fn create_index_backfills_existing_documents() {
-        let tmp = tempdir().unwrap();
-        let (connection, service, _query, _catalog) =
-            test_services(tmp.path().to_path_buf(), disabled_config());
-        let mut session = connection.open_session();
-        create_collection(&service, &mut session, "users", &["name"]);
-
-        service
-            .insert_one(&mut session, "users", json!({"_id": 1, "name": "alice"}))
-            .unwrap();
-        service
-            .create_index(
-                &mut session,
-                "users",
-                CreateIndexRequest::single_field_ascending("name"),
-            )
-            .unwrap();
-
-        session
-            .with_transaction(|session| {
-                let mut cursor = session.open_index_cursor("index:users:name_1")?;
-                let has_entries = cursor.next()?.is_some();
-                assert!(has_entries);
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn ready_false_indexes_are_ignored_until_backfill_completes() {
-        let tmp = tempdir().unwrap();
-        let (connection, service, query, catalog) =
-            test_services(tmp.path().to_path_buf(), disabled_config());
-        let mut session = connection.open_session();
-        create_collection(&service, &mut session, "users", &["name"]);
-
-        service
-            .insert_one(&mut session, "users", json!({"_id": 1, "name": "alice"}))
-            .unwrap();
-
-        let request = CreateIndexRequest::single_field_ascending("name");
-        let registration = service
-            .ensure_index_registered_committed(&mut session, "users", &request, "name")
-            .unwrap();
-        assert!(registration.needs_build);
-        assert!(service
-            .metadata_store
-            .get(registration.entry.uri())
-            .unwrap()
-            .is_none());
-
-        service
-            .create_index(&mut session, "users", request)
-            .unwrap();
-
-        let committed_indexes = catalog.list_index_definitions("users");
-        assert!(committed_indexes
-            .iter()
-            .any(|index| index.name() == "name_1" && index.ready()));
-
-        let docs = query
-            .find(&mut session, "users", Some(json!({"name": "alice"})))
-            .unwrap();
-        assert_eq!(docs.len(), 1);
-    }
-
+    // EARS: When a document is inserted, updated, and deleted through the low-
+    // level write path, each operation shall become visible through the read path.
     #[test]
     fn crud_roundtrip() {
         let tmp = tempdir().unwrap();
-        let (connection, service, query, _catalog) =
-            test_services(tmp.path().to_path_buf(), disabled_config());
-        let mut session = connection.open_session();
-        create_collection(&service, &mut session, "users", &["name", "age"]);
+        let services = test_services(tmp.path().to_path_buf(), disabled_config());
+        let mut session = services.connection.open_session();
+        create_collection(&services.ddl_path, "users", &["name", "age"]);
 
-        let inserted = service
-            .insert_one(&mut session, "users", json!({"name": "alice", "age": 30}))
-            .unwrap();
+        let inserted = insert_one(
+            &services.write_path,
+            &mut session,
+            "users",
+            json!({"name": "alice", "age": 30}),
+        )
+        .unwrap();
         let id = inserted.get("_id").unwrap().clone();
 
-        let fetched = query
+        let fetched = services
+            .query
             .find(&mut session, "users", Some(json!({"_id": id.clone()})))
             .unwrap()
             .into_iter()
@@ -810,18 +600,19 @@ mod tests {
             .unwrap();
         assert_eq!(fetched.get("name"), Some(&json!("alice")));
 
-        let updated = service
-            .update_one(
-                &mut session,
-                "users",
-                Some(json!({"_id": id.clone()})),
-                json!({"$set": {"age": 31}}),
-            )
-            .unwrap();
+        let updated = update_one(
+            &services.write_path,
+            &mut session,
+            "users",
+            Some(json!({"_id": id.clone()})),
+            json!({"$set": {"age": 31}}),
+        )
+        .unwrap();
         assert_eq!(updated.matched, 1);
         assert_eq!(updated.modified, 1);
 
-        let fetched = query
+        let fetched = services
+            .query
             .find(&mut session, "users", Some(json!({"_id": id.clone()})))
             .unwrap()
             .into_iter()
@@ -829,54 +620,37 @@ mod tests {
             .unwrap();
         assert_eq!(fetched.get("age"), Some(&json!(31)));
 
-        let deleted = service
-            .delete_one(&mut session, "users", Some(json!({"_id": id})))
-            .unwrap();
+        let deleted = delete_one(
+            &services.write_path,
+            &mut session,
+            "users",
+            Some(json!({"_id": id})),
+        )
+        .unwrap();
         assert_eq!(deleted, 1);
-        assert!(query
+        assert!(services
+            .query
             .find(&mut session, "users", Some(json!({"name": "alice"})))
             .unwrap()
             .is_empty());
     }
 
-    #[test]
-    fn create_index_registers_index_name() {
-        let tmp = tempdir().unwrap();
-        let (connection, service, _query, catalog) =
-            test_services(tmp.path().to_path_buf(), disabled_config());
-        let mut session = connection.open_session();
-        create_collection(&service, &mut session, "users", &["name"]);
-
-        service
-            .insert_one(&mut session, "users", json!({"_id": 1, "name": "alice"}))
-            .unwrap();
-        service
-            .create_index(
-                &mut session,
-                "users",
-                CreateIndexRequest::single_field_ascending("name"),
-            )
-            .unwrap();
-        assert!(catalog
-            .list_index_definitions("users")
-            .iter()
-            .any(|index| index.name() == "name_1"));
-    }
-
+    // EARS: When a transaction aborts after staging a user write, the write
+    // path shall leave neither user data nor oplog entries behind.
     #[test]
     fn failing_transaction_aborts_changes() {
         let tmp = tempdir().unwrap();
-        let (connection, service, query, catalog) =
-            test_services(tmp.path().to_path_buf(), disabled_config());
-        let mut session = connection.open_session();
-        create_collection(&service, &mut session, "items", &["value"]);
+        let services = test_services(tmp.path().to_path_buf(), disabled_config());
+        let mut session = services.connection.open_session();
+        create_collection(&services.ddl_path, "items", &["value"]);
 
-        let err = service
-            .run_in_transaction(&mut session, |this, session| {
-                let _ = this.insert_one_in_transaction(
+        let err = session
+            .with_transaction(|session| {
+                let _ = services.write_path.insert_one_in_transaction(
                     session,
                     "items",
                     json!({"_id": "abort-me", "value": "v1"}),
+                    OplogMode::GenerateOplog,
                 )?;
                 Err::<(), WrongoDBError>(WrongoDBError::Storage(crate::StorageError(
                     "force abort".into(),
@@ -884,10 +658,50 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("force abort"));
-        assert!(query
+        assert!(services
+            .query
             .find(&mut session, "items", Some(json!({"_id": "abort-me"})))
             .unwrap()
             .is_empty());
-        assert!(catalog.lookup_collection("items").is_some());
+        assert!(services
+            .oplog_store
+            .list_entries(&mut session)
+            .unwrap()
+            .is_empty());
+        assert!(services.catalog.lookup_collection("items").is_some());
+    }
+
+    // EARS: When a collection mutation is applied in suppress-oplog mode, the
+    // write path shall update user data without appending oplog entries.
+    #[test]
+    fn suppress_oplog_mode_mutates_data_without_appending_entries() {
+        let tmp = tempdir().unwrap();
+        let services = test_services(tmp.path().to_path_buf(), disabled_config());
+        let mut session = services.connection.open_session();
+        create_collection(&services.ddl_path, "items", &["value"]);
+
+        session
+            .with_transaction(|session| {
+                services.write_path.insert_one_in_transaction(
+                    session,
+                    "items",
+                    json!({"_id": "no-oplog", "value": "v1"}),
+                    OplogMode::SuppressOplog,
+                )?;
+                Ok::<(), WrongoDBError>(())
+            })
+            .unwrap();
+
+        let docs = services
+            .query
+            .find(&mut session, "items", Some(json!({"_id": "no-oplog"})))
+            .unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].get("value"), Some(&json!("v1")));
+        assert!(services
+            .oplog_store
+            .list_entries(&mut session)
+            .unwrap()
+            .is_empty());
     }
 }

@@ -74,7 +74,6 @@ impl Command for InsertCommand {
 
     fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("insert").unwrap_or("test");
-        let mut session = db.connection().open_session();
 
         let inserted_ids: Vec<ObjectId> = if let Ok(docs) = doc.get_array("documents") {
             let mut ids = Vec::new();
@@ -89,11 +88,8 @@ impl Command for InsertCommand {
                         _ => ObjectId::new(),
                     };
                     let json_doc = bson_to_json_document(&doc_with_id);
-                    db.collection_write_path().insert_one(
-                        &mut session,
-                        coll_name,
-                        Value::Object(json_doc),
-                    )?;
+                    db.write_ops()
+                        .insert_one(coll_name, Value::Object(json_doc))?;
                     ids.push(id);
                 }
             }
@@ -181,7 +177,6 @@ impl Command for UpdateCommand {
 
     fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("update").unwrap_or("test");
-        let mut session = db.connection().open_session();
         let mut n_matched = 0i32;
         let mut n_modified = 0i32;
 
@@ -199,19 +194,11 @@ impl Command for UpdateCommand {
                     let multi = update_doc.get_bool("multi").unwrap_or(false);
 
                     let result = if multi {
-                        db.collection_write_path().update_many(
-                            &mut session,
-                            coll_name,
-                            filter_json,
-                            update_json,
-                        )?
+                        db.write_ops()
+                            .update_many(coll_name, filter_json, update_json)?
                     } else {
-                        db.collection_write_path().update_one(
-                            &mut session,
-                            coll_name,
-                            filter_json,
-                            update_json,
-                        )?
+                        db.write_ops()
+                            .update_one(coll_name, filter_json, update_json)?
                     };
 
                     n_matched += result.matched as i32;
@@ -237,7 +224,6 @@ impl Command for DeleteCommand {
 
     fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("delete").unwrap_or("test");
-        let mut session = db.connection().open_session();
         let mut n_deleted = 0i32;
 
         if let Ok(deletes) = doc.get_array("deletes") {
@@ -249,17 +235,9 @@ impl Command for DeleteCommand {
                     let limit = delete_doc.get_i32("limit").unwrap_or(0);
 
                     if limit == 1 {
-                        n_deleted += db.collection_write_path().delete_one(
-                            &mut session,
-                            coll_name,
-                            filter_json,
-                        )? as i32;
+                        n_deleted += db.write_ops().delete_one(coll_name, filter_json)? as i32;
                     } else {
-                        n_deleted += db.collection_write_path().delete_many(
-                            &mut session,
-                            coll_name,
-                            filter_json,
-                        )? as i32;
+                        n_deleted += db.write_ops().delete_many(coll_name, filter_json)? as i32;
                     }
                 }
             }

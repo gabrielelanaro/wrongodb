@@ -5,7 +5,7 @@ WrongoDB currently has two externally visible personalities:
 - a WT-like local storage API exposed as `Connection`, `Session`, and `TableCursor`
 - a MongoDB wire-protocol server layered on top of that storage API
 
-The repository does not currently contain an active distributed RAFT subsystem. It does now expose a small server-layer replication coordinator above `Connection`; older references to RAFT in the README were historical and have been removed from the maintained architecture entry points.
+The repository does not currently contain an active distributed RAFT subsystem. It does now expose a server-layer replication module above `Connection`, including primary write admission and a storage-backed internal oplog; older references to RAFT in the README were historical and have been removed from the maintained architecture entry points.
 
 ## Layer map
 
@@ -13,10 +13,12 @@ The repository does not currently contain an active distributed RAFT subsystem. 
 MongoDB wire protocol
   -> src/server/*
   -> src/api/database_context.rs
+  -> src/write_ops/*
+  -> src/api/ddl_path.rs
+  -> src/collection_write_path.rs
   -> src/replication/*
   -> src/catalog/*
   -> src/document_query.rs
-  -> src/collection_write_path.rs
   -> src/storage/api/*
   -> src/storage/* and src/txn/*
 ```
@@ -44,6 +46,8 @@ This layer is intentionally local and storage-shaped. It does not own BSON docum
 Files:
 - `src/server/*`
 - `src/api/database_context.rs`
+- `src/write_ops/*`
+- `src/api/ddl_path.rs`
 - `src/replication/*`
 - `src/document_query.rs`
 - `src/collection_write_path.rs`
@@ -51,8 +55,10 @@ Files:
 Responsibilities:
 - accept MongoDB wire-protocol requests
 - translate commands into storage sessions
-- implement collection CRUD, `createCollection`, `createIndexes`, and query planning over the storage API
-- own server-layer replication state above the storage connection
+- route CRUD through `write_ops`
+- route `createCollection` and `createIndexes` through `DdlPath`
+- implement query planning over the storage API
+- own server-layer replication state and the internal logical oplog above the storage connection
 
 ### Durable catalog layer
 

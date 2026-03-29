@@ -1,0 +1,114 @@
+use serde_json::Value;
+
+use crate::{Document, StorageError, WrongoDBError};
+
+use super::{OpTime, OplogEntry, OplogMode, OplogOperation, OplogStore, ReplicationCoordinator};
+use crate::storage::api::Session;
+
+/// Mongo-style logical write observer that appends oplog rows inside the write transaction.
+#[derive(Debug, Clone)]
+pub(crate) struct ReplicationObserver {
+    coordinator: ReplicationCoordinator,
+    oplog_store: OplogStore,
+}
+
+impl ReplicationObserver {
+    /// Build a write observer over the current coordinator and oplog store.
+    pub(crate) fn new(coordinator: ReplicationCoordinator, oplog_store: OplogStore) -> Self {
+        Self {
+            coordinator,
+            oplog_store,
+        }
+    }
+
+    /// Append an insert oplog row for one inserted document.
+    pub(crate) fn on_insert(
+        &self,
+        session: &mut Session,
+        collection: &str,
+        document: &Document,
+        oplog_mode: OplogMode,
+    ) -> Result<Option<OpTime>, WrongoDBError> {
+        self.append_entry_for_write(
+            session,
+            oplog_mode,
+            OplogOperation::Insert {
+                ns: collection_namespace(collection),
+                document: document.clone(),
+            },
+        )
+    }
+
+    /// Append an update oplog row for one updated document.
+    pub(crate) fn on_update(
+        &self,
+        session: &mut Session,
+        collection: &str,
+        document: &Document,
+        oplog_mode: OplogMode,
+    ) -> Result<Option<OpTime>, WrongoDBError> {
+        let id = document
+            .get("_id")
+            .ok_or_else(|| StorageError("updated document is missing _id".into()))?;
+
+        self.append_entry_for_write(
+            session,
+            oplog_mode,
+            OplogOperation::Update {
+                ns: collection_namespace(collection),
+                document: document.clone(),
+                document_key: document_key(id),
+            },
+        )
+    }
+
+    /// Append a delete oplog row for one deleted document.
+    pub(crate) fn on_delete(
+        &self,
+        session: &mut Session,
+        collection: &str,
+        id: &Value,
+        oplog_mode: OplogMode,
+    ) -> Result<Option<OpTime>, WrongoDBError> {
+        self.append_entry_for_write(
+            session,
+            oplog_mode,
+            OplogOperation::Delete {
+                ns: collection_namespace(collection),
+                document_key: document_key(id),
+            },
+        )
+    }
+
+    fn append_entry_for_write(
+        &self,
+        session: &mut Session,
+        oplog_mode: OplogMode,
+        operation: OplogOperation,
+    ) -> Result<Option<OpTime>, WrongoDBError> {
+        if oplog_mode == OplogMode::SuppressOplog {
+            return Ok(None);
+        }
+
+        // The oplog row must land in the same local transaction as the user
+        // data change so both commit or abort together.
+        let op_time = OpTime {
+            term: self.coordinator.current_term(),
+            index: self.coordinator.reserve_next_op_index(),
+        };
+        self.oplog_store
+            .append(session, &OplogEntry { op_time, operation })?;
+        Ok(Some(op_time))
+    }
+}
+
+// TODO: why test? Something seems awfill off here? What are you trying to do?
+fn collection_namespace(collection: &str) -> String {
+    format!("test.{collection}")
+}
+
+fn document_key(id: &Value) -> Document {
+    let mut key = Document::new();
+    key.insert("_id".to_string(), id.clone());
+    key
+}

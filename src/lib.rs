@@ -8,6 +8,7 @@ mod replication;
 mod server;
 mod storage;
 mod txn;
+mod write_ops;
 
 pub use crate::core::errors::{DocumentValidationError, StorageError, WrongoDBError};
 pub use crate::server::start_server;

@@ -62,7 +62,6 @@ impl Command for CreateIndexesCommand {
 
     fn execute(&self, doc: &Document, db: &DatabaseContext) -> Result<Document, WrongoDBError> {
         let coll_name = doc.get_str("createIndexes").unwrap_or("test");
-        let mut session = db.connection().open_session();
         let mut created = 0i32;
         let mut requests = Vec::new();
 
@@ -75,8 +74,7 @@ impl Command for CreateIndexesCommand {
         }
 
         for request in requests {
-            db.collection_write_path()
-                .create_index(&mut session, coll_name, request)?;
+            db.ddl_path().create_index(coll_name, request)?;
             created += 1;
         }
 

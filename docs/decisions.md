@@ -1,5 +1,25 @@
 # Decisions
 
+## 2026-03-29: Align primary writes to a Mongo-style `write_ops -> collection_write_path -> oplog observer` stack
+
+**Decision**
+- Add `src/write_ops/` as the top server-side CRUD executor above `CollectionWritePath`.
+- Narrow `CollectionWritePath` to low-level in-transaction document mutation only.
+- Split top-level DDL into `src/api/ddl_path.rs` instead of keeping collection/index creation inside `CollectionWritePath`.
+- Extend `ReplicationCoordinator` with primary-side write admission and oplog index allocation:
+  - `require_writable_primary()`
+  - `current_term()`
+  - `reserve_next_op_index()`
+  - `seed_next_op_index()`
+- Add a Mongo-style `ReplicationObserver` that appends logical oplog rows from the document layer.
+- Persist the oplog through a replication-owned internal storage table, `table:__oplog`, rather than through `storage/wal`.
+- Initialize the oplog table and reseed the next oplog index in `DatabaseContext`.
+
+**Why**
+- MongoDB does not have separate "local write" and "replicated write" stacks on the primary. It has one replication-aware primary write path, plus a separate future oplog-apply path for followers.
+- Keeping write admission and oplog policy above `Connection` preserves the storage/replication boundary while still making the oplog commit atomically with user data inside one local transaction.
+- Moving DDL out of `CollectionWritePath` leaves the low-level mutator focused on collection-local row/index changes and makes the layering easier to reason about from the command handlers down.
+
 ## 2026-03-28: Add a top-level replication module above `Connection`
 
 **Decision**

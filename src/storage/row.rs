@@ -194,6 +194,25 @@ pub(crate) fn decode_row_value(
         .into_document(primary_key, table)
 }
 
+pub(crate) fn decode_row_value_from_metadata(
+    row_format: RowFormat,
+    value_columns: &[String],
+    primary_key: &[u8],
+    primary_value: &[u8],
+) -> Result<Document, WrongoDBError> {
+    let decoded = DecodedRow::from_bytes(row_format, value_columns, primary_value)?;
+    let mut document = Document::new();
+    document.insert("_id".to_string(), decode_id_value(primary_key)?);
+
+    for (column, value) in value_columns.iter().zip(decoded.fields.into_iter()) {
+        if let Some(value) = value {
+            document.insert(column.clone(), value);
+        }
+    }
+
+    Ok(document)
+}
+
 pub(crate) fn index_key_from_row(
     table: &TableMetadata,
     index: &IndexMetadata,
