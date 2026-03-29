@@ -3,10 +3,24 @@
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 
-use crate::common::kv::{get_kv, insert_kv_in_transaction, update_kv_in_transaction};
 use tempfile::tempdir;
 
-use wrongodb::{Connection, ConnectionConfig};
+use wrongodb::{Connection, ConnectionConfig, WrongoDBError};
+
+fn table_uri(collection: &str) -> String {
+    format!("table:{collection}")
+}
+
+fn get_kv(
+    conn: &Connection,
+    collection: &str,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, WrongoDBError> {
+    let mut session = conn.open_session();
+    session.create_table(&table_uri(collection), Vec::new())?;
+    let mut cursor = session.open_table_cursor(&table_uri(collection))?;
+    cursor.get(key)
+}
 
 fn global_wal_path(db_dir: &std::path::Path) -> std::path::PathBuf {
     db_dir.join("global.wal")
@@ -18,12 +32,12 @@ fn insert_kv(conn: &Connection, table: &str, key: &[u8], value: &[u8]) {
         .create_table(&format!("table:{table}"), Vec::new())
         .unwrap();
     session
-        .with_transaction(|session| insert_kv_in_transaction(session, table, key, value))
+        .with_transaction(|session| {
+            session
+                .open_table_cursor(&format!("table:{table}"))?
+                .insert(key, value)
+        })
         .unwrap();
-}
-
-fn insert_kv_non_transactional(conn: &Connection, table: &str, key: &[u8], value: &[u8]) {
-    insert_kv(conn, table, key, value);
 }
 
 fn exists(conn: &Connection, table: &str, key: &[u8]) -> bool {
@@ -112,7 +126,9 @@ fn recovery_skips_explicitly_aborted_transaction_writes() {
         session.create_table("table:test", Vec::new()).unwrap();
 
         let _ = session.with_transaction(|session| {
-            insert_kv_in_transaction(session, "test", b"k1", b"a")?;
+            session
+                .open_table_cursor("table:test")?
+                .insert(b"k1", b"a")?;
             Err::<(), wrongodb::WrongoDBError>(wrongodb::StorageError("abort".into()).into())
         });
     }
@@ -130,13 +146,15 @@ fn recovery_replays_transactional_writes_at_commit_time() {
 
     {
         let conn = Connection::open(&db_path, ConnectionConfig::new()).unwrap();
-        insert_kv_non_transactional(&conn, "test", b"shared", b"plain");
+        insert_kv(&conn, "test", b"shared", b"plain");
 
         let mut session = conn.open_session();
 
         session
             .with_transaction(|session| {
-                update_kv_in_transaction(session, "test", b"shared", b"txn")
+                session
+                    .open_table_cursor("table:test")?
+                    .update(b"shared", b"txn")
             })
             .unwrap();
     }

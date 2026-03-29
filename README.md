@@ -1,6 +1,6 @@
 # WrongoDB
 
-Last updated: `2026-03-29`
+Last updated: `2026-03-28`
 
 The database that teaches you how databases work by doing everything wrong first, then fixing it.
 
@@ -52,7 +52,7 @@ The codebase is organized by domain to keep storage, catalog, and server concern
 - `src/collection_write_path.rs`: internal Mongo-style document/index write orchestration
 - `src/document_query.rs`: internal document/query helpers used by the server path
 - `src/server/`: MongoDB wire-protocol server, command handlers, and startup reconciliation
-- `src/bin/`: server and benchmark binary entry points
+- `src/bin/`: server binary entry point
 
 Integration tests are grouped under `tests/`:
 - `tests/storage_suite.rs`, `tests/connection_suite.rs`, and `tests/server_suite.rs`: suite entry points for `tests/storage/`, `tests/connection/`, and `tests/server/`
@@ -60,7 +60,7 @@ Integration tests are grouped under `tests/`:
 - `tests/public_api_surface.rs`: public API surface checks
 - `tests/bench_wire_ab_smoke.rs`: wire protocol benchmark smoke tests
 
-See the integration tests under `tests/` for recovery, checkpointing, and WAL behavior.
+See the `examples/` directory for additional standalone programs demonstrating recovery, checkpointing, and WAL behavior.
 
 ## Documentation
 

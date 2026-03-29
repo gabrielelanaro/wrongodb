@@ -2,10 +2,27 @@
 
 use std::fs;
 
-use crate::common::kv::insert_kv;
 use tempfile::tempdir;
 
-use wrongodb::{Connection, ConnectionConfig};
+use wrongodb::{Connection, ConnectionConfig, WrongoDBError};
+
+fn table_uri(collection: &str) -> String {
+    format!("table:{collection}")
+}
+
+fn insert_kv(
+    conn: &Connection,
+    collection: &str,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), WrongoDBError> {
+    let mut session = conn.open_session();
+    session.create_table(&table_uri(collection), Vec::new())?;
+    session.with_transaction(|session| {
+        let mut cursor = session.open_table_cursor(&table_uri(collection))?;
+        cursor.insert(key, value)
+    })
+}
 
 fn global_wal_path(db_dir: &std::path::Path) -> std::path::PathBuf {
     db_dir.join("global.wal")
