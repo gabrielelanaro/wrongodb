@@ -1,20 +1,23 @@
 use super::crud::namespace_from_field;
+use super::cursor::{create_materialized_cursor_response, default_batch_size};
 use crate::api::DatabaseContext;
 use crate::core::errors::DocumentValidationError;
 use crate::core::Namespace;
 use crate::server::commands::{Command, CommandContext};
 use crate::WrongoDBError;
+use async_trait::async_trait;
 use bson::{doc, spec::BinarySubtype, Binary, Bson, Document};
 
 /// Handles: listDatabases
 pub struct ListDatabasesCommand;
 
+#[async_trait]
 impl Command for ListDatabasesCommand {
     fn names(&self) -> &[&str] {
         &["listDatabases"]
     }
 
-    fn execute(
+    async fn execute(
         &self,
         ctx: &CommandContext,
         _doc: &Document,
@@ -49,24 +52,25 @@ impl Command for ListDatabasesCommand {
 /// Handles: listCollections
 pub struct ListCollectionsCommand;
 
+#[async_trait]
 impl Command for ListCollectionsCommand {
     fn names(&self) -> &[&str] {
         &["listCollections"]
     }
 
-    fn execute(
+    async fn execute(
         &self,
         ctx: &CommandContext,
         _doc: &Document,
         db: &DatabaseContext,
     ) -> Result<Document, WrongoDBError> {
         let collections = db.list_collections(ctx.db_name())?;
-        let collections_bson: Vec<Bson> = collections
+        let collections_docs: Vec<Document> = collections
             .into_iter()
             .filter_map(|name| {
                 let namespace = Namespace::new(ctx.db_name().clone(), name.clone()).ok()?;
                 let definition = db.collection_definition(&namespace).ok()??;
-                Some(Bson::Document(doc! {
+                Some(doc! {
                     "name": name.clone(),
                     "type": "collection",
                     "options": Bson::Document(definition.options().clone()),
@@ -82,31 +86,30 @@ impl Command for ListCollectionsCommand {
                         "key": { "_id": Bson::Int32(1) },
                         "name": "_id_",
                     },
-                }))
+                })
             })
             .collect();
 
         let cursor_namespace = Namespace::list_collections_cursor(ctx.db_name().clone())?;
-        Ok(doc! {
-            "ok": Bson::Double(1.0),
-            "cursor": {
-                "id": Bson::Int64(0),
-                "ns": cursor_namespace.full_name(),
-                "firstBatch": Bson::Array(collections_bson),
-            },
-        })
+        Ok(create_materialized_cursor_response(
+            ctx,
+            cursor_namespace,
+            collections_docs,
+            default_batch_size(_doc),
+        ))
     }
 }
 
 /// Handles: createCollection, create
 pub struct CreateCollectionCommand;
 
+#[async_trait]
 impl Command for CreateCollectionCommand {
     fn names(&self) -> &[&str] {
         &["createCollection", "create"]
     }
 
-    fn execute(
+    async fn execute(
         &self,
         ctx: &CommandContext,
         doc: &Document,
@@ -135,12 +138,13 @@ impl Command for CreateCollectionCommand {
 /// Handles: dbStats
 pub struct DbStatsCommand;
 
+#[async_trait]
 impl Command for DbStatsCommand {
     fn names(&self) -> &[&str] {
         &["dbStats"]
     }
 
-    fn execute(
+    async fn execute(
         &self,
         ctx: &CommandContext,
         _doc: &Document,
@@ -174,12 +178,13 @@ impl Command for DbStatsCommand {
 /// Handles: collStats
 pub struct CollStatsCommand;
 
+#[async_trait]
 impl Command for CollStatsCommand {
     fn names(&self) -> &[&str] {
         &["collStats"]
     }
 
-    fn execute(
+    async fn execute(
         &self,
         ctx: &CommandContext,
         doc: &Document,

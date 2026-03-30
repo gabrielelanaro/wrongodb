@@ -1,19 +1,22 @@
 use super::crud::namespace_from_field;
+use super::cursor::{create_materialized_cursor_response, default_batch_size};
 use crate::api::DatabaseContext;
 use crate::catalog::CreateIndexRequest;
 use crate::server::commands::{Command, CommandContext};
 use crate::WrongoDBError;
+use async_trait::async_trait;
 use bson::{doc, Bson, Document};
 
 /// Handles: listIndexes
 pub struct ListIndexesCommand;
 
+#[async_trait]
 impl Command for ListIndexesCommand {
     fn names(&self) -> &[&str] {
         &["listIndexes"]
     }
 
-    fn execute(
+    async fn execute(
         &self,
         ctx: &CommandContext,
         doc: &Document,
@@ -22,7 +25,7 @@ impl Command for ListIndexesCommand {
         let namespace = namespace_from_field(ctx, doc, "listIndexes")?;
         let indexes = db.list_indexes(&namespace)?;
 
-        let indexes_bson: Vec<Bson> = indexes
+        let indexes_docs: Vec<Document> = indexes
             .into_iter()
             .map(|index| {
                 let key_doc = index
@@ -30,43 +33,42 @@ impl Command for ListIndexesCommand {
                     .get_document("key")
                     .cloned()
                     .unwrap_or_default();
-                Bson::Document(doc! {
+                doc! {
                     "v": Bson::Int32(2),
                     "key": key_doc,
                     "name": index.name(),
                     "ns": namespace.full_name(),
-                })
+                }
             })
             .collect();
 
-        let mut result_indexes = vec![Bson::Document(doc! {
+        let mut result_indexes = vec![doc! {
             "v": Bson::Int32(2),
             "key": { "_id": Bson::Int32(1) },
             "name": "_id_",
             "ns": namespace.full_name(),
-        })];
-        result_indexes.extend(indexes_bson);
+        }];
+        result_indexes.extend(indexes_docs);
 
-        Ok(doc! {
-            "ok": Bson::Double(1.0),
-            "cursor": {
-                "id": Bson::Int64(0),
-                "ns": namespace.full_name(),
-                "firstBatch": Bson::Array(result_indexes),
-            },
-        })
+        Ok(create_materialized_cursor_response(
+            ctx,
+            namespace,
+            result_indexes,
+            default_batch_size(doc),
+        ))
     }
 }
 
 /// Handles: createIndexes
 pub struct CreateIndexesCommand;
 
+#[async_trait]
 impl Command for CreateIndexesCommand {
     fn names(&self) -> &[&str] {
         &["createIndexes"]
     }
 
-    fn execute(
+    async fn execute(
         &self,
         ctx: &CommandContext,
         doc: &Document,

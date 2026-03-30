@@ -5,7 +5,9 @@ use crate::catalog::{CatalogStore, CollectionCatalog, IndexDefinition};
 use crate::collection_write_path::CollectionWritePath;
 use crate::core::{DatabaseName, Namespace};
 use crate::document_query::DocumentQuery;
-use crate::replication::{bootstrap_oplog, ReplicationCoordinator, ReplicationObserver};
+use crate::replication::{
+    bootstrap_oplog, OplogAwaitService, ReplicationCoordinator, ReplicationObserver,
+};
 use crate::write_ops::WriteOps;
 use crate::{Connection, WrongoDBError};
 
@@ -21,6 +23,7 @@ pub(crate) struct DatabaseContext {
     document_query: DocumentQuery,
     ddl_path: DdlPath,
     write_ops: WriteOps,
+    oplog_await_service: OplogAwaitService,
     replication: ReplicationCoordinator,
 }
 
@@ -37,6 +40,11 @@ impl DatabaseContext {
         drop(session);
 
         let oplog_store = bootstrap_oplog(connection.as_ref(), catalog.as_ref(), &replication)?;
+        let latest_oplog_index = {
+            let mut session = connection.open_session();
+            oplog_store.load_latest_index(&mut session)?
+        };
+        let oplog_await_service = OplogAwaitService::new(latest_oplog_index);
 
         let session = connection.open_session();
         catalog.load_cache(&session)?;
@@ -59,6 +67,7 @@ impl DatabaseContext {
             connection.clone(),
             collection_write_path.clone(),
             replication.clone(),
+            oplog_await_service.clone(),
         );
 
         Ok(Self {
@@ -67,6 +76,7 @@ impl DatabaseContext {
             document_query,
             ddl_path,
             write_ops,
+            oplog_await_service,
             replication,
         })
     }
@@ -89,6 +99,10 @@ impl DatabaseContext {
 
     pub(crate) fn hello_state(&self) -> (bool, Option<String>) {
         self.replication.hello_state()
+    }
+
+    pub(crate) fn oplog_await_service(&self) -> OplogAwaitService {
+        self.oplog_await_service.clone()
     }
 
     pub(crate) fn list_databases(&self) -> Vec<DatabaseName> {

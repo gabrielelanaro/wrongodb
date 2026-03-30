@@ -1,8 +1,10 @@
+mod await_service;
 mod bootstrap;
 mod coordinator;
 mod observer;
 mod oplog;
 
+pub(crate) use await_service::OplogAwaitService;
 pub(crate) use bootstrap::bootstrap_oplog;
 pub(crate) use coordinator::{ReplicationConfig, ReplicationCoordinator};
 pub(crate) use observer::ReplicationObserver;

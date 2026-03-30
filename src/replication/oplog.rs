@@ -97,6 +97,14 @@ impl OplogStore {
         Ok(last_op_time)
     }
 
+    /// Load the latest durable oplog index, or `0` when the oplog is empty.
+    pub(crate) fn load_latest_index(&self, session: &mut Session) -> Result<u64, WrongoDBError> {
+        Ok(self
+            .load_last_op_time(session)?
+            .map(|op_time| op_time.index)
+            .unwrap_or(0))
+    }
+
     /// Append one logical oplog entry inside the caller's active transaction.
     pub(crate) fn append(
         &self,

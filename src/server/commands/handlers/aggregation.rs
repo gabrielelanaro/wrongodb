@@ -1,19 +1,25 @@
-use super::crud::{bson_to_value, namespace_from_field, value_to_bson_value};
+use super::crud::namespace_from_field;
+use super::cursor::{create_materialized_cursor_response, default_batch_size};
 use crate::api::DatabaseContext;
-use crate::server::commands::{Command, CommandContext};
+use crate::server::commands::{
+    bson_document_to_json_value, json_value_to_bson_document, json_value_to_bson_value, Command,
+    CommandContext,
+};
 use crate::WrongoDBError;
+use async_trait::async_trait;
 use bson::{doc, Bson, Document};
 use serde_json::Value;
 
 /// Handles: count (deprecated but still used)
 pub struct CountCommand;
 
+#[async_trait]
 impl Command for CountCommand {
     fn names(&self) -> &[&str] {
         &["count"]
     }
 
-    fn execute(
+    async fn execute(
         &self,
         ctx: &CommandContext,
         doc: &Document,
@@ -22,7 +28,7 @@ impl Command for CountCommand {
         let namespace = namespace_from_field(ctx, doc, "count")?;
         let mut session = db.connection().open_session();
         let query = doc.get("query").and_then(|q| q.as_document()).cloned();
-        let filter_json = query.map(|d| bson_to_value(&d));
+        let filter_json = query.map(|d| bson_document_to_json_value(&d));
 
         let count = db
             .document_query()
@@ -38,12 +44,13 @@ impl Command for CountCommand {
 /// Handles: distinct
 pub struct DistinctCommand;
 
+#[async_trait]
 impl Command for DistinctCommand {
     fn names(&self) -> &[&str] {
         &["distinct"]
     }
 
-    fn execute(
+    async fn execute(
         &self,
         ctx: &CommandContext,
         doc: &Document,
@@ -53,14 +60,14 @@ impl Command for DistinctCommand {
         let mut session = db.connection().open_session();
         let key = doc.get_str("key").unwrap_or("_id");
         let query = doc.get("query").and_then(|q| q.as_document()).cloned();
-        let filter_json = query.map(|d| bson_to_value(&d));
+        let filter_json = query.map(|d| bson_document_to_json_value(&d));
 
         let values = db
             .document_query()
             .distinct(&mut session, &namespace, key, filter_json)?;
         let values_bson: Vec<Bson> = values
             .into_iter()
-            .map(|v| value_to_bson_value(&v))
+            .map(|v| json_value_to_bson_value(&v))
             .collect();
 
         Ok(doc! {
@@ -74,12 +81,13 @@ impl Command for DistinctCommand {
 /// Note: Currently only supports basic pipeline stages ($match, $limit, $skip, $count)
 pub struct AggregateCommand;
 
+#[async_trait]
 impl Command for AggregateCommand {
     fn names(&self) -> &[&str] {
         &["aggregate"]
     }
 
-    fn execute(
+    async fn execute(
         &self,
         ctx: &CommandContext,
         doc: &Document,
@@ -97,19 +105,17 @@ impl Command for AggregateCommand {
             }
         }
 
-        let results_bson: Vec<Bson> = results
+        let results_docs: Vec<Document> = results
             .into_iter()
-            .map(|d| Bson::Document(super::crud::value_to_bson(&Value::Object(d))))
+            .map(|d| json_value_to_bson_document(&Value::Object(d)))
             .collect();
 
-        Ok(doc! {
-            "ok": Bson::Double(1.0),
-            "cursor": {
-                "id": Bson::Int64(0),
-                "ns": namespace.full_name(),
-                "firstBatch": Bson::Array(results_bson),
-            },
-        })
+        Ok(create_materialized_cursor_response(
+            ctx,
+            namespace,
+            results_docs,
+            default_batch_size(doc),
+        ))
     }
 }
 
@@ -118,7 +124,7 @@ fn apply_pipeline_stage(
     mut results: Vec<serde_json::Map<String, Value>>,
 ) -> Result<Vec<serde_json::Map<String, Value>>, WrongoDBError> {
     if let Ok(match_doc) = stage.get_document("$match") {
-        let filter = bson_to_value(match_doc);
+        let filter = bson_document_to_json_value(match_doc);
         if let Value::Object(filter_obj) = filter {
             results.retain(|doc| filter_obj.iter().all(|(k, v)| doc.get(k) == Some(v)));
         }
@@ -144,7 +150,7 @@ fn apply_pipeline_stage(
     }
 
     if let Ok(project_doc) = stage.get_document("$project") {
-        let project_filter = bson_to_value(project_doc);
+        let project_filter = bson_document_to_json_value(project_doc);
         if let Value::Object(proj_obj) = project_filter {
             results = results
                 .into_iter()

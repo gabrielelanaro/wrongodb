@@ -1,5 +1,21 @@
 # Decisions
 
+## 2026-03-30: Add Mongo-style server-side cursors and oplog-only awaitData through public `find` / `getMore`
+
+**Decision**
+- Add a process-local cursor manager under `src/server/commands/` and return real non-zero cursor ids from `find`, `listCollections`, `listIndexes`, and `aggregate` when more data remains.
+- Make command execution async so `getMore` can wait without blocking a Tokio worker thread.
+- Extend `DocumentQuery` with paged reads and resume tokens keyed by raw storage keys instead of storing borrowed storage cursors.
+- Add narrow `_id` range support for `_id.$gt` and `_id.$gte`.
+- Support `tailable` and `awaitData` only on `local.oplog.rs`.
+- Wake oplog awaitData cursors from a dedicated post-commit oplog await service instead of polling.
+
+**Why**
+- MongoDB keeps cursor state on the server and resumes later batches from a bookmark, not by re-sending the entire result set in `firstBatch`.
+- Using the public `find` / `getMore` path for oplog reads keeps WrongoDB's future follower fetch path closer to MongoDB and avoids inventing a temporary replication-only transport.
+- Bookmark-based continuation matches MongoDB's ordinary non-snapshot cursor semantics better than pinning one snapshot across the whole cursor lifetime.
+- Restricting `tailable` and `awaitData` to `local.oplog.rs` gives WrongoDB the oplog behavior replication needs without pretending to have MongoDB's full capped-collection feature set.
+
 ## 2026-03-29: Make namespaces first-class and key the catalog by full namespace
 
 **Decision**

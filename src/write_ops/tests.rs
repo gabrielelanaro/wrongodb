@@ -11,7 +11,8 @@ use crate::collection_write_path::CollectionWritePath;
 use crate::core::{DatabaseName, Namespace};
 use crate::document_query::DocumentQuery;
 use crate::replication::{
-    OplogOperation, OplogStore, ReplicationConfig, ReplicationCoordinator, ReplicationObserver,
+    OplogAwaitService, OplogOperation, OplogStore, ReplicationConfig, ReplicationCoordinator,
+    ReplicationObserver,
 };
 use crate::storage::api::{Connection, ConnectionConfig};
 use crate::WrongoDBError;
@@ -59,7 +60,12 @@ fn open_services(
         ReplicationObserver::new(write_replication.clone(), oplog_store.clone()),
     );
     let ddl_path = DdlPath::new(connection.clone(), metadata_store, catalog, ddl_replication);
-    let write_ops = WriteOps::new(connection.clone(), collection_write_path, write_replication);
+    let write_ops = WriteOps::new(
+        connection.clone(),
+        collection_write_path,
+        write_replication,
+        OplogAwaitService::new(next_op_index.saturating_sub(1)),
+    );
 
     TestServices {
         connection,

@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use bson::{doc, Bson, Document};
 
 use crate::api::DatabaseContext;
@@ -7,12 +8,13 @@ use crate::WrongoDBError;
 /// Handles: hello, isMaster, ismaster
 pub struct HelloCommand;
 
+#[async_trait]
 impl Command for HelloCommand {
     fn names(&self) -> &[&str] {
         &["hello", "ismaster", "isMaster"]
     }
 
-    fn execute(
+    async fn execute(
         &self,
         _ctx: &CommandContext,
         _doc: &Document,
@@ -45,12 +47,13 @@ impl Command for HelloCommand {
 /// Handles: ping
 pub struct PingCommand;
 
+#[async_trait]
 impl Command for PingCommand {
     fn names(&self) -> &[&str] {
         &["ping"]
     }
 
-    fn execute(
+    async fn execute(
         &self,
         _ctx: &CommandContext,
         _doc: &Document,
@@ -63,12 +66,13 @@ impl Command for PingCommand {
 /// Handles: buildInfo, buildinfo
 pub struct BuildInfoCommand;
 
+#[async_trait]
 impl Command for BuildInfoCommand {
     fn names(&self) -> &[&str] {
         &["buildInfo", "buildinfo"]
     }
 
-    fn execute(
+    async fn execute(
         &self,
         _ctx: &CommandContext,
         _doc: &Document,
@@ -93,12 +97,13 @@ impl Command for BuildInfoCommand {
 /// Handles: serverStatus
 pub struct ServerStatusCommand;
 
+#[async_trait]
 impl Command for ServerStatusCommand {
     fn names(&self) -> &[&str] {
         &["serverStatus"]
     }
 
-    fn execute(
+    async fn execute(
         &self,
         _ctx: &CommandContext,
         _doc: &Document,
@@ -122,12 +127,13 @@ impl Command for ServerStatusCommand {
 /// Handles: connectionStatus
 pub struct ConnectionStatusCommand;
 
+#[async_trait]
 impl Command for ConnectionStatusCommand {
     fn names(&self) -> &[&str] {
         &["connectionStatus"]
     }
 
-    fn execute(
+    async fn execute(
         &self,
         _ctx: &CommandContext,
         _doc: &Document,

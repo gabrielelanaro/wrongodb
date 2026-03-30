@@ -30,7 +30,7 @@ impl CommandRegistry {
         self.handlers.push(handler);
     }
 
-    pub(crate) fn execute(
+    pub(crate) async fn execute(
         &self,
         ctx: &CommandContext,
         doc: &Document,
@@ -38,7 +38,7 @@ impl CommandRegistry {
     ) -> Result<Document, WrongoDBError> {
         for key in doc.keys() {
             if let Some(&idx) = self.name_to_handler.get(&key.to_lowercase()) {
-                return self.handlers[idx].execute(ctx, doc, db);
+                return self.handlers[idx].execute(ctx, doc, db).await;
             }
         }
         Ok(doc! { "ok": Bson::Double(0.0), "errmsg": "Command not found" })

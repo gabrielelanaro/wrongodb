@@ -75,6 +75,14 @@ fn database_names(response: &Document) -> Vec<String> {
         .collect()
 }
 
+fn cursor_id(response: &Document) -> i64 {
+    response
+        .get_document("cursor")
+        .unwrap()
+        .get_i64("id")
+        .unwrap()
+}
+
 // EARS: When a MongoDB client exercises the supported CRUD and cursor commands,
 // the server shall accept the end-to-end flow over the wire protocol.
 #[tokio::test]
@@ -320,4 +328,341 @@ async fn test_list_databases_requires_admin_database() {
     assert!(err
         .to_string()
         .contains("listDatabases must run against the admin database"));
+}
+
+// EARS: When a `find` response is shorter than the full result set, the server
+// shall return a non-zero cursor id and only the requested first batch.
+#[tokio::test]
+async fn test_find_returns_non_zero_cursor_when_batch_is_short() {
+    let server = TestServer::start().await;
+    let db = server.database("test");
+    db.run_command(doc! { "createCollection": "users", "storageColumns": ["name"] })
+        .await
+        .unwrap();
+
+    let coll = db.collection::<Document>("users");
+    coll.insert_many(vec![doc! { "name": "alice" }, doc! { "name": "bob" }])
+        .await
+        .unwrap();
+
+    let response = db
+        .run_command(doc! { "find": "users", "batchSize": 1 })
+        .await
+        .unwrap();
+
+    let cursor = response.get_document("cursor").unwrap();
+    assert!(cursor.get_i64("id").unwrap() > 0);
+    assert_eq!(cursor.get_array("firstBatch").unwrap().len(), 1);
+}
+
+// EARS: When `singleBatch` is set on `find`, the server shall return only the
+// first batch and close the cursor immediately.
+#[tokio::test]
+async fn test_find_single_batch_closes_the_cursor() {
+    let server = TestServer::start().await;
+    let db = server.database("test");
+    db.run_command(doc! { "createCollection": "users", "storageColumns": ["name"] })
+        .await
+        .unwrap();
+
+    let coll = db.collection::<Document>("users");
+    coll.insert_many(vec![doc! { "name": "alice" }, doc! { "name": "bob" }])
+        .await
+        .unwrap();
+
+    let response = db
+        .run_command(doc! { "find": "users", "batchSize": 1, "singleBatch": true })
+        .await
+        .unwrap();
+
+    let cursor = response.get_document("cursor").unwrap();
+    assert_eq!(cursor.get_i64("id").unwrap(), 0);
+    assert_eq!(cursor.get_array("firstBatch").unwrap().len(), 1);
+}
+
+// EARS: When `getMore` continues a live find cursor, it shall return the next
+// batch and close the cursor when the results are exhausted.
+#[tokio::test]
+async fn test_get_more_drains_remaining_batches() {
+    let server = TestServer::start().await;
+    let db = server.database("test");
+    db.run_command(doc! { "createCollection": "users", "storageColumns": ["name"] })
+        .await
+        .unwrap();
+
+    let coll = db.collection::<Document>("users");
+    coll.insert_many(vec![doc! { "name": "alice" }, doc! { "name": "bob" }])
+        .await
+        .unwrap();
+
+    let response = db
+        .run_command(doc! { "find": "users", "batchSize": 1 })
+        .await
+        .unwrap();
+    let live_cursor_id = cursor_id(&response);
+
+    let get_more = db
+        .run_command(doc! { "getMore": live_cursor_id, "collection": "users" })
+        .await
+        .unwrap();
+    let cursor = get_more.get_document("cursor").unwrap();
+    let next_batch = cursor.get_array("nextBatch").unwrap();
+
+    assert_eq!(next_batch.len(), 1);
+    assert_eq!(cursor.get_i64("id").unwrap(), 0);
+}
+
+// EARS: When `find` has both `limit` and `batchSize`, the server shall treat
+// `limit` as the total cursor budget across `firstBatch` and `getMore`.
+#[tokio::test]
+async fn test_find_limit_is_total_across_get_more() {
+    let server = TestServer::start().await;
+    let db = server.database("test");
+    db.run_command(doc! { "createCollection": "users", "storageColumns": ["name"] })
+        .await
+        .unwrap();
+
+    let coll = db.collection::<Document>("users");
+    coll.insert_many(vec![
+        doc! { "name": "alice" },
+        doc! { "name": "bob" },
+        doc! { "name": "carol" },
+    ])
+    .await
+    .unwrap();
+
+    let response = db
+        .run_command(doc! { "find": "users", "batchSize": 1, "limit": 2 })
+        .await
+        .unwrap();
+    let live_cursor_id = cursor_id(&response);
+    assert!(live_cursor_id > 0);
+    assert_eq!(
+        response
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let get_more = db
+        .run_command(doc! { "getMore": live_cursor_id, "collection": "users" })
+        .await
+        .unwrap();
+    let cursor = get_more.get_document("cursor").unwrap();
+
+    assert_eq!(cursor.get_array("nextBatch").unwrap().len(), 1);
+    assert_eq!(cursor.get_i64("id").unwrap(), 0);
+}
+
+// EARS: When a materialized command cursor has more rows than fit in the first
+// batch, `getMore` shall resume it through the same saved cursor mechanism.
+#[tokio::test]
+async fn test_list_collections_get_more_uses_saved_materialized_cursor() {
+    let server = TestServer::start().await;
+    let db = server.database("test");
+
+    db.run_command(doc! { "createCollection": "users", "storageColumns": ["name"] })
+        .await
+        .unwrap();
+    db.run_command(doc! { "createCollection": "posts", "storageColumns": ["title"] })
+        .await
+        .unwrap();
+
+    let response = db
+        .run_command(doc! { "listCollections": 1, "cursor": { "batchSize": 1 } })
+        .await
+        .unwrap();
+    let cursor = response.get_document("cursor").unwrap();
+    let live_cursor_id = cursor.get_i64("id").unwrap();
+
+    assert!(live_cursor_id > 0);
+    assert_eq!(cursor.get_array("firstBatch").unwrap().len(), 1);
+
+    let get_more = db
+        .run_command(doc! { "getMore": live_cursor_id, "collection": "$cmd.listCollections" })
+        .await
+        .unwrap();
+    let next_batch = get_more
+        .get_document("cursor")
+        .unwrap()
+        .get_array("nextBatch")
+        .unwrap();
+
+    assert_eq!(next_batch.len(), 1);
+}
+
+// EARS: When `killCursors` removes a live cursor, a later `getMore` shall
+// fail instead of silently returning an empty batch.
+#[tokio::test]
+async fn test_kill_cursors_removes_saved_state() {
+    let server = TestServer::start().await;
+    let db = server.database("test");
+    db.run_command(doc! { "createCollection": "users", "storageColumns": ["name"] })
+        .await
+        .unwrap();
+
+    let coll = db.collection::<Document>("users");
+    coll.insert_many(vec![doc! { "name": "alice" }, doc! { "name": "bob" }])
+        .await
+        .unwrap();
+
+    let response = db
+        .run_command(doc! { "find": "users", "batchSize": 1 })
+        .await
+        .unwrap();
+    let live_cursor_id = cursor_id(&response);
+
+    db.run_command(doc! { "killCursors": "users", "cursors": [live_cursor_id] })
+        .await
+        .unwrap();
+
+    let err = db
+        .run_command(doc! { "getMore": live_cursor_id, "collection": "users" })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("cursor not found"));
+}
+
+// EARS: When `awaitData` is set without `tailable`, the server shall reject
+// the command instead of pretending the cursor can wait.
+#[tokio::test]
+async fn test_await_data_requires_tailable() {
+    let server = TestServer::start().await;
+    let local_db = server.database("local");
+
+    let err = local_db
+        .run_command(doc! { "find": "oplog.rs", "awaitData": true })
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("awaitData requires tailable=true"));
+}
+
+// EARS: When a non-oplog namespace asks for a tailable cursor, the server
+// shall reject the command instead of enabling unsupported capped semantics.
+#[tokio::test]
+async fn test_tailable_is_rejected_for_non_oplog_namespace() {
+    let server = TestServer::start().await;
+    let db = server.database("test");
+    db.run_command(doc! { "createCollection": "users", "storageColumns": ["name"] })
+        .await
+        .unwrap();
+
+    let err = db
+        .run_command(doc! { "find": "users", "tailable": true })
+        .await
+        .unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("tailable and awaitData are only supported on local.oplog.rs"));
+}
+
+// EARS: When a tailable awaitData oplog cursor reaches the current end, the
+// server shall wake the waiting `getMore` after a later committed write.
+#[tokio::test]
+async fn test_tailable_oplog_cursor_waits_for_new_write() {
+    let server = TestServer::start().await;
+    let app_db = server.database("test");
+    let local_db = server.database("local");
+
+    app_db
+        .run_command(doc! { "createCollection": "users", "storageColumns": ["name"] })
+        .await
+        .unwrap();
+    let coll = app_db.collection::<Document>("users");
+    coll.insert_one(doc! { "name": "alice" }).await.unwrap();
+
+    let find_response = local_db
+        .run_command(doc! {
+            "find": "oplog.rs",
+            "filter": { "_id": { "$gt": 1_i64 } },
+            "batchSize": 1,
+            "tailable": true,
+            "awaitData": true,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(cursor_namespace(&find_response), "local.oplog.rs");
+    assert!(cursor_id(&find_response) > 0);
+    assert!(find_response
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap()
+        .is_empty());
+
+    let live_cursor_id = cursor_id(&find_response);
+    let local_db_for_get_more = local_db.clone();
+    let wait_for_get_more = tokio::spawn(async move {
+        local_db_for_get_more
+            .run_command(doc! {
+                "getMore": live_cursor_id,
+                "collection": "oplog.rs",
+                "maxTimeMS": 5_000_i64,
+            })
+            .await
+            .unwrap()
+    });
+
+    coll.insert_one(doc! { "name": "bob" }).await.unwrap();
+
+    let get_more_response = wait_for_get_more.await.unwrap();
+    let cursor = get_more_response.get_document("cursor").unwrap();
+    let next_batch = cursor.get_array("nextBatch").unwrap();
+
+    assert_eq!(next_batch.len(), 1);
+    assert!(cursor.get_i64("id").unwrap() > 0);
+    let oplog_entry = next_batch[0].as_document().unwrap();
+    assert_eq!(oplog_entry.get_i64("_id").unwrap(), 2);
+    assert_eq!(oplog_entry.get_str("op").unwrap(), "i");
+    assert_eq!(oplog_entry.get_str("ns").unwrap(), "test.users");
+}
+
+// EARS: When a tailable awaitData oplog cursor times out without a new write,
+// `getMore` shall return an empty batch and keep the cursor alive.
+#[tokio::test]
+async fn test_tailable_oplog_cursor_timeout_keeps_cursor_alive() {
+    let server = TestServer::start().await;
+    let app_db = server.database("test");
+    let local_db = server.database("local");
+
+    app_db
+        .run_command(doc! { "createCollection": "users", "storageColumns": ["name"] })
+        .await
+        .unwrap();
+    app_db
+        .collection::<Document>("users")
+        .insert_one(doc! { "name": "alice" })
+        .await
+        .unwrap();
+
+    let find_response = local_db
+        .run_command(doc! {
+            "find": "oplog.rs",
+            "filter": { "_id": { "$gt": 1_i64 } },
+            "batchSize": 1,
+            "tailable": true,
+            "awaitData": true,
+        })
+        .await
+        .unwrap();
+    let live_cursor_id = cursor_id(&find_response);
+
+    let get_more_response = local_db
+        .run_command(doc! {
+            "getMore": live_cursor_id,
+            "collection": "oplog.rs",
+            "maxTimeMS": 25_i64,
+        })
+        .await
+        .unwrap();
+    let cursor = get_more_response.get_document("cursor").unwrap();
+
+    assert!(cursor.get_i64("id").unwrap() > 0);
+    assert!(cursor.get_array("nextBatch").unwrap().is_empty());
 }

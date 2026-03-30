@@ -104,7 +104,8 @@ Current behavior:
 
 - `count` uses the same document query path as `find`
 - `distinct` computes distinct values in the server layer after reading matching documents
-- `aggregate` is an in-memory pipeline over fetched documents
+- `aggregate` is an in-memory pipeline over fetched documents and now uses the same
+  server-side cursor continuation model as `find`
 
 Supported aggregation stages today:
 
@@ -125,11 +126,12 @@ Implemented commands:
 
 Current behavior:
 
-- both are stubs
-- server responses always use cursor id `0`
-- `find`, `listCollections`, `listIndexes`, and `aggregate` return the whole first batch immediately
-- `getMore` therefore always returns an empty `nextBatch`
-- `killCursors` does not manage real server-side cursor state
+- server-side cursor state is process-local and keyed by non-zero cursor ids
+- `find` returns a non-zero cursor id when more results remain after `firstBatch`
+- `listCollections`, `listIndexes`, and `aggregate` page through saved server-side cursor state
+- `getMore` resumes the saved cursor and returns `nextBatch`
+- `killCursors` removes saved cursor state
+- cursor state is not durable; a server restart drops live cursors
 
 ## Query capabilities
 
@@ -141,10 +143,15 @@ Current filters are intentionally small:
 
 - no filter, meaning full collection scan
 - exact `_id` lookup
+- `_id: { "$gt": scalar }`
+- `_id: { "$gte": scalar }`
 - exact equality on one indexed field when a ready secondary index exists
 - exact field equality checks evaluated document-by-document
 
-The matching model is currently simple field equality. There is no general operator engine for `$gt`, `$lt`, `$in`, `$or`, nested expression trees, or sort-aware planning.
+The matching model is still intentionally narrow. Only `_id.$gt` and `_id.$gte`
+were added for oplog-style continuation. There is still no general operator
+engine for `$lt`, `$in`, `$or`, nested expression trees, or sort-aware
+planning.
 
 ### Query planning
 
@@ -152,8 +159,9 @@ Current planning is:
 
 1. if the filter is empty, scan the table
 2. if the filter includes `_id`, do a direct primary-key lookup
-3. otherwise, if there is a ready secondary index whose field appears in the filter, do an equality range scan on that index
-4. otherwise, fall back to a full table scan
+3. if the filter includes `_id.$gt` or `_id.$gte`, do a primary-key range scan
+4. otherwise, if there is a ready secondary index whose field appears in the filter, do an equality range scan on that index
+5. otherwise, fall back to a full table scan
 
 This is deliberately narrow and easy to reason about.
 
@@ -165,8 +173,11 @@ This is deliberately narrow and easy to reason about.
 - `limit`
 - `batchSize`
 - `cursor.batchSize`
+- `singleBatch`
 
-These are applied after documents are materialized through the current query path. There is no server-side cursor continuation.
+`skip` is applied on the initial `find` only. `limit` is a total result budget
+across the lifetime of the cursor. Server-side continuation resumes from the
+last emitted raw key rather than materializing the full result eagerly.
 
 ### Distinct
 
@@ -182,7 +193,25 @@ These are applied after documents are materialized through the current query pat
 
 - reads the collection through the document query path with no pushed-down pipeline planning
 - applies supported stages in memory
-- returns everything in `firstBatch`
+- may return a live server-side cursor when the first batch is shortened
+
+### Tailable oplog reads
+
+WrongoDB now supports a narrow oplog-only slice of MongoDB's tailable cursor
+behavior:
+
+- `find` on `local.oplog.rs` accepts `tailable: true`
+- `find` on `local.oplog.rs` accepts `awaitData: true`
+- `getMore` on a tailable oplog cursor can wait for new committed oplog rows
+- oplog continuation is driven by `_id` order, where `_id` is the oplog index
+
+Important constraints:
+
+- `tailable` and `awaitData` are only supported on `local.oplog.rs`
+- there is no general capped-collection subsystem
+- there are no exhaust cursors
+- ordinary collection cursors are bookmark-based, not one frozen snapshot across
+  all batches
 
 ## Major limitations
 
@@ -191,11 +220,12 @@ This is the short list that matters when deciding whether to extend the current 
 - explicit `storageColumns` required at collection creation time
 - only single-field ascending secondary indexes
 - indexed fields must be declared up front in `storageColumns`
-- no server-side cursor state
 - no sort support in `find`
 - no generalized query operator engine
 - no upsert semantics
 - aggregation is intentionally partial and in-memory
+- `tailable` and `awaitData` are oplog-only
+- cursor state is in-memory only and disappears on restart
 - several stats responses include placeholder size metrics
 
 ## Where to extend

@@ -11,8 +11,10 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use self::commands::handlers::crud::{bson_to_value, value_to_bson};
-use self::commands::{CommandContext, CommandRegistry};
+use self::commands::{
+    bson_document_to_json_value, json_value_to_bson_document, CommandContext, CommandRegistry,
+    CursorManager,
+};
 use crate::api::DatabaseContext;
 use crate::core::{DatabaseName, Namespace};
 use crate::replication::{ReplicationConfig, ReplicationCoordinator};
@@ -69,14 +71,18 @@ pub async fn start_server(
     let replication = ReplicationCoordinator::new(ReplicationConfig::default());
     let db = Arc::new(DatabaseContext::new(conn, replication)?);
     let registry = Arc::new(CommandRegistry::new());
+    let cursor_manager = Arc::new(CursorManager::new());
     println!("Server listening on {}", addr);
 
     loop {
         let (socket, _) = listener.accept().await?;
         let db_clone = Arc::clone(&db);
         let registry_clone = Arc::clone(&registry);
+        let cursor_manager_clone = Arc::clone(&cursor_manager);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, db_clone, registry_clone).await {
+            if let Err(e) =
+                handle_connection(socket, db_clone, registry_clone, cursor_manager_clone).await
+            {
                 eprintln!("Connection error: {}", e);
             }
         });
@@ -87,6 +93,7 @@ async fn handle_connection(
     mut socket: TcpStream,
     db: Arc<DatabaseContext>,
     registry: Arc<CommandRegistry>,
+    cursor_manager: Arc<CursorManager>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let mut header_buf = [0u8; 16];
@@ -119,11 +126,11 @@ async fn handle_connection(
 
         match header.op_code {
             OP_MSG => {
-                let response = handle_op_msg(&body_buf, &db, &registry).await?;
+                let response = handle_op_msg(&body_buf, &db, &registry, &cursor_manager).await?;
                 send_op_msg_response(&mut socket, header.request_id, &response).await?;
             }
             OP_QUERY => {
-                let response = handle_op_query(&body_buf, &db, &registry).await?;
+                let response = handle_op_query(&body_buf, &db, &registry, &cursor_manager).await?;
                 send_reply(&mut socket, header.request_id, &response).await?;
             }
             _ => continue,
@@ -135,6 +142,7 @@ async fn handle_op_msg(
     body_buf: &[u8],
     db: &Arc<DatabaseContext>,
     registry: &CommandRegistry,
+    cursor_manager: &Arc<CursorManager>,
 ) -> Result<Document, WrongoDBError> {
     let mut cursor = Cursor::new(body_buf);
     let _flag_bits = ReadBytesExt::read_u32::<LittleEndian>(&mut cursor)?;
@@ -174,14 +182,18 @@ async fn handle_op_msg(
     }
 
     if let Some(mut doc) = command_doc {
-        let ctx = CommandContext::new(command_database_name(&doc)?);
+        let ctx = CommandContext::new(
+            command_database_name(&doc)?,
+            Arc::clone(cursor_manager),
+            db.oplog_await_service(),
+        );
         if let Some(seq_docs) = doc_sequences.get("documents") {
             if doc.get("documents").is_none() {
                 let docs_bson = seq_docs.iter().cloned().map(Bson::Document).collect();
                 doc.insert("documents", Bson::Array(docs_bson));
             }
         }
-        return Ok(match registry.execute(&ctx, &doc, db.as_ref()) {
+        return Ok(match registry.execute(&ctx, &doc, db.as_ref()).await {
             Ok(response) => response,
             Err(err) => command_error_document(&err),
         });
@@ -194,6 +206,7 @@ async fn handle_op_query(
     body_buf: &[u8],
     db: &Arc<DatabaseContext>,
     registry: &CommandRegistry,
+    cursor_manager: &Arc<CursorManager>,
 ) -> Result<Document, WrongoDBError> {
     let mut cursor = Cursor::new(body_buf);
     let _flags = ReadBytesExt::read_i32::<LittleEndian>(&mut cursor)?;
@@ -220,14 +233,20 @@ async fn handle_op_query(
     let query_doc: Document = bson::from_slice(&query_buf).map_err(WrongoDBError::BsonDe)?;
 
     if namespace.is_command_namespace() {
-        let ctx = CommandContext::new(namespace.db_name().clone());
-        return Ok(match registry.execute(&ctx, &query_doc, db.as_ref()) {
-            Ok(response) => response,
-            Err(err) => command_error_document(&err),
-        });
+        let ctx = CommandContext::new(
+            namespace.db_name().clone(),
+            Arc::clone(cursor_manager),
+            db.oplog_await_service(),
+        );
+        return Ok(
+            match registry.execute(&ctx, &query_doc, db.as_ref()).await {
+                Ok(response) => response,
+                Err(err) => command_error_document(&err),
+            },
+        );
     }
 
-    let filter_json = bson_to_value(&query_doc);
+    let filter_json = bson_document_to_json_value(&query_doc);
     let mut session = db.connection().open_session();
     let results = match db
         .document_query()
@@ -238,7 +257,7 @@ async fn handle_op_query(
     };
     let results_bson: Vec<Bson> = results
         .into_iter()
-        .map(|d| Bson::Document(value_to_bson(&Value::Object(d))))
+        .map(|d| Bson::Document(json_value_to_bson_document(&Value::Object(d))))
         .collect();
 
     Ok(doc! {
