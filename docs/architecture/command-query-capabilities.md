@@ -38,8 +38,9 @@ Implemented commands:
 
 Current behavior:
 
-- `listDatabases` currently reports a single logical database, `test`
-- `listCollections` is backed by the durable collection catalog
+- `listDatabases` is admin-only and enumerates database names from the namespace-keyed durable
+  catalog; the reserved `local` database is present for oplog state
+- `listCollections` is backed by the durable collection catalog for the requested database
 - `createCollection` requires `storageColumns`
 - collection creation is explicit; writes do not auto-create collections
 - `dbStats` and `collStats` compute counts, but several size-related fields are placeholders
@@ -82,7 +83,7 @@ Implemented commands:
 Current behavior:
 
 - `_id_` is always reported as the implicit primary index
-- secondary indexes are persisted in the durable collection catalog and storage metadata
+- secondary indexes are persisted in the namespace-keyed durable collection catalog and storage metadata
 - index build/backfill is triggered through `Session::create_index`
 
 Important constraints:
@@ -187,7 +188,6 @@ These are applied after documents are materialized through the current query pat
 
 This is the short list that matters when deciding whether to extend the current server path or redesign it.
 
-- single logical database: `test`
 - explicit `storageColumns` required at collection creation time
 - only single-field ascending secondary indexes
 - indexed fields must be declared up front in `storageColumns`

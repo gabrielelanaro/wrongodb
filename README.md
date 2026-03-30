@@ -1,6 +1,6 @@
 # WrongoDB
 
-Last updated: `2026-03-29`
+Last updated: `2026-03-30`
 
 The database that teaches you how databases work by doing everything wrong first, then fixing it.
 
@@ -31,10 +31,10 @@ A learning-oriented single-node MongoDB-compatible database in Rust, inspired by
 - `Connection`/`Session`/`TableCursor` low-level storage API
 - Explicit transaction scopes via `Session::with_transaction()`
 - MongoDB wire protocol server (works with `mongosh`)
-- Internal Mongo-style write stack with `write_ops`, `CollectionWritePath`, and a storage-backed logical oplog in `table:__oplog`
+- Internal Mongo-style write stack with `write_ops`, `CollectionWritePath`, and a storage-backed logical oplog in the reserved `local.oplog.rs` collection
 
-`TableCursor` is intentionally a local/store-level API. Document semantics, collection catalog state,
-and index creation live above it in the server/document layer.
+`TableCursor` is intentionally a local/store-level API. Document semantics, namespace-aware collection
+catalog state, and index creation live above it in the server/document layer.
 
 ### Future Work
 - Background maintenance: space reuse, compaction, compression
@@ -45,9 +45,9 @@ and index creation live above it in the server/document layer.
 The codebase is organized by domain to keep storage, catalog, and server concerns separate:
 
 - `src/storage/`: storage API, metadata store, B+tree, page store, WAL, recovery, and checkpoints
-- `src/catalog/`: durable collection catalog stored above the storage metadata layer
+- `src/catalog/`: durable namespace-keyed collection catalog stored above the storage metadata layer
 - `src/api/`: server-side context above the storage API
-- `src/core/`: shared types/utilities (BSON codec, document helpers, errors)
+- `src/core/`: shared types/utilities (BSON codec, document helpers, namespace types, errors)
 - `src/index/`: secondary index implementation and key encoding
 - `src/txn/`: global transaction state, snapshot visibility, and transaction runtime
 - `src/api/ddl_path.rs`: top-level `createCollection` / `createIndexes` path above storage
@@ -55,7 +55,7 @@ The codebase is organized by domain to keep storage, catalog, and server concern
 - `src/collection_write_path.rs`: low-level in-transaction collection document mutator
 - `src/document_query.rs`: internal document/query helpers used by the server path
 - `src/server/`: MongoDB wire-protocol server, command handlers, and startup reconciliation
-- `src/replication/`: server-layer replication state, oplog observer, and internal oplog table management above the storage connection
+- `src/replication/`: server-layer replication state, oplog observer, and `local.oplog.rs` collection management above the storage connection
 - `src/bin/`: server binary entry point
 
 Integration tests are grouped under `tests/`:

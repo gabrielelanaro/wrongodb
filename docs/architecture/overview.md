@@ -5,6 +5,9 @@ WrongoDB currently has two externally visible personalities:
 - a WT-like local storage API exposed as `Connection`, `Session`, and `TableCursor`
 - a MongoDB wire-protocol server layered on top of that storage API
 
+Shared identity types such as `DatabaseName` and `Namespace` live in `src/core/namespace.rs` so
+command parsing, catalog lookups, and cursor replies all speak the same namespace model.
+
 The repository does not currently contain an active distributed RAFT subsystem. It does now expose a server-layer replication module above `Connection`, including primary write admission and a storage-backed internal oplog; older references to RAFT in the README were historical and have been removed from the maintained architecture entry points.
 
 ## Layer map
@@ -72,7 +75,7 @@ Responsibilities:
 
 The split is deliberate:
 - storage metadata answers "which logical URI maps to which physical store and schema?"
-- collection catalog answers "which collections and indexes exist from the server's point of view?"
+- collection catalog answers "which `db.collection` namespaces and indexes exist from the server's point of view?"
 
 ### Storage engine internals
 

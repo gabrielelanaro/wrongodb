@@ -1,6 +1,6 @@
 # Documentation
 
-Maintained docs live in exactly two places:
+Maintained docs live in the following places:
 
 - [`architecture/overview.md`](architecture/overview.md): current system structure and layer boundaries
 - [`architecture/storage-engine.md`](architecture/storage-engine.md): storage metadata, B+tree/page/block internals, checkpointing, WAL, and recovery

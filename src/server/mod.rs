@@ -51,6 +51,12 @@ impl MsgHeader {
     }
 }
 
+/// Start the MongoDB wire-protocol server on `addr`.
+///
+/// Startup audits the durable catalog before the listener begins accepting
+/// requests so missing referenced stores fail fast, orphaned store files are
+/// reported up front, and the replication layer can bootstrap the reserved
+/// `local.oplog.rs` namespace.
 pub async fn start_server(
     addr: &str,
     conn: Arc<Connection>,

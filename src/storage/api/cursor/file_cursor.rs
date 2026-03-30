@@ -54,6 +54,7 @@ impl<'session> FileCursor<'session> {
     // Public API
     // ------------------------------------------------------------------------
 
+    /// Restrict iteration to the given half-open key range.
     pub fn set_range(&mut self, start: Option<Vec<u8>>, end: Option<Vec<u8>>) {
         let mut state = self.state.lock();
         state.range_start = start;
@@ -61,6 +62,7 @@ impl<'session> FileCursor<'session> {
         state.reset_runtime();
     }
 
+    /// Insert a new key/value pair into the managed file.
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
 
@@ -76,6 +78,7 @@ impl<'session> FileCursor<'session> {
         Ok(())
     }
 
+    /// Replace the value for an existing key.
     pub fn update(&mut self, key: &[u8], value: &[u8]) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
 
@@ -93,6 +96,7 @@ impl<'session> FileCursor<'session> {
         Ok(())
     }
 
+    /// Delete an existing key/value pair.
     pub fn delete(&mut self, key: &[u8]) -> Result<(), WrongoDBError> {
         self.ensure_writable()?;
 
@@ -110,10 +114,12 @@ impl<'session> FileCursor<'session> {
         Ok(())
     }
 
+    /// Fetch the visible value for `key` in the current transaction context.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, WrongoDBError> {
         self.visible_value(key, self.current_txn_id())
     }
 
+    /// Return the next visible key/value pair in the configured range.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<CursorEntry>, WrongoDBError> {
         let txn_id = self.current_txn_id();
@@ -146,6 +152,7 @@ impl<'session> FileCursor<'session> {
         }
     }
 
+    /// Reset the cursor position to the beginning.
     pub fn reset(&mut self) {
         self.state.lock().reset_runtime();
     }

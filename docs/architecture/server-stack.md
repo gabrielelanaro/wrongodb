@@ -14,6 +14,9 @@ Server startup currently looks like this:
 
 The startup reconciliation step matters because the server depends on both storage metadata and the durable collection catalog being internally consistent.
 
+During `DatabaseContext` construction, the server also ensures the namespace-keyed catalog exists,
+bootstraps the reserved `local.oplog.rs` namespace, and seeds the next oplog index from durable state.
+
 ## Main server services
 
 ### `DatabaseContext`
@@ -22,7 +25,8 @@ File:
 - `src/api/database_context.rs`
 
 Role:
-- groups the server-only services layered on top of one storage `Connection`
+- groups the server-only services layered on top of one storage `Connection` and keeps command
+  execution namespace-aware
 
 It currently owns:
 
@@ -41,10 +45,12 @@ Files:
 - `src/catalog/collection_catalog.rs`
 
 Role:
-- durable Mongo-visible catalog stored in `file:_catalog.wt`
+- durable Mongo-visible catalog stored in `file:_catalog.wt` and keyed by full `db.collection`
+  namespace
 
 It persists collection definitions that include:
 
+- full namespace (`db.collection`)
 - collection name
 - table URI
 - UUID
@@ -64,7 +70,7 @@ Role:
 
 Current behavior:
 
-- resolves the committed collection definition from the catalog
+- resolves the committed collection definition from the namespace-keyed catalog
 - opens a storage `TableCursor`
 - performs direct `_id` lookup when possible
 - performs a simple single-index equality plan when a ready secondary index matches the filter

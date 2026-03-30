@@ -144,8 +144,6 @@ impl OplogStore {
     }
 }
 
-
-// TODO: why does the caller needs to know this information? It seems that there is a leaky abstraction here.
 /// Return the reserved Mongo-style oplog namespace.
 pub(crate) fn oplog_namespace() -> Namespace {
     Namespace::new(
