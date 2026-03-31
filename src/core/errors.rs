@@ -25,6 +25,9 @@ pub enum WrongoDBError {
     #[error("bson deserialization error: {0}")]
     BsonDe(#[from] bson::de::Error),
 
+    #[error("mongodb driver error: {0}")]
+    Mongo(#[from] mongodb::error::Error),
+
     #[error("protocol error: {0}")]
     Protocol(String),
 
