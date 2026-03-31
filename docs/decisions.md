@@ -1,5 +1,21 @@
 # Decisions
 
+## 2026-03-30: Build first secondary replication on top of the public oplog cursor path
+
+**Decision**
+- Extend `ReplicationConfig` with explicit node role, node identity, primary hint, and sync-source URI, and use that configuration to make secondaries non-writable in both `hello` and write admission.
+- Reuse the public `find` / `getMore` oplog cursor path for follower fetches instead of adding a replication-only oplog fetch command.
+- Use the local oplog as the secondary's durable fetch queue and add one replication-owned metadata namespace, `local.repl_state`, that stores the durable `lastApplied` marker.
+- Extend the logical oplog with `CreateCollection` and `CreateIndex` entries so DDL replicates through the same path as CRUD.
+- Add a small primary-side `replSetUpdatePosition` command that stores follower `lastWritten` and `lastApplied` progress by node name.
+- Keep the first follower runtime direct-primary-only and implement it as one `SecondaryReplicator` loop that fetches, persists locally, applies locally, and reports progress.
+
+**Why**
+- MongoDB followers read the oplog through the normal query/cursor machinery, so reusing the public oplog cursor path keeps WrongoDB closer to MongoDB's shape and avoids a throwaway transport.
+- Separating `lastWritten` from `lastApplied` is necessary for crash safety: after restart, the secondary must know which locally persisted oplog rows still need to be applied.
+- Replicating only CRUD would diverge as soon as the primary created a collection or index; DDL has to be part of the logical oplog for a usable secondary.
+- WrongoDB does not need MongoDB's full set of replication subsystems yet. Treating the local oplog as the durable queue collapses MongoDB's fetch-buffer complexity while preserving the important correctness boundary between fetch and apply.
+
 ## 2026-03-30: Add Mongo-style server-side cursors and oplog-only awaitData through public `find` / `getMore`
 
 **Decision**
