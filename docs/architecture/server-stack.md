@@ -6,16 +6,18 @@ This document describes the current architecture above the storage API.
 
 Server startup currently looks like this:
 
-1. open a `Connection`
-2. run `audit_catalog`
-3. build a `DatabaseContext`
-4. accept MongoDB wire-protocol requests
-5. dispatch each command through `CommandRegistry`
+1. build a `ReplicationConfig` in the binary entry point
+2. open a `Connection`
+3. run `audit_catalog`
+4. build a `DatabaseContext`
+5. spawn the secondary replicator when the configured role is `secondary`
+6. accept MongoDB wire-protocol requests
+7. dispatch each command through `CommandRegistry`
 
 The startup reconciliation step matters because the server depends on both storage metadata and the durable collection catalog being internally consistent.
 
 During `DatabaseContext` construction, the server also ensures the namespace-keyed catalog exists,
-bootstraps the reserved `local.oplog.rs` namespace, and seeds the next oplog index from durable state.
+bootstraps the reserved `local.oplog.rs` and `local.repl_state` namespaces, and seeds the next oplog index from durable state.
 
 ## Main server services
 
@@ -27,6 +29,8 @@ File:
 Role:
 - groups the server-only services layered on top of one storage `Connection` and keeps command
   execution namespace-aware
+- is parameterized by `ReplicationCoordinator` during construction, but does not retain it as a
+  long-lived service locator
 
 It currently owns:
 
@@ -34,9 +38,11 @@ It currently owns:
 - `DocumentQuery`
 - `DdlPath`
 - `WriteOps`
-- `ReplicationCoordinator`
+- `OplogAwaitService`
 
 This keeps the MongoDB command handlers thin and prevents server-only policy from leaking into the storage API.
+The replication coordinator remains an explicit constructor input so write admission and `hello`
+state are policy-driven without becoming part of the context object.
 
 ### `CollectionCatalog`
 
@@ -97,7 +103,7 @@ Current behavior:
 ### `WriteOps`
 
 File:
-- `src/write_ops/mod.rs`
+- `src/write_ops/executor.rs`
 
 Role:
 - top-level CRUD executor modeled after MongoDB's `write_ops_exec`
@@ -108,6 +114,7 @@ Current behavior:
 - opens one `Session`
 - runs one `Session::with_transaction(...)` per logical write operation from the command layer
 - calls `CollectionWritePath` only through its in-transaction mutation methods
+- notifies oplog await waiters after commit so oplog cursors can wake promptly
 
 ### `CollectionWritePath`
 
@@ -122,12 +129,13 @@ Current behavior:
 - validates and normalizes documents
 - encodes storage rows
 - performs insert, update, and delete through the storage API
-- calls the replication observer after each logical document mutation
+- stays oplog-agnostic; `WriteOps` owns oplog emission and wakeups
 
 ### `ReplicationObserver` and oplog
 
 Files:
-- `src/replication/mod.rs`
+- `src/replication/observer.rs`
+- `src/replication/oplog.rs`
 
 Role:
 - append one logical oplog row per replicated document mutation
@@ -137,7 +145,25 @@ Current behavior:
 - stores oplog entries in the reserved internal namespace `local.oplog.rs`
 - reserves `OpTime { term, index }` through `ReplicationCoordinator`
 - writes oplog rows inside the same storage transaction as the user-data mutation
-- supports `GenerateOplog` and `SuppressOplog` modes so a future follower-apply path can reuse `CollectionWritePath` without recursively re-oplogging
+- supports `GenerateOplog` and `SuppressOplog` modes so `OplogApplier` can reuse `CollectionWritePath` without recursively re-oplogging
+
+### `SecondaryReplicator`
+
+Files:
+- `src/replication/secondary.rs`
+- `src/replication/applier.rs`
+- `src/replication/state_store.rs`
+
+Role:
+- follower-side runtime for processes launched with `ReplicationRole::Secondary`
+
+Current behavior:
+
+- reads committed oplog entries through the public `find` / `getMore` path against `local.oplog.rs`
+- persists fetched oplog rows locally before applying them
+- replays CRUD and DDL entries through `OplogApplier`
+- stores durable `lastApplied` markers in `local.repl_state`
+- reports `lastWritten` and `lastApplied` progress back to the primary with `replSetUpdatePosition`
 
 ## Current write layering
 

@@ -1,5 +1,18 @@
 # Decisions
 
+## 2026-03-31: Wire server startup through explicit replication roles
+
+**Decision**
+- Keep `start_server` as the primary-mode convenience wrapper and route it through a separate `start_server_with_replication` entry point.
+- Parse replication mode, node name, and sync-source settings in the server binary, then pass a `ReplicationConfig` into startup instead of hiding role selection inside the storage layer.
+- Spawn the secondary replication runtime only when the configured role is `secondary`.
+- Keep `DatabaseContext` free of long-lived replication policy; it receives `ReplicationCoordinator` during construction and returns any secondary-only runtime separately.
+
+**Why**
+- Primary/secondary mode is server boot policy, not storage state.
+- The same command surface should be able to expose writable-primary or read-only behavior based on launch configuration without creating a special case inside `Connection`.
+- Returning the follower runtime separately keeps the server context focused on command services instead of turning it into a service locator.
+
 ## 2026-03-31: Keep `CollectionWritePath` replication-agnostic and move oplog concerns to `WriteOps` and `OplogApplier`
 
 **Decision**

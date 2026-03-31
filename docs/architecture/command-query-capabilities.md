@@ -22,7 +22,8 @@ Implemented commands:
 Current behavior:
 
 - enough handshake and metadata is returned for clients such as `mongosh`
-- these responses are mostly static
+- `isWritablePrimary`, `isMaster`, `readOnly`, and optional `primary` reflect the configured replication role
+- the rest of the response is mostly static apart from timestamps
 - there is no authentication model behind `connectionStatus`
 
 ### Database and collection management
@@ -132,6 +133,18 @@ Current behavior:
 - `getMore` resumes the saved cursor and returns `nextBatch`
 - `killCursors` removes saved cursor state
 - cursor state is not durable; a server restart drops live cursors
+
+### Replication
+
+Implemented commands:
+
+- `replSetUpdatePosition`
+
+Current behavior:
+
+- secondary members report `lastWritten` and `lastApplied` progress by node name
+- the primary stores that progress in the in-memory replication coordinator
+- this is used by the secondary apply loop after it persists and applies oplog entries
 
 ## Query capabilities
 
