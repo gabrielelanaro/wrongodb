@@ -15,7 +15,7 @@ use self::commands::{
     bson_document_to_json_value, json_value_to_bson_document, CommandContext, CommandRegistry,
     CursorManager,
 };
-use crate::api::DatabaseContext;
+use crate::api::{build_database_context, DatabaseContext};
 use crate::core::{DatabaseName, Namespace};
 use crate::replication::{ReplicationConfig, ReplicationCoordinator};
 use crate::server::recovery::audit_catalog;
@@ -63,13 +63,28 @@ pub async fn start_server(
     addr: &str,
     conn: Arc<Connection>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    start_server_with_replication(addr, conn, ReplicationConfig::default()).await
+}
+
+/// Start the MongoDB wire-protocol server with explicit replication policy.
+pub async fn start_server_with_replication(
+    addr: &str,
+    conn: Arc<Connection>,
+    replication_config: ReplicationConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
     let report = audit_catalog(conn.as_ref())?;
     for store in &report.orphaned_stores {
         eprintln!("orphaned store file: {store}");
     }
-    let replication = ReplicationCoordinator::new(ReplicationConfig::default());
-    let db = Arc::new(DatabaseContext::new(conn, replication)?);
+    let replication = ReplicationCoordinator::new(replication_config);
+    let (db, secondary_replicator) = build_database_context(conn, replication.clone())?;
+    let db = Arc::new(db);
+    if let Some(replicator) = secondary_replicator {
+        tokio::spawn(async move {
+            replicator.run_forever().await;
+        });
+    }
     let registry = Arc::new(CommandRegistry::new());
     let cursor_manager = Arc::new(CursorManager::new());
     println!("Server listening on {}", addr);
@@ -79,9 +94,16 @@ pub async fn start_server(
         let db_clone = Arc::clone(&db);
         let registry_clone = Arc::clone(&registry);
         let cursor_manager_clone = Arc::clone(&cursor_manager);
+        let replication_clone = replication.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(socket, db_clone, registry_clone, cursor_manager_clone).await
+            if let Err(e) = handle_connection(
+                socket,
+                db_clone,
+                registry_clone,
+                cursor_manager_clone,
+                replication_clone,
+            )
+            .await
             {
                 eprintln!("Connection error: {}", e);
             }
@@ -94,6 +116,7 @@ async fn handle_connection(
     db: Arc<DatabaseContext>,
     registry: Arc<CommandRegistry>,
     cursor_manager: Arc<CursorManager>,
+    replication: ReplicationCoordinator,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let mut header_buf = [0u8; 16];
@@ -126,11 +149,14 @@ async fn handle_connection(
 
         match header.op_code {
             OP_MSG => {
-                let response = handle_op_msg(&body_buf, &db, &registry, &cursor_manager).await?;
+                let response =
+                    handle_op_msg(&body_buf, &db, &registry, &cursor_manager, &replication).await?;
                 send_op_msg_response(&mut socket, header.request_id, &response).await?;
             }
             OP_QUERY => {
-                let response = handle_op_query(&body_buf, &db, &registry, &cursor_manager).await?;
+                let response =
+                    handle_op_query(&body_buf, &db, &registry, &cursor_manager, &replication)
+                        .await?;
                 send_reply(&mut socket, header.request_id, &response).await?;
             }
             _ => continue,
@@ -143,6 +169,7 @@ async fn handle_op_msg(
     db: &Arc<DatabaseContext>,
     registry: &CommandRegistry,
     cursor_manager: &Arc<CursorManager>,
+    replication: &ReplicationCoordinator,
 ) -> Result<Document, WrongoDBError> {
     let mut cursor = Cursor::new(body_buf);
     let _flag_bits = ReadBytesExt::read_u32::<LittleEndian>(&mut cursor)?;
@@ -186,6 +213,7 @@ async fn handle_op_msg(
             command_database_name(&doc)?,
             Arc::clone(cursor_manager),
             db.oplog_await_service(),
+            replication.clone(),
         );
         if let Some(seq_docs) = doc_sequences.get("documents") {
             if doc.get("documents").is_none() {
@@ -207,6 +235,7 @@ async fn handle_op_query(
     db: &Arc<DatabaseContext>,
     registry: &CommandRegistry,
     cursor_manager: &Arc<CursorManager>,
+    replication: &ReplicationCoordinator,
 ) -> Result<Document, WrongoDBError> {
     let mut cursor = Cursor::new(body_buf);
     let _flags = ReadBytesExt::read_i32::<LittleEndian>(&mut cursor)?;
@@ -237,6 +266,7 @@ async fn handle_op_query(
             namespace.db_name().clone(),
             Arc::clone(cursor_manager),
             db.oplog_await_service(),
+            replication.clone(),
         );
         return Ok(
             match registry.execute(&ctx, &query_doc, db.as_ref()).await {

@@ -11,7 +11,8 @@ mod txn;
 mod write_ops;
 
 pub use crate::core::errors::{DocumentValidationError, StorageError, WrongoDBError};
-pub use crate::server::start_server;
+pub use crate::replication::{ReplicationConfig, ReplicationRole};
+pub use crate::server::{start_server, start_server_with_replication};
 pub use crate::storage::api::{
     Connection, ConnectionConfig, CursorEntry, LogSyncMethod, LoggingConfig, Session, TableCursor,
     TransactionSyncConfig,

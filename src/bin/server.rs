@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use wrongodb::{start_server, Connection, ConnectionConfig};
+use wrongodb::{
+    start_server_with_replication, Connection, ConnectionConfig, ReplicationConfig, ReplicationRole,
+};
 
 fn print_usage_and_exit(exit_code: i32) -> ! {
     eprintln!(
@@ -10,6 +12,9 @@ fn print_usage_and_exit(exit_code: i32) -> ! {
            --addr, -a   Full address to bind, e.g. 127.0.0.1:27017\n\
            --port, -p   Port to bind on 127.0.0.1\n\
            --db-path    Database directory path (default: test.db)\n\
+           --role       Replication role: primary or secondary\n\
+           --node-name  Stable node name used for replication progress\n\
+           --sync-source MongoDB URI for the primary when role=secondary\n\
            --help, -h   Show this help message\n\
          \n\
          Notes:\n\
@@ -24,6 +29,9 @@ struct ParsedArgs {
     addr_flag: Option<String>,
     port_flag: Option<String>,
     db_path_flag: Option<String>,
+    role_flag: Option<String>,
+    node_name_flag: Option<String>,
+    sync_source_flag: Option<String>,
     positional_addr: Option<String>,
 }
 
@@ -32,6 +40,9 @@ fn parse_args() -> ParsedArgs {
         addr_flag: None,
         port_flag: None,
         db_path_flag: None,
+        role_flag: None,
+        node_name_flag: None,
+        sync_source_flag: None,
         positional_addr: None,
     };
 
@@ -60,6 +71,27 @@ fn parse_args() -> ParsedArgs {
                 });
                 parsed.db_path_flag = Some(value);
             }
+            "--role" => {
+                let value = iter.next().unwrap_or_else(|| {
+                    eprintln!("error: --role requires a value");
+                    print_usage_and_exit(2);
+                });
+                parsed.role_flag = Some(value);
+            }
+            "--node-name" => {
+                let value = iter.next().unwrap_or_else(|| {
+                    eprintln!("error: --node-name requires a value");
+                    print_usage_and_exit(2);
+                });
+                parsed.node_name_flag = Some(value);
+            }
+            "--sync-source" => {
+                let value = iter.next().unwrap_or_else(|| {
+                    eprintln!("error: --sync-source requires a value");
+                    print_usage_and_exit(2);
+                });
+                parsed.sync_source_flag = Some(value);
+            }
             _ if arg.starts_with("--addr=") => {
                 parsed.addr_flag = Some(arg["--addr=".len()..].to_string());
             }
@@ -68,6 +100,15 @@ fn parse_args() -> ParsedArgs {
             }
             _ if arg.starts_with("--db-path=") => {
                 parsed.db_path_flag = Some(arg["--db-path=".len()..].to_string());
+            }
+            _ if arg.starts_with("--role=") => {
+                parsed.role_flag = Some(arg["--role=".len()..].to_string());
+            }
+            _ if arg.starts_with("--node-name=") => {
+                parsed.node_name_flag = Some(arg["--node-name=".len()..].to_string());
+            }
+            _ if arg.starts_with("--sync-source=") => {
+                parsed.sync_source_flag = Some(arg["--sync-source=".len()..].to_string());
             }
             _ if arg.starts_with('-') => {
                 eprintln!("error: unknown option '{arg}'");
@@ -122,6 +163,55 @@ fn db_path(parsed: &ParsedArgs) -> String {
     "test.db".to_string()
 }
 
+fn replication_config(parsed: &ParsedArgs) -> ReplicationConfig {
+    let role_raw = parsed
+        .role_flag
+        .clone()
+        .or_else(|| std::env::var("WRONGO_ROLE").ok())
+        .unwrap_or_else(|| "primary".to_string());
+    let role = match role_raw.to_lowercase().as_str() {
+        "primary" => ReplicationRole::Primary,
+        "secondary" => ReplicationRole::Secondary,
+        other => {
+            eprintln!("error: unsupported --role value '{other}'");
+            print_usage_and_exit(2);
+        }
+    };
+
+    let node_name = parsed
+        .node_name_flag
+        .clone()
+        .or_else(|| std::env::var("WRONGO_NODE_NAME").ok())
+        .unwrap_or_else(|| match role {
+            ReplicationRole::Primary => "node-1".to_string(),
+            ReplicationRole::Secondary => "node-2".to_string(),
+        });
+    let sync_source_uri = parsed
+        .sync_source_flag
+        .clone()
+        .or_else(|| std::env::var("WRONGO_SYNC_SOURCE").ok())
+        .filter(|value| !value.is_empty());
+    if role == ReplicationRole::Secondary && sync_source_uri.is_none() {
+        eprintln!("error: secondary role requires --sync-source or WRONGO_SYNC_SOURCE");
+        print_usage_and_exit(2);
+    }
+
+    ReplicationConfig {
+        role,
+        node_name,
+        primary_hint: sync_source_uri.as_deref().map(sync_source_primary_hint),
+        sync_source_uri,
+        term: 1,
+    }
+}
+
+fn sync_source_primary_hint(uri: &str) -> String {
+    uri.strip_prefix("mongodb://")
+        .unwrap_or(uri)
+        .trim_end_matches('/')
+        .to_string()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parsed = parse_args();
@@ -130,6 +220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::open(&path, config)?;
     let conn = Arc::new(conn);
     let addr = server_addr(&parsed);
-    start_server(&addr, conn).await?;
+    let replication = replication_config(&parsed);
+    start_server_with_replication(&addr, conn, replication).await?;
     Ok(())
 }
