@@ -12,7 +12,7 @@ use crate::core::{DatabaseName, Namespace};
 use crate::document_query::DocumentQuery;
 use crate::replication::{
     OplogAwaitService, OplogOperation, OplogStore, ReplicationConfig, ReplicationCoordinator,
-    ReplicationObserver,
+    ReplicationObserver, ReplicationRole,
 };
 use crate::storage::api::{Connection, ConnectionConfig};
 use crate::WrongoDBError;
@@ -38,8 +38,13 @@ fn open_services(
     let metadata_store = connection.metadata_store();
     let oplog_store = OplogStore::new(metadata_store.clone(), TEST_OPLOG_TABLE_URI);
     let catalog = Arc::new(CollectionCatalog::new(CatalogStore::new()));
-    let ddl_replication = ReplicationCoordinator::new(ddl_replication_config);
-    let write_replication = ReplicationCoordinator::new(write_replication_config);
+    let shared_replication = (ddl_replication_config == write_replication_config)
+        .then(|| ReplicationCoordinator::new(ddl_replication_config.clone()));
+    let ddl_replication = shared_replication
+        .clone()
+        .unwrap_or_else(|| ReplicationCoordinator::new(ddl_replication_config));
+    let write_replication =
+        shared_replication.unwrap_or_else(|| ReplicationCoordinator::new(write_replication_config));
 
     let mut session = connection.open_session();
     oplog_store.ensure_table_exists(&mut session).unwrap();
@@ -53,16 +58,19 @@ fn open_services(
     catalog.load_cache(&session).unwrap();
 
     let query = DocumentQuery::new(catalog.clone());
-    let collection_write_path = CollectionWritePath::new(
-        metadata_store.clone(),
-        catalog.clone(),
-        query.clone(),
-        ReplicationObserver::new(write_replication.clone(), oplog_store.clone()),
+    let collection_write_path =
+        CollectionWritePath::new(metadata_store.clone(), catalog.clone(), query.clone());
+    let ddl_path = DdlPath::new(
+        connection.clone(),
+        metadata_store,
+        catalog,
+        ddl_replication.clone(),
+        ReplicationObserver::new(ddl_replication, oplog_store.clone()),
     );
-    let ddl_path = DdlPath::new(connection.clone(), metadata_store, catalog, ddl_replication);
     let write_ops = WriteOps::new(
         connection.clone(),
         collection_write_path,
+        ReplicationObserver::new(write_replication.clone(), oplog_store.clone()),
         write_replication,
         OplogAwaitService::new(next_op_index.saturating_sub(1)),
     );
@@ -90,8 +98,10 @@ fn non_primary_write_is_rejected_before_mutation_and_oplog_append() {
         ConnectionConfig::new().logging_enabled(false),
         ReplicationConfig::default(),
         ReplicationConfig {
-            is_writable_primary: false,
+            role: ReplicationRole::Secondary,
+            node_name: "node-2".to_string(),
             primary_hint: Some("node-2".to_string()),
+            sync_source_uri: Some("mongodb://node-2".to_string()),
             term: 8,
         },
     );
@@ -118,11 +128,14 @@ fn non_primary_write_is_rejected_before_mutation_and_oplog_append() {
         .find(&mut session, &namespace("users"), Some(json!({"_id": 1})))
         .unwrap()
         .is_empty());
-    assert!(services
-        .oplog_store
-        .list_entries(&mut session)
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        services
+            .oplog_store
+            .list_entries(&mut session)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 // EARS: When `updateMany` matches multiple documents, the write executor shall
@@ -168,13 +181,14 @@ fn update_many_emits_one_oplog_row_per_affected_document_in_order() {
 
     let mut session = services.connection.open_session();
     let entries = services.oplog_store.list_entries(&mut session).unwrap();
-    assert_eq!(entries.len(), 4);
+    assert_eq!(entries.len(), 5);
     assert_eq!(entries[0].op_time.index, 1);
     assert_eq!(entries[1].op_time.index, 2);
     assert_eq!(entries[2].op_time.index, 3);
     assert_eq!(entries[3].op_time.index, 4);
+    assert_eq!(entries[4].op_time.index, 5);
 
-    let update_ids: Vec<i64> = entries[2..]
+    let update_ids: Vec<i64> = entries[3..]
         .iter()
         .map(|entry| match &entry.operation {
             OplogOperation::Update { document_key, .. } => document_key["_id"].as_i64().unwrap(),
@@ -217,7 +231,7 @@ fn delete_many_emits_one_oplog_row_per_affected_document() {
 
     let mut session = services.connection.open_session();
     let entries = services.oplog_store.list_entries(&mut session).unwrap();
-    let delete_ids: Vec<i64> = entries[2..]
+    let delete_ids: Vec<i64> = entries[3..]
         .iter()
         .map(|entry| match &entry.operation {
             OplogOperation::Delete { document_key, .. } => document_key["_id"].as_i64().unwrap(),
@@ -259,8 +273,8 @@ fn oplog_survives_restart_through_storage_wal_recovery() {
     let mut session = reopened.open_session();
     let entries = oplog_store.list_entries(&mut session).unwrap();
 
-    assert_eq!(entries.len(), 1);
-    match &entries[0].operation {
+    assert_eq!(entries.len(), 2);
+    match &entries[1].operation {
         OplogOperation::Insert { ns, document } => {
             assert_eq!(ns, &namespace("users").full_name());
             assert_eq!(document["name"], json!("alice"));

@@ -10,7 +10,7 @@ use crate::core::errors::StorageError;
 use crate::core::{DatabaseName, Namespace};
 use crate::storage::api::Session;
 use crate::storage::metadata_store::{
-    table_uri, MetadataEntry, MetadataStore, INDEX_URI_PREFIX, TABLE_URI_PREFIX,
+    table_uri, MetadataStore, INDEX_URI_PREFIX, TABLE_URI_PREFIX,
 };
 use crate::WrongoDBError;
 
@@ -49,6 +49,12 @@ impl CreateIndexRequest {
     pub(crate) fn single_field_ascending(field: &str) -> Self {
         Self::from_bson_spec(&bson::doc! { "key": { field: 1 }, "name": default_index_name(field) })
             .expect("single-field test index request")
+    }
+
+    /// Builds the normalized single-field ascending request used by oplog apply.
+    pub(crate) fn single_field_ascending_named(field: &str, name: &str) -> Self {
+        Self::from_bson_spec(&bson::doc! { "key": { field: 1 }, "name": name })
+            .expect("single-field ascending oplog request")
     }
 
     /// Returns the canonical Mongo-visible index name.
@@ -149,14 +155,47 @@ impl CollectionDefinition {
         table_uri: impl Into<String>,
         storage_columns: Vec<String>,
     ) -> Self {
+        Self::new_with_uuid(namespace, table_uri, storage_columns, uuid_binary())
+    }
+
+    /// Creates a new collection definition with an explicit UUID.
+    pub(crate) fn new_with_uuid(
+        namespace: Namespace,
+        table_uri: impl Into<String>,
+        storage_columns: Vec<String>,
+        uuid: Binary,
+    ) -> Self {
         Self {
             namespace,
             table_uri: table_uri.into(),
-            uuid: uuid_binary(),
+            uuid,
             options: collection_options(&storage_columns),
             storage_columns,
             indexes: BTreeMap::new(),
         }
+    }
+
+    /// Creates a new collection definition with a generated storage ident.
+    pub(crate) fn new_generated(namespace: Namespace, storage_columns: Vec<String>) -> Self {
+        Self::new(
+            namespace,
+            table_uri(&generated_table_ident()),
+            storage_columns,
+        )
+    }
+
+    /// Creates a new collection definition with an explicit UUID and generated storage ident.
+    pub(crate) fn new_generated_with_uuid(
+        namespace: Namespace,
+        storage_columns: Vec<String>,
+        uuid: Binary,
+    ) -> Self {
+        Self::new_with_uuid(
+            namespace,
+            table_uri(&generated_table_ident()),
+            storage_columns,
+            uuid,
+        )
     }
 
     pub(crate) fn namespace(&self) -> &Namespace {
@@ -193,6 +232,35 @@ impl CollectionDefinition {
     /// Returns the durable secondary indexes keyed by index name.
     pub(crate) fn indexes(&self) -> &BTreeMap<String, IndexDefinition> {
         &self.indexes
+    }
+
+    /// Adds a secondary index definition when it does not already exist.
+    pub(crate) fn add_index(&mut self, index: IndexDefinition) -> bool {
+        let name = index.name.clone();
+        if self.indexes.contains_key(&name) {
+            return false;
+        }
+
+        self.indexes.insert(name, index);
+        true
+    }
+
+    /// Updates the ready state for one named secondary index.
+    pub(crate) fn mark_index_ready(
+        &mut self,
+        index_name: &str,
+        ready: bool,
+    ) -> Result<(), WrongoDBError> {
+        let Some(index) = self.indexes.get_mut(index_name) else {
+            return Err(StorageError(format!(
+                "unknown index {index_name} on collection {}",
+                self.namespace.full_name()
+            ))
+            .into());
+        };
+
+        index.ready = ready;
+        Ok(())
     }
 }
 
@@ -332,102 +400,33 @@ impl CollectionCatalog {
     // Write API
     // ------------------------------------------------------------------------
 
-    /// Creates a collection with storage in its own transaction flow.
-    ///
-    /// This handles both storage creation and catalog entry insertion.
-    /// Returns the definition and a boolean indicating whether it was newly created.
+    /// Creates one durable collection entry if it does not already exist.
     pub(crate) fn create_collection(
         &self,
-        session: &mut Session,
-        namespace: &Namespace,
-        storage_columns: &[String],
-    ) -> Result<(CollectionDefinition, bool), WrongoDBError> {
-        let definition = new_collection_definition(namespace.clone(), storage_columns.to_vec());
-        session.create_table(definition.table_uri(), storage_columns.to_vec())?;
-
-        session.with_transaction(|session| {
-            if let Some(existing) = self.get_collection(session, namespace)? {
-                return Ok((existing, false));
-            }
-
-            let record = catalog_record_from_collection_definition(&definition)?;
-            self.store
-                .put_record(session, &namespace.full_name(), &record)?;
-            self.refresh_cache_entry(session, namespace)?;
-            Ok((definition.clone(), true))
-        })
-    }
-
-    /// Registers an index on a collection if it doesn't already exist.
-    ///
-    /// Returns `true` if the index was newly added.
-    pub(crate) fn ensure_index(
-        &self,
         session: &Session,
-        namespace: &Namespace,
-        index: IndexDefinition,
+        definition: &CollectionDefinition,
     ) -> Result<bool, WrongoDBError> {
-        let mut definition = self.get_collection(session, namespace)?.ok_or_else(|| {
-            StorageError(format!("unknown collection: {}", namespace.full_name()))
-        })?;
-        if definition.indexes.contains_key(index.name()) {
+        let namespace = definition.namespace();
+        if self.get_collection(session, namespace)?.is_some() {
             return Ok(false);
         }
 
-        definition.indexes.insert(index.name.clone(), index);
-        let record = catalog_record_from_collection_definition(&definition)?;
-        self.store
-            .put_record(session, &namespace.full_name(), &record)?;
-
-        // Auto-refresh cache after successful write
-        self.refresh_cache_entry(session, namespace)?;
-
+        self.put_collection(session, definition)?;
         Ok(true)
     }
 
-    /// Creates an index in its own transaction.
-    ///
-    /// Returns `true` if the index was newly added.
-    pub(crate) fn create_index(
+    /// Persists one collection entry as the current catalog state.
+    pub(crate) fn put_collection(
         &self,
-        session: &mut Session,
-        namespace: &Namespace,
-        index: IndexDefinition,
-    ) -> Result<bool, WrongoDBError> {
-        session.with_transaction(|session| self.ensure_index(session, namespace, index))
-    }
-
-    /// Builds index storage and marks the index as ready.
-    ///
-    /// This handles:
-    /// 1. Create storage (outside transaction)
-    /// 2. Mark ready (in transaction)
-    pub(crate) fn build_and_mark_index_ready(
-        &self,
-        session: &mut Session,
-        namespace: &Namespace,
-        table_uri: &str,
-        index_name: &str,
-        metadata_entry: &MetadataEntry,
+        session: &Session,
+        definition: &CollectionDefinition,
     ) -> Result<(), WrongoDBError> {
-        // Step 1: Create storage (outside transaction)
-        session.create_index(table_uri, metadata_entry)?;
-
-        // Step 2: Mark ready
-        self.set_index_ready(session, namespace, index_name, true)
-    }
-
-    /// Sets the ready state of an index in its own transaction.
-    pub(crate) fn set_index_ready(
-        &self,
-        session: &mut Session,
-        namespace: &Namespace,
-        index_name: &str,
-        ready: bool,
-    ) -> Result<(), WrongoDBError> {
-        session.with_transaction(|session| {
-            self.set_index_ready_inner(session, namespace, index_name, ready)
-        })
+        let namespace = definition.namespace();
+        let record = catalog_record_from_collection_definition(definition)?;
+        self.store
+            .put_record(session, &namespace.full_name(), &record)?;
+        self.refresh_cache_entry(session, namespace)?;
+        Ok(())
     }
 
     // ------------------------------------------------------------------------
@@ -443,35 +442,6 @@ impl CollectionCatalog {
         for collection in self.list_collections(session)? {
             validate_collection_references(&collection, metadata_store)?;
         }
-        Ok(())
-    }
-
-    fn set_index_ready_inner(
-        &self,
-        session: &Session,
-        namespace: &Namespace,
-        index_name: &str,
-        ready: bool,
-    ) -> Result<(), WrongoDBError> {
-        let mut definition = self.get_collection(session, namespace)?.ok_or_else(|| {
-            StorageError(format!("unknown collection: {}", namespace.full_name()))
-        })?;
-        let Some(index) = definition.indexes.get_mut(index_name) else {
-            return Err(StorageError(format!(
-                "unknown index {index_name} on collection {}",
-                namespace.full_name()
-            ))
-            .into());
-        };
-        index.ready = ready;
-
-        let record = catalog_record_from_collection_definition(&definition)?;
-        self.store
-            .put_record(session, &namespace.full_name(), &record)?;
-
-        // Auto-refresh cache after successful write
-        self.refresh_cache_entry(session, namespace)?;
-
         Ok(())
     }
 }
@@ -624,12 +594,8 @@ fn default_index_name(field: &str) -> String {
     format!("{field}_1")
 }
 
-fn new_collection_definition(
-    namespace: Namespace,
-    storage_columns: Vec<String>,
-) -> CollectionDefinition {
-    let table_ident = format!("c_{}", Uuid::new_v4().simple());
-    CollectionDefinition::new(namespace, table_uri(&table_ident), storage_columns)
+fn generated_table_ident() -> String {
+    format!("c_{}", Uuid::new_v4().simple())
 }
 
 fn collection_options(storage_columns: &[String]) -> Document {
@@ -663,6 +629,93 @@ fn single_field_ascending_key_field(key: &Document) -> Result<String, WrongoDBEr
     }
 
     Ok(field.to_string())
+}
+
+#[cfg(test)]
+mod request_tests {
+    use tempfile::tempdir;
+
+    use super::{CollectionCatalog, CollectionDefinition, CreateIndexRequest, IndexDefinition};
+    use crate::catalog::CatalogStore;
+    use crate::core::Namespace;
+    use crate::storage::api::{Connection, ConnectionConfig};
+
+    fn namespace(name: &str) -> Namespace {
+        Namespace::parse(&format!("test.{name}")).expect("valid test namespace")
+    }
+
+    // EARS: When the caller creates a durable collection entry inside its own
+    // transaction, the catalog shall create it if absent and report false on a
+    // second create without opening its own transaction.
+    #[test]
+    fn create_collection_is_create_if_absent() {
+        let dir = tempdir().unwrap();
+        let connection = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
+        let catalog = CollectionCatalog::new(CatalogStore::new());
+        let mut session = connection.open_session();
+        catalog.ensure_store_exists(&mut session).unwrap();
+
+        let definition =
+            CollectionDefinition::new_generated(namespace("users"), vec!["name".to_string()]);
+        session
+            .create_table(definition.table_uri(), vec!["name".to_string()])
+            .unwrap();
+        session
+            .with_transaction(|session| catalog.create_collection(session, &definition))
+            .unwrap();
+
+        let created_again = session
+            .with_transaction(|session| catalog.create_collection(session, &definition))
+            .unwrap();
+
+        assert!(!created_again);
+    }
+
+    // EARS: When the caller persists an updated collection state, the catalog
+    // shall replace the durable row and refresh cache-visible index readiness.
+    #[test]
+    fn put_collection_replaces_current_state() {
+        let dir = tempdir().unwrap();
+        let connection = Connection::open(dir.path(), ConnectionConfig::default()).unwrap();
+        let catalog = CollectionCatalog::new(CatalogStore::new());
+        let mut session = connection.open_session();
+        catalog.ensure_store_exists(&mut session).unwrap();
+
+        let mut definition =
+            CollectionDefinition::new_generated(namespace("users"), vec!["name".to_string()]);
+        session
+            .create_table(definition.table_uri(), vec!["name".to_string()])
+            .unwrap();
+        session
+            .with_transaction(|session| catalog.create_collection(session, &definition))
+            .unwrap();
+
+        let request = CreateIndexRequest::single_field_ascending("name");
+        let index = IndexDefinition::from_request_with_ready(
+            &request,
+            "index:users:name_1".to_string(),
+            false,
+        );
+        assert!(definition.add_index(index));
+        definition.mark_index_ready("name_1", true).unwrap();
+
+        session
+            .with_transaction(|session| catalog.put_collection(session, &definition))
+            .unwrap();
+
+        let stored = catalog
+            .get_collection(&session, &namespace("users"))
+            .unwrap()
+            .unwrap();
+        assert!(stored.indexes().get("name_1").unwrap().ready());
+        assert!(catalog
+            .lookup_collection(&namespace("users"))
+            .unwrap()
+            .indexes()
+            .get("name_1")
+            .unwrap()
+            .ready());
+    }
 }
 
 fn is_ascending_one(value: &Bson) -> bool {

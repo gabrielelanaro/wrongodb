@@ -1,11 +1,16 @@
 use std::sync::Arc;
 
+use bson::{spec::BinarySubtype, Binary};
 use uuid::Uuid;
 
-use crate::catalog::{CollectionCatalog, CreateIndexRequest, IndexDefinition};
+use crate::catalog::{
+    CollectionCatalog, CollectionDefinition, CreateIndexRequest, IndexDefinition,
+};
 use crate::core::errors::StorageError;
 use crate::core::Namespace;
-use crate::replication::{is_reserved_namespace, ReplicationCoordinator};
+use crate::replication::{
+    is_reserved_namespace, OplogMode, ReplicationCoordinator, ReplicationObserver,
+};
 use crate::storage::metadata_store::{index_uri, MetadataEntry, MetadataStore};
 use crate::storage::row::validate_storage_columns;
 use crate::{Connection, WrongoDBError};
@@ -14,6 +19,9 @@ use crate::{Connection, WrongoDBError};
 struct IndexBuildPlan {
     entry: MetadataEntry,
     needs_build: bool,
+    should_emit_oplog: bool,
+    definition_before_build: Option<CollectionDefinition>,
+    definition_after_build: CollectionDefinition,
 }
 
 /// Top-level DDL service above the WT-like storage API and collection catalog.
@@ -23,6 +31,7 @@ pub(crate) struct DdlPath {
     metadata_store: Arc<MetadataStore>,
     catalog: Arc<CollectionCatalog>,
     replication: ReplicationCoordinator,
+    replication_observer: ReplicationObserver,
 }
 
 impl DdlPath {
@@ -32,12 +41,14 @@ impl DdlPath {
         metadata_store: Arc<MetadataStore>,
         catalog: Arc<CollectionCatalog>,
         replication: ReplicationCoordinator,
+        replication_observer: ReplicationObserver,
     ) -> Self {
         Self {
             connection,
             metadata_store,
             catalog,
             replication,
+            replication_observer,
         }
     }
 
@@ -48,23 +59,29 @@ impl DdlPath {
         storage_columns: Vec<String>,
     ) -> Result<(), WrongoDBError> {
         self.replication.require_writable_primary()?;
-        validate_user_namespace(namespace)?;
-        validate_storage_columns(&storage_columns)?;
+        self.create_collection_internal(
+            namespace,
+            storage_columns,
+            None,
+            OplogMode::GenerateOplog,
+            false,
+        )
+    }
 
-        let mut session = self.connection.open_session();
-        let (_, created) =
-            self.catalog
-                .create_collection(&mut session, namespace, &storage_columns)?;
-
-        if !created {
-            return Err(StorageError(format!(
-                "collection already exists: {}",
-                namespace.full_name()
-            ))
-            .into());
-        }
-
-        Ok(())
+    /// Apply a replicated create-collection oplog entry locally.
+    pub(crate) fn apply_create_collection(
+        &self,
+        namespace: &Namespace,
+        storage_columns: Vec<String>,
+        collection_uuid: String,
+    ) -> Result<(), WrongoDBError> {
+        self.create_collection_internal(
+            namespace,
+            storage_columns,
+            Some(collection_uuid),
+            OplogMode::SuppressOplog,
+            true,
+        )
     }
 
     /// Creates one secondary index from the normalized server-side request.
@@ -74,6 +91,87 @@ impl DdlPath {
         request: CreateIndexRequest,
     ) -> Result<(), WrongoDBError> {
         self.replication.require_writable_primary()?;
+        self.create_index_internal(namespace, request, OplogMode::GenerateOplog)
+    }
+
+    /// Apply a replicated create-index oplog entry locally.
+    pub(crate) fn apply_create_index(
+        &self,
+        namespace: &Namespace,
+        name: &str,
+        indexed_field: &str,
+    ) -> Result<(), WrongoDBError> {
+        self.create_index_internal(
+            namespace,
+            CreateIndexRequest::single_field_ascending_named(indexed_field, name),
+            OplogMode::SuppressOplog,
+        )
+    }
+
+    fn create_collection_internal(
+        &self,
+        namespace: &Namespace,
+        storage_columns: Vec<String>,
+        collection_uuid: Option<String>,
+        oplog_mode: OplogMode,
+        allow_existing_match: bool,
+    ) -> Result<(), WrongoDBError> {
+        validate_user_namespace(namespace)?;
+        validate_storage_columns(&storage_columns)?;
+
+        let mut session = self.connection.open_session();
+        if let Some(existing) = self.catalog.get_collection(&session, namespace)? {
+            return self.handle_existing_collection(
+                namespace,
+                &storage_columns,
+                collection_uuid.as_deref(),
+                &existing,
+                allow_existing_match,
+            );
+        }
+
+        let definition = if let Some(collection_uuid) = collection_uuid.clone() {
+            CollectionDefinition::new_generated_with_uuid(
+                namespace.clone(),
+                storage_columns.clone(),
+                uuid_binary_from_string(&collection_uuid)?,
+            )
+        } else {
+            CollectionDefinition::new_generated(namespace.clone(), storage_columns.clone())
+        };
+        let collection_uuid = collection_uuid_string(definition.uuid())?;
+        session.create_table(definition.table_uri(), storage_columns.clone())?;
+
+        session.with_transaction(|session| {
+            let created = self.catalog.create_collection(session, &definition)?;
+            if !created {
+                let existing = self.load_collection_definition(session, namespace)?;
+                return self.handle_existing_collection(
+                    namespace,
+                    &storage_columns,
+                    Some(collection_uuid.as_str()),
+                    &existing,
+                    allow_existing_match,
+                );
+            }
+
+            let _ = self.replication_observer.on_create_collection(
+                session,
+                namespace,
+                storage_columns.clone(),
+                collection_uuid.clone(),
+                oplog_mode,
+            )?;
+            Ok(())
+        })
+    }
+
+    fn create_index_internal(
+        &self,
+        namespace: &Namespace,
+        request: CreateIndexRequest,
+        oplog_mode: OplogMode,
+    ) -> Result<(), WrongoDBError> {
         validate_user_namespace(namespace)?;
 
         let mut session = self.connection.open_session();
@@ -92,39 +190,39 @@ impl DdlPath {
             .into());
         }
 
-        // `createIndexes` is orchestration, not a pure catalog write. The DDL
-        // layer must decide whether this request is creating a new index,
-        // resuming an unfinished one, or repairing missing storage metadata
-        // for an already-ready catalog entry. That planning belongs above the
-        // catalog. The catalog should stay focused on durable metadata
-        // transitions (`ready=false`, `ready=true`, lookup), while the DDL
-        // layer coordinates physical index creation through `Session`.
-        let build_plan = self.plan_index_build(
-            &mut session,
-            namespace,
-            &definition,
-            &request,
-            &indexed_field,
-        )?;
-        if build_plan.needs_build {
-            self.catalog.build_and_mark_index_ready(
-                &mut session,
-                namespace,
-                &table_uri,
-                request.name(),
-                &build_plan.entry,
-            )?;
+        let build_plan = self.plan_index_build(&definition, &request, &indexed_field)?;
+        if !build_plan.needs_build {
+            return Ok(());
         }
 
-        Ok(())
+        if let Some(definition_to_persist) = &build_plan.definition_before_build {
+            session.with_transaction(|session| {
+                self.catalog.put_collection(session, definition_to_persist)
+            })?;
+        }
+
+        session.create_index(&table_uri, &build_plan.entry)?;
+        session.with_transaction(|session| {
+            let mut ready_definition = build_plan.definition_after_build.clone();
+            ready_definition.mark_index_ready(request.name(), true)?;
+            self.catalog.put_collection(session, &ready_definition)?;
+            if build_plan.should_emit_oplog {
+                let _ = self.replication_observer.on_create_index(
+                    session,
+                    namespace,
+                    request.name().to_string(),
+                    indexed_field.clone(),
+                    oplog_mode,
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Decide whether this index needs a new build or a repair pass.
     fn plan_index_build(
         &self,
-        session: &mut crate::storage::api::Session,
-        namespace: &Namespace,
-        definition: &crate::catalog::CollectionDefinition,
+        definition: &CollectionDefinition,
         request: &CreateIndexRequest,
         indexed_field: &str,
     ) -> Result<IndexBuildPlan, WrongoDBError> {
@@ -140,6 +238,9 @@ impl DdlPath {
             return Ok(IndexBuildPlan {
                 entry: metadata_entry,
                 needs_build: !index.ready() || stored_entry.is_none(),
+                should_emit_oplog: !index.ready(),
+                definition_before_build: None,
+                definition_after_build: definition.clone(),
             });
         }
 
@@ -147,11 +248,16 @@ impl DdlPath {
             table_ident_from_uri(definition.table_uri()),
             &new_index_ident(),
         );
-        let _ = self.catalog.create_index(
-            session,
-            namespace,
-            IndexDefinition::from_request_with_ready(request, index_uri.clone(), false),
-        )?;
+        let mut definition_before_build = definition.clone();
+        let added = definition_before_build.add_index(IndexDefinition::from_request_with_ready(
+            request,
+            index_uri.clone(),
+            false,
+        ));
+        debug_assert!(
+            added,
+            "new index build should not duplicate an existing name"
+        );
         Ok(IndexBuildPlan {
             entry: MetadataEntry::index(
                 table_ident_from_uri(definition.table_uri()),
@@ -162,7 +268,39 @@ impl DdlPath {
                 vec![indexed_field.to_string()],
             ),
             needs_build: true,
+            should_emit_oplog: true,
+            definition_before_build: Some(definition_before_build.clone()),
+            definition_after_build: definition_before_build,
         })
+    }
+
+    fn handle_existing_collection(
+        &self,
+        namespace: &Namespace,
+        storage_columns: &[String],
+        collection_uuid: Option<&str>,
+        existing: &CollectionDefinition,
+        allow_existing_match: bool,
+    ) -> Result<(), WrongoDBError> {
+        if allow_existing_match
+            && existing.storage_columns() == storage_columns
+            && collection_uuid
+                .map(|expected| {
+                    matches!(
+                        collection_uuid_string(existing.uuid()),
+                        Ok(actual) if actual == expected
+                    )
+                })
+                .unwrap_or(true)
+        {
+            return Ok(());
+        }
+
+        Err(StorageError(format!(
+            "collection already exists: {}",
+            namespace.full_name()
+        ))
+        .into())
     }
 
     fn load_collection_definition(
@@ -188,6 +326,21 @@ fn validate_user_namespace(namespace: &Namespace) -> Result<(), WrongoDBError> {
     }
 
     Ok(())
+}
+
+fn collection_uuid_string(uuid: &Binary) -> Result<String, WrongoDBError> {
+    let parsed = Uuid::from_slice(&uuid.bytes)
+        .map_err(|err| StorageError(format!("invalid collection UUID bytes: {err}")))?;
+    Ok(parsed.to_string())
+}
+
+fn uuid_binary_from_string(raw: &str) -> Result<Binary, WrongoDBError> {
+    let uuid = Uuid::parse_str(raw)
+        .map_err(|err| StorageError(format!("invalid collection UUID: {err}")))?;
+    Ok(Binary {
+        subtype: BinarySubtype::Uuid,
+        bytes: uuid.as_bytes().to_vec(),
+    })
 }
 
 fn new_index_ident() -> String {
@@ -221,8 +374,8 @@ mod tests {
     use crate::core::{DatabaseName, Namespace};
     use crate::document_query::DocumentQuery;
     use crate::replication::{
-        oplog_namespace, OplogMode, OplogStore, ReplicationConfig, ReplicationCoordinator,
-        ReplicationObserver,
+        oplog_namespace, OplogOperation, OplogStore, ReplicationConfig,
+        ReplicationCoordinator, ReplicationObserver, ReplicationRole,
     };
     use crate::storage::api::{Connection, ConnectionConfig, Session};
     use crate::WrongoDBError;
@@ -237,10 +390,11 @@ mod tests {
         write_path: CollectionWritePath,
         query: DocumentQuery,
         catalog: Arc<CollectionCatalog>,
+        oplog_store: OplogStore,
     }
 
     impl TestServices {
-        fn new(replication_config: ReplicationConfig) -> Self {
+        fn new(ddl_replication_config: ReplicationConfig) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let connection = Arc::new(
                 Connection::open(dir.path(), ConnectionConfig::new().logging_enabled(false))
@@ -249,7 +403,7 @@ mod tests {
             let metadata_store = connection.metadata_store();
             let oplog_store = OplogStore::new(metadata_store.clone(), TEST_OPLOG_TABLE_URI);
             let catalog = Arc::new(CollectionCatalog::new(CatalogStore::new()));
-            let replication = ReplicationCoordinator::new(replication_config);
+            let ddl_replication = ReplicationCoordinator::new(ddl_replication_config);
             let mut session = connection.open_session();
             oplog_store.ensure_table_exists(&mut session).unwrap();
             let next_op_index = oplog_store
@@ -257,22 +411,19 @@ mod tests {
                 .unwrap()
                 .map(|op_time| op_time.index + 1)
                 .unwrap_or(1);
-            replication.seed_next_op_index(next_op_index);
+            ddl_replication.seed_next_op_index(next_op_index);
             catalog.ensure_store_exists(&mut session).unwrap();
             catalog.load_cache(&session).unwrap();
 
             let query = DocumentQuery::new(catalog.clone());
-            let write_path = CollectionWritePath::new(
-                metadata_store.clone(),
-                catalog.clone(),
-                query.clone(),
-                ReplicationObserver::new(replication.clone(), oplog_store),
-            );
+            let write_path =
+                CollectionWritePath::new(metadata_store.clone(), catalog.clone(), query.clone());
             let ddl_path = DdlPath::new(
                 connection.clone(),
                 metadata_store,
                 catalog.clone(),
-                replication,
+                ddl_replication.clone(),
+                ReplicationObserver::new(ddl_replication, oplog_store.clone()),
             );
 
             Self {
@@ -282,6 +433,7 @@ mod tests {
                 write_path,
                 query,
                 catalog,
+                oplog_store,
             }
         }
     }
@@ -298,21 +450,16 @@ mod tests {
     ) {
         session
             .with_transaction(|session| {
-                write_path.insert_one_in_transaction(
-                    session,
-                    &namespace(collection),
-                    doc,
-                    OplogMode::GenerateOplog,
-                )?;
+                let _ = write_path.insert_one(session, &namespace(collection), doc)?;
                 Ok(())
             })
             .unwrap();
     }
 
-    // EARS: When user DDL targets the reserved oplog collection name, the DDL
+    // EARS: When user DDL targets a reserved replication namespace, the DDL
     // path shall reject the request.
     #[test]
-    fn create_collection_rejects_reserved_oplog_name() {
+    fn create_collection_rejects_reserved_replication_name() {
         let services = TestServices::new(ReplicationConfig::default());
 
         let err = services
@@ -330,8 +477,10 @@ mod tests {
     #[test]
     fn non_primary_rejects_create_collection() {
         let services = TestServices::new(ReplicationConfig {
-            is_writable_primary: false,
-            primary_hint: Some("node-2".to_string()),
+            role: ReplicationRole::Secondary,
+            node_name: "node-2".to_string(),
+            primary_hint: Some("node-1".to_string()),
+            sync_source_uri: Some("mongodb://node-1".to_string()),
             term: 7,
         });
 
@@ -344,7 +493,7 @@ mod tests {
             err,
             WrongoDBError::NotLeader {
                 leader_hint: Some(ref leader_hint)
-            } if leader_hint == "node-2"
+            } if leader_hint == "node-1"
         ));
     }
 
@@ -506,5 +655,35 @@ mod tests {
 
         assert!(matches!(err, WrongoDBError::Storage(StorageError(_))));
         assert!(err.to_string().contains("collection already exists"));
+    }
+
+    // EARS: When a primary creates a collection or index, the DDL path shall
+    // append matching logical DDL entries to the oplog.
+    #[test]
+    fn ddl_operations_append_logical_oplog_entries() {
+        let services = TestServices::new(ReplicationConfig::default());
+        services
+            .ddl_path
+            .create_collection(&namespace("users"), vec!["name".to_string()])
+            .unwrap();
+        services
+            .ddl_path
+            .create_index(
+                &namespace("users"),
+                CreateIndexRequest::single_field_ascending("name"),
+            )
+            .unwrap();
+
+        let mut session = services.connection.open_session();
+        let entries = services.oplog_store.list_entries(&mut session).unwrap();
+
+        assert!(matches!(
+            entries[0].operation,
+            OplogOperation::CreateCollection { .. }
+        ));
+        assert!(matches!(
+            entries[1].operation,
+            OplogOperation::CreateIndex { .. }
+        ));
     }
 }

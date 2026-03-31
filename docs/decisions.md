@@ -1,5 +1,31 @@
 # Decisions
 
+## 2026-03-31: Keep `CollectionWritePath` replication-agnostic and move oplog concerns to `WriteOps` and `OplogApplier`
+
+**Decision**
+- Keep `CollectionWritePath` focused on collection-local mutation only: validation, document shaping, row encoding, and insert/update/delete primitives inside a caller-owned transaction.
+- Remove oplog emission, `OpTime` return values, and oplog-replay-specific helper methods from `CollectionWritePath`.
+- Make `WriteOps` own primary-side oplog emission inside the same transaction after successful collection mutation.
+- Make `OplogApplier` own replicated CRUD replay semantics such as idempotent insert handling and full-document update replay.
+
+**Why**
+- `CollectionWritePath` had started exposing replication-specific behavior through `*_with_op_time_*` and `apply_*_entry_*` methods, which blurred the boundary between plain collection mutation, primary oplog generation, and secondary replay.
+- The transaction scope is already explicit in the caller's `Session`, so the write path does not need to encode replication workflow in its interface to preserve atomicity.
+- `WriteOps` is the correct owner for primary write orchestration, while `OplogApplier` is the correct owner for replay idempotency and oplog-entry semantics.
+
+## 2026-03-31: Make `CollectionCatalog` a persistence-only service and move DDL workflow ownership to `DdlPath`
+
+**Decision**
+- Keep `CollectionCatalog` responsible only for reading catalog state, create-if-absent persistence, replacing current collection state, cache refresh, and catalog validation.
+- Remove transaction-owning helpers and DDL workflow helpers from `CollectionCatalog`.
+- Move generated collection-definition construction and index-state mutation onto `CollectionDefinition`.
+- Make `DdlPath` own transaction boundaries and the full two-phase index-build workflow, including the `ready` transition.
+
+**Why**
+- The old catalog API mixed persistence, transaction ownership, builders, and DDL-specific workflow steps such as index readiness, which made the abstraction leaky and hard to reason about.
+- The storage session already carries the transaction context, so repeating transaction ownership in the catalog API added duplicate and misleading surface area.
+- Index readiness is real durable state, but it is part of the DDL workflow, not a generic catalog concern. Keeping that workflow in `DdlPath` makes the orchestration boundary clearer while preserving restart-safe repair behavior.
+
 ## 2026-03-30: Build first secondary replication on top of the public oplog cursor path
 
 **Decision**

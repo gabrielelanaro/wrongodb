@@ -8,7 +8,6 @@ use crate::core::document::{normalize_document_in_place, validate_is_object};
 use crate::core::errors::{DocumentValidationError, StorageError};
 use crate::core::Namespace;
 use crate::document_query::DocumentQuery;
-use crate::replication::{OpTime, OplogMode, ReplicationObserver};
 use crate::storage::api::Session;
 use crate::storage::metadata_store::MetadataStore;
 use crate::storage::row::encode_row_value;
@@ -21,18 +20,38 @@ pub(crate) struct UpdateResult {
     pub(crate) modified: usize,
 }
 
+/// Result of updating at most one document.
+#[derive(Debug, Clone)]
+pub(crate) struct UpdateOneOutcome {
+    pub(crate) result: UpdateResult,
+    pub(crate) updated_document: Option<Document>,
+}
+
+/// Result of updating multiple documents.
+#[derive(Debug, Clone)]
+pub(crate) struct UpdateManyOutcome {
+    pub(crate) result: UpdateResult,
+    pub(crate) updated_documents: Vec<Document>,
+}
+
+/// Result of deleting one or more documents.
+#[derive(Debug, Clone)]
+pub(crate) struct DeleteOutcome {
+    pub(crate) deleted: usize,
+    pub(crate) deleted_ids: Vec<Value>,
+}
+
 /// Low-level in-transaction collection mutator.
 ///
 /// This module mirrors MongoDB's `collection_write_path` role more closely than
 /// the old WrongoDB service shape: it owns document validation, row encoding,
 /// and collection-local mutations, but it does not own top-level transaction
-/// scope, write admission, or DDL orchestration.
+/// scope, oplog generation, replication replay semantics, or DDL orchestration.
 #[derive(Clone)]
 pub(crate) struct CollectionWritePath {
     metadata_store: Arc<MetadataStore>,
     catalog: Arc<CollectionCatalog>,
     document_query: DocumentQuery,
-    replication_observer: ReplicationObserver,
 }
 
 impl CollectionWritePath {
@@ -41,36 +60,21 @@ impl CollectionWritePath {
         metadata_store: Arc<MetadataStore>,
         catalog: Arc<CollectionCatalog>,
         document_query: DocumentQuery,
-        replication_observer: ReplicationObserver,
     ) -> Self {
         Self {
             metadata_store,
             catalog,
             document_query,
-            replication_observer,
         }
     }
 
-    /// Inserts one document inside the caller's active transaction.
-    #[allow(dead_code)]
-    pub(crate) fn insert_one_in_transaction(
+    /// Inserts one document using the caller's active transaction.
+    pub(crate) fn insert_one(
         &self,
         session: &mut Session,
         namespace: &Namespace,
         doc: Value,
-        oplog_mode: OplogMode,
     ) -> Result<Document, WrongoDBError> {
-        self.insert_one_with_op_time_in_transaction(session, namespace, doc, oplog_mode)
-            .map(|(document, _)| document)
-    }
-
-    pub(crate) fn insert_one_with_op_time_in_transaction(
-        &self,
-        session: &mut Session,
-        namespace: &Namespace,
-        doc: Value,
-        oplog_mode: OplogMode,
-    ) -> Result<(Document, Option<OpTime>), WrongoDBError> {
         validate_is_object(&doc)?;
         let mut obj = doc.as_object().expect("validated object").clone();
         normalize_document_in_place(&mut obj)?;
@@ -83,47 +87,30 @@ impl CollectionWritePath {
         let key = encode_id_value(id)?;
         let value = self.encode_row_for_table(&table_uri, &obj)?;
         self.insert_record(session, &table_uri, &key, &value)?;
-        let op_time = self
-            .replication_observer
-            .on_insert(session, namespace, &obj, oplog_mode)?;
-        Ok((obj, op_time))
+        Ok(obj)
     }
 
-    /// Updates the first matching document inside the caller's active transaction.
-    #[allow(dead_code)]
-    pub(crate) fn update_one_in_transaction(
+    /// Updates the first matching document using the caller's active transaction.
+    pub(crate) fn update_one(
         &self,
         session: &mut Session,
         namespace: &Namespace,
         filter: Option<Value>,
         update: Value,
-        oplog_mode: OplogMode,
-    ) -> Result<UpdateResult, WrongoDBError> {
-        self.update_one_with_op_time_in_transaction(session, namespace, filter, update, oplog_mode)
-            .map(|(result, _)| result)
-    }
-
-    pub(crate) fn update_one_with_op_time_in_transaction(
-        &self,
-        session: &mut Session,
-        namespace: &Namespace,
-        filter: Option<Value>,
-        update: Value,
-        oplog_mode: OplogMode,
-    ) -> Result<(UpdateResult, Option<OpTime>), WrongoDBError> {
+    ) -> Result<UpdateOneOutcome, WrongoDBError> {
         let definition = self.registered_collection_definition(session, namespace)?;
         let table_uri = definition.table_uri().to_string();
         let docs = self
             .document_query
             .find_in_transaction(session, namespace, filter)?;
         if docs.is_empty() {
-            return Ok((
-                UpdateResult {
+            return Ok(UpdateOneOutcome {
+                result: UpdateResult {
                     matched: 0,
                     modified: 0,
                 },
-                None,
-            ));
+                updated_document: None,
+            });
         }
 
         let doc = &docs[0];
@@ -134,58 +121,40 @@ impl CollectionWritePath {
         let key = encode_id_value(id)?;
         let value = self.encode_row_for_table(&table_uri, &updated_doc)?;
         self.update_record(session, &table_uri, &key, &value)?;
-        let op_time =
-            self.replication_observer
-                .on_update(session, namespace, &updated_doc, oplog_mode)?;
-
-        Ok((
-            UpdateResult {
+        Ok(UpdateOneOutcome {
+            result: UpdateResult {
                 matched: 1,
                 modified: 1,
             },
-            op_time,
-        ))
+            updated_document: Some(updated_doc),
+        })
     }
 
-    /// Updates every matching document inside the caller's active transaction.
-    #[allow(dead_code)]
-    pub(crate) fn update_many_in_transaction(
+    /// Updates every matching document using the caller's active transaction.
+    pub(crate) fn update_many(
         &self,
         session: &mut Session,
         namespace: &Namespace,
         filter: Option<Value>,
         update: Value,
-        oplog_mode: OplogMode,
-    ) -> Result<UpdateResult, WrongoDBError> {
-        self.update_many_with_op_time_in_transaction(session, namespace, filter, update, oplog_mode)
-            .map(|(result, _)| result)
-    }
-
-    pub(crate) fn update_many_with_op_time_in_transaction(
-        &self,
-        session: &mut Session,
-        namespace: &Namespace,
-        filter: Option<Value>,
-        update: Value,
-        oplog_mode: OplogMode,
-    ) -> Result<(UpdateResult, Option<OpTime>), WrongoDBError> {
+    ) -> Result<UpdateManyOutcome, WrongoDBError> {
         let definition = self.registered_collection_definition(session, namespace)?;
         let table_uri = definition.table_uri().to_string();
         let docs = self
             .document_query
             .find_in_transaction(session, namespace, filter)?;
         if docs.is_empty() {
-            return Ok((
-                UpdateResult {
+            return Ok(UpdateManyOutcome {
+                result: UpdateResult {
                     matched: 0,
                     modified: 0,
                 },
-                None,
-            ));
+                updated_documents: Vec::new(),
+            });
         }
 
         let mut modified = 0;
-        let mut latest_op_time = None;
+        let mut updated_documents = Vec::new();
         for doc in docs {
             let updated_doc = apply_update(&doc, &update)?;
             let id = doc
@@ -194,109 +163,115 @@ impl CollectionWritePath {
             let key = encode_id_value(id)?;
             let value = self.encode_row_for_table(&table_uri, &updated_doc)?;
             self.update_record(session, &table_uri, &key, &value)?;
-            latest_op_time = self.replication_observer.on_update(
-                session,
-                namespace,
-                &updated_doc,
-                oplog_mode,
-            )?;
             modified += 1;
+            updated_documents.push(updated_doc);
         }
 
-        Ok((
-            UpdateResult {
+        Ok(UpdateManyOutcome {
+            result: UpdateResult {
                 matched: modified,
                 modified,
             },
-            latest_op_time,
-        ))
+            updated_documents,
+        })
     }
 
-    /// Deletes the first matching document inside the caller's active transaction.
-    #[allow(dead_code)]
-    pub(crate) fn delete_one_in_transaction(
+    /// Deletes the first matching document using the caller's active transaction.
+    pub(crate) fn delete_one(
         &self,
         session: &mut Session,
         namespace: &Namespace,
         filter: Option<Value>,
-        oplog_mode: OplogMode,
-    ) -> Result<usize, WrongoDBError> {
-        self.delete_one_with_op_time_in_transaction(session, namespace, filter, oplog_mode)
-            .map(|(deleted, _)| deleted)
-    }
-
-    pub(crate) fn delete_one_with_op_time_in_transaction(
-        &self,
-        session: &mut Session,
-        namespace: &Namespace,
-        filter: Option<Value>,
-        oplog_mode: OplogMode,
-    ) -> Result<(usize, Option<OpTime>), WrongoDBError> {
+    ) -> Result<DeleteOutcome, WrongoDBError> {
         let definition = self.registered_collection_definition(session, namespace)?;
         let table_uri = definition.table_uri().to_string();
         let docs = self
             .document_query
             .find_in_transaction(session, namespace, filter)?;
         if docs.is_empty() {
-            return Ok((0, None));
+            return Ok(DeleteOutcome {
+                deleted: 0,
+                deleted_ids: Vec::new(),
+            });
         }
 
         let doc = &docs[0];
         let Some(id) = doc.get("_id") else {
-            return Ok((0, None));
+            return Ok(DeleteOutcome {
+                deleted: 0,
+                deleted_ids: Vec::new(),
+            });
         };
         let key = encode_id_value(id)?;
         self.delete_record(session, &table_uri, &key)?;
-        let op_time = self
-            .replication_observer
-            .on_delete(session, namespace, id, oplog_mode)?;
-        Ok((1, op_time))
+        Ok(DeleteOutcome {
+            deleted: 1,
+            deleted_ids: vec![id.clone()],
+        })
     }
 
-    /// Deletes every matching document inside the caller's active transaction.
-    #[allow(dead_code)]
-    pub(crate) fn delete_many_in_transaction(
+    /// Deletes every matching document using the caller's active transaction.
+    pub(crate) fn delete_many(
         &self,
         session: &mut Session,
         namespace: &Namespace,
         filter: Option<Value>,
-        oplog_mode: OplogMode,
-    ) -> Result<usize, WrongoDBError> {
-        self.delete_many_with_op_time_in_transaction(session, namespace, filter, oplog_mode)
-            .map(|(deleted, _)| deleted)
-    }
-
-    pub(crate) fn delete_many_with_op_time_in_transaction(
-        &self,
-        session: &mut Session,
-        namespace: &Namespace,
-        filter: Option<Value>,
-        oplog_mode: OplogMode,
-    ) -> Result<(usize, Option<OpTime>), WrongoDBError> {
+    ) -> Result<DeleteOutcome, WrongoDBError> {
         let definition = self.registered_collection_definition(session, namespace)?;
         let table_uri = definition.table_uri().to_string();
         let docs = self
             .document_query
             .find_in_transaction(session, namespace, filter)?;
         if docs.is_empty() {
-            return Ok((0, None));
+            return Ok(DeleteOutcome {
+                deleted: 0,
+                deleted_ids: Vec::new(),
+            });
         }
 
         let mut deleted = 0;
-        let mut latest_op_time = None;
+        let mut deleted_ids = Vec::new();
         for doc in docs {
             let Some(id) = doc.get("_id") else {
                 continue;
             };
             let key = encode_id_value(id)?;
             self.delete_record(session, &table_uri, &key)?;
-            latest_op_time = self
-                .replication_observer
-                .on_delete(session, namespace, id, oplog_mode)?;
             deleted += 1;
+            deleted_ids.push(id.clone());
         }
 
-        Ok((deleted, latest_op_time))
+        Ok(DeleteOutcome {
+            deleted,
+            deleted_ids,
+        })
+    }
+
+    /// Replaces one document by `_id` using the caller's active transaction.
+    pub(crate) fn replace_one(
+        &self,
+        session: &mut Session,
+        namespace: &Namespace,
+        document: &Document,
+    ) -> Result<(), WrongoDBError> {
+        let definition = self.registered_collection_definition(session, namespace)?;
+        let table_uri = definition.table_uri().to_string();
+        let key = encode_id_value(document_id(document)?)?;
+        let value = self.encode_row_for_table(&table_uri, document)?;
+        self.update_record(session, &table_uri, &key, &value)
+    }
+
+    /// Deletes one document by `_id` using the caller's active transaction.
+    pub(crate) fn delete_by_id(
+        &self,
+        session: &mut Session,
+        namespace: &Namespace,
+        id: &Value,
+    ) -> Result<(), WrongoDBError> {
+        let definition = self.registered_collection_definition(session, namespace)?;
+        let table_uri = definition.table_uri().to_string();
+        let key = encode_id_value(id)?;
+        self.delete_record(session, &table_uri, &key)
     }
 
     fn insert_record(
@@ -431,6 +406,12 @@ fn apply_update(doc: &Document, update: &Value) -> Result<Document, WrongoDBErro
     Ok(new_doc)
 }
 
+fn document_id(document: &Document) -> Result<&Value, WrongoDBError> {
+    document
+        .get("_id")
+        .ok_or_else(|| DocumentValidationError("missing _id".into()).into())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -445,7 +426,7 @@ mod tests {
     use crate::core::{DatabaseName, Namespace};
     use crate::document_query::DocumentQuery;
     use crate::replication::{
-        OplogMode, OplogStore, ReplicationConfig, ReplicationCoordinator, ReplicationObserver,
+        OplogStore, ReplicationConfig, ReplicationCoordinator, ReplicationObserver,
     };
     use crate::storage::api::{Connection, ConnectionConfig, Session};
     use crate::WrongoDBError;
@@ -483,13 +464,13 @@ mod tests {
             metadata_store.clone(),
             catalog.clone(),
             document_query.clone(),
-            ReplicationObserver::new(replication.clone(), oplog_store.clone()),
         );
         let ddl_path = DdlPath::new(
             connection.clone(),
             metadata_store,
             catalog.clone(),
-            replication,
+            replication.clone(),
+            ReplicationObserver::new(replication, oplog_store.clone()),
         );
 
         TestServices {
@@ -528,14 +509,7 @@ mod tests {
         collection: &str,
         doc: serde_json::Value,
     ) -> Result<crate::Document, WrongoDBError> {
-        session.with_transaction(|session| {
-            service.insert_one_in_transaction(
-                session,
-                &namespace(collection),
-                doc,
-                OplogMode::GenerateOplog,
-            )
-        })
+        session.with_transaction(|session| service.insert_one(session, &namespace(collection), doc))
     }
 
     fn update_one(
@@ -546,13 +520,9 @@ mod tests {
         update: serde_json::Value,
     ) -> Result<super::UpdateResult, WrongoDBError> {
         session.with_transaction(|session| {
-            service.update_one_in_transaction(
-                session,
-                &namespace(collection),
-                filter,
-                update,
-                OplogMode::GenerateOplog,
-            )
+            service
+                .update_one(session, &namespace(collection), filter, update)
+                .map(|outcome| outcome.result)
         })
     }
 
@@ -563,12 +533,9 @@ mod tests {
         filter: Option<serde_json::Value>,
     ) -> Result<usize, WrongoDBError> {
         session.with_transaction(|session| {
-            service.delete_one_in_transaction(
-                session,
-                &namespace(collection),
-                filter,
-                OplogMode::GenerateOplog,
-            )
+            service
+                .delete_one(session, &namespace(collection), filter)
+                .map(|outcome| outcome.deleted)
         })
     }
 
@@ -766,11 +733,10 @@ mod tests {
 
         let err = session
             .with_transaction(|session| {
-                let _ = services.write_path.insert_one_in_transaction(
+                let _ = services.write_path.insert_one(
                     session,
                     &namespace("items"),
                     json!({"_id": "abort-me", "value": "v1"}),
-                    OplogMode::GenerateOplog,
                 )?;
                 Err::<(), WrongoDBError>(WrongoDBError::Storage(crate::StorageError(
                     "force abort".into(),
@@ -787,21 +753,25 @@ mod tests {
             )
             .unwrap()
             .is_empty());
-        assert!(services
-            .oplog_store
-            .list_entries(&mut session)
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            services
+                .oplog_store
+                .list_entries(&mut session)
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(services
             .catalog
             .lookup_collection(&namespace("items"))
             .is_some());
     }
 
-    // EARS: When a collection mutation is applied in suppress-oplog mode, the
-    // write path shall update user data without appending oplog entries.
+    // EARS: When a collection mutation goes through the collection write path,
+    // the write path shall mutate user data without appending oplog entries on
+    // its own.
     #[test]
-    fn suppress_oplog_mode_mutates_data_without_appending_entries() {
+    fn collection_write_path_mutates_data_without_appending_oplog_entries() {
         let tmp = tempdir().unwrap();
         let services = test_services(tmp.path().to_path_buf(), disabled_config());
         let mut session = services.connection.open_session();
@@ -809,11 +779,10 @@ mod tests {
 
         session
             .with_transaction(|session| {
-                services.write_path.insert_one_in_transaction(
+                let _ = services.write_path.insert_one(
                     session,
                     &namespace("items"),
                     json!({"_id": "no-oplog", "value": "v1"}),
-                    OplogMode::SuppressOplog,
                 )?;
                 Ok::<(), WrongoDBError>(())
             })
@@ -829,10 +798,13 @@ mod tests {
             .unwrap();
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].get("value"), Some(&json!("v1")));
-        assert!(services
-            .oplog_store
-            .list_entries(&mut session)
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            services
+                .oplog_store
+                .list_entries(&mut session)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

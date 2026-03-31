@@ -579,7 +579,7 @@ async fn test_tailable_oplog_cursor_waits_for_new_write() {
     let find_response = local_db
         .run_command(doc! {
             "find": "oplog.rs",
-            "filter": { "_id": { "$gt": 1_i64 } },
+            "filter": { "_id": { "$gt": 2_i64 } },
             "batchSize": 1,
             "tailable": true,
             "awaitData": true,
@@ -618,7 +618,7 @@ async fn test_tailable_oplog_cursor_waits_for_new_write() {
     assert_eq!(next_batch.len(), 1);
     assert!(cursor.get_i64("id").unwrap() > 0);
     let oplog_entry = next_batch[0].as_document().unwrap();
-    assert_eq!(oplog_entry.get_i64("_id").unwrap(), 2);
+    assert_eq!(oplog_entry.get_i64("_id").unwrap(), 3);
     assert_eq!(oplog_entry.get_str("op").unwrap(), "i");
     assert_eq!(oplog_entry.get_str("ns").unwrap(), "test.users");
 }

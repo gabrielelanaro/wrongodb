@@ -6,7 +6,8 @@ use crate::collection_write_path::CollectionWritePath;
 use crate::core::{DatabaseName, Namespace};
 use crate::document_query::DocumentQuery;
 use crate::replication::{
-    bootstrap_oplog, OplogAwaitService, ReplicationCoordinator, ReplicationObserver,
+    bootstrap_oplog, bootstrap_replication_state, OplogApplier, OplogAwaitService,
+    ReplicationCoordinator, ReplicationObserver, ReplicationRole, SecondaryReplicator,
 };
 use crate::write_ops::WriteOps;
 use crate::{Connection, WrongoDBError};
@@ -24,61 +25,97 @@ pub(crate) struct DatabaseContext {
     ddl_path: DdlPath,
     write_ops: WriteOps,
     oplog_await_service: OplogAwaitService,
+}
+
+/// Build the server-facing database context and any secondary-only runtime.
+///
+/// The context is intentionally narrow: it only exposes the operations that the
+/// wire-protocol layer needs. The secondary replication runtime is assembled
+/// here from explicit dependencies and returned separately so it does not have
+/// to reach back through [`DatabaseContext`] as a service locator.
+pub(crate) fn build_database_context(
+    connection: Arc<Connection>,
     replication: ReplicationCoordinator,
+) -> Result<(DatabaseContext, Option<SecondaryReplicator>), WrongoDBError> {
+    let metadata_store = connection.metadata_store();
+    let catalog = Arc::new(CollectionCatalog::new(CatalogStore::new()));
+    let mut session = connection.open_session();
+    catalog.ensure_store_exists(&mut session)?;
+    drop(session);
+
+    let oplog_store = bootstrap_oplog(connection.as_ref(), catalog.as_ref(), &replication)?;
+    let replication_state_store =
+        bootstrap_replication_state(connection.as_ref(), catalog.as_ref())?;
+    let latest_oplog_index = {
+        let mut session = connection.open_session();
+        oplog_store.load_latest_index(&mut session)?
+    };
+    let oplog_await_service = OplogAwaitService::new(latest_oplog_index);
+
+    let session = connection.open_session();
+    catalog.load_cache(&session)?;
+
+    let document_query = DocumentQuery::new(catalog.clone());
+    let replication_observer = ReplicationObserver::new(replication.clone(), oplog_store.clone());
+    let collection_write_path = CollectionWritePath::new(
+        metadata_store.clone(),
+        catalog.clone(),
+        document_query.clone(),
+    );
+    let ddl_path = DdlPath::new(
+        connection.clone(),
+        metadata_store,
+        catalog.clone(),
+        replication.clone(),
+        replication_observer.clone(),
+    );
+    let write_ops = WriteOps::new(
+        connection.clone(),
+        collection_write_path.clone(),
+        replication_observer.clone(),
+        replication.clone(),
+        oplog_await_service.clone(),
+    );
+    let secondary_replicator = if replication.role() == ReplicationRole::Secondary {
+        let applier = OplogApplier::new(
+            connection.clone(),
+            collection_write_path,
+            document_query.clone(),
+            ddl_path.clone(),
+            replication_state_store.clone(),
+        );
+        Some(SecondaryReplicator::new(
+            connection.clone(),
+            oplog_store,
+            replication_state_store,
+            applier,
+            replication.clone(),
+        ))
+    } else {
+        None
+    };
+
+    let db = DatabaseContext {
+        connection,
+        catalog,
+        document_query,
+        ddl_path,
+        write_ops,
+        oplog_await_service,
+    };
+
+    Ok((db, secondary_replicator))
 }
 
 impl DatabaseContext {
     /// Builds the server-side services layered above one storage connection.
+    #[cfg(test)]
     pub(crate) fn new(
         connection: Arc<Connection>,
         replication: ReplicationCoordinator,
     ) -> Result<Self, WrongoDBError> {
-        let metadata_store = connection.metadata_store();
-        let catalog = Arc::new(CollectionCatalog::new(CatalogStore::new()));
-        let mut session = connection.open_session();
-        catalog.ensure_store_exists(&mut session)?;
-        drop(session);
-
-        let oplog_store = bootstrap_oplog(connection.as_ref(), catalog.as_ref(), &replication)?;
-        let latest_oplog_index = {
-            let mut session = connection.open_session();
-            oplog_store.load_latest_index(&mut session)?
-        };
-        let oplog_await_service = OplogAwaitService::new(latest_oplog_index);
-
-        let session = connection.open_session();
-        catalog.load_cache(&session)?;
-
-        let document_query = DocumentQuery::new(catalog.clone());
-        let replication_observer = ReplicationObserver::new(replication.clone(), oplog_store);
-        let collection_write_path = CollectionWritePath::new(
-            metadata_store.clone(),
-            catalog.clone(),
-            document_query.clone(),
-            replication_observer,
-        );
-        let ddl_path = DdlPath::new(
-            connection.clone(),
-            metadata_store,
-            catalog.clone(),
-            replication.clone(),
-        );
-        let write_ops = WriteOps::new(
-            connection.clone(),
-            collection_write_path.clone(),
-            replication.clone(),
-            oplog_await_service.clone(),
-        );
-
-        Ok(Self {
-            connection,
-            catalog,
-            document_query,
-            ddl_path,
-            write_ops,
-            oplog_await_service,
-            replication,
-        })
+        let (db, _) = build_database_context(connection, replication)?;
+        Ok(db)
     }
 
     pub(crate) fn connection(&self) -> &Connection {
@@ -95,10 +132,6 @@ impl DatabaseContext {
 
     pub(crate) fn write_ops(&self) -> &WriteOps {
         &self.write_ops
-    }
-
-    pub(crate) fn hello_state(&self) -> (bool, Option<String>) {
-        self.replication.hello_state()
     }
 
     pub(crate) fn oplog_await_service(&self) -> OplogAwaitService {
@@ -201,9 +234,10 @@ mod tests {
         let mut session = reopened.open_session();
         let entries = oplog_store.list_entries(&mut session).unwrap();
 
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].op_time.index, 1);
         assert_eq!(entries[1].op_time.index, 2);
+        assert_eq!(entries[2].op_time.index, 3);
     }
 
     // EARS: When two databases define collections with the same collection

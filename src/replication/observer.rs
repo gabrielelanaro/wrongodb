@@ -81,6 +81,46 @@ impl ReplicationObserver {
         )
     }
 
+    /// Append a create-collection oplog row.
+    pub(crate) fn on_create_collection(
+        &self,
+        session: &mut Session,
+        namespace: &Namespace,
+        storage_columns: Vec<String>,
+        collection_uuid: String,
+        oplog_mode: OplogMode,
+    ) -> Result<Option<OpTime>, WrongoDBError> {
+        self.append_entry_for_write(
+            session,
+            oplog_mode,
+            OplogOperation::CreateCollection {
+                ns: namespace.full_name(),
+                storage_columns,
+                collection_uuid,
+            },
+        )
+    }
+
+    /// Append a create-index oplog row.
+    pub(crate) fn on_create_index(
+        &self,
+        session: &mut Session,
+        namespace: &Namespace,
+        name: String,
+        indexed_field: String,
+        oplog_mode: OplogMode,
+    ) -> Result<Option<OpTime>, WrongoDBError> {
+        self.append_entry_for_write(
+            session,
+            oplog_mode,
+            OplogOperation::CreateIndex {
+                ns: namespace.full_name(),
+                name,
+                indexed_field,
+            },
+        )
+    }
+
     fn append_entry_for_write(
         &self,
         session: &mut Session,

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bson::{Bson, Document as BsonDocument};
 use serde_json::{Number, Value};
 
 use crate::core::bson::encode_id_value;
@@ -16,7 +17,9 @@ const OPLOG_COLUMNS: [&str; 5] = ["term", "op", "ns", "o", "o2"];
 /// Replication position assigned to one oplog entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OpTime {
+    /// Replication term that assigned this oplog position.
     pub(crate) term: u64,
+    /// Monotonic oplog index within one term.
     pub(crate) index: u64,
 }
 
@@ -43,12 +46,24 @@ pub(crate) enum OplogOperation {
         ns: String,
         document_key: Document,
     },
+    CreateCollection {
+        ns: String,
+        storage_columns: Vec<String>,
+        collection_uuid: String,
+    },
+    CreateIndex {
+        ns: String,
+        name: String,
+        indexed_field: String,
+    },
 }
 
 /// One oplog row with its assigned replication position.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OplogEntry {
+    /// Durable oplog position assigned by the primary.
     pub(crate) op_time: OpTime,
+    /// Logical operation the follower must replay.
     pub(crate) operation: OplogOperation,
 }
 
@@ -117,20 +132,43 @@ impl OplogStore {
         cursor.insert(&key, &value)
     }
 
+    /// Read oplog entries after `after_index` in oplog order.
+    pub(crate) fn list_after(
+        &self,
+        session: &mut Session,
+        after_index: u64,
+        limit: usize,
+    ) -> Result<Vec<OplogEntry>, WrongoDBError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut cursor = session.open_table_cursor(&self.table_uri)?;
+        cursor.set_range(
+            Some(encode_id_value(&Value::Number(Number::from(
+                after_index.saturating_add(1),
+            )))?),
+            None,
+        );
+
+        let oplog_metadata = self.oplog_metadata()?;
+        let mut entries = Vec::new();
+        while entries.len() < limit {
+            let Some((key, value)) = cursor.next()? else {
+                break;
+            };
+            entries.push(decode_oplog_entry(&oplog_metadata, &key, &value)?);
+        }
+
+        Ok(entries)
+    }
+
     #[cfg(test)]
     pub(crate) fn list_entries(
         &self,
         session: &mut Session,
     ) -> Result<Vec<OplogEntry>, WrongoDBError> {
-        let mut cursor = session.open_table_cursor(&self.table_uri)?;
-        let oplog_metadata = self.oplog_metadata()?;
-        let mut entries = Vec::new();
-
-        while let Some((key, value)) = cursor.next()? {
-            entries.push(decode_oplog_entry(&oplog_metadata, &key, &value)?);
-        }
-
-        Ok(entries)
+        self.list_after(session, 0, usize::MAX)
     }
 
     fn encode_row(&self, entry: &OplogEntry) -> Result<Vec<u8>, WrongoDBError> {
@@ -161,16 +199,27 @@ pub(crate) fn oplog_namespace() -> Namespace {
     .expect("local.oplog.rs is a valid namespace")
 }
 
-/// Return whether a namespace is reserved for replication-owned oplog state.
-pub(crate) fn is_reserved_namespace(namespace: &Namespace) -> bool {
-    namespace.db_name().is_local() && namespace.collection_name() == OPLOG_COLLECTION
-}
-
 pub(in crate::replication) fn oplog_storage_columns() -> Vec<String> {
     OPLOG_COLUMNS
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>()
+}
+
+/// Decode one oplog entry from a BSON command result document.
+pub(crate) fn oplog_entry_from_bson_document(
+    document: &BsonDocument,
+) -> Result<OplogEntry, WrongoDBError> {
+    let index = required_u64_bson_field(document, "_id")?;
+    let term = required_u64_bson_field(document, "term")?;
+    let op = required_string_bson_field(document, "op")?;
+    let ns = required_string_bson_field(document, "ns")?;
+
+    let operation = decode_operation_from_raw_fields(document, &op, ns)?;
+    Ok(OplogEntry {
+        op_time: OpTime { term, index },
+        operation,
+    })
 }
 
 fn oplog_row_from_entry(entry: &OplogEntry) -> Result<Document, WrongoDBError> {
@@ -190,8 +239,6 @@ fn oplog_row_from_entry(entry: &OplogEntry) -> Result<Document, WrongoDBError> {
             row.insert("ns".to_string(), Value::String(ns.clone()));
             row.insert(
                 "o".to_string(),
-                // `wt_row_v1` currently stores only scalar cells, so logical
-                // document payloads are encoded as JSON strings.
                 Value::String(serde_json::to_string(document)?),
             );
         }
@@ -219,6 +266,36 @@ fn oplog_row_from_entry(entry: &OplogEntry) -> Result<Document, WrongoDBError> {
                 Value::String(serde_json::to_string(document_key)?),
             );
         }
+        OplogOperation::CreateCollection {
+            ns,
+            storage_columns,
+            collection_uuid,
+        } => {
+            row.insert("op".to_string(), Value::String("c".to_string()));
+            row.insert("ns".to_string(), Value::String(ns.clone()));
+            row.insert(
+                "o".to_string(),
+                Value::String(serde_json::to_string(&serde_json::json!({
+                    "storageColumns": storage_columns,
+                    "collectionUuid": collection_uuid,
+                }))?),
+            );
+        }
+        OplogOperation::CreateIndex {
+            ns,
+            name,
+            indexed_field,
+        } => {
+            row.insert("op".to_string(), Value::String("ci".to_string()));
+            row.insert("ns".to_string(), Value::String(ns.clone()));
+            row.insert(
+                "o".to_string(),
+                Value::String(serde_json::to_string(&serde_json::json!({
+                    "name": name,
+                    "indexedField": indexed_field,
+                }))?),
+            );
+        }
     }
 
     Ok(row)
@@ -241,28 +318,76 @@ fn decode_oplog_entry(
     let term = required_u64_field(&row, "term")?;
     let op = required_string_field(&row, "op")?;
     let ns = required_string_field(&row, "ns")?;
-
-    let operation = match op.as_str() {
-        "i" => OplogOperation::Insert {
-            ns,
-            document: required_json_document_field(&row, "o")?,
-        },
-        "u" => OplogOperation::Update {
-            ns,
-            document: required_json_document_field(&row, "o")?,
-            document_key: required_json_document_field(&row, "o2")?,
-        },
-        "d" => OplogOperation::Delete {
-            ns,
-            document_key: required_json_document_field(&row, "o")?,
-        },
-        _ => return Err(StorageError(format!("unknown oplog op type: {op}")).into()),
-    };
+    let operation = decode_operation_from_raw_fields(&row, &op, ns)?;
 
     Ok(OplogEntry {
         op_time: OpTime { term, index },
         operation,
     })
+}
+
+fn decode_operation_from_raw_fields<T>(
+    row: &T,
+    op: &str,
+    ns: String,
+) -> Result<OplogOperation, WrongoDBError>
+where
+    T: RawOplogFields,
+{
+    match op {
+        "i" => Ok(OplogOperation::Insert {
+            ns,
+            document: row.required_json_document_field("o")?,
+        }),
+        "u" => Ok(OplogOperation::Update {
+            ns,
+            document: row.required_json_document_field("o")?,
+            document_key: row.required_json_document_field("o2")?,
+        }),
+        "d" => Ok(OplogOperation::Delete {
+            ns,
+            document_key: row.required_json_document_field("o")?,
+        }),
+        "c" => {
+            let command = row.required_json_document_field("o")?;
+            Ok(OplogOperation::CreateCollection {
+                ns,
+                storage_columns: required_string_array_field(&command, "storageColumns")?,
+                collection_uuid: required_string_field(&command, "collectionUuid")?,
+            })
+        }
+        "ci" => {
+            let command = row.required_json_document_field("o")?;
+            Ok(OplogOperation::CreateIndex {
+                ns,
+                name: required_string_field(&command, "name")?,
+                indexed_field: required_string_field(&command, "indexedField")?,
+            })
+        }
+        _ => Err(StorageError(format!("unknown oplog op type: {op}")).into()),
+    }
+}
+
+trait RawOplogFields {
+    fn required_json_document_field(&self, field: &str) -> Result<Document, WrongoDBError>;
+}
+
+impl RawOplogFields for Document {
+    fn required_json_document_field(&self, field: &str) -> Result<Document, WrongoDBError> {
+        required_json_document_field(self, field)
+    }
+}
+
+impl RawOplogFields for BsonDocument {
+    fn required_json_document_field(&self, field: &str) -> Result<Document, WrongoDBError> {
+        let raw = required_string_bson_field(self, field)?;
+        let value: Value = serde_json::from_str(&raw)?;
+        let object = value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| StorageError(format!("oplog field {field} is not a JSON document")))?;
+        Ok(object)
+    }
 }
 
 fn required_u64_field(doc: &Document, field: &str) -> Result<u64, WrongoDBError> {
@@ -278,6 +403,23 @@ fn required_string_field(doc: &Document, field: &str) -> Result<String, WrongoDB
         .ok_or_else(|| StorageError(format!("oplog row is missing string field {field}")).into())
 }
 
+fn required_string_array_field(doc: &Document, field: &str) -> Result<Vec<String>, WrongoDBError> {
+    let values = doc
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| StorageError(format!("oplog row is missing array field {field}")))?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| StorageError(format!("oplog field {field} contains non-string")))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
 fn required_json_document_field(doc: &Document, field: &str) -> Result<Document, WrongoDBError> {
     let raw = required_string_field(doc, field)?;
     let value: Value = serde_json::from_str(&raw)?;
@@ -288,12 +430,26 @@ fn required_json_document_field(doc: &Document, field: &str) -> Result<Document,
     Ok(object)
 }
 
+fn required_u64_bson_field(doc: &BsonDocument, field: &str) -> Result<u64, WrongoDBError> {
+    match doc.get(field) {
+        Some(Bson::Int32(value)) if *value >= 0 => Ok(*value as u64),
+        Some(Bson::Int64(value)) if *value >= 0 => Ok(*value as u64),
+        _ => Err(StorageError(format!("oplog row is missing numeric field {field}")).into()),
+    }
+}
+
+fn required_string_bson_field(doc: &BsonDocument, field: &str) -> Result<String, WrongoDBError> {
+    doc.get_str(field)
+        .map(str::to_string)
+        .map_err(|_| StorageError(format!("oplog row is missing string field {field}")).into())
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{OpTime, OplogEntry, OplogOperation, OplogStore};
+    use super::{oplog_entry_from_bson_document, OpTime, OplogEntry, OplogOperation, OplogStore};
     use crate::core::{DatabaseName, Namespace};
     use crate::storage::api::{Connection, ConnectionConfig};
 
@@ -344,5 +500,37 @@ mod tests {
             oplog_store.load_last_op_time(&mut session).unwrap(),
             Some(OpTime { term: 3, index: 42 })
         );
+    }
+
+    // EARS: When a secondary parses oplog rows returned over the wire, it shall
+    // decode both CRUD and DDL operations into the logical oplog shape.
+    #[test]
+    fn bson_oplog_documents_decode_into_logical_entries() {
+        let update = bson::doc! {
+            "_id": 7_i64,
+            "term": 1_i64,
+            "op": "u",
+            "ns": "test.users",
+            "o": "{\"_id\":7,\"name\":\"alice\"}",
+            "o2": "{\"_id\":7}",
+        };
+        let create_collection = bson::doc! {
+            "_id": 8_i64,
+            "term": 1_i64,
+            "op": "c",
+            "ns": "test.users",
+            "o": "{\"storageColumns\":[\"name\"],\"collectionUuid\":\"uuid-1\"}",
+        };
+
+        assert!(matches!(
+            oplog_entry_from_bson_document(&update).unwrap().operation,
+            OplogOperation::Update { .. }
+        ));
+        assert!(matches!(
+            oplog_entry_from_bson_document(&create_collection)
+                .unwrap()
+                .operation,
+            OplogOperation::CreateCollection { .. }
+        ));
     }
 }

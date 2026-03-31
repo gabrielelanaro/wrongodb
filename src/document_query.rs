@@ -810,7 +810,7 @@ mod tests {
     use crate::collection_write_path::CollectionWritePath;
     use crate::core::DatabaseName;
     use crate::replication::{
-        OplogMode, OplogStore, ReplicationConfig, ReplicationCoordinator, ReplicationObserver,
+        OplogStore, ReplicationConfig, ReplicationCoordinator, ReplicationObserver,
     };
     use crate::storage::api::{Connection, ConnectionConfig};
 
@@ -847,13 +847,15 @@ mod tests {
                 catalog.load_cache(&session).unwrap();
             }
             let query = DocumentQuery::new(catalog.clone());
-            let write_path = CollectionWritePath::new(
-                metadata_store.clone(),
-                catalog.clone(),
-                query.clone(),
-                ReplicationObserver::new(replication.clone(), oplog_store),
+            let write_path =
+                CollectionWritePath::new(metadata_store.clone(), catalog.clone(), query.clone());
+            let ddl_path = DdlPath::new(
+                connection.clone(),
+                metadata_store,
+                catalog,
+                replication.clone(),
+                ReplicationObserver::new(replication, oplog_store),
             );
-            let ddl_path = DdlPath::new(connection.clone(), metadata_store, catalog, replication);
 
             Self {
                 _dir: dir,
@@ -890,11 +892,10 @@ mod tests {
             .unwrap();
         session
             .with_transaction(|session| {
-                fixture.write_path.insert_one_in_transaction(
+                let _ = fixture.write_path.insert_one(
                     session,
                     &namespace("test"),
                     json!({"_id": 1, "name": "alice"}),
-                    OplogMode::GenerateOplog,
                 )?;
                 Ok(())
             })
@@ -927,17 +928,15 @@ mod tests {
         let mut session = fixture.connection.open_session();
         session
             .with_transaction(|session| {
-                fixture.write_path.insert_one_in_transaction(
+                let _ = fixture.write_path.insert_one(
                     session,
                     &namespace("users"),
                     json!({"_id": 1, "name": "alice"}),
-                    OplogMode::GenerateOplog,
                 )?;
-                fixture.write_path.insert_one_in_transaction(
+                let _ = fixture.write_path.insert_one(
                     session,
                     &namespace("users"),
                     json!({"_id": 2, "name": "bob"}),
-                    OplogMode::GenerateOplog,
                 )?;
                 Ok(())
             })
@@ -969,17 +968,15 @@ mod tests {
         let mut session = fixture.connection.open_session();
         session
             .with_transaction(|session| {
-                fixture.write_path.insert_one_in_transaction(
+                let _ = fixture.write_path.insert_one(
                     session,
                     &namespace("users"),
                     json!({"_id": 1, "name": "alice"}),
-                    OplogMode::GenerateOplog,
                 )?;
-                fixture.write_path.insert_one_in_transaction(
+                let _ = fixture.write_path.insert_one(
                     session,
                     &namespace("users"),
                     json!({"_id": 2, "name": "bob"}),
-                    OplogMode::GenerateOplog,
                 )?;
                 Ok(())
             })
@@ -1012,17 +1009,15 @@ mod tests {
         let mut session = fixture.connection.open_session();
         session
             .with_transaction(|session| {
-                fixture.write_path.insert_one_in_transaction(
+                let _ = fixture.write_path.insert_one(
                     session,
                     &namespace("users"),
                     json!({"_id": 1, "name": "alice"}),
-                    OplogMode::GenerateOplog,
                 )?;
-                fixture.write_path.insert_one_in_transaction(
+                let _ = fixture.write_path.insert_one(
                     session,
                     &namespace("users"),
                     json!({"_id": 2, "name": "bob"}),
-                    OplogMode::GenerateOplog,
                 )?;
                 Ok(())
             })
