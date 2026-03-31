@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::core::DatabaseName;
-use crate::replication::OplogAwaitService;
+use crate::replication::{OplogAwaitService, ReplicationCoordinator};
 
 use super::CursorManager;
 
@@ -11,6 +11,7 @@ pub(crate) struct CommandContext {
     db_name: DatabaseName,
     cursor_manager: Arc<CursorManager>,
     oplog_await_service: OplogAwaitService,
+    replication: ReplicationCoordinator,
 }
 
 impl CommandContext {
@@ -19,11 +20,13 @@ impl CommandContext {
         db_name: DatabaseName,
         cursor_manager: Arc<CursorManager>,
         oplog_await_service: OplogAwaitService,
+        replication: ReplicationCoordinator,
     ) -> Self {
         Self {
             db_name,
             cursor_manager,
             oplog_await_service,
+            replication,
         }
     }
 
@@ -40,5 +43,10 @@ impl CommandContext {
     /// Return the oplog await service used by tailable cursors.
     pub(crate) fn oplog_await_service(&self) -> &OplogAwaitService {
         &self.oplog_await_service
+    }
+
+    /// Return the replication coordinator for replication-aware commands.
+    pub(crate) fn replication(&self) -> &ReplicationCoordinator {
+        &self.replication
     }
 }

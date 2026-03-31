@@ -66,6 +66,7 @@ impl CommandRegistry {
         self.register(Box::new(handlers::CountCommand));
         self.register(Box::new(handlers::DistinctCommand));
         self.register(Box::new(handlers::AggregateCommand));
+        self.register(Box::new(handlers::ReplSetUpdatePositionCommand));
     }
 }
 

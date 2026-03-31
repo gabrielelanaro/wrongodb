@@ -16,11 +16,11 @@ impl Command for HelloCommand {
 
     async fn execute(
         &self,
-        _ctx: &CommandContext,
+        ctx: &CommandContext,
         _doc: &Document,
-        db: &DatabaseContext,
+        _db: &DatabaseContext,
     ) -> Result<Document, WrongoDBError> {
-        let (is_writable_primary, leader_hint) = db.hello_state();
+        let (is_writable_primary, leader_hint) = ctx.replication().hello_state();
         let mut response = doc! {
             "ok": Bson::Double(1.0),
             "isMaster": Bson::Boolean(is_writable_primary),
