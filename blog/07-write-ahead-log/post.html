@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The Gap Between Checkpoints - Write ahead log</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.6; color: #111; max-width: 760px; margin: 40px auto; padding: 0 20px; }
+    article { width: 100%; }
+    img { max-width: 100%; height: auto; display: block; margin: 24px auto; }
+    pre { background: #f6f8fa; padding: 16px; overflow-x: auto; border-radius: 8px; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    h1, h2, h3 { line-height: 1.25; }
+    ul, ol { padding-left: 24px; }
+  </style>
+</head>
+<body>
+<article>
+<h1>The Gap Between Checkpoints - Write ahead log</h1>
+<h2>What problem does a WAL solve?</h2>
+<p>It took me a while to write this post because I kept getting the WAL design wrong.</p>
+<p>Let me start with a small recap.</p>
+<p>WrongoDB stores data in a B+tree. A B+Tree is stored on disk in pages, and whenever we do a modification to the tree, the relevant page is coped in memory and put into a cache so that writes are fast. This is called "copy-on-write".</p>
+<p><strong>When a page changes, do not overwrite the old saved page. Write the new data somewhere else, then later switch the tree to point to the new page.</strong></p>
+<p>But when do things get written to disk then? These pages are periodically flushed to disk, along with some metadata. This process is called "checkpoint".</p>
+<p>You now understand that since we got stuff going into memory first, if we crash between checkpoints, poof, we are doomed, we lose the data.</p>
+<p>That is exactly the problem the WAL solves. So here is the one-sentence definition for this post:</p>
+<p><strong>A write-ahead log is a file where the database stores a write before that write has been fully copied into the main data files.</strong></p>
+<p>And for this post, we have professor shiba inu to tell us how it works.</p>
+<p><img alt="Cartoon: without WAL the write disappears, with WAL it survives the crash" src="images/01-wal-cartoon-matched-style.png" /></p>
+<h2>Enter the WAL</h2>
+<p>How does the WAL work then? Before the database says "this write is safe", it first appends an entry to file called <code>global.wal</code> and syncs that log file immediately.</p>
+<p>So now the write path looks like this:</p>
+<ol>
+<li>accept a write</li>
+<li>update the new in-memory version</li>
+<li>append the write to the WAL</li>
+<li>sync the WAL</li>
+<li>later, during a checkpoint, copy those changes into the main data files</li>
+</ol>
+<p>The main data files may still be old, but the write is at least safely stored in the WAL. On restart, the database can read the WAL entry and apply that write again.</p>
+<p>That is why it is called "write-ahead" logging. The log is written <strong>ahead of</strong> the main data files catching up.</p>
+<p>One more term before we continue: <code>LSN</code> means "log sequence number". It is just the position of an entry in the WAL.</p>
+<p>To keep this post simple, think of the WAL as storing entries like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">WalEntryHeader</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">lsn</span><span class="p">:</span><span class="w"> </span><span class="kt">u64</span><span class="p">,</span>
+<span class="w">    </span><span class="n">prev_lsn</span><span class="p">:</span><span class="w"> </span><span class="kt">u64</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="k">pub</span><span class="w"> </span><span class="k">enum</span><span class="w"> </span><span class="nc">LogOp</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">Put</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">key</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">u8</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">value</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">u8</span><span class="o">&gt;</span><span class="w"> </span><span class="p">},</span>
+<span class="w">    </span><span class="n">Delete</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">key</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">u8</span><span class="o">&gt;</span><span class="w"> </span><span class="p">},</span>
+<span class="p">}</span>
+
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">WalEntry</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">header</span><span class="p">:</span><span class="w"> </span><span class="nc">WalEntryHeader</span><span class="p">,</span>
+<span class="w">    </span><span class="n">ops</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">LogOp</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<ul>
+<li>one <code>LogOp</code> is one change</li>
+<li>one WAL entry can contain one or more <code>LogOp</code>s (think of indexes, or stuff that need to be updated together as a unit, this is why we store multiple in one entry)</li>
+<li>each WAL entry also has a small header with a "log sequence number" or <code>lsn</code>, so we can identify each entry in order</li>
+</ul>
+<h2>The recovery procedure</h2>
+<p>Recovery is the process of reading the WAL and applying the changes to the main data files, seems simple at first, but I had spend a ton of time de-slopping this code.</p>
+<p>The first question is, ok I got these changes in the wal. Where do I start my replay?</p>
+<p>We need somehow to mark a point in the WAL that says:</p>
+<p>"Everything before this point is already reflected in the main data files."</p>
+<p>The clean way to do this is:</p>
+<ul>
+<li>each WAL entry stores its log sequence number (<code>lsn</code>), which tells us its position in the WAL</li>
+<li>when we finish a checkpoint, we record that <code>lsn</code> in the checkpoint metadata</li>
+</ul>
+<p>So the checkpoint tells us, "the main data files are good up to this WAL position."</p>
+<p>After that, recovery is just: start from the last checkpoint LSN, then walk forward through the WAL entry headers until the end.</p>
+<p>After a crash, WrongoDB does this:</p>
+<p><img alt="Recovery flow from the last checkpoint to stable pages" src="images/02-recovery-cartoon.png" /></p>
+<ol>
+<li>open the database</li>
+<li>check whether <code>global.wal</code> exists</li>
+<li>open the WAL starting from the LSN stored by the last checkpoint</li>
+<li>scan forward until the end.</li>
+<li>read the list of <code>LogOp</code>s from each WAL entry</li>
+<li>apply those <code>LogOp</code>s through the normal B+tree write path</li>
+<li>run a checkpoint so the main data files catch up again</li>
+</ol>
+<p>An important detail:</p>
+<p>recovery reuses the normal write path instead of inventing a separate recovery-only page format.</p>
+<p>But there is one important catch: recovery must not write to the WAL again while it is applying the WAL.</p>
+<p>In other words, "same same but different", and this is exactly the sort of rule that can wreck the code as the agent will start to leak abstractions left and right to implement this.</p>
+<h2>Wall of wrong</h2>
+<p>Here's a list of all the things I did wrong while building this.</p>
+<h3>Mistake 1: one WAL per tree</h3>
+<p>You use plan mode, agent asks for a question on how to extend from single tree to multiple trees: maybe each B+tree should have its own log file.</p>
+<p>That sounds neat until one user write touches more than one tree. Metadata can change. Secondary indexes can change. One write can affect multiple places.</p>
+<p>Now restart has to answer ugly questions:</p>
+<ul>
+<li>which log do I read first?</li>
+<li>how do I know the writes from different logs belong to the same WAL entry?</li>
+<li>what is the single correct recovery order?</li>
+</ul>
+<p>That is why WrongoDB moved to one <code>global.wal</code> for the whole connection.</p>
+<p>One log is easier to reason about than several almost-synchronized logs.</p>
+<h3>Mistake 2: What exactly to log in the WAL.</h3>
+<p>I tried:</p>
+<ul>
+<li>logging page bytes directly: bad idea, how do you deal with split and multi-page changes?</li>
+<li>logging individual <code>LogOp</code> like put and deletes: also bad idea as now you have the issue of atomicity, this was extremely important to get transaction work and I went on a massive rabbit hole to be able to grasp it.</li>
+</ul>
+<p>Logging a list of <code>LogOp</code>s is much cleaner. That is also much closer to how WiredTiger approaches the problem.</p>
+<h3>Mistake 3: treating WAL as an isolated feature</h3>
+<p>This was the biggest one.</p>
+<p>I kept thinking, "I just need a log file."</p>
+<p>That is not really the problem.</p>
+<p>The real questions are:</p>
+<ul>
+<li>when is it safe to say a write is durable?</li>
+<li>what exactly gets written into the log?</li>
+<li>how does restart know what to replay, and in what order?</li>
+<li>how do metadata changes fit into the same model?</li>
+</ul>
+<p>Once I started looking at WAL a bit more holistically things finally clicked. How wiredtiger treats transaction (for a future post), was also super important to nail the WAL.</p>
+<h2>What’s next</h2>
+<ul>
+<li>MVCC and transactions!</li>
+</ul>
+</article>
+</body>
+</html>
