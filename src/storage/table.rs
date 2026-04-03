@@ -7,6 +7,7 @@ use crate::storage::mvcc::ReconcileStats;
 use crate::storage::page_store::{BlockFilePageStore, Page, PageStore};
 use crate::storage::reserved_store::StoreId;
 use crate::storage::row::RowFormat;
+use crate::storage::wal::Lsn;
 use crate::txn::{GlobalTxnState, ReadVisibility, TxnId};
 use crate::WrongoDBError;
 
@@ -160,9 +161,13 @@ pub(crate) fn open_or_create_btree<P: AsRef<Path>>(path: P) -> Result<BTreeCurso
     } else {
         let mut page_store = BlockFilePageStore::create(path, 4096)?;
         init_root_if_missing(&mut page_store)?;
-        page_store.checkpoint()?;
+        page_store.checkpoint(Lsn::new(0, 0))?;
         Ok(BTreeCursor::new(Box::new(page_store)))
     }
+}
+
+pub(crate) fn read_store_checkpoint_lsn<P: AsRef<Path>>(path: P) -> Result<Lsn, WrongoDBError> {
+    Ok(BlockFilePageStore::open(path)?.checkpoint_lsn())
 }
 
 // ============================================================================
@@ -248,9 +253,10 @@ pub(crate) fn checkpoint_store(
     global_txn: &GlobalTxnState,
     store_id: StoreId,
     history_store: Option<&mut HistoryStore>,
+    checkpoint_lsn: Lsn,
 ) -> Result<(), WrongoDBError> {
     let _ = reconcile_for_checkpoint(btree, global_txn, store_id, history_store)?;
-    btree.checkpoint()
+    btree.checkpoint(checkpoint_lsn)
 }
 
 pub(crate) fn reconcile_for_checkpoint(
@@ -530,9 +536,12 @@ mod tests {
             global_txn.as_ref(),
             TEST_STORE_ID,
             Some(&mut history_store),
+            Lsn::new(0, 0),
         )
         .unwrap();
-        history_store.checkpoint(global_txn.as_ref()).unwrap();
+        history_store
+            .checkpoint(global_txn.as_ref(), Lsn::new(0, 0))
+            .unwrap();
 
         drop(history_store);
         drop(btree);

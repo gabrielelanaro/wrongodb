@@ -13,7 +13,9 @@ use crate::storage::log_manager::{open_recovery_reader_if_present, LogManager};
 pub use crate::storage::log_manager::{LogSyncMethod, LoggingConfig, TransactionSyncConfig};
 use crate::storage::metadata_store::{reseed_next_store_id_from_metadata, MetadataStore};
 use crate::storage::recovery::recover_from_wal;
-use crate::storage::reserved_store::HS_STORE_NAME;
+use crate::storage::reserved_store::{HS_STORE_NAME, METADATA_STORE_NAME};
+use crate::storage::table::read_store_checkpoint_lsn;
+use crate::storage::wal::Lsn;
 use crate::txn::GlobalTxnState;
 use crate::WrongoDBError;
 
@@ -136,7 +138,10 @@ impl Connection {
             global_txn.clone(),
             log_manager.clone(),
         )?);
-        if let Some(recovery_reader) = open_recovery_reader_if_present(&base_path) {
+        let recovery_start_lsn = metadata_checkpoint_lsn(&base_path)?;
+        if let Some(recovery_reader) =
+            open_recovery_reader_if_present(&base_path, recovery_start_lsn)
+        {
             let mut history_store_guard = history_store.write();
             recover_from_wal(
                 &base_path,
@@ -207,6 +212,15 @@ impl Connection {
     pub(crate) fn base_path(&self) -> &Path {
         &self.base_path
     }
+}
+
+fn metadata_checkpoint_lsn(base_path: &Path) -> Result<Lsn, WrongoDBError> {
+    let metadata_path = base_path.join(METADATA_STORE_NAME);
+    if !metadata_path.exists() {
+        return Ok(Lsn::new(0, 0));
+    }
+
+    read_store_checkpoint_lsn(metadata_path)
 }
 
 #[cfg(test)]

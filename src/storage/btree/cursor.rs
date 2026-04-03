@@ -15,6 +15,7 @@ use crate::storage::history::{HistoryEntry, HistoryStore};
 use crate::storage::mvcc::{ReconcileStats, Update, UpdateChain, UpdateHandle, UpdateType};
 use crate::storage::page_store::{Page, PageEdit, PageRead, PageStore, PageType, RowInsert};
 use crate::storage::reserved_store::StoreId;
+use crate::storage::wal::Lsn;
 use crate::txn::{ReadVisibility, Transaction, TxnId};
 
 // ============================================================================
@@ -257,10 +258,10 @@ impl BTreeCursor {
     // Public API: Lifecycle Operations
     // ------------------------------------------------------------------------
 
-    pub(crate) fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
+    pub(crate) fn checkpoint(&mut self, checkpoint_lsn: Lsn) -> Result<(), WrongoDBError> {
         let root = self.page_store.checkpoint_prepare();
         self.page_store.checkpoint_flush_data()?;
-        self.page_store.checkpoint_commit(root)?;
+        self.page_store.checkpoint_commit(root, checkpoint_lsn)?;
         Ok(())
     }
 

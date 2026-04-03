@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::core::errors::{StorageError, WrongoDBError};
 use crate::storage::block::file::BlockFile;
+use crate::storage::wal::Lsn;
 
 use super::page::Page;
 use super::page_cache::{PageCache, PageCacheConfig};
@@ -91,6 +92,10 @@ impl BlockFilePageStore {
         })
     }
 
+    pub fn checkpoint_lsn(&self) -> Lsn {
+        self.bf.checkpoint_lsn()
+    }
+
     // ------------------------------------------------------------------------
     // Lifecycle - Checkpoint
     // ------------------------------------------------------------------------
@@ -110,10 +115,10 @@ impl BlockFilePageStore {
     ///
     /// After checkpoint, the working root becomes the stable root, and
     /// all COW copies become the authoritative versions.
-    pub fn checkpoint(&mut self) -> Result<(), WrongoDBError> {
+    pub fn checkpoint(&mut self, checkpoint_lsn: Lsn) -> Result<(), WrongoDBError> {
         let root = self.working_root;
         self.flush_cache()?;
-        self.bf.set_root_block_id(root)?;
+        self.bf.set_root_block_id(root, checkpoint_lsn)?;
         self.bf.sync_all()?;
         self.bf.reclaim_discarded()?;
         self.bf.sync_all()?;
@@ -350,8 +355,12 @@ impl CheckpointStore for BlockFilePageStore {
         self.flush_cache()
     }
 
-    fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError> {
-        self.bf.set_root_block_id(new_root)?;
+    fn checkpoint_commit(
+        &mut self,
+        new_root: u64,
+        checkpoint_lsn: Lsn,
+    ) -> Result<(), WrongoDBError> {
+        self.bf.set_root_block_id(new_root, checkpoint_lsn)?;
         self.bf.sync_all()?;
         self.bf.reclaim_discarded()?;
         self.bf.sync_all()?;

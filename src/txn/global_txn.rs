@@ -96,6 +96,14 @@ impl GlobalTxnState {
         !guard.is_empty()
     }
 
+    /// Return the most recently allocated transaction ID.
+    ///
+    /// Checkpoint code uses this to detect whether any transaction started
+    /// during the checkpoint window.
+    pub fn current_txn_id(&self) -> TxnId {
+        self.current_txn_id.load(Ordering::Acquire)
+    }
+
     /// Mark a transaction as aborted
     pub fn mark_aborted(&self, txn_id: TxnId) {
         let mut guard = self

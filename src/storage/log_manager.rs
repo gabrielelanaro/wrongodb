@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
-use crate::storage::wal::{LogFile, WalFileReader};
+use crate::storage::wal::{LogFile, Lsn, WalFileReader};
 use crate::txn::{Timestamp, TxnId, TxnLogOp};
 use crate::WrongoDBError;
 
@@ -57,7 +57,7 @@ impl Default for TransactionSyncConfig {
 /// Runtime logging configuration for a [`crate::Connection`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoggingConfig {
-    /// Whether newly opened connections append commit and checkpoint records.
+    /// Whether newly opened connections append commit records.
     ///
     /// Startup recovery still runs if a log file is already present.
     pub enabled: bool,
@@ -79,7 +79,7 @@ impl Default for LoggingConfig {
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StorageSyncPolicy {
+enum StorageSyncPolicy {
     Buffered,
     Sync,
 }
@@ -111,10 +111,9 @@ impl LogManager {
     // ------------------------------------------------------------------------
 
     pub(crate) fn open(base_path: &Path, config: &LoggingConfig) -> Result<Self, WrongoDBError> {
-        let log_file = if config.enabled {
-            Some(Mutex::new(LogFile::open_or_create(log_file_path(
-                base_path,
-            ))?))
+        let path = log_file_path(base_path);
+        let log_file = if config.enabled || path.exists() {
+            Some(Mutex::new(LogFile::open_or_create(path)?))
         } else {
             None
         };
@@ -139,11 +138,6 @@ impl LogManager {
     // Public API
     // ------------------------------------------------------------------------
 
-    /// Whether this manager was opened with runtime logging enabled.
-    pub(crate) fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
     /// Append one committed transaction record to the runtime log.
     ///
     /// This is the storage-facing durability hook used by [`Session`](crate::Session)
@@ -155,6 +149,10 @@ impl LogManager {
         commit_ts: Timestamp,
         ops: &[TxnLogOp],
     ) -> Result<(), WrongoDBError> {
+        if !self.enabled {
+            return Ok(());
+        }
+
         let Some(log_file) = &self.log_file else {
             return Ok(());
         };
@@ -167,32 +165,30 @@ impl LogManager {
         Ok(())
     }
 
-    /// Append one checkpoint record to the runtime log.
+    /// Capture the current durable checkpoint boundary for one checkpoint run.
     ///
-    /// The caller still owns checkpoint policy, including store flushing and the
-    /// decision about whether truncation is currently allowed.
-    pub(crate) fn log_checkpoint(&self) -> Result<(), WrongoDBError> {
+    /// The returned LSN is the next append position, which is also the replay
+    /// boundary the checkpoint is about to cover.
+    pub(crate) fn capture_checkpoint_boundary(&self) -> Result<Lsn, WrongoDBError> {
         let Some(log_file) = &self.log_file else {
-            return Ok(());
+            return Ok(Lsn::new(0, 0));
         };
 
         let mut log_file = log_file.lock();
-        log_file.log_checkpoint()?;
-        if self.sync_policy == StorageSyncPolicy::Sync {
-            log_file.sync()?;
-        }
-        Ok(())
+        log_file.sync()?;
+        Ok(log_file.end_lsn())
     }
 
-    /// Truncate the runtime log after a completed checkpoint.
-    ///
-    /// When logging is disabled this is a no-op.
-    pub(crate) fn truncate_to_checkpoint(&self) -> Result<(), WrongoDBError> {
+    /// Truncate the runtime log only when the checkpoint boundary still matches the WAL tail.
+    pub(crate) fn truncate_if_tail_matches(
+        &self,
+        boundary_lsn: Lsn,
+    ) -> Result<bool, WrongoDBError> {
         let Some(log_file) = &self.log_file else {
-            return Ok(());
+            return Ok(false);
         };
 
-        log_file.lock().truncate_to_checkpoint()
+        log_file.lock().truncate_if_tail_matches(boundary_lsn)
     }
 }
 
@@ -200,13 +196,17 @@ impl LogManager {
 // Recovery Helpers
 // ============================================================================
 
-pub(crate) fn open_recovery_reader_if_present(base_path: &Path) -> Option<WalFileReader> {
+/// Open the recovery reader at the caller-provided replay start if the WAL exists.
+pub(crate) fn open_recovery_reader_if_present(
+    base_path: &Path,
+    start_lsn: Lsn,
+) -> Option<WalFileReader> {
     let wal_path = log_file_path(base_path);
     if !wal_path.exists() {
         return None;
     }
 
-    match WalFileReader::open(&wal_path) {
+    match WalFileReader::open_from_lsn(&wal_path, start_lsn) {
         Ok(reader) => Some(reader),
         Err(err) => {
             eprintln!("Skipping global WAL recovery (failed to open WAL): {err}");
@@ -238,10 +238,9 @@ mod tests {
     }
 
     #[test]
-    fn disabled_manager_is_noop_and_reports_disabled() {
+    fn disabled_manager_is_noop() {
         let manager = LogManager::disabled();
 
-        assert!(!manager.is_enabled());
         manager
             .log_transaction_commit(
                 7,
@@ -290,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_truncate_works_when_invoked_by_caller() {
+    fn checkpoint_truncate_works_when_tail_is_unchanged() {
         let dir = tempdir().unwrap();
         let manager = LogManager::open(dir.path(), &LoggingConfig::default()).unwrap();
 
@@ -310,8 +309,8 @@ mod tests {
         let before = std::fs::metadata(&wal_path).unwrap().len();
         assert!(before > 512);
 
-        manager.log_checkpoint().unwrap();
-        manager.truncate_to_checkpoint().unwrap();
+        let boundary = manager.capture_checkpoint_boundary().unwrap();
+        assert!(manager.truncate_if_tail_matches(boundary).unwrap());
 
         let after_truncate = std::fs::metadata(&wal_path).unwrap().len();
         assert!(after_truncate <= 512);

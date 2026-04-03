@@ -9,6 +9,7 @@ use crate::storage::btree::BTreeCursor;
 use crate::storage::mvcc::UpdateType;
 use crate::storage::reserved_store::{StoreId, HS_STORE_ID};
 use crate::storage::table::{checkpoint_store, open_or_create_btree, scan_range};
+use crate::storage::wal::Lsn;
 use crate::txn::{GlobalTxnState, Timestamp, TXN_NONE};
 use crate::WrongoDBError;
 
@@ -119,8 +120,15 @@ impl HistoryStore {
     pub(in crate::storage) fn checkpoint(
         &mut self,
         global_txn: &GlobalTxnState,
+        checkpoint_lsn: Lsn,
     ) -> Result<(), WrongoDBError> {
-        checkpoint_store(&mut self.btree, global_txn, HS_STORE_ID, None)
+        checkpoint_store(
+            &mut self.btree,
+            global_txn,
+            HS_STORE_ID,
+            None,
+            checkpoint_lsn,
+        )
     }
 
     // ------------------------------------------------------------------------

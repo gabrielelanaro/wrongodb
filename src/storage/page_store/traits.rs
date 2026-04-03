@@ -1,4 +1,5 @@
 use crate::core::errors::WrongoDBError;
+use crate::storage::wal::Lsn;
 
 use super::page::Page;
 use super::types::{PageEdit, ReadPin};
@@ -29,9 +30,21 @@ pub(crate) trait RootStore: std::fmt::Debug + Send + Sync {
 }
 
 pub(crate) trait CheckpointStore: std::fmt::Debug + Send + Sync {
+    /// Capture the root page that should become durable for this checkpoint.
     fn checkpoint_prepare(&self) -> u64;
+
+    /// Flush dirty page data needed by the prepared root.
     fn checkpoint_flush_data(&mut self) -> Result<(), WrongoDBError>;
-    fn checkpoint_commit(&mut self, new_root: u64) -> Result<(), WrongoDBError>;
+
+    /// Publish the prepared root and the WAL replay boundary it covers.
+    ///
+    /// `checkpoint_lsn` means "this store already includes every committed WAL
+    /// record before this LSN".
+    fn checkpoint_commit(
+        &mut self,
+        new_root: u64,
+        checkpoint_lsn: Lsn,
+    ) -> Result<(), WrongoDBError>;
 }
 
 /// Combined trait for a complete page store implementation.

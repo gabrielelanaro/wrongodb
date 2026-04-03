@@ -641,8 +641,11 @@ mod tests {
     use crate::storage::log_manager::{open_recovery_reader_if_present, LogManager, LoggingConfig};
     use crate::storage::metadata_store::MetadataStore;
     use crate::storage::recovery::recover_from_wal;
-    use crate::storage::reserved_store::HS_STORE_NAME;
-    use crate::storage::wal::{WalFileReader, WalReader, WalRecord};
+    use crate::storage::reserved_store::{
+        FIRST_DYNAMIC_STORE_ID, HS_STORE_NAME, METADATA_STORE_NAME,
+    };
+    use crate::storage::table::read_store_checkpoint_lsn;
+    use crate::storage::wal::{Lsn, WalFileReader, WalReader, WalRecord};
     use crate::txn::GlobalTxnState;
 
     const TEST_FILE_URI: &str = "file:items.main.wt";
@@ -730,7 +733,13 @@ mod tests {
         history_store: &mut HistoryStore,
         global_txn: &GlobalTxnState,
     ) {
-        let Some(reader) = open_recovery_reader_if_present(base_path) else {
+        let metadata_path = base_path.join(METADATA_STORE_NAME);
+        let start_lsn = if metadata_path.exists() {
+            read_store_checkpoint_lsn(&metadata_path).unwrap()
+        } else {
+            Lsn::new(0, 0)
+        };
+        let Some(reader) = open_recovery_reader_if_present(base_path, start_lsn) else {
             return;
         };
         recover_from_wal(
@@ -1038,9 +1047,7 @@ mod tests {
 
         assert!(after >= before);
         let records = read_wal_records(dir.path());
-        assert!(records
-            .iter()
-            .all(|record| !matches!(record, WalRecord::Checkpoint)));
+        assert!(!records.is_empty());
     }
 
     #[test]
@@ -1060,6 +1067,137 @@ mod tests {
 
         let after = std::fs::metadata(&wal_path).unwrap().len();
         assert!(after <= 512);
+    }
+
+    #[test]
+    fn recovery_reader_starts_from_metadata_checkpoint_lsn_after_non_truncating_checkpoint() {
+        let dir = tempdir().unwrap();
+        let base_path = dir.path().to_path_buf();
+        let global_txn = Arc::new(GlobalTxnState::new());
+        let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
+        let log_manager =
+            Arc::new(LogManager::open(&base_path, &LoggingConfig::default()).unwrap());
+        let metadata_store = Arc::new(
+            MetadataStore::new(
+                base_path.clone(),
+                store_handles.clone(),
+                global_txn.clone(),
+                log_manager.clone(),
+            )
+            .unwrap(),
+        );
+        let history_store = Arc::new(RwLock::new(
+            HistoryStore::open_or_create(base_path.join(HS_STORE_NAME)).unwrap(),
+        ));
+        let mut session = Session::new(
+            base_path.clone(),
+            store_handles.clone(),
+            metadata_store.clone(),
+            history_store.clone(),
+            global_txn.clone(),
+            log_manager.clone(),
+        );
+        let mut checkpoint_session = Session::new(
+            base_path.clone(),
+            store_handles,
+            metadata_store,
+            history_store,
+            global_txn,
+            log_manager,
+        );
+        session.create_table(TEST_URI, Vec::new()).unwrap();
+        session.begin_transaction().unwrap();
+        insert_in_transaction(&mut session, TEST_KEY, TEST_VALUE).unwrap();
+
+        checkpoint_session.checkpoint().unwrap();
+        let checkpoint_lsn =
+            read_store_checkpoint_lsn(base_path.join(METADATA_STORE_NAME)).unwrap();
+
+        session.commit_transaction().unwrap();
+
+        let mut reader = open_recovery_reader_if_present(&base_path, checkpoint_lsn).unwrap();
+        let records: Vec<_> = std::iter::from_fn(|| reader.read_record().unwrap()).collect();
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            &records[0].1,
+            WalRecord::TxnCommit { ops, .. }
+                if ops == &vec![crate::txn::TxnLogOp::Put {
+                    store_id: FIRST_DYNAMIC_STORE_ID,
+                    key: TEST_KEY.to_vec(),
+                    value: TEST_VALUE.to_vec(),
+                }]
+        ));
+    }
+
+    #[test]
+    fn recovery_checkpoints_replayed_tail_so_second_restart_reads_nothing() {
+        let dir = tempdir().unwrap();
+        let base_path = dir.path().to_path_buf();
+        let checkpoint_before_recovery = {
+            let global_txn = Arc::new(GlobalTxnState::new());
+            let store_handles = Arc::new(HandleCache::<String, RwLock<BTreeCursor>>::new());
+            let log_manager =
+                Arc::new(LogManager::open(&base_path, &LoggingConfig::default()).unwrap());
+            let metadata_store = Arc::new(
+                MetadataStore::new(
+                    base_path.clone(),
+                    store_handles.clone(),
+                    global_txn.clone(),
+                    log_manager.clone(),
+                )
+                .unwrap(),
+            );
+            let history_store = Arc::new(RwLock::new(
+                HistoryStore::open_or_create(base_path.join(HS_STORE_NAME)).unwrap(),
+            ));
+            let mut session = Session::new(
+                base_path.clone(),
+                store_handles.clone(),
+                metadata_store.clone(),
+                history_store.clone(),
+                global_txn.clone(),
+                log_manager.clone(),
+            );
+            let mut checkpoint_session = Session::new(
+                base_path.clone(),
+                store_handles,
+                metadata_store,
+                history_store,
+                global_txn,
+                log_manager,
+            );
+            session.create_table(TEST_URI, Vec::new()).unwrap();
+            session.begin_transaction().unwrap();
+            insert_in_transaction(&mut session, TEST_KEY, TEST_VALUE).unwrap();
+            checkpoint_session.checkpoint().unwrap();
+
+            let checkpoint_lsn =
+                read_store_checkpoint_lsn(base_path.join(METADATA_STORE_NAME)).unwrap();
+            session.commit_transaction().unwrap();
+            checkpoint_lsn
+        };
+
+        let recovered_session = SessionTestFixture::open_local_wal(&base_path).into_session();
+        let mut recovered_cursor = recovered_session.open_table_cursor(TEST_URI).unwrap();
+        assert_eq!(
+            recovered_cursor.get(TEST_KEY).unwrap(),
+            Some(TEST_VALUE.to_vec())
+        );
+
+        let checkpoint_after_recovery =
+            read_store_checkpoint_lsn(base_path.join(METADATA_STORE_NAME)).unwrap();
+        assert!(checkpoint_after_recovery > checkpoint_before_recovery);
+
+        let mut reader =
+            open_recovery_reader_if_present(&base_path, checkpoint_after_recovery).unwrap();
+        assert!(reader.read_record().unwrap().is_none());
+
+        let reopened_session = SessionTestFixture::open_local_wal(&base_path).into_session();
+        let mut reopened_cursor = reopened_session.open_table_cursor(TEST_URI).unwrap();
+        assert_eq!(
+            reopened_cursor.get(TEST_KEY).unwrap(),
+            Some(TEST_VALUE.to_vec())
+        );
     }
 
     #[test]

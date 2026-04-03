@@ -7,6 +7,7 @@ use crc32fast::Hasher;
 
 use super::manager::{BlockManager, Extent, ExtentLists};
 use crate::core::errors::{StorageError, WrongoDBError};
+use crate::storage::wal::Lsn;
 
 // ============================================================================
 // Constants
@@ -17,9 +18,9 @@ const NONE_BLOCK_ID: u64 = 0;
 const CHECKSUM_SIZE: usize = 4;
 const DEFAULT_PAGE_SIZE: usize = 4096;
 const MAGIC: [u8; 8] = *b"MMWT0001";
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 const CHECKPOINT_SLOT_COUNT: usize = 2;
-const CHECKPOINT_SLOT_SIZE: usize = 8 + 8 + 4;
+const CHECKPOINT_SLOT_SIZE: usize = 8 + 8 + 4 + 8 + 4;
 const HEADER_FIXED_SIZE: usize =
     8 + 2 + 4 + 4 + 4 + 4 + (CHECKPOINT_SLOT_COUNT * CHECKPOINT_SLOT_SIZE);
 const HEADER_MIN_SIZE: usize = HEADER_FIXED_SIZE;
@@ -38,27 +39,30 @@ const EXTENT_ENCODED_SIZE: usize = 8 + 8 + 8;
 struct CheckpointSlot {
     root_block_id: u64,
     generation: u64,
+    checkpoint_lsn: Lsn,
     crc32: u32,
 }
 
 impl CheckpointSlot {
-    fn new(root_block_id: u64, generation: u64) -> Self {
-        let crc32 = checkpoint_slot_crc(root_block_id, generation);
+    fn new(root_block_id: u64, generation: u64, checkpoint_lsn: Lsn) -> Self {
+        let crc32 = checkpoint_slot_crc(root_block_id, generation, checkpoint_lsn);
         Self {
             root_block_id,
             generation,
+            checkpoint_lsn,
             crc32,
         }
     }
 
     fn is_valid(&self) -> bool {
-        self.crc32 == checkpoint_slot_crc(self.root_block_id, self.generation)
+        self.crc32 == checkpoint_slot_crc(self.root_block_id, self.generation, self.checkpoint_lsn)
     }
 
-    fn update(&mut self, root_block_id: u64, generation: u64) {
+    fn update(&mut self, root_block_id: u64, generation: u64, checkpoint_lsn: Lsn) {
         self.root_block_id = root_block_id;
         self.generation = generation;
-        self.crc32 = checkpoint_slot_crc(root_block_id, generation);
+        self.checkpoint_lsn = checkpoint_lsn;
+        self.crc32 = checkpoint_slot_crc(root_block_id, generation, checkpoint_lsn);
     }
 }
 
@@ -89,8 +93,8 @@ struct FileHeader {
 
 impl Default for FileHeader {
     fn default() -> Self {
-        let slot0 = CheckpointSlot::new(NONE_BLOCK_ID, 1);
-        let slot1 = CheckpointSlot::new(NONE_BLOCK_ID, 0);
+        let slot0 = CheckpointSlot::new(NONE_BLOCK_ID, 1, Lsn::new(0, 0));
+        let slot1 = CheckpointSlot::new(NONE_BLOCK_ID, 0, Lsn::new(0, 0));
         Self {
             magic: MAGIC,
             version: VERSION,
@@ -124,15 +128,19 @@ impl FileHeader {
         let mut checkpoint_slots = [CheckpointSlot {
             root_block_id: NONE_BLOCK_ID,
             generation: 0,
+            checkpoint_lsn: Lsn::new(0, 0),
             crc32: 0,
         }; CHECKPOINT_SLOT_COUNT];
         for slot in &mut checkpoint_slots {
             let root_block_id = rdr.read_u64::<LittleEndian>()?;
             let generation = rdr.read_u64::<LittleEndian>()?;
+            let checkpoint_lsn_file_id = rdr.read_u32::<LittleEndian>()?;
+            let checkpoint_lsn_offset = rdr.read_u64::<LittleEndian>()?;
             let crc32 = rdr.read_u32::<LittleEndian>()?;
             *slot = CheckpointSlot {
                 root_block_id,
                 generation,
+                checkpoint_lsn: Lsn::new(checkpoint_lsn_file_id, checkpoint_lsn_offset),
                 crc32,
             };
         }
@@ -164,15 +172,19 @@ impl FileHeader {
         let mut checkpoint_slots = [CheckpointSlot {
             root_block_id: NONE_BLOCK_ID,
             generation: 0,
+            checkpoint_lsn: Lsn::new(0, 0),
             crc32: 0,
         }; CHECKPOINT_SLOT_COUNT];
         for slot in &mut checkpoint_slots {
             let root_block_id = rdr.read_u64::<LittleEndian>()?;
             let generation = rdr.read_u64::<LittleEndian>()?;
+            let checkpoint_lsn_file_id = rdr.read_u32::<LittleEndian>()?;
+            let checkpoint_lsn_offset = rdr.read_u64::<LittleEndian>()?;
             let crc32 = rdr.read_u32::<LittleEndian>()?;
             *slot = CheckpointSlot {
                 root_block_id,
                 generation,
+                checkpoint_lsn: Lsn::new(checkpoint_lsn_file_id, checkpoint_lsn_offset),
                 crc32,
             };
         }
@@ -228,6 +240,8 @@ impl FileHeader {
         for slot in &self.checkpoint_slots {
             buf.write_u64::<LittleEndian>(slot.root_block_id)?;
             buf.write_u64::<LittleEndian>(slot.generation)?;
+            buf.write_u32::<LittleEndian>(slot.checkpoint_lsn.file_id)?;
+            buf.write_u64::<LittleEndian>(slot.checkpoint_lsn.offset)?;
             buf.write_u32::<LittleEndian>(slot.crc32)?;
         }
 
@@ -408,6 +422,11 @@ impl BlockFile {
         self.header.checkpoint_slots[self.active_checkpoint_slot].root_block_id
     }
 
+    /// Return the recovery restart boundary from the active checkpoint slot.
+    pub(in crate::storage) fn checkpoint_lsn(&self) -> Lsn {
+        self.header.checkpoint_slots[self.active_checkpoint_slot].checkpoint_lsn
+    }
+
     /// Update the root block ID in the next checkpoint slot.
     ///
     /// Advances to the next checkpoint slot with an incremented generation number,
@@ -416,6 +435,7 @@ impl BlockFile {
     pub(in crate::storage) fn set_root_block_id(
         &mut self,
         root_block_id: u64,
+        checkpoint_lsn: Lsn,
     ) -> Result<(), WrongoDBError> {
         let current_slot = self.active_checkpoint_slot;
         let next_slot = (current_slot + 1) % CHECKPOINT_SLOT_COUNT;
@@ -424,7 +444,7 @@ impl BlockFile {
         if next_gen == 0 {
             next_gen = 1;
         }
-        self.header.checkpoint_slots[next_slot].update(root_block_id, next_gen);
+        self.header.checkpoint_slots[next_slot].update(root_block_id, next_gen, checkpoint_lsn);
         self.active_checkpoint_slot = next_slot;
         self.block_manager.set_stable_generation(next_gen);
         self.write_header()?;
@@ -647,10 +667,12 @@ fn crc32(data: &[u8]) -> u32 {
     hasher.finalize()
 }
 
-fn checkpoint_slot_crc(root_block_id: u64, generation: u64) -> u32 {
+fn checkpoint_slot_crc(root_block_id: u64, generation: u64, checkpoint_lsn: Lsn) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(&root_block_id.to_le_bytes());
     hasher.update(&generation.to_le_bytes());
+    hasher.update(&checkpoint_lsn.file_id.to_le_bytes());
+    hasher.update(&checkpoint_lsn.offset.to_le_bytes());
     hasher.finalize()
 }
 
@@ -681,4 +703,47 @@ fn write_header_page(file: &mut File, payload: &[u8]) -> Result<(), WrongoDBErro
     writer.write_all(payload)?;
     writer.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    const TEST_PAGE_SIZE: usize = 4096;
+
+    #[test]
+    fn checkpoint_slot_round_trip_preserves_checkpoint_lsn() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("table.wt");
+
+        let mut block_file = BlockFile::create(&path, TEST_PAGE_SIZE).unwrap();
+        block_file.set_root_block_id(7, Lsn::new(3, 4096)).unwrap();
+        block_file.close().unwrap();
+
+        let reopened = BlockFile::open(&path).unwrap();
+        assert_eq!(reopened.root_block_id(), 7);
+        assert_eq!(reopened.checkpoint_lsn(), Lsn::new(3, 4096));
+    }
+
+    #[test]
+    fn block_file_v3_header_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.wt");
+        let mut file = File::create(&path).unwrap();
+        let header = FileHeader {
+            version: 3,
+            page_size: TEST_PAGE_SIZE as u32,
+            ..FileHeader::default()
+        };
+        let payload = header
+            .pack(&ExtentLists::default(), TEST_PAGE_SIZE - CHECKSUM_SIZE)
+            .unwrap();
+        write_header_page(&mut file, &payload).unwrap();
+        file.sync_all().unwrap();
+
+        let err = BlockFile::open(&path).unwrap_err();
+        assert!(err.to_string().contains("unsupported version: 3"));
+    }
 }

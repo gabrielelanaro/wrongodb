@@ -12,21 +12,33 @@ use crate::storage::metadata_store::{MetadataStore, FILE_URI_PREFIX};
 use crate::storage::reserved_store::{
     reserved_store_name_for_id, StoreId, METADATA_STORE_ID, METADATA_STORE_NAME,
 };
-use crate::storage::table::{checkpoint_store, open_or_create_btree};
-use crate::storage::wal::{RecoveryError, WalReader, WalRecord};
+use crate::storage::table::{checkpoint_store, open_or_create_btree, read_store_checkpoint_lsn};
+use crate::storage::wal::{Lsn, RecoveryError, WalReader, WalRecord, WalRecordHeader};
 use crate::txn::{GlobalTxnState, Transaction, TxnId, TxnLogOp};
 use crate::WrongoDBError;
 
 type StoreHandleCache = HandleCache<String, RwLock<BTreeCursor>>;
-type StoreNameById = HashMap<StoreId, String>;
+type StoreReplayStateById = HashMap<StoreId, StoreReplayState>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoreReplayState {
+    store_name: String,
+    checkpoint_lsn: Lsn,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct CommittedTransaction {
     txn_id: TxnId,
+    commit_lsn: Lsn,
     ops: Vec<TxnLogOp>,
 }
 
 /// Replays committed transactions from the global WAL into storage.
+///
+/// Recovery is intentionally split into two passes:
+/// - replay metadata rows first so file-backed store ids resolve correctly
+/// - replay non-metadata rows only for stores whose checkpoint LSN is older
+///   than the transaction commit LSN
 ///
 /// Recovery stops when it reaches a corrupted tail record. That treats a torn
 /// final WAL write as end-of-log, which lets startup proceed after a crash that
@@ -39,29 +51,39 @@ pub(in crate::storage) fn recover_from_wal(
     global_txn: &GlobalTxnState,
     mut reader: impl WalReader,
 ) -> Result<(), WrongoDBError> {
-    let transactions = read_committed_transactions(&mut reader)?;
+    let transactions = collect_committed_transactions(&mut reader)?;
+    let replay_end_lsn = reader.current_lsn();
 
-    apply_metadata_transactions(base_path, store_handles, global_txn, &transactions)?;
-    let store_names_by_id = rebuild_store_name_map(metadata_store)?;
-    apply_non_metadata_transactions(
+    replay_committed_transactions(
         base_path,
         store_handles,
         global_txn,
-        &store_names_by_id,
+        &StoreReplayStateById::new(),
         &transactions,
+        ReplayStage::Metadata,
+    )?;
+    let store_states_by_id = load_store_replay_state(base_path, metadata_store)?;
+    replay_committed_transactions(
+        base_path,
+        store_handles,
+        global_txn,
+        &store_states_by_id,
+        &transactions,
+        ReplayStage::DataStores,
     )?;
 
-    checkpoint_recovered_stores(
+    checkpoint_replayed_state(
         base_path,
         metadata_store,
         store_handles,
         history_store,
         global_txn,
+        replay_end_lsn,
     )?;
     Ok(())
 }
 
-fn read_committed_transactions(
+fn collect_committed_transactions(
     reader: &mut dyn WalReader,
 ) -> Result<Vec<CommittedTransaction>, WrongoDBError> {
     let mut transactions = Vec::new();
@@ -71,147 +93,158 @@ fn read_committed_transactions(
     Ok(transactions)
 }
 
-fn apply_metadata_transactions(
+fn replay_committed_transactions(
     base_path: &Path,
     store_handles: &StoreHandleCache,
     global_txn: &GlobalTxnState,
+    store_states_by_id: &StoreReplayStateById,
     transactions: &[CommittedTransaction],
+    stage: ReplayStage,
 ) -> Result<(), WrongoDBError> {
     for txn in transactions {
-        apply_committed_transaction(
+        replay_committed_transaction(
             base_path,
             store_handles,
             global_txn,
-            &HashMap::new(),
+            store_states_by_id,
             txn.txn_id,
+            txn.commit_lsn,
             &txn.ops,
-            ReplayPass::MetadataOnly,
+            stage,
         )?;
     }
     Ok(())
 }
 
-fn rebuild_store_name_map(metadata_store: &MetadataStore) -> Result<StoreNameById, WrongoDBError> {
+fn load_store_replay_state(
+    base_path: &Path,
+    metadata_store: &MetadataStore,
+) -> Result<StoreReplayStateById, WrongoDBError> {
     metadata_store
         .scan_prefix(FILE_URI_PREFIX)?
         .into_iter()
-        .map(|entry| Ok((entry.store_id()?, entry.file_name()?.to_string())))
+        .map(|entry| {
+            let store_name = entry.file_name()?.to_string();
+            Ok((
+                entry.store_id()?,
+                StoreReplayState {
+                    checkpoint_lsn: load_store_checkpoint_lsn(base_path, &store_name)?,
+                    store_name,
+                },
+            ))
+        })
         .collect::<Result<HashMap<_, _>, WrongoDBError>>()
 }
 
-fn apply_non_metadata_transactions(
+fn replay_committed_transaction(
     base_path: &Path,
     store_handles: &StoreHandleCache,
     global_txn: &GlobalTxnState,
-    store_names_by_id: &StoreNameById,
-    transactions: &[CommittedTransaction],
-) -> Result<(), WrongoDBError> {
-    for txn in transactions {
-        apply_committed_transaction(
-            base_path,
-            store_handles,
-            global_txn,
-            store_names_by_id,
-            txn.txn_id,
-            &txn.ops,
-            ReplayPass::NonMetadata,
-        )?;
-    }
-    Ok(())
-}
-
-fn apply_committed_transaction(
-    base_path: &Path,
-    store_handles: &StoreHandleCache,
-    global_txn: &GlobalTxnState,
-    store_names_by_id: &StoreNameById,
+    store_states_by_id: &StoreReplayStateById,
     txn_id: TxnId,
+    commit_lsn: Lsn,
     ops: &[TxnLogOp],
-    replay_pass: ReplayPass,
+    stage: ReplayStage,
 ) -> Result<(), WrongoDBError> {
     let mut txn = Transaction::replay(txn_id);
 
     for op in ops {
-        if !replay_pass.includes(op) {
+        if !stage.includes(op) {
             continue;
         }
 
-        apply_replayed_operation(base_path, store_handles, store_names_by_id, &mut txn, op)?;
+        if stage == ReplayStage::DataStores
+            && !store_needs_replay(store_states_by_id, commit_lsn, op)
+        {
+            continue;
+        }
+
+        apply_replayed_op(base_path, store_handles, store_states_by_id, &mut txn, op)?;
     }
 
     txn.commit(global_txn)?;
     Ok(())
 }
 
-fn checkpoint_recovered_stores(
+fn checkpoint_replayed_state(
     base_path: &Path,
     metadata_store: &MetadataStore,
     store_handles: &StoreHandleCache,
     history_store: &mut HistoryStore,
     global_txn: &GlobalTxnState,
+    checkpoint_lsn: Lsn,
 ) -> Result<(), WrongoDBError> {
     global_txn.begin_checkpoint();
 
-    let checkpoint_result = checkpoint_recovered_store_handles(
+    let checkpoint_result = checkpoint_replayed_store_files(
         base_path,
         metadata_store,
         store_handles,
         history_store,
         global_txn,
+        checkpoint_lsn,
     );
 
     global_txn.end_checkpoint();
     checkpoint_result
 }
 
-fn checkpoint_recovered_store_handles(
+fn checkpoint_replayed_store_files(
     base_path: &Path,
     metadata_store: &MetadataStore,
     store_handles: &StoreHandleCache,
     history_store: &mut HistoryStore,
     global_txn: &GlobalTxnState,
+    checkpoint_lsn: Lsn,
 ) -> Result<(), WrongoDBError> {
-    checkpoint_store(
-        &mut open_store_by_name(base_path, store_handles, METADATA_STORE_NAME)?.write(),
-        global_txn,
-        METADATA_STORE_ID,
-        None,
-    )?;
-
+    // `all_stores_with_id` returns file-backed user stores. `history.wt` and
+    // `metadata.wt` are checkpointed explicitly below so the replay anchor is
+    // written last into `metadata.wt`.
     for (store_id, store_name) in metadata_store.all_stores_with_id()? {
         checkpoint_store(
             &mut open_store_by_name(base_path, store_handles, &store_name)?.write(),
             global_txn,
             store_id,
             Some(&mut *history_store),
+            checkpoint_lsn,
         )?;
     }
 
-    history_store.checkpoint(global_txn)
+    history_store.checkpoint(global_txn, checkpoint_lsn)?;
+    checkpoint_store(
+        &mut open_store_by_name(base_path, store_handles, METADATA_STORE_NAME)?.write(),
+        global_txn,
+        METADATA_STORE_ID,
+        None,
+        checkpoint_lsn,
+    )
 }
 
 fn next_committed_transaction(
     reader: &mut dyn WalReader,
 ) -> Result<Option<CommittedTransaction>, WrongoDBError> {
     loop {
-        let Some(record) = read_next_record_or_stop_at_corrupt_tail(reader)? else {
+        let Some((header, record)) = read_next_record_or_stop_at_corrupt_tail(reader)? else {
             return Ok(None);
         };
 
         match record {
             WalRecord::TxnCommit { txn_id, ops, .. } => {
-                return Ok(Some(CommittedTransaction { txn_id, ops }));
+                return Ok(Some(CommittedTransaction {
+                    txn_id,
+                    commit_lsn: header.lsn,
+                    ops,
+                }));
             }
-            WalRecord::Checkpoint => {}
         }
     }
 }
 
 fn read_next_record_or_stop_at_corrupt_tail(
     reader: &mut dyn WalReader,
-) -> Result<Option<WalRecord>, WrongoDBError> {
+) -> Result<Option<(WalRecordHeader, WalRecord)>, WrongoDBError> {
     match reader.read_record() {
-        Ok(Some((_header, record))) => Ok(Some(record)),
+        Ok(Some(record)) => Ok(Some(record)),
         Ok(None) => Ok(None),
         Err(
             err @ (RecoveryError::ChecksumMismatch { .. }
@@ -226,10 +259,10 @@ fn read_next_record_or_stop_at_corrupt_tail(
     }
 }
 
-fn apply_replayed_operation(
+fn apply_replayed_op(
     base_path: &Path,
     store_handles: &StoreHandleCache,
-    store_names_by_id: &StoreNameById,
+    store_states_by_id: &StoreReplayStateById,
     txn: &mut Transaction,
     op: &TxnLogOp,
 ) -> Result<(), WrongoDBError> {
@@ -240,12 +273,12 @@ fn apply_replayed_operation(
             value,
         } => {
             let store =
-                open_store_for_recovery_id(base_path, store_handles, store_names_by_id, *store_id)?;
+                open_store_for_replay(base_path, store_handles, store_states_by_id, *store_id)?;
             store.write().put(*store_id, key, value, txn)?;
         }
         TxnLogOp::Delete { store_id, key } => {
             let store =
-                open_store_for_recovery_id(base_path, store_handles, store_names_by_id, *store_id)?;
+                open_store_for_replay(base_path, store_handles, store_states_by_id, *store_id)?;
             let _ = store.write().delete(*store_id, key, txn)?;
         }
     }
@@ -253,17 +286,44 @@ fn apply_replayed_operation(
     Ok(())
 }
 
-fn open_store_for_recovery_id(
+fn open_store_for_replay(
     base_path: &Path,
     store_handles: &StoreHandleCache,
-    store_names_by_id: &StoreNameById,
+    store_states_by_id: &StoreReplayStateById,
     store_id: StoreId,
 ) -> Result<Arc<RwLock<BTreeCursor>>, WrongoDBError> {
     let store_name = reserved_store_name_for_id(store_id)
         .map(str::to_string)
-        .or_else(|| store_names_by_id.get(&store_id).cloned())
+        .or_else(|| {
+            store_states_by_id
+                .get(&store_id)
+                .map(|state| state.store_name.clone())
+        })
         .ok_or_else(|| StorageError(format!("unknown store id during recovery: {store_id}")))?;
     open_store_by_name(base_path, store_handles, &store_name)
+}
+
+fn load_store_checkpoint_lsn(base_path: &Path, store_name: &str) -> Result<Lsn, WrongoDBError> {
+    let store_path = base_path.join(store_name);
+    if !store_path.exists() {
+        return Ok(Lsn::new(0, 0));
+    }
+
+    read_store_checkpoint_lsn(store_path)
+}
+
+fn store_needs_replay(
+    store_states_by_id: &StoreReplayStateById,
+    commit_lsn: Lsn,
+    op: &TxnLogOp,
+) -> bool {
+    // Newly created stores may not exist on disk yet, so "missing state" means
+    // "replay from the start".
+    let checkpoint_lsn = store_states_by_id
+        .get(&store_id_for(op))
+        .map(|state| state.checkpoint_lsn)
+        .unwrap_or_else(|| Lsn::new(0, 0));
+    commit_lsn >= checkpoint_lsn
 }
 
 fn open_store_by_name(
@@ -278,21 +338,23 @@ fn open_store_by_name(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReplayPass {
-    MetadataOnly,
-    NonMetadata,
+enum ReplayStage {
+    Metadata,
+    DataStores,
 }
 
-impl ReplayPass {
+impl ReplayStage {
     fn includes(&self, op: &TxnLogOp) -> bool {
-        let store_id = match op {
-            TxnLogOp::Put { store_id, .. } | TxnLogOp::Delete { store_id, .. } => *store_id,
-        };
-
         match self {
-            Self::MetadataOnly => store_id == METADATA_STORE_ID,
-            Self::NonMetadata => store_id != METADATA_STORE_ID,
+            Self::Metadata => store_id_for(op) == METADATA_STORE_ID,
+            Self::DataStores => store_id_for(op) != METADATA_STORE_ID,
         }
+    }
+}
+
+fn store_id_for(op: &TxnLogOp) -> StoreId {
+    match op {
+        TxnLogOp::Put { store_id, .. } | TxnLogOp::Delete { store_id, .. } => *store_id,
     }
 }
 
@@ -325,6 +387,7 @@ mod tests {
 
     struct TestWalReader {
         records: VecDeque<(WalRecordHeader, WalRecord)>,
+        current_lsn: Lsn,
     }
 
     #[derive(Serialize)]
@@ -341,13 +404,22 @@ mod tests {
         fn new(records: Vec<(WalRecordHeader, WalRecord)>) -> Self {
             Self {
                 records: records.into(),
+                current_lsn: Lsn::new(0, 0),
             }
         }
     }
 
     impl WalReader for TestWalReader {
         fn read_record(&mut self) -> Result<Option<(WalRecordHeader, WalRecord)>, RecoveryError> {
-            Ok(self.records.pop_front())
+            let record = self.records.pop_front();
+            if let Some((header, _)) = &record {
+                self.current_lsn = header.lsn;
+            }
+            Ok(record)
+        }
+
+        fn current_lsn(&self) -> Lsn {
+            self.current_lsn
         }
     }
 
@@ -445,6 +517,7 @@ mod tests {
         assert_eq!(
             super::next_committed_transaction(&mut reader).unwrap(),
             Some(super::CommittedTransaction {
+                commit_lsn: Lsn::new(0, 1),
                 txn_id: 7,
                 ops: vec![TxnLogOp::Put {
                     store_id: TEST_STORE_ID,
@@ -456,33 +529,12 @@ mod tests {
     }
 
     #[test]
-    fn test_next_committed_transaction_skips_checkpoint_records() {
-        let mut reader = TestWalReader::new(vec![
-            test_wal_record(1, WalRecord::Checkpoint),
-            test_wal_record(
-                2,
-                WalRecord::TxnCommit {
-                    txn_id: 7,
-                    commit_ts: 7,
-                    ops: vec![TxnLogOp::Put {
-                        store_id: TEST_STORE_ID,
-                        key: b"committed".to_vec(),
-                        value: b"v1".to_vec(),
-                    }],
-                },
-            ),
-        ]);
+    fn test_next_committed_transaction_returns_none_at_eof() {
+        let mut reader = TestWalReader::new(Vec::new());
 
         assert_eq!(
             super::next_committed_transaction(&mut reader).unwrap(),
-            Some(super::CommittedTransaction {
-                txn_id: 7,
-                ops: vec![TxnLogOp::Put {
-                    store_id: TEST_STORE_ID,
-                    key: b"committed".to_vec(),
-                    value: b"v1".to_vec(),
-                }],
-            })
+            None
         );
     }
 

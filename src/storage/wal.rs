@@ -14,7 +14,7 @@ use crate::txn::{Timestamp, TxnId, TxnLogOp};
 #[cfg(test)]
 const GLOBAL_WAL_FILE_NAME: &str = "global.wal";
 const WAL_MAGIC: &[u8; 8] = b"WALG001\0";
-const WAL_VERSION: u16 = 6;
+const WAL_VERSION: u16 = 7;
 const WAL_HEADER_SIZE: usize = 512;
 const RECORD_HEADER_SIZE: usize = 26;
 
@@ -28,26 +28,24 @@ const RECORD_HEADER_SIZE: usize = 26;
 /// The type still carries both fields because record headers and recovery code
 /// already speak in terms of full LSNs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Lsn {
+pub(crate) struct Lsn {
     /// Log file identifier for the record position.
-    pub file_id: u32,
+    pub(crate) file_id: u32,
     /// Byte offset within the log file.
-    pub offset: u64,
+    pub(crate) offset: u64,
 }
 
 /// WAL record discriminator stored in each record header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum WalRecordType {
+pub(crate) enum WalRecordType {
     /// One committed transaction record containing all logical operations.
     TxnCommit = 1,
-    /// One checkpoint marker record.
-    Checkpoint = 2,
 }
 
 /// WAL record payload used for recovery replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WalRecord {
+pub(crate) enum WalRecord {
     /// Committed transaction payload.
     TxnCommit {
         /// Transaction identifier that produced the committed operations.
@@ -57,13 +55,11 @@ pub enum WalRecord {
         /// Logical operations replayed during recovery.
         ops: Vec<TxnLogOp>,
     },
-    /// Checkpoint marker record.
-    Checkpoint,
 }
 
 /// Fixed-size header that precedes each WAL record.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WalRecordHeader {
+pub(crate) struct WalRecordHeader {
     /// Encoded [`WalRecordType`] discriminator.
     pub record_type: u8,
     /// Reserved record flags.
@@ -80,7 +76,7 @@ pub struct WalRecordHeader {
 
 /// Recovery-specific error type for sequential WAL replay.
 #[derive(Debug)]
-pub enum RecoveryError {
+pub(crate) enum RecoveryError {
     /// Record bytes were read successfully but failed the CRC check.
     ChecksumMismatch {
         offset: u64,
@@ -108,19 +104,22 @@ pub enum RecoveryError {
 }
 
 /// Reader interface for sequential WAL replay.
-pub trait WalReader {
+pub(crate) trait WalReader {
     /// Read the next valid record from the current reader position.
     ///
     /// Returns `Ok(None)` on clean EOF and on a truncated tail where a full
     /// header or payload is no longer available.
     fn read_record(&mut self) -> Result<Option<(WalRecordHeader, WalRecord)>, RecoveryError>;
+
+    /// Return the current replay position as the next LSN to read.
+    fn current_lsn(&self) -> Lsn;
 }
 
 /// File-backed WAL reader used during recovery.
 ///
-/// The reader starts at the checkpoint LSN recorded in the file header when
-/// present, otherwise at the first record after the file header.
-pub struct WalFileReader {
+/// The caller chooses the replay start LSN explicitly. The reader clamps that
+/// start to the first record boundary after the fixed WAL header.
+pub(crate) struct WalFileReader {
     file: File,
     current_offset: u64,
     last_valid_lsn: Lsn,
@@ -135,8 +134,7 @@ pub struct WalFileReader {
 struct LogFileHeader {
     magic: [u8; 8],
     version: u16,
-    last_lsn: Lsn,
-    checkpoint_lsn: Lsn,
+    last_record_lsn: Lsn,
     crc32: u32,
 }
 
@@ -146,7 +144,7 @@ pub(crate) struct LogFile {
     header: LogFileHeader,
     write_buffer: Vec<u8>,
     buffer_capacity: usize,
-    last_lsn: Lsn,
+    next_lsn: Lsn,
     last_record_lsn: Lsn,
 }
 
@@ -156,12 +154,12 @@ pub(crate) struct LogFile {
 
 impl Lsn {
     /// Construct one LSN from a log file identifier and byte offset.
-    pub fn new(file_id: u32, offset: u64) -> Self {
+    pub(crate) fn new(file_id: u32, offset: u64) -> Self {
         Self { file_id, offset }
     }
 
     /// Whether this LSN points at a real record position.
-    pub fn is_valid(&self) -> bool {
+    pub(crate) fn is_valid(&self) -> bool {
         self.file_id != 0 || self.offset != 0
     }
 }
@@ -176,7 +174,6 @@ impl TryFrom<u8> for WalRecordType {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(Self::TxnCommit),
-            2 => Ok(Self::Checkpoint),
             _ => Err(StorageError(format!("invalid WAL record type: {value}")).into()),
         }
     }
@@ -188,10 +185,9 @@ impl TryFrom<u8> for WalRecordType {
 
 impl WalRecord {
     /// Return the discriminator stored in the corresponding record header.
-    pub fn record_type(&self) -> WalRecordType {
+    pub(crate) fn record_type(&self) -> WalRecordType {
         match self {
             WalRecord::TxnCommit { .. } => WalRecordType::TxnCommit,
-            WalRecord::Checkpoint => WalRecordType::Checkpoint,
         }
     }
 
@@ -211,7 +207,6 @@ impl WalRecord {
                     serialize_log_op(&mut buf, op);
                 }
             }
-            WalRecord::Checkpoint => {}
         }
 
         buf
@@ -248,7 +243,6 @@ impl WalRecord {
                     ops,
                 })
             }
-            WalRecordType::Checkpoint => Ok(WalRecord::Checkpoint),
         }
     }
 }
@@ -396,10 +390,19 @@ impl From<std::io::Error> for RecoveryError {
 impl WalFileReader {
     /// Open one WAL file for sequential recovery replay.
     ///
-    /// The file header is validated before any record is read. If the header
-    /// contains a checkpoint LSN, the reader starts from that offset so replay
-    /// skips records older than the last completed checkpoint.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, RecoveryError> {
+    /// The file header is validated before any record is read.
+    pub(crate) fn open<P: AsRef<Path>>(path: P) -> Result<Self, RecoveryError> {
+        Self::open_from_lsn(path, Lsn::new(0, WAL_HEADER_SIZE as u64))
+    }
+
+    /// Open one WAL file and position the reader at `start_lsn`.
+    ///
+    /// Callers use this to replay only the WAL tail after a checkpointed store
+    /// boundary.
+    pub(crate) fn open_from_lsn<P: AsRef<Path>>(
+        path: P,
+        start_lsn: Lsn,
+    ) -> Result<Self, RecoveryError> {
         let path = path.as_ref();
         if !path.exists() {
             return Err(RecoveryError::InvalidWalFile(format!(
@@ -421,10 +424,10 @@ impl WalFileReader {
             ));
         }
 
-        let current_offset = if header.checkpoint_lsn.is_valid() {
-            header.checkpoint_lsn.offset
-        } else {
+        let current_offset = if start_lsn.offset < WAL_HEADER_SIZE as u64 {
             WAL_HEADER_SIZE as u64
+        } else {
+            start_lsn.offset
         };
 
         Ok(Self {
@@ -507,6 +510,10 @@ impl WalReader for WalFileReader {
 
         Ok(Some((header, record)))
     }
+
+    fn current_lsn(&self) -> Lsn {
+        Lsn::new(0, self.current_offset)
+    }
 }
 
 // ============================================================================
@@ -518,8 +525,7 @@ impl LogFileHeader {
         let mut header = Self {
             magic: *WAL_MAGIC,
             version: WAL_VERSION,
-            last_lsn: Lsn::new(0, 0),
-            checkpoint_lsn: Lsn::new(0, 0),
+            last_record_lsn: Lsn::new(0, 0),
             crc32: 0,
         };
         header.crc32 = header.compute_crc32();
@@ -542,14 +548,9 @@ impl LogFileHeader {
         // reserved
         cursor += 4;
 
-        buf[cursor..cursor + 4].copy_from_slice(&self.last_lsn.file_id.to_le_bytes());
+        buf[cursor..cursor + 4].copy_from_slice(&self.last_record_lsn.file_id.to_le_bytes());
         cursor += 4;
-        buf[cursor..cursor + 8].copy_from_slice(&self.last_lsn.offset.to_le_bytes());
-        cursor += 8;
-
-        buf[cursor..cursor + 4].copy_from_slice(&self.checkpoint_lsn.file_id.to_le_bytes());
-        cursor += 4;
-        buf[cursor..cursor + 8].copy_from_slice(&self.checkpoint_lsn.offset.to_le_bytes());
+        buf[cursor..cursor + 8].copy_from_slice(&self.last_record_lsn.offset.to_le_bytes());
         cursor += 8;
 
         buf[cursor..cursor + 4].copy_from_slice(&self.crc32.to_le_bytes());
@@ -584,29 +585,16 @@ impl LogFileHeader {
         cursor += 4; // version + reserved
         cursor += 4; // reserved
 
-        let last_lsn_file_id = u32::from_le_bytes(
+        let last_record_lsn_file_id = u32::from_le_bytes(
             data[cursor..cursor + 4]
                 .try_into()
-                .map_err(|_| StorageError("invalid last_lsn file_id".into()))?,
+                .map_err(|_| StorageError("invalid last_record_lsn file_id".into()))?,
         );
         cursor += 4;
-        let last_lsn_offset = u64::from_le_bytes(
+        let last_record_lsn_offset = u64::from_le_bytes(
             data[cursor..cursor + 8]
                 .try_into()
-                .map_err(|_| StorageError("invalid last_lsn offset".into()))?,
-        );
-        cursor += 8;
-
-        let checkpoint_lsn_file_id = u32::from_le_bytes(
-            data[cursor..cursor + 4]
-                .try_into()
-                .map_err(|_| StorageError("invalid checkpoint_lsn file_id".into()))?,
-        );
-        cursor += 4;
-        let checkpoint_lsn_offset = u64::from_le_bytes(
-            data[cursor..cursor + 8]
-                .try_into()
-                .map_err(|_| StorageError("invalid checkpoint_lsn offset".into()))?,
+                .map_err(|_| StorageError("invalid last_record_lsn offset".into()))?,
         );
         cursor += 8;
 
@@ -619,8 +607,7 @@ impl LogFileHeader {
         Ok(Self {
             magic,
             version,
-            last_lsn: Lsn::new(last_lsn_file_id, last_lsn_offset),
-            checkpoint_lsn: Lsn::new(checkpoint_lsn_file_id, checkpoint_lsn_offset),
+            last_record_lsn: Lsn::new(last_record_lsn_file_id, last_record_lsn_offset),
             crc32,
         })
     }
@@ -631,10 +618,8 @@ impl LogFileHeader {
         hasher.update(&self.version.to_le_bytes());
         hasher.update(&[0u8, 0u8]);
         hasher.update(&[0u8; 4]);
-        hasher.update(&self.last_lsn.file_id.to_le_bytes());
-        hasher.update(&self.last_lsn.offset.to_le_bytes());
-        hasher.update(&self.checkpoint_lsn.file_id.to_le_bytes());
-        hasher.update(&self.checkpoint_lsn.offset.to_le_bytes());
+        hasher.update(&self.last_record_lsn.file_id.to_le_bytes());
+        hasher.update(&self.last_record_lsn.offset.to_le_bytes());
         hasher.finalize()
     }
 
@@ -676,7 +661,7 @@ impl LogFile {
             header,
             write_buffer: Vec::with_capacity(Self::DEFAULT_BUFFER_CAPACITY),
             buffer_capacity: Self::DEFAULT_BUFFER_CAPACITY,
-            last_lsn: Lsn::new(0, WAL_HEADER_SIZE as u64),
+            next_lsn: Lsn::new(0, WAL_HEADER_SIZE as u64),
             last_record_lsn: Lsn::new(0, 0),
         })
     }
@@ -706,8 +691,8 @@ impl LogFile {
             file.set_len(write_offset)?;
         }
 
-        if header.last_lsn != last_record_lsn {
-            header.last_lsn = last_record_lsn;
+        if header.last_record_lsn != last_record_lsn {
+            header.last_record_lsn = last_record_lsn;
             header.crc32 = header.compute_crc32();
             file.seek(SeekFrom::Start(0))?;
             file.write_all(&header.serialize())?;
@@ -720,7 +705,7 @@ impl LogFile {
             header,
             write_buffer: Vec::with_capacity(Self::DEFAULT_BUFFER_CAPACITY),
             buffer_capacity: Self::DEFAULT_BUFFER_CAPACITY,
-            last_lsn: Lsn::new(0, write_offset),
+            next_lsn: Lsn::new(0, write_offset),
             last_record_lsn,
         })
     }
@@ -729,27 +714,28 @@ impl LogFile {
     // Checkpoint Operations
     // ------------------------------------------------------------------------
 
-    #[cfg(test)]
-    fn set_checkpoint_lsn(&mut self, lsn: Lsn) -> Result<(), WrongoDBError> {
-        self.header.checkpoint_lsn = lsn;
-        self.header.crc32 = self.header.compute_crc32();
-
-        let header_bytes = self.header.serialize();
-        self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&header_bytes)?;
-        self.file.sync_all()?;
-
-        Ok(())
+    /// Return the next append position for the WAL.
+    ///
+    /// This is the checkpoint boundary that says "all records before this LSN
+    /// are already included in the checkpoint being written".
+    pub(crate) fn end_lsn(&self) -> Lsn {
+        self.next_lsn
     }
 
-    pub(crate) fn truncate_to_checkpoint(&mut self) -> Result<(), WrongoDBError> {
+    pub(crate) fn truncate_if_tail_matches(
+        &mut self,
+        boundary_lsn: Lsn,
+    ) -> Result<bool, WrongoDBError> {
+        if self.next_lsn != boundary_lsn {
+            return Ok(false);
+        }
+
         self.sync()?;
         self.file.set_len(WAL_HEADER_SIZE as u64)?;
 
-        self.last_lsn = Lsn::new(0, WAL_HEADER_SIZE as u64);
+        self.next_lsn = Lsn::new(0, WAL_HEADER_SIZE as u64);
         self.last_record_lsn = Lsn::new(0, 0);
-        self.header.last_lsn = Lsn::new(0, 0);
-        self.header.checkpoint_lsn = Lsn::new(0, 0);
+        self.header.last_record_lsn = Lsn::new(0, 0);
         self.header.crc32 = self.header.compute_crc32();
         let header_bytes = self.header.serialize();
         self.file.seek(SeekFrom::Start(0))?;
@@ -757,7 +743,7 @@ impl LogFile {
         self.file.sync_all()?;
         self.file.seek(SeekFrom::Start(WAL_HEADER_SIZE as u64))?;
 
-        Ok(())
+        Ok(true)
     }
 
     // ------------------------------------------------------------------------
@@ -787,10 +773,6 @@ impl LogFile {
         })
     }
 
-    pub(crate) fn log_checkpoint(&mut self) -> Result<Lsn, WrongoDBError> {
-        self.append_record(WalRecord::Checkpoint)
-    }
-
     // ------------------------------------------------------------------------
     // Private Helpers
     // ------------------------------------------------------------------------
@@ -800,7 +782,7 @@ impl LogFile {
         let record_type = record.record_type() as u8;
         let payload_len = payload.len() as u16;
 
-        let lsn = self.last_lsn;
+        let lsn = self.next_lsn;
         let prev_lsn = self.last_record_lsn;
 
         let mut hasher = Hasher::new();
@@ -825,12 +807,12 @@ impl LogFile {
         self.write_buffered(&payload)?;
 
         let record_size = RECORD_HEADER_SIZE + payload.len();
-        self.last_lsn = Lsn::new(
-            self.last_lsn.file_id,
-            self.last_lsn.offset + record_size as u64,
+        self.next_lsn = Lsn::new(
+            self.next_lsn.file_id,
+            self.next_lsn.offset + record_size as u64,
         );
         self.last_record_lsn = lsn;
-        self.header.last_lsn = lsn;
+        self.header.last_record_lsn = lsn;
 
         Ok(lsn)
     }
@@ -1097,25 +1079,21 @@ mod tests {
         assert_eq!(header.lsn, Lsn::new(0, WAL_HEADER_SIZE as u64));
         assert_eq!(header.prev_lsn, Lsn::new(0, 0));
 
-        match record {
-            WalRecord::TxnCommit {
-                txn_id,
-                commit_ts,
-                ops,
-            } => {
-                assert_eq!(txn_id, 1);
-                assert_eq!(commit_ts, 1);
-                assert_eq!(
-                    ops,
-                    vec![TxnLogOp::Put {
-                        store_id: TEST_STORE_ID,
-                        key: b"k1".to_vec(),
-                        value: b"v1".to_vec(),
-                    }]
-                );
-            }
-            other => panic!("unexpected record: {other:?}"),
-        }
+        let WalRecord::TxnCommit {
+            txn_id,
+            commit_ts,
+            ops,
+        } = record;
+        assert_eq!(txn_id, 1);
+        assert_eq!(commit_ts, 1);
+        assert_eq!(
+            ops,
+            vec![TxnLogOp::Put {
+                store_id: TEST_STORE_ID,
+                key: b"k1".to_vec(),
+                value: b"v1".to_vec(),
+            }]
+        );
     }
 
     #[test]
@@ -1172,7 +1150,16 @@ mod tests {
             ],
         )
         .unwrap();
-        wal.log_checkpoint().unwrap();
+        wal.log_txn_commit(
+            2,
+            2,
+            &[TxnLogOp::Put {
+                store_id: TEST_STORE_ID,
+                key: b"k2".to_vec(),
+                value: b"v2".to_vec(),
+            }],
+        )
+        .unwrap();
         wal.sync().unwrap();
 
         let mut reader = WalFileReader::open(&wal_path).unwrap();
@@ -1187,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn truncate_then_append_restarts_record_sequence_after_checkpoint() {
+    fn truncate_then_append_restarts_record_sequence_after_tail_reset() {
         let dir = tempdir().unwrap();
         let wal_path = wal_path(dir.path());
         let mut wal = LogFile::open_or_create(&wal_path).unwrap();
@@ -1202,10 +1189,9 @@ mod tests {
             }],
         )
         .unwrap();
-        let checkpoint_lsn = wal.log_checkpoint().unwrap();
-        wal.set_checkpoint_lsn(checkpoint_lsn).unwrap();
         wal.sync().unwrap();
-        wal.truncate_to_checkpoint().unwrap();
+        let boundary_lsn = wal.end_lsn();
+        assert!(wal.truncate_if_tail_matches(boundary_lsn).unwrap());
 
         wal.log_txn_commit(
             2,
@@ -1226,7 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn truncate_clears_checkpoint_and_last_lsn_metadata() {
+    fn truncate_clears_last_record_lsn_metadata() {
         let dir = tempdir().unwrap();
         let wal_path = wal_path(dir.path());
         let mut wal = LogFile::open_or_create(&wal_path).unwrap();
@@ -1241,14 +1227,12 @@ mod tests {
             }],
         )
         .unwrap();
-        let checkpoint_lsn = wal.log_checkpoint().unwrap();
-        wal.set_checkpoint_lsn(checkpoint_lsn).unwrap();
         wal.sync().unwrap();
-        wal.truncate_to_checkpoint().unwrap();
+        let boundary_lsn = wal.end_lsn();
+        assert!(wal.truncate_if_tail_matches(boundary_lsn).unwrap());
 
         let header = read_header(&wal_path);
-        assert_eq!(header.last_lsn, Lsn::new(0, 0));
-        assert_eq!(header.checkpoint_lsn, Lsn::new(0, 0));
+        assert_eq!(header.last_record_lsn, Lsn::new(0, 0));
     }
 
     #[test]
@@ -1259,8 +1243,7 @@ mod tests {
         let mut header = LogFileHeader {
             magic: *WAL_MAGIC,
             version: 1,
-            last_lsn: Lsn::new(0, 0),
-            checkpoint_lsn: Lsn::new(0, 0),
+            last_record_lsn: Lsn::new(0, 0),
             crc32: 0,
         };
         header.crc32 = header.compute_crc32();
