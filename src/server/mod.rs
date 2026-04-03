@@ -53,7 +53,7 @@ impl MsgHeader {
     }
 }
 
-/// Start the MongoDB wire-protocol server on `addr` using the default primary config.
+/// Start the MongoDB wire-protocol server on `addr`.
 ///
 /// Startup audits the durable catalog before the listener begins accepting
 /// requests so missing referenced stores fail fast, orphaned store files are
@@ -67,10 +67,6 @@ pub async fn start_server(
 }
 
 /// Start the MongoDB wire-protocol server with explicit replication policy.
-///
-/// When the configured role is `secondary`, startup also boots the follower
-/// replication runtime after the durable oplog and replication-state
-/// namespaces are initialized.
 pub async fn start_server_with_replication(
     addr: &str,
     conn: Arc<Connection>,

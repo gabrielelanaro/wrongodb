@@ -1,6 +1,6 @@
 # WrongoDB
 
-Last updated: `2026-03-31`
+Last updated: `2026-03-30`
 
 The database that teaches you how databases work by doing everything wrong first, then fixing it.
 
@@ -18,7 +18,7 @@ It is a learning resource, a playground, and a documentation of the path from "n
 
 ## Current State
 
-A learning-oriented MongoDB-compatible database in Rust with primary/secondary replication roles, inspired by WiredTiger's architecture.
+A learning-oriented single-node MongoDB-compatible database in Rust, inspired by WiredTiger's architecture.
 
 ### Storage Engine
 - **B+tree storage**: Fixed-size paged files with slotted leaf/internal pages, arbitrary height, splits, range scans
@@ -31,7 +31,7 @@ A learning-oriented MongoDB-compatible database in Rust with primary/secondary r
 - `Connection`/`Session`/`TableCursor` low-level storage API
 - Explicit transaction scopes via `Session::with_transaction()`
 - MongoDB wire protocol server (works with `mongosh`)
-- Internal Mongo-style write stack with `write_ops`, `CollectionWritePath`, and a storage-backed logical oplog in the reserved `local.oplog.rs` collection, plus secondary replication state in `local.repl_state`
+- Internal Mongo-style write stack with `write_ops`, `CollectionWritePath`, and a storage-backed logical oplog in the reserved `local.oplog.rs` collection
 
 `TableCursor` is intentionally a local/store-level API. Document semantics, namespace-aware collection
 catalog state, and index creation live above it in the server/document layer.
@@ -54,8 +54,8 @@ The codebase is organized by domain to keep storage, catalog, and server concern
 - `src/write_ops/`: top-level Mongo-style CRUD executor above the collection mutator
 - `src/collection_write_path.rs`: low-level in-transaction collection document mutator
 - `src/document_query.rs`: internal document/query helpers used by the server path
-- `src/server/`: MongoDB wire-protocol server, command handlers, and role-aware startup reconciliation
-- `src/replication/`: server-layer replication state, oplog observer, secondary apply runtime, and `local.oplog.rs` / `local.repl_state` collection management above the storage connection
+- `src/server/`: MongoDB wire-protocol server, command handlers, and startup reconciliation
+- `src/replication/`: server-layer replication state, oplog observer, and `local.oplog.rs` collection management above the storage connection
 - `src/bin/`: server binary entry point
 
 Integration tests are grouped under `tests/`:
@@ -132,7 +132,6 @@ wrongodb-server
 
 You can also set the listen address with `--addr`, `--port`, `WRONGO_ADDR`, or `WRONGO_PORT`.
 For benchmark isolation, you can set data path with `--db-path` or `WRONGO_DB_PATH`.
-Replication mode is configured with `--role` or `WRONGO_ROLE`, `--node-name` or `WRONGO_NODE_NAME`, and `--sync-source` or `WRONGO_SYNC_SOURCE`; secondary mode requires a sync source.
 
 Run tests with `cargo test`.
 

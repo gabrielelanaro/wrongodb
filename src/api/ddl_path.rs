@@ -374,8 +374,8 @@ mod tests {
     use crate::core::{DatabaseName, Namespace};
     use crate::document_query::DocumentQuery;
     use crate::replication::{
-        oplog_namespace, OplogOperation, OplogStore, ReplicationConfig,
-        ReplicationCoordinator, ReplicationObserver, ReplicationRole,
+        oplog_namespace, OplogOperation, OplogStore, ReplicationConfig, ReplicationCoordinator,
+        ReplicationObserver, ReplicationRole,
     };
     use crate::storage::api::{Connection, ConnectionConfig, Session};
     use crate::WrongoDBError;

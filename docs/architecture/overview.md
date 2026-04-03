@@ -8,7 +8,7 @@ WrongoDB currently has two externally visible personalities:
 Shared identity types such as `DatabaseName` and `Namespace` live in `src/core/namespace.rs` so
 command parsing, catalog lookups, and cursor replies all speak the same namespace model.
 
-The repository does not currently contain an active distributed RAFT subsystem. It does now expose a server-layer replication module above `Connection`, including primary write admission, oplog capture, a secondary apply runtime, and the durable `local.oplog.rs` / `local.repl_state` namespaces; older references to RAFT in the README were historical and have been removed from the maintained architecture entry points.
+The repository does not currently contain an active distributed RAFT subsystem. It does now expose a server-layer replication module above `Connection`, including primary write admission and a storage-backed internal oplog; older references to RAFT in the README were historical and have been removed from the maintained architecture entry points.
 
 ## Layer map
 
@@ -61,7 +61,7 @@ Responsibilities:
 - route CRUD through `write_ops`
 - route `createCollection` and `createIndexes` through `DdlPath`
 - implement query planning over the storage API
-- own server-layer replication policy, the internal logical oplog, and the secondary apply runtime above the storage connection
+- own server-layer replication state and the internal logical oplog above the storage connection
 
 ### Durable catalog layer
 

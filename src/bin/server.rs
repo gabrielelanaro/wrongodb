@@ -20,8 +20,7 @@ fn print_usage_and_exit(exit_code: i32) -> ! {
          Notes:\n\
            * If both --addr and --port are provided, --addr wins.\n\
            * Legacy positional ADDR is still supported.\n\
-           * DB path can also be set via WRONGO_DB_PATH.\n\
-           * Replication settings can also be set via WRONGO_ROLE, WRONGO_NODE_NAME, and WRONGO_SYNC_SOURCE."
+           * DB path can also be set via WRONGO_DB_PATH."
     );
     std::process::exit(exit_code);
 }
