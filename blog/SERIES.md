@@ -11,7 +11,7 @@ The narrative thread:
 1) “I can store and query documents” (toy but real)
 2) “I need predictable IO units” (pages)
 3) “I need structures, not scans” (B+tree)
-4) “I need a durability story” (WAL + checkpoints)
+4) “I need a durability model” (WAL + checkpoints)
 
 ## Proposed posts
 
@@ -39,6 +39,14 @@ Note: another agent is actively working in the repo on Slice D; treat the code a
 ### 05 — What “WAL + checkpoints” will mean here
 Status: outline later
 Goal: set expectations: not production durability, but real invariants and recovery flow.
+
+### 06 — Checkpoints and copy-on-write
+File: `blog/06-checkpoints-and-cow/post.md`
+Goal: stable vs working root, why checkpoints make the tree crash-safe, and why writes between checkpoints are still at risk.
+
+### 07 — The gap between checkpoints
+File: `blog/07-write-ahead-log/post.md`
+Goal: explain why the WAL exists, how recovery starts from the checkpoint LSN, and which design mistakes led to the current shape.
 
 ## Reusable post template
 

@@ -131,23 +131,6 @@ I tried:
 
 Logging a list of `LogOp`s is much cleaner. That is also much closer to how WiredTiger approaches the problem.
 
-### Mistake 3: treating WAL as an isolated feature
-
-This was the biggest one.
-
-I kept thinking, "I just need a log file."
-
-That is not really the problem.
-
-The real questions are:
-
-- when is it safe to say a write is durable?
-- what exactly gets written into the log?
-- how does restart know what to replay, and in what order?
-- how do metadata changes fit into the same model?
-
-Once I started looking at WAL a bit more holistically things finally clicked. How wiredtiger treats transaction (for a future post), was also super important to nail the WAL.
-
 ## What’s next
 
 - MVCC and transactions!

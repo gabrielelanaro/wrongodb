@@ -55,6 +55,15 @@ def _default_out_path(post_dir: str | None) -> Path:
     return post_path / "images" / f"generated_{stamp}.png"
 
 
+def _reference_mime_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".webp":
+        return "image/webp"
+    return "image/png"
+
+
 def _extract_image_data(response) -> tuple[bytes, str | None] | None:
     parts = None
     if hasattr(response, "parts") and response.parts:
@@ -393,7 +402,13 @@ def _critique_image(
 
 
 def _generate_image_bytes(
-    client, model: str, prompt: str, aspect: str, size: str
+    client,
+    model: str,
+    prompt: str,
+    aspect: str,
+    size: str,
+    reference_image_bytes: bytes | None = None,
+    reference_image_mime: str | None = None,
 ) -> tuple[bytes, str | None, str | None]:
     from google.genai import types
 
@@ -402,11 +417,31 @@ def _generate_image_bytes(
         image_size=size,
     )
     config = types.GenerateContentConfig(image_config=image_config)
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config=config,
-    )
+    if reference_image_bytes is None:
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=config,
+        )
+    else:
+        image_part = types.Part.from_bytes(
+            data=reference_image_bytes,
+            mime_type=reference_image_mime or "image/png",
+        )
+        text_part = types.Part.from_text(
+            text=(
+                f"{prompt}\n\n"
+                "Use the attached image as a style and composition reference where helpful. "
+                "Preserve the reference's visual language, character design quality, and overall feel "
+                "unless the prompt explicitly asks for changes."
+            )
+        )
+        content = types.Content(role="user", parts=[text_part, image_part])
+        response = client.models.generate_content(
+            model=model,
+            contents=[content],
+            config=config,
+        )
 
     extracted = _extract_image_data(response)
     if not extracted:
@@ -471,6 +506,11 @@ def main() -> int:
         default=2,
         help="Max critique/refine cycles in agentic mode (default: 2)",
     )
+    parser.add_argument(
+        "--reference",
+        default=None,
+        help="Optional reference image to guide style/composition in direct image generation mode",
+    )
 
     args = parser.parse_args()
 
@@ -495,6 +535,16 @@ def main() -> int:
         out_path = _default_out_path(args.post)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    reference_image_bytes = None
+    reference_image_mime = None
+    if args.reference:
+        reference_path = Path(args.reference)
+        if not reference_path.exists():
+            print(f"Reference image not found: {reference_path}", file=sys.stderr)
+            return 2
+        reference_image_bytes = reference_path.read_bytes()
+        reference_image_mime = _reference_mime_type(reference_path)
+
     client = genai.Client()
 
     if args.agentic:
@@ -517,6 +567,8 @@ def main() -> int:
                 current_prompt,
                 args.aspect,
                 args.size,
+                reference_image_bytes=reference_image_bytes,
+                reference_image_mime=reference_image_mime,
             )
             if error_text:
                 print(error_text)
@@ -567,6 +619,7 @@ def main() -> int:
             "model": args.model,
             "aspect": args.aspect,
             "size": args.size,
+            "reference": args.reference,
             "iterations_requested": args.iterations,
             "iterations_used": len(critiques),
             "critiques": critiques,
@@ -595,6 +648,8 @@ def main() -> int:
         args.prompt,
         args.aspect,
         args.size,
+        reference_image_bytes=reference_image_bytes,
+        reference_image_mime=reference_image_mime,
     )
     if error_text:
         print(error_text)

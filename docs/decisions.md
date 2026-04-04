@@ -2783,3 +2783,53 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
   boundary as other storage objects instead of peeking into `Session` internals.
 - Treating `metadata.wt` as the sole reserved file keeps the bootstrap boundary small while letting
   the catalog participate in normal metadata, WAL replay, and checkpoint flows.
+
+## 2026-04-03: Make per-store checkpoint LSNs the recovery source of truth
+
+**Decision**
+- Persist a `checkpoint_lsn` in each store file's active checkpoint slot.
+- Treat `metadata.wt`'s checkpoint LSN as the global WAL replay start on open.
+- Remove checkpoint records from the WAL format entirely.
+- Replay one global WAL scan, but apply non-metadata operations only when the
+  transaction commit LSN is at or after that store's checkpoint LSN.
+- Keep WAL truncation as optional cleanup only; it is no longer part of recovery correctness.
+
+**Why**
+- Recovery should be anchored in the durable store checkpoints, not in whether the WAL happened to
+  be physically truncated.
+- Using `metadata.wt` as the restart anchor mirrors WiredTiger's model closely enough for this
+  codebase while keeping the checkpoint state with the store files instead of adding a separate
+  metadata row format.
+- Per-store checkpoint LSNs let recovery skip already-checkpointed operations without needing a
+  separate replay pass per file.
+- Removing checkpoint WAL records simplifies the log format and avoids maintaining two competing
+  sources of truth for restart boundaries.
+
+## 2026-04-04: Realign Mongo collections around logical documents, not storage columns
+
+**Decision**
+- Remove `storageColumns` from the Mongo-facing collection contract, durable collection catalog
+  state, and replicated create-collection oplog entries.
+- Store Mongo collection rows in a dedicated `document_v1` row format keyed by encoded `_id` and
+  containing one opaque encoded document payload.
+- Keep the low-level WT-like storage API (`create_table`, `open_table_cursor`, raw index metadata)
+  available for direct storage usage, but stop using its implicit table/index behavior as the
+  reference model for Mongo-facing CRUD and DDL.
+- Make the Mongo collection write path own secondary-index maintenance explicitly:
+  - insert primary record, then add secondary keys
+  - update primary record, then reconcile old/new secondary keys
+  - delete secondary keys, then delete the primary record
+- Keep shared document-to-index-key derivation in a small storage-neutral internal helper in the
+  index layer, not inside WT-like cursor/session code.
+- Change replicated create-index oplog entries to carry the normalized index spec instead of only
+  the index name plus indexed field.
+
+**Why**
+- MongoDB does not ask callers to declare physical storage columns when creating a collection; that
+  requirement was a storage-shaped leak into the public Mongo API.
+- MongoDB owns index semantics above WiredTiger. Requiring Mongo CRUD to flow through
+  `TableCursor` side effects was coupling the wrong layer to the wrong abstraction.
+- A document row format makes the collection contract match Mongo-style logical documents while
+  still keeping the WT-like raw table API available for storage-oriented work and tests.
+- Persisting logical collection options and full index specs in catalog/oplog metadata gives
+  replication and recovery the same Mongo-visible schema shape that primary-side DDL uses.

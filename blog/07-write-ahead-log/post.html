@@ -110,18 +110,6 @@
 <li>logging individual <code>LogOp</code> like put and deletes: also bad idea as now you have the issue of atomicity, this was extremely important to get transaction work and I went on a massive rabbit hole to be able to grasp it.</li>
 </ul>
 <p>Logging a list of <code>LogOp</code>s is much cleaner. That is also much closer to how WiredTiger approaches the problem.</p>
-<h3>Mistake 3: treating WAL as an isolated feature</h3>
-<p>This was the biggest one.</p>
-<p>I kept thinking, "I just need a log file."</p>
-<p>That is not really the problem.</p>
-<p>The real questions are:</p>
-<ul>
-<li>when is it safe to say a write is durable?</li>
-<li>what exactly gets written into the log?</li>
-<li>how does restart know what to replay, and in what order?</li>
-<li>how do metadata changes fit into the same model?</li>
-</ul>
-<p>Once I started looking at WAL a bit more holistically things finally clicked. How wiredtiger treats transaction (for a future post), was also super important to nail the WAL.</p>
 <h2>What’s next</h2>
 <ul>
 <li>MVCC and transactions!</li>
