@@ -1,5 +1,18 @@
 # Decisions
 
+## 2026-03-31: Wire server startup through explicit replication roles
+
+**Decision**
+- Keep `start_server` as the primary-mode convenience wrapper and route it through a separate `start_server_with_replication` entry point.
+- Parse replication mode, node name, and sync-source settings in the server binary, then pass a `ReplicationConfig` into startup instead of hiding role selection inside the storage layer.
+- Spawn the secondary replication runtime only when the configured role is `secondary`.
+- Keep `DatabaseContext` free of long-lived replication policy; it receives `ReplicationCoordinator` during construction and returns any secondary-only runtime separately.
+
+**Why**
+- Primary/secondary mode is server boot policy, not storage state.
+- The same command surface should be able to expose writable-primary or read-only behavior based on launch configuration without creating a special case inside `Connection`.
+- Returning the follower runtime separately keeps the server context focused on command services instead of turning it into a service locator.
+
 ## 2026-03-31: Keep `CollectionWritePath` replication-agnostic and move oplog concerns to `WriteOps` and `OplogApplier`
 
 **Decision**
@@ -2804,32 +2817,3 @@ RefCell lets us do a runtime-checked temporary &mut to the BTree.
   separate replay pass per file.
 - Removing checkpoint WAL records simplifies the log format and avoids maintaining two competing
   sources of truth for restart boundaries.
-
-## 2026-04-04: Realign Mongo collections around logical documents, not storage columns
-
-**Decision**
-- Remove `storageColumns` from the Mongo-facing collection contract, durable collection catalog
-  state, and replicated create-collection oplog entries.
-- Store Mongo collection rows in a dedicated `document_v1` row format keyed by encoded `_id` and
-  containing one opaque encoded document payload.
-- Keep the low-level WT-like storage API (`create_table`, `open_table_cursor`, raw index metadata)
-  available for direct storage usage, but stop using its implicit table/index behavior as the
-  reference model for Mongo-facing CRUD and DDL.
-- Make the Mongo collection write path own secondary-index maintenance explicitly:
-  - insert primary record, then add secondary keys
-  - update primary record, then reconcile old/new secondary keys
-  - delete secondary keys, then delete the primary record
-- Keep shared document-to-index-key derivation in a small storage-neutral internal helper in the
-  index layer, not inside WT-like cursor/session code.
-- Change replicated create-index oplog entries to carry the normalized index spec instead of only
-  the index name plus indexed field.
-
-**Why**
-- MongoDB does not ask callers to declare physical storage columns when creating a collection; that
-  requirement was a storage-shaped leak into the public Mongo API.
-- MongoDB owns index semantics above WiredTiger. Requiring Mongo CRUD to flow through
-  `TableCursor` side effects was coupling the wrong layer to the wrong abstraction.
-- A document row format makes the collection contract match Mongo-style logical documents while
-  still keeping the WT-like raw table API available for storage-oriented work and tests.
-- Persisting logical collection options and full index specs in catalog/oplog metadata gives
-  replication and recovery the same Mongo-visible schema shape that primary-side DDL uses.
